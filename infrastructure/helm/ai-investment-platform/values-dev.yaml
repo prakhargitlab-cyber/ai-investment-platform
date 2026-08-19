@@ -1,0 +1,6 @@
+global:
+  environment: DEV
+  imageRegistry: localhost:5001
+
+devDependencies:
+  enabled: true

@@ -1,0 +1,129 @@
+global:
+  imageRegistry: localhost:5001
+  imagePullPolicy: IfNotPresent
+  environment: DEV
+
+frontend:
+  enabled: true
+  image: ai-investment/frontend
+  tag: latest
+  port: 3000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+javaServices:
+  - name: api-gateway
+    image: ai-investment/api-gateway
+    tag: latest
+    port: 8080
+  - name: auth-service
+    image: ai-investment/auth-service
+    tag: latest
+    port: 8080
+  - name: portfolio-service
+    image: ai-investment/portfolio-service
+    tag: latest
+    port: 8080
+  - name: broker-service
+    image: ai-investment/broker-service
+    tag: latest
+    port: 8080
+  - name: company-service
+    image: ai-investment/company-service
+    tag: latest
+    port: 8080
+  - name: research-service
+    image: ai-investment/research-service
+    tag: latest
+    port: 8080
+  - name: recommendation-service
+    image: ai-investment/recommendation-service
+    tag: latest
+    port: 8080
+  - name: risk-service
+    image: ai-investment/risk-service
+    tag: latest
+    port: 8080
+  - name: notification-service
+    image: ai-investment/notification-service
+    tag: latest
+    port: 8080
+
+javaServiceDefaults:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+
+aiServices:
+  - name: research-engine
+    image: ai-investment/research-engine
+    tag: latest
+    port: 8000
+  - name: valuation-engine
+    image: ai-investment/valuation-engine
+    tag: latest
+    port: 8000
+  - name: ranking-engine
+    image: ai-investment/ranking-engine
+    tag: latest
+    port: 8000
+  - name: portfolio-optimizer
+    image: ai-investment/portfolio-optimizer
+    tag: latest
+    port: 8000
+
+aiServiceDefaults:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+
+research:
+  liveEnabled: false
+  demoEnabled: true
+
+devDependencies:
+  enabled: true
+  postgres:
+    image: postgres:16-alpine
+    database: investment
+    username: investment
+    password: ""
+    passwordSecretName: dev-postgres
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  redis:
+    image: redis:7-alpine
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  kafka:
+    image: bitnami/kafka:3.7
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi

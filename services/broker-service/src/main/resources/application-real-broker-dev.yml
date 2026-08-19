@@ -1,0 +1,15 @@
+broker:
+  ibkr:
+    enabled: ${IBKR_ENABLED:false}
+    base-url: ${IBKR_BASE_URL:}
+    client-id: ${IBKR_CLIENT_ID:}
+    callback-url: ${IBKR_CALLBACK_URL:}
+    auth-method: ${IBKR_AUTH_METHOD:}
+    official-documentation-verified: ${IBKR_OFFICIAL_DOCUMENTATION_VERIFIED:false}
+  icici-direct:
+    enabled: ${ICICI_DIRECT_ENABLED:false}
+    base-url: ${ICICI_DIRECT_BASE_URL:}
+    client-id: ${ICICI_DIRECT_CLIENT_ID:}
+    callback-url: ${ICICI_DIRECT_CALLBACK_URL:}
+    auth-method: ${ICICI_DIRECT_AUTH_METHOD:}
+    official-documentation-verified: ${ICICI_DIRECT_OFFICIAL_DOCUMENTATION_VERIFIED:false}

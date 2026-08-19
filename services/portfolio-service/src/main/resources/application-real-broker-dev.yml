@@ -1,0 +1,2 @@
+market:
+  demo-mode: ${MARKET_DATA_DEMO_MODE:false}

@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: api-gateway
+portfolio:
+  service:
+    base-url: ${PORTFOLIO_SERVICE_BASE_URL:http://localhost:8082}
+broker:
+  service:
+    base-url: ${BROKER_SERVICE_BASE_URL:http://localhost:8083}
+research:
+  engine:
+    base-url: ${RESEARCH_ENGINE_BASE_URL:http://localhost:8000}
+server:
+  port: ${SERVER_PORT:8080}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+logging:
+  pattern:
+    level: "%5p [correlationId:%X{correlationId:-}]"

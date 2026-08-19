@@ -1,0 +1,10 @@
+global:
+  environment: PRD
+  imageRegistry: ""
+
+devDependencies:
+  enabled: false
+
+research:
+  liveEnabled: false
+  demoEnabled: false

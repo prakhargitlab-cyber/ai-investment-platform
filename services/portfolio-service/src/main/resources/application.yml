@@ -1,0 +1,53 @@
+spring:
+  application:
+    name: portfolio-service
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:investment}
+    username: ${DB_USER:investment}
+    password: ${DB_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+market:
+  demo-mode: ${MARKET_DATA_DEMO_MODE:false}
+  quote-cache:
+    mode: ${MARKET_QUOTE_CACHE_MODE:memory}
+    ttl: ${MARKET_QUOTE_CACHE_TTL:PT5M}
+server:
+  port: ${SERVER_PORT:8082}
+springdoc:
+  api-docs:
+    enabled: ${OPENAPI_ENABLED:false}
+  swagger-ui:
+    enabled: ${OPENAPI_ENABLED:false}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+logging:
+  pattern:
+    level: "%5p [correlationId:%X{correlationId:-}]"
+---
+spring:
+  config:
+    activate:
+      on-profile: DEV
+market:
+  demo-mode: ${MARKET_DATA_DEMO_MODE:true}
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true

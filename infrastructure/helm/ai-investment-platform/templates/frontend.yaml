@@ -4,44 +4,169 @@ kind: Deployment
 metadata:
   name: frontend
   labels:
-    {{- include "aip.labels" . | nindent 4 }}
-    app.kubernetes.io/component: frontend
+    {{- include "aip.componentLabels" (dict "root" . "component" "frontend") | nindent 4 }}
 spec:
-  replicas: 1
+  {{- if not .Values.frontend.autoscaling.enabled }}
+  replicas: {{ .Values.frontend.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.global.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml .Values.global.rolloutStrategy | nindent 4 }}
   selector:
     matchLabels:
-      app.kubernetes.io/component: frontend
+      {{- include "aip.selectorLabels" (dict "root" . "component" "frontend") | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/component: frontend
+        {{- include "aip.podLabels" (dict "root" . "component" "frontend") | nindent 8 }}
+      {{- $annotations := include "aip.podAnnotations" (dict "root" . "language" "nodejs") }}
+      {{- if $annotations }}
+      annotations:
+        {{- $annotations | nindent 8 }}
+      {{- end }}
     spec:
+      serviceAccountName: {{ include "aip.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.global.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.global.terminationGracePeriodSeconds }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.global.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.global.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.global.topologySpread.topologyKey | quote }}
+          whenUnsatisfiable: {{ .Values.global.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "aip.selectorLabels" (dict "root" . "component" "frontend") | nindent 14 }}
+      {{- end }}
       containers:
         - name: frontend
-          image: {{ include "aip.image" (dict "root" . "image" .Values.frontend.image "tag" .Values.frontend.tag) }}
-          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          image: {{ include "aip.image" (dict "root" . "image" .Values.frontend.image "tag" .Values.frontend.tag) | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | quote }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            {{- include "aip.commonEnv" (dict "root" . "serviceName" "frontend") | nindent 12 }}
+            - name: NODE_ENV
+              value: production
           ports:
-            - containerPort: {{ .Values.frontend.port }}
+            - name: http
+              containerPort: {{ .Values.frontend.port }}
+          {{- if .Values.frontend.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.frontend.probes.startup.path }}
+              port: http
+            periodSeconds: {{ .Values.frontend.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.frontend.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.frontend.probes.startup.failureThreshold }}
+          {{- end }}
           readinessProbe:
             httpGet:
-              path: /api/health
-              port: {{ .Values.frontend.port }}
+              path: {{ .Values.frontend.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ .Values.frontend.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.frontend.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.frontend.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
-              path: /api/health
-              port: {{ .Values.frontend.port }}
+              path: {{ .Values.frontend.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ .Values.frontend.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.frontend.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.frontend.probes.liveness.failureThreshold }}
           resources:
             {{- toYaml .Values.frontend.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.global.temporaryStorage.enabled }}
+            - name: temporary-storage
+              mountPath: {{ .Values.global.temporaryStorage.mountPath | quote }}
+            {{- end }}
+            {{- if .Values.frontend.cache.enabled }}
+            - name: next-cache
+              mountPath: {{ .Values.frontend.cache.mountPath | quote }}
+            {{- end }}
+      volumes:
+        {{- if .Values.global.temporaryStorage.enabled }}
+        - name: temporary-storage
+          emptyDir:
+            {{- with .Values.global.temporaryStorage.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
+        {{- end }}
+        {{- if .Values.frontend.cache.enabled }}
+        - name: next-cache
+          emptyDir:
+            {{- with .Values.frontend.cache.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: frontend
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "frontend") | nindent 4 }}
 spec:
+  type: {{ .Values.frontend.service.type }}
   selector:
-    app.kubernetes.io/component: frontend
+    {{- include "aip.selectorLabels" (dict "root" . "component" "frontend") | nindent 4 }}
   ports:
     - name: http
-      port: 80
-      targetPort: {{ .Values.frontend.port }}
-{{- end }}
+      port: {{ .Values.frontend.service.port }}
+      targetPort: http
+{{ if .Values.frontend.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "frontend") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: {{ .Values.frontend.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.frontend.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.frontend.autoscaling.targetCPUUtilizationPercentage }}
+{{ end }}
+{{ if .Values.frontend.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "frontend") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.frontend.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "frontend") | nindent 6 }}
+{{ end }}
+{{ end }}

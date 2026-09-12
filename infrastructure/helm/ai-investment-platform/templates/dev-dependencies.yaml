@@ -1,4 +1,14 @@
 {{- if .Values.devDependencies.enabled }}
+{{- if .Values.auth.createDevSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.auth.jwtSecretName }}
+type: Opaque
+stringData:
+  {{ .Values.auth.jwtSecretKey }}: {{ .Values.auth.devJwtSecret | quote }}
+---
+{{- end }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -7,11 +17,32 @@ type: Opaque
 stringData:
   POSTGRES_PASSWORD: {{ default (randAlphaNum 32) .Values.devDependencies.postgres.password | quote }}
 ---
+{{- if and .Values.devDependencies.postgres.persistence.enabled (not .Values.devDependencies.postgres.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-dev
+  labels:
+    app.kubernetes.io/component: postgres
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.devDependencies.postgres.persistence.storageClass }}
+  storageClassName: {{ .Values.devDependencies.postgres.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.devDependencies.postgres.persistence.size | quote }}
+---
+{{- end }}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: postgres
 spec:
+  serviceName: postgres
   replicas: 1
   selector:
     matchLabels:
@@ -34,16 +65,46 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.devDependencies.postgres.passwordSecretName }}
                   key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
           ports:
-            - containerPort: 5432
+            - name: postgres
+              containerPort: 5432
+          startupProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- if .Values.devDependencies.postgres.persistence.enabled }}
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          {{- end }}
           resources:
             {{- toYaml .Values.devDependencies.postgres.resources | nindent 12 }}
+      {{- if .Values.devDependencies.postgres.persistence.enabled }}
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: {{ default "postgres-data-dev" .Values.devDependencies.postgres.persistence.existingClaim }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: postgres
 spec:
+  type: ClusterIP
   selector:
     app.kubernetes.io/component: postgres
   ports:
@@ -68,7 +129,23 @@ spec:
         - name: redis
           image: {{ .Values.devDependencies.redis.image }}
           ports:
-            - containerPort: 6379
+            - name: redis
+              containerPort: 6379
+          startupProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 10
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.devDependencies.redis.resources | nindent 12 }}
 ---
@@ -77,6 +154,7 @@ kind: Service
 metadata:
   name: redis
 spec:
+  type: ClusterIP
   selector:
     app.kubernetes.io/component: redis
   ports:
@@ -101,22 +179,50 @@ spec:
         - name: kafka
           image: {{ .Values.devDependencies.kafka.image }}
           env:
-            - name: KAFKA_CFG_NODE_ID
+            - name: CLUSTER_ID
+              value: "MkU3OEVBNTcwNTJENDM2Qk"
+            - name: KAFKA_NODE_ID
               value: "0"
-            - name: KAFKA_CFG_PROCESS_ROLES
+            - name: KAFKA_PROCESS_ROLES
               value: controller,broker
-            - name: KAFKA_CFG_CONTROLLER_QUORUM_VOTERS
-              value: 0@kafka:9093
-            - name: KAFKA_CFG_LISTENERS
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: 0@localhost:9093
+            - name: KAFKA_LISTENERS
               value: PLAINTEXT://:9092,CONTROLLER://:9093
-            - name: KAFKA_CFG_ADVERTISED_LISTENERS
+            - name: KAFKA_ADVERTISED_LISTENERS
               value: PLAINTEXT://kafka:9092
-            - name: KAFKA_CFG_CONTROLLER_LISTENER_NAMES
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
               value: CONTROLLER
-            - name: ALLOW_PLAINTEXT_LISTENER
-              value: "yes"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: PLAINTEXT
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
           ports:
-            - containerPort: 9092
+            - name: broker
+              containerPort: 9092
+            - name: controller
+              containerPort: 9093
+          startupProbe:
+            tcpSocket:
+              port: broker
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: broker
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: broker
+            periodSeconds: 10
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.devDependencies.kafka.resources | nindent 12 }}
 ---
@@ -125,9 +231,105 @@ kind: Service
 metadata:
   name: kafka
 spec:
+  type: ClusterIP
   selector:
     app.kubernetes.io/component: kafka
   ports:
-    - port: 9092
+    - name: broker
+      port: 9092
       targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+{{- if .Values.devDependencies.searxng.enabled }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.devDependencies.searxng.secretName }}
+type: Opaque
+stringData:
+  {{ .Values.devDependencies.searxng.secretKeyName }}: {{ default (randAlphaNum 48) .Values.devDependencies.searxng.secretKey | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-settings
+data:
+  settings.yml: |
+    use_default_settings: true
+    server:
+      limiter: false
+      image_proxy: false
+    search:
+      formats:
+        - html
+        - json
+    ui:
+      static_use_hash: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: searxng
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: searxng
+    spec:
+      containers:
+        - name: searxng
+          image: {{ .Values.devDependencies.searxng.image }}
+          env:
+            - name: SEARXNG_SETTINGS_PATH
+              value: /etc/searxng/settings.yml
+            - name: SEARXNG_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.devDependencies.searxng.secretName }}
+                  key: {{ .Values.devDependencies.searxng.secretKeyName }}
+          ports:
+            - containerPort: {{ .Values.devDependencies.searxng.port }}
+          volumeMounts:
+            - name: searxng-settings
+              mountPath: /etc/searxng/settings.yml
+              subPath: settings.yml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.devDependencies.searxng.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.devDependencies.searxng.port }}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.devDependencies.searxng.resources | nindent 12 }}
+      volumes:
+        - name: searxng-settings
+          configMap:
+            name: searxng-settings
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: searxng
+  ports:
+    - name: http
+      port: 80
+      targetPort: {{ .Values.devDependencies.searxng.port }}
+{{- end }}
 {{- end }}

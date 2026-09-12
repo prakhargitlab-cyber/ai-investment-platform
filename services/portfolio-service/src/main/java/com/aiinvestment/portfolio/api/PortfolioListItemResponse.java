@@ -14,11 +14,27 @@ public record PortfolioListItemResponse(
         MoneyResponse unrealizedProfitLoss,
         java.math.BigDecimal unrealizedProfitLossPercent,
         int positions,
-        Instant updatedAt
+        Instant updatedAt,
+        String provider,
+        UUID brokerConnectionId,
+        Instant lastBrokerSyncAt,
+        Instant lastBrokerSyncAttemptAt,
+        String lastBrokerSyncErrorCode,
+        boolean valuationComplete,
+        String acquisitionSource,
+        String sourceAccountReference,
+        Instant lastImportedAt,
+        String lastImportedFilename
 ) {
     public static PortfolioListItemResponse from(Portfolio portfolio, PortfolioSummary summary) {
-        return new PortfolioListItemResponse(portfolio.portfolioId(), portfolio.name(), portfolio.baseCurrency(),
+        return new PortfolioListItemResponse(portfolio.portfolioId(), PortfolioPresentationName.forPortfolio(portfolio), portfolio.baseCurrency(),
                 MoneyResponse.from(summary.totalMarketValue()), MoneyResponse.from(summary.unrealizedProfitLoss()),
-                summary.unrealizedProfitLossPercent(), summary.numberOfPositions(), portfolio.updatedAt());
+                summary.unrealizedProfitLossPercent(), summary.numberOfPositions(), portfolio.updatedAt(),
+                portfolio.brokerProvider() == null ? null : portfolio.brokerProvider().name(),
+                portfolio.brokerConnectionId(), portfolio.lastSuccessfulBrokerSyncAt(),
+                portfolio.lastBrokerSyncAttemptAt(), portfolio.lastBrokerSyncErrorCode(),
+                summary.totalMarketValue() != null && !"XXX".equals(summary.totalMarketValue().currency()),
+                portfolio.acquisitionSource(), portfolio.sourceAccountReference(), portfolio.lastImportedAt(),
+                portfolio.lastImportedFilename());
     }
 }

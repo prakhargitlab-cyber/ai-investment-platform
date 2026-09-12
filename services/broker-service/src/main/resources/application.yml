@@ -2,32 +2,163 @@ spring:
   application:
     name: broker-service
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:investment}
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:investment}?sslmode=${DB_SSL_MODE:disable}&connectTimeout=${DB_CONNECT_TIMEOUT_SECONDS:10}&socketTimeout=${DB_SOCKET_TIMEOUT_SECONDS:30}
     username: ${DB_USER:investment}
     password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAXIMUM_SIZE:8}
+      minimum-idle: ${DB_POOL_MINIMUM_IDLE:1}
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT_MS:10000}
+      idle-timeout: ${DB_POOL_IDLE_TIMEOUT_MS:600000}
+      max-lifetime: ${DB_POOL_MAX_LIFETIME_MS:1800000}
   jpa:
     hibernate:
       ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: broker
     open-in-view: false
   flyway:
     enabled: true
+    connect-retries: ${FLYWAY_CONNECT_RETRIES:10}
+    validate-on-migrate: true
+    out-of-order: false
+    schemas: broker
+    default-schema: broker
+    table: flyway_schema_history_broker
+
 broker:
+  advanced-individual-credentials-enabled: ${BROKER_ADVANCED_INDIVIDUAL_CREDENTIALS_ENABLED:false}
+
   ibkr:
     enabled: ${IBKR_ENABLED:false}
     base-url: ${IBKR_BASE_URL:}
+    oauth2-base-url: ${IBKR_OAUTH2_BASE_URL:}
+    gateway-base-url: ${IBKR_GATEWAY_BASE_URL:}
     client-id: ${IBKR_CLIENT_ID:}
+    client-key-id: ${IBKR_CLIENT_KEY_ID:}
     callback-url: ${IBKR_CALLBACK_URL:}
     auth-method: ${IBKR_AUTH_METHOD:}
     official-documentation-verified: ${IBKR_OFFICIAL_DOCUMENTATION_VERIFIED:false}
+    market-data-enabled: ${IBKR_MARKET_DATA_ENABLED:false}
+    insecure-tls: ${IBKR_INSECURE_TLS:false}
+    connector-base-url: ${IBKR_CONNECTOR_BASE_URL:}
+    connector-runtime-mode: ${IBKR_CONNECTOR_RUNTIME_MODE:LOCAL_AGENT}
+    connector-login-url: ${IBKR_CONNECTOR_LOGIN_URL:}
+    connector-internal-token: ${IBKR_CONNECTOR_INTERNAL_TOKEN:}
+    connector-idle-timeout-seconds: ${IBKR_CONNECTOR_IDLE_TIMEOUT_SECONDS:1800}
+    connector-session-timeout-seconds: ${IBKR_CONNECTOR_SESSION_TIMEOUT_SECONDS:86400}
+    private-key-reference: ${IBKR_PRIVATE_KEY_REFERENCE:}
+    session-reference: ${IBKR_SESSION_REFERENCE:}
+
+    runtime:
+      mode: ${IBKR_RUNTIME_MODE:STATIC}
+      namespace: ${IBKR_RUNTIME_NAMESPACE:ai-investment}
+      image: ${IBKR_RUNTIME_IMAGE:}
+      image-pull-policy: ${IBKR_RUNTIME_IMAGE_PULL_POLICY:IfNotPresent}
+      service-account-name: ${IBKR_RUNTIME_SERVICE_ACCOUNT:ibkr-runtime-orchestrator}
+      port: ${IBKR_RUNTIME_PORT:8080}
+      # Match the dedicated runtime startupProbe budget. Both initial allocation
+      # and user-action stale-runtime replacement go through this one policy.
+      startup-timeout-seconds: ${IBKR_RUNTIME_STARTUP_TIMEOUT_SECONDS:240}
+      api-server: ${IBKR_RUNTIME_API_SERVER:}
+      service-account-token-file: ${IBKR_RUNTIME_SERVICE_ACCOUNT_TOKEN_FILE:/var/run/secrets/kubernetes.io/serviceaccount/token}
+
+      gateway-package-claim-name: ${IBKR_RUNTIME_GATEWAY_PACKAGE_CLAIM_NAME:}
+      gateway-package-mount-path: ${IBKR_RUNTIME_GATEWAY_PACKAGE_MOUNT_PATH:/opt/ibkr/clientportal.gw-source}
+      gateway-package-read-only: ${IBKR_RUNTIME_GATEWAY_PACKAGE_READ_ONLY:true}
+
+      workspace-mount-path: ${IBKR_RUNTIME_WORKSPACE_MOUNT_PATH:/opt/ibkr/runtime}
+      workspace-medium: ${IBKR_RUNTIME_WORKSPACE_MEDIUM:}
+      workspace-size-limit: ${IBKR_RUNTIME_WORKSPACE_SIZE_LIMIT:}
+
+      internal-token-secret-name: ${IBKR_RUNTIME_INTERNAL_TOKEN_SECRET_NAME:}
+      internal-token-secret-key: ${IBKR_RUNTIME_INTERNAL_TOKEN_SECRET_KEY:}
+
+      gateway-base-url: ${IBKR_RUNTIME_GATEWAY_BASE_URL:https://127.0.0.1:5000/v1/api}
+      gateway-tls-verify: ${IBKR_RUNTIME_GATEWAY_TLS_VERIFY:true}
+      login-public-base-url: ${IBKR_RUNTIME_LOGIN_PUBLIC_BASE_URL:}
+
+      kubernetes:
+        spec:
+          runtime-image: ${IBKR_RUNTIME_SPEC_RUNTIME_IMAGE:}
+          image-pull-policy: ${IBKR_RUNTIME_SPEC_IMAGE_PULL_POLICY:IfNotPresent}
+
+          # Important:
+          # IBKRKubernetesRuntimeSpecProperties binds to:
+          # broker.ibkr.runtime.kubernetes.spec
+          #
+          # These values must therefore exist here as well.
+          gateway-base-url: ${IBKR_RUNTIME_GATEWAY_BASE_URL:https://127.0.0.1:5000/v1/api}
+          gateway-tls-verify: ${IBKR_RUNTIME_GATEWAY_TLS_VERIFY:true}
+          login-public-base-url: ${IBKR_RUNTIME_LOGIN_PUBLIC_BASE_URL:}
+
+          init-container:
+            name: ${IBKR_RUNTIME_SPEC_INIT_NAME:copy-gateway-package}
+            image: ${IBKR_RUNTIME_SPEC_INIT_IMAGE:}
+            image-pull-policy: ${IBKR_RUNTIME_SPEC_INIT_IMAGE_PULL_POLICY:IfNotPresent}
+
+          resources:
+            requests:
+              cpu: ""
+              memory: ""
+            limits:
+              cpu: ""
+              memory: ""
+
+          service-account-name: ${IBKR_RUNTIME_SPEC_SERVICE_ACCOUNT:ibkr-runtime-orchestrator}
+
+          image-pull-secrets: []
+
+          pod-labels: {}
+          pod-annotations: {}
+          service-labels: {}
+          service-annotations: {}
+
+          ports:
+            container-port: 8080
+            service-port: 80
+            service-target-port: 8080
+            gateway-port: 5000
+
+          gateway-package:
+            claim-name: "${IBKR_RUNTIME_SPEC_GATEWAY_PACKAGE_CLAIM_NAME:}"
+            mount-path: "${IBKR_RUNTIME_SPEC_GATEWAY_PACKAGE_MOUNT_PATH:/opt/ibkr/clientportal.gw-source}"
+            read-only: "${IBKR_RUNTIME_SPEC_GATEWAY_PACKAGE_READ_ONLY:true}"
+
+          workspace:
+            mount-path: /opt/ibkr/runtime
+            medium: ""
+            size-limit: ""
+
+          internal-token:
+            secret-name: "${IBKR_RUNTIME_SPEC_INTERNAL_TOKEN_SECRET_NAME:}"
+            secret-key: "${IBKR_RUNTIME_SPEC_INTERNAL_TOKEN_SECRET_KEY:}"
+
+          node-selector: {}
+          tolerations: []
+          affinity: {}
+          topology-spread-constraints: []
+
   icici-direct:
     enabled: ${ICICI_DIRECT_ENABLED:false}
     base-url: ${ICICI_DIRECT_BASE_URL:}
-    client-id: ${ICICI_DIRECT_CLIENT_ID:}
-    callback-url: ${ICICI_DIRECT_CALLBACK_URL:}
+    login-url: ${ICICI_DIRECT_LOGIN_URL:https://api.icicidirect.com/apiuser/login}
+    app-key: ${ICICI_DIRECT_APP_KEY:}
+    redirect-url: ${ICICI_DIRECT_REDIRECT_URL:}
     auth-method: ${ICICI_DIRECT_AUTH_METHOD:}
+    secret-key-reference: ${ICICI_DIRECT_SECRET_KEY_REFERENCE:}
     official-documentation-verified: ${ICICI_DIRECT_OFFICIAL_DOCUMENTATION_VERIFIED:false}
+
+  hdfc-securities:
+    base-url: ${HDFC_SECURITIES_BASE_URL:https://developer.hdfcsec.com}
+    login-url: ${HDFC_SECURITIES_LOGIN_URL:https://developer.hdfcsec.com/oapi/v1/login}
+    session-ttl-seconds: ${HDFC_SECURITIES_SESSION_TTL_SECONDS:86400}
+
 server:
   port: ${SERVER_PORT:8083}
+  shutdown: graceful
+
 management:
   endpoints:
     web:
@@ -37,6 +168,7 @@ management:
     health:
       probes:
         enabled: true
+
 logging:
   pattern:
-    level: "%5p [correlationId:%X{correlationId:-}]"
+    console: "timestamp=%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX,UTC} service=${spring.application.name} environment=${AIP_ENVIRONMENT:LOCAL} level=%p requestId=%X{correlationId:-} logger=%logger{36} message=%replace(%msg){'[\\r\\n]',' '}%n"

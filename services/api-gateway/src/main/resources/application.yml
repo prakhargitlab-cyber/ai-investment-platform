@@ -1,17 +1,42 @@
 spring:
   application:
     name: api-gateway
+  servlet:
+    multipart:
+      # This service is a transparent proxy. Parsing multipart here consumes the servlet stream
+      # before the downstream portfolio-service can bind the original file part.
+      enabled: false
 portfolio:
   service:
     base-url: ${PORTFOLIO_SERVICE_BASE_URL:http://localhost:8082}
 broker:
   service:
     base-url: ${BROKER_SERVICE_BASE_URL:http://localhost:8083}
+ibkr:
+  connector:
+    base-url: ${IBKR_CONNECTOR_PROXY_BASE_URL:}
+company:
+  service:
+    base-url: ${COMPANY_SERVICE_BASE_URL:http://localhost:8084}
+auth:
+  service:
+    base-url: ${AUTH_SERVICE_BASE_URL:http://localhost:8081}
+  issuer: ${AUTH_ISSUER:ai-investment-dev}
+  jwt-secret: ${AUTH_JWT_SECRET:dev-phase5a-local-jwt-secret-change-me-32}
 research:
   engine:
     base-url: ${RESEARCH_ENGINE_BASE_URL:http://localhost:8000}
+frontend:
+  base-url: ${FRONTEND_BASE_URL:http://localhost:3000}
+gateway:
+  http:
+    connect-timeout: ${GATEWAY_HTTP_CONNECT_TIMEOUT:3s}
+    read-timeout: ${GATEWAY_HTTP_READ_TIMEOUT:30s}
+  cors:
+    allowed-origins: ${GATEWAY_CORS_ALLOWED_ORIGINS:http://localhost:3000,http://127.0.0.1:3000}
 server:
   port: ${SERVER_PORT:8080}
+  shutdown: graceful
 management:
   endpoints:
     web:
@@ -23,4 +48,4 @@ management:
         enabled: true
 logging:
   pattern:
-    level: "%5p [correlationId:%X{correlationId:-}]"
+    console: "timestamp=%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX,UTC} service=${spring.application.name} environment=${AIP_ENVIRONMENT:LOCAL} level=%p requestId=%X{correlationId:-} logger=%logger{36} message=%replace(%msg){'[\\r\\n]',' '}%n"

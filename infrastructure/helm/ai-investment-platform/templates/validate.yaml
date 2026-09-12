@@ -1,0 +1,98 @@
+{{- if and .Values.mcpGateway.enabled (not .Values.mcpGateway.implemented) -}}
+{{- fail "MCP gateway cannot be enabled until its implementation is present" -}}
+{{- end -}}
+{{- if .Values.mcpGateway.ingress.enabled -}}
+{{- fail "MCP gateway is INTERNAL_ONLY and cannot enable public ingress" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.enabled (ne .Values.mcpGateway.service.type "ClusterIP") -}}
+{{- fail "MCP gateway must use a ClusterIP Service" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.enabled (ne .Values.mcpGateway.transport "streamable-http") -}}
+{{- fail "The Kubernetes MCP workload requires streamable-http transport" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.enabled (not .Values.featureFlags.mcpEnabled) -}}
+{{- fail "MCP gateway requires featureFlags.mcpEnabled" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.yahooFinance.enabled (not .Values.mcpGateway.externalProvidersEnabled) -}}
+{{- fail "Yahoo Finance MCP requires the external provider gateway" -}}
+{{- end -}}
+{{- if and .Values.yahooFinanceMcp.enabled (not .Values.yahooFinanceMcp.implemented) -}}
+{{- fail "First-party Yahoo Finance MCP cannot be enabled until its implementation is present" -}}
+{{- end -}}
+{{- if .Values.yahooFinanceMcp.ingress.enabled -}}
+{{- fail "First-party Yahoo Finance MCP is INTERNAL_ONLY and cannot enable public ingress" -}}
+{{- end -}}
+{{- if and .Values.yahooFinanceMcp.enabled (ne .Values.yahooFinanceMcp.service.type "ClusterIP") -}}
+{{- fail "First-party Yahoo Finance MCP must use a ClusterIP Service" -}}
+{{- end -}}
+{{- if and .Values.yahooFinanceMcp.enabled (ne .Values.yahooFinanceMcp.transport "streamable-http") -}}
+{{- fail "The Kubernetes Yahoo Finance MCP workload requires streamable-http transport" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.yahooFinance.enabled .Values.yahooFinanceMcp.enabled (ne .Values.mcpGateway.yahooFinance.endpoint (printf "%s/mcp" .Values.serviceEndpoints.yahooFinanceMcp)) -}}
+{{- fail "The first-party Yahoo MCP gateway endpoint must use the centralized internal service endpoint" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.yahooFinance.enabled (not (default .Values.yahooFinanceMcp.capabilities .Values.mcpGateway.yahooFinance.capabilities)) -}}
+{{- fail "Yahoo Finance MCP requires reviewed, exact capability mappings" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.yahooFinance.enabled (eq .Values.mcpGateway.yahooFinance.transport "streamable-http") (not .Values.mcpGateway.yahooFinance.endpoint) -}}
+{{- fail "Yahoo Finance MCP Streamable HTTP requires an endpoint reference" -}}
+{{- end -}}
+{{- if and .Values.mcpGateway.yahooFinance.enabled (eq .Values.mcpGateway.yahooFinance.transport "stdio") (not .Values.mcpGateway.yahooFinance.stdioCommand) -}}
+{{- fail "Yahoo Finance MCP STDIO requires an executable reference" -}}
+{{- end -}}
+{{- if and .Values.research.mcpAcquisition.enabled (not .Values.mcpGateway.yahooFinance.enabled) -}}
+{{- fail "MCP-first research acquisition requires Yahoo Finance MCP" -}}
+{{- end -}}
+{{- if eq (upper .Values.global.environment) "AZURE" -}}
+{{- if .Values.devDependencies.enabled -}}
+{{- fail "AZURE profile must disable devDependencies" -}}
+{{- end -}}
+{{- if or (not .Values.global.imageRegistry) (contains "localhost" .Values.global.imageRegistry) (contains "k3d" .Values.global.imageRegistry) -}}
+{{- fail "AZURE profile requires a non-local image registry such as ACR" -}}
+{{- end -}}
+{{- if not .Values.global.imageTag -}}
+{{- fail "AZURE profile requires an immutable image tag" -}}
+{{- end -}}
+{{- if not .Values.global.azure.workloadIdentity.enabled -}}
+{{- fail "AZURE profile requires Workload Identity to be enabled" -}}
+{{- end -}}
+{{- if not .Values.keyVault.enabled -}}
+{{- fail "AZURE profile requires Key Vault CSI integration" -}}
+{{- end -}}
+{{- if or .Values.auth.devLoginEnabled .Values.auth.createDevSecret .Values.auth.devJwtSecret -}}
+{{- fail "AZURE profile cannot enable development auth or embed a JWT secret" -}}
+{{- end -}}
+{{- if not .Values.apiGateway.ingress.enabled -}}
+{{- fail "AZURE profile requires the controlled API gateway ingress" -}}
+{{- end -}}
+{{- if or (not .Values.apiGateway.ingress.host) (not .Values.apiGateway.ingress.tls) -}}
+{{- fail "AZURE ingress requires an explicit host and TLS configuration" -}}
+{{- end -}}
+{{- if not .Values.apiGateway.cors.allowedOrigins -}}
+{{- fail "AZURE profile requires explicit CORS origins" -}}
+{{- end -}}
+{{- range .Values.apiGateway.cors.allowedOrigins -}}
+{{- if or (eq . "*") (contains "localhost" .) (contains "127.0.0.1" .) -}}
+{{- fail "AZURE CORS origins cannot be wildcard or loopback addresses" -}}
+{{- end -}}
+{{- end -}}
+{{- if has (lower .Values.database.sslMode) (list "disable" "allow" "prefer") -}}
+{{- fail "AZURE PostgreSQL must require TLS" -}}
+{{- end -}}
+{{- if not .Values.redis.tlsEnabled -}}
+{{- fail "AZURE Redis configuration must enable TLS" -}}
+{{- end -}}
+{{- if and .Values.kafka.enabled (not (contains "SSL" (upper .Values.kafka.securityProtocol))) -}}
+{{- fail "AZURE Kafka must use a TLS security protocol" -}}
+{{- end -}}
+{{- if or .Values.ibkr.connectorInternalToken .Values.ibkrConnector.internalToken -}}
+{{- fail "AZURE broker tokens must come from secret references" -}}
+{{- end -}}
+{{- if .Values.ibkrConnector.packageVolumeClaim -}}
+{{- fail "The DEV_ONLY IBKR Gateway package PVC cannot be used by the AZURE profile" -}}
+{{- end -}}
+{{- $research := default (dict) (index (default (dict) .Values.workloadOverrides) "research-engine") -}}
+{{- if and (eq .Values.research.distributedLock.backend "process") (or (default false $research.autoscaling.enabled) (gt (int (default 1 $research.replicaCount)) 1)) -}}
+{{- fail "research-engine must remain single-replica while its lock backend is process-local" -}}
+{{- end -}}
+{{- end -}}

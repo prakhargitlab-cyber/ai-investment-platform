@@ -1,0 +1,10 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:research;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH
+    username: sa
+    password:
+  flyway:
+    enabled: true
+    schemas: research
+    default-schema: research
+    table: flyway_schema_history_research

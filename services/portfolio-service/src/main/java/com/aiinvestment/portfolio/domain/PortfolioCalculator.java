@@ -26,26 +26,31 @@ public class PortfolioCalculator {
     }
 
     public PortfolioSummary summarize(Portfolio portfolio, List<PortfolioPosition> positions, List<BrokerCashBalance> cashBalances) {
-        Money marketValue = Money.zero(portfolio.baseCurrency());
+        boolean valuationComplete = positions.stream().allMatch(position -> position.marketValue() != null);
+        Money marketValue = valuationComplete ? Money.zero(portfolio.baseCurrency()) : null;
         Money costBasis = Money.zero(portfolio.baseCurrency());
         for (PortfolioPosition position : positions) {
-            marketValue = marketValue.add(convert(position.marketValue(), portfolio.baseCurrency()));
+            if (marketValue != null) {
+                marketValue = marketValue.add(convert(position.marketValue(), portfolio.baseCurrency()));
+            }
             costBasis = costBasis.add(convert(position.costBasis(), portfolio.baseCurrency()));
         }
         Money cash = Money.zero(portfolio.baseCurrency());
         for (BrokerCashBalance balance : cashBalances) {
             cash = cash.add(convert(balance.cash(), portfolio.baseCurrency()));
         }
-        Money profitLoss = marketValue.subtract(costBasis);
-        BigDecimal profitLossPercent = BigDecimal.ZERO;
-        if (costBasis.amount().compareTo(BigDecimal.ZERO) != 0) {
+        Money profitLoss = marketValue == null ? null : marketValue.subtract(costBasis);
+        BigDecimal profitLossPercent = profitLoss == null ? null : BigDecimal.ZERO;
+        if (profitLoss != null && costBasis.amount().compareTo(BigDecimal.ZERO) != 0) {
             profitLossPercent = profitLoss.amount()
                     .divide(costBasis.amount(), 8, RoundingMode.HALF_UP)
                     .multiply(BigDecimal.valueOf(100))
                     .setScale(4, RoundingMode.HALF_UP);
         }
         return new PortfolioSummary(portfolio.portfolioId(), portfolio.baseCurrency(), marketValue, costBasis,
-                profitLoss, profitLossPercent, cash, positions.size(), allocations(positions, portfolio.baseCurrency()));
+                profitLoss, profitLossPercent, cash, positions.size(), valuationComplete
+                ? allocations(positions, portfolio.baseCurrency())
+                : new AllocationBreakdown(Map.of(), Map.of(), Map.of(), Map.of(), Map.of()));
     }
 
     private AllocationBreakdown allocations(List<PortfolioPosition> positions, String baseCurrency) {

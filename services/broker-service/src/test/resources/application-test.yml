@@ -10,3 +10,13 @@ spring:
     open-in-view: false
   flyway:
     enabled: true
+broker:
+  icici-direct:
+    enabled: true
+    base-url: https://api.icicidirect.com/breezeapi/api/v1/
+    login-url: https://api.icicidirect.com/apiuser/login
+    app-key: dummy-test-app-key
+    redirect-url: https://application.example.test/icici/return
+    auth-method: breeze-interactive-session
+    secret-key-reference: ICICI_DUMMY_TEST_SECRET
+    official-documentation-verified: true

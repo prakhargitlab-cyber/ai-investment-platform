@@ -1,0 +1,44 @@
+global:
+  environment: TEST
+  springProfile: TEST
+  imageRegistry: test-registry.invalid
+  imageTag: test
+
+devDependencies:
+  enabled: false
+
+database:
+  host: postgres.test.invalid
+  passwordSecretName: test-postgresql
+  sslMode: disable
+
+redis:
+  host: redis.test.invalid
+  tlsEnabled: false
+
+auth:
+  issuer: ai-investment-test
+  devLoginEnabled: false
+  createDevSecret: false
+  jwtSecretName: test-auth-jwt
+
+apiGateway:
+  cors:
+    allowedOrigins:
+      - https://frontend.test.invalid
+  ingress:
+    enabled: false
+
+keyVault:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+research:
+  liveEnabled: false
+  demoEnabled: false
+  persistence:
+    enabled: false
+  distributedLock:
+    backend: process

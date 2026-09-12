@@ -20,8 +20,31 @@ class InstrumentNormalizerTest {
 
         assertThat(instrument.ticker()).isEqualTo("NVDA");
         assertThat(instrument.exchange()).isEqualTo("XNAS");
+        assertThat(instrument.provider()).isEqualTo("IBKR");
+        assertThat(instrument.providerInstrumentId()).isEqualTo("265598");
         assertThat(instrument.tradingCurrency()).isEqualTo("USD");
         assertThat(instrument.assetType()).isEqualTo(AssetType.EQUITY);
+        assertThat(instrument.canonicalSymbol()).isEqualTo("NVDA");
+        assertThat(instrument.canonicalExchange()).isEqualTo("XNAS");
+        assertThat(instrument.securityType()).isEqualTo("EQUITY");
+    }
+
+    @Test
+    void ibkrNormalizerMapsRoutingExchangeAliasesToCanonicalMic() {
+        IBKRInstrumentNormalizer normalizer = new IBKRInstrumentNormalizer();
+
+        var aixtron = normalizer.normalize(new BrokerInstrumentIdentity(BrokerType.IBKR, null, "aixa-conid",
+                "DE000A0WMPJ6", "AIXA", "IBIS2", "IBIS2", "AIXTRON SE", "EUR", "DE", AssetType.EQUITY));
+        var amsterdam = normalizer.normalize(new BrokerInstrumentIdentity(BrokerType.IBKR, null, "iusa-conid",
+                "IE00B4L5Y983", "IUSA", "AEB", "AEB", "iShares Core S&P 500 UCITS ETF", "EUR", "NL", AssetType.ETF));
+
+        assertThat(aixtron.exchange()).isEqualTo("XETR");
+        assertThat(aixtron.mic()).isEqualTo("XETR");
+        assertThat(aixtron.companyName()).isEqualTo("AIXTRON SE");
+        assertThat(amsterdam.exchange()).isEqualTo("XAMS");
+        assertThat(amsterdam.assetType()).isEqualTo(AssetType.ETF);
+        assertThat(amsterdam.brokerSymbol()).isEqualTo("IUSA");
+        assertThat(amsterdam.brokerExchange()).isEqualTo("AEB");
     }
 
     @Test

@@ -1,8 +1,27 @@
 spring:
   application:
     name: research-service
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:investment}?sslmode=${DB_SSL_MODE:disable}&connectTimeout=${DB_CONNECT_TIMEOUT_SECONDS:10}&socketTimeout=${DB_SOCKET_TIMEOUT_SECONDS:30}
+    username: ${DB_USER:investment}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAXIMUM_SIZE:4}
+      minimum-idle: ${DB_POOL_MINIMUM_IDLE:1}
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT_MS:10000}
+      idle-timeout: ${DB_POOL_IDLE_TIMEOUT_MS:600000}
+      max-lifetime: ${DB_POOL_MAX_LIFETIME_MS:1800000}
+  flyway:
+    enabled: true
+    connect-retries: ${FLYWAY_CONNECT_RETRIES:10}
+    validate-on-migrate: true
+    out-of-order: false
+    schemas: research
+    default-schema: research
+    table: flyway_schema_history_research
 server:
   port: ${SERVER_PORT:8085}
+  shutdown: graceful
 management:
   endpoints:
     web:
@@ -14,4 +33,4 @@ management:
         enabled: true
 logging:
   pattern:
-    level: "%5p [correlationId:%X{correlationId:-}]"
+    console: "timestamp=%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX,UTC} service=${spring.application.name} environment=${AIP_ENVIRONMENT:LOCAL} level=%p requestId=%X{correlationId:-} logger=%logger{36} message=%replace(%msg){'[\\r\\n]',' '}%n"

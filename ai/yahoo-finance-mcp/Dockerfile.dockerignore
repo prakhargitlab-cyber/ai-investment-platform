@@ -1,0 +1,10 @@
+**
+!ai/
+!ai/research-engine/
+!ai/research-engine/pyproject.toml
+!ai/research-engine/app/
+!ai/research-engine/app/**
+!ai/yahoo-finance-mcp/
+!ai/yahoo-finance-mcp/pyproject.toml
+!ai/yahoo-finance-mcp/yahoo_mcp_server/
+!ai/yahoo-finance-mcp/yahoo_mcp_server/**

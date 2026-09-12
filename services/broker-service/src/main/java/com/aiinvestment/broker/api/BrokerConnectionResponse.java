@@ -6,15 +6,13 @@ import com.aiinvestment.shared.domain.broker.BrokerProvider;
 import java.time.Instant;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 public record BrokerConnectionResponse(
         UUID connectionId,
-        UUID userId,
         String brokerType,
-        String externalAccountReference,
         String displayName,
         String status,
+        String accountCurrency,
         Instant connectedAt,
         Instant lastSuccessfulSyncAt,
         Instant lastSyncAttemptAt,
@@ -27,13 +25,21 @@ public record BrokerConnectionResponse(
         boolean readOnly
 ) {
     public static BrokerConnectionResponse from(BrokerConnection connection, BrokerProvider provider) {
-        return new BrokerConnectionResponse(connection.connectionId(), connection.userId(), connection.brokerType().name(),
-                connection.externalAccountReference(), connection.displayName(), connection.status().name(),
+        String providerStatus = connection.providerStatus() == null || connection.providerStatus().isBlank()
+                ? provider.connectionStatus().providerStatus().name()
+                : connection.providerStatus();
+        String dataFreshness = connection.dataFreshness() == null || connection.dataFreshness().isBlank()
+                ? (connection.brokerType().name().equals("MOCK") ? "DEMO" : "UNAVAILABLE")
+                : connection.dataFreshness();
+        return new BrokerConnectionResponse(connection.connectionId(), connection.brokerType().name(),
+                connection.displayName(), connection.status().name(),
+                connection.accountCurrency(),
                 connection.connectedAt(), connection.lastSuccessfulSyncAt(), connection.lastSyncAttemptAt(),
                 connection.lastErrorCode(), connection.createdAt(), connection.updatedAt(),
-                provider.connectionCapabilities().capabilities().stream().map(Enum::name).collect(Collectors.toUnmodifiableSet()),
-                provider.connectionStatus().providerStatus().name(),
-                connection.brokerType().name().equals("MOCK") ? "DEMO" : "UNAVAILABLE",
-                !provider.connectionCapabilities().capabilities().contains(com.aiinvestment.shared.domain.broker.BrokerCapability.ORDER_EXECUTION));
+                BrokerProviderResponse.capabilities(provider, connection),
+                providerStatus,
+                dataFreshness,
+                !BrokerProviderResponse.capabilities(provider, connection)
+                        .contains(com.aiinvestment.shared.domain.broker.BrokerCapability.ORDER_EXECUTION.name()));
     }
 }

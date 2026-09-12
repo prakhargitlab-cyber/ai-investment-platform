@@ -1,0 +1,246 @@
+{{- if .Values.mcpGateway.enabled }}
+{{- $config := .Values.mcpGateway -}}
+{{- $yahooCapabilities := default .Values.yahooFinanceMcp.capabilities $config.yahooFinance.capabilities -}}
+{{- $serviceFqdn := printf "mcp-gateway.%s.svc" .Release.Namespace -}}
+{{- $serviceClusterFqdn := printf "%s.cluster.local" $serviceFqdn -}}
+{{- $allowedHosts := concat $config.allowedHosts (list $serviceFqdn (printf "%s:*" $serviceFqdn) $serviceClusterFqdn (printf "%s:*" $serviceClusterFqdn)) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-gateway
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "mcp-gateway") | nindent 4 }}
+spec:
+  {{- if not $config.autoscaling.enabled }}
+  replicas: {{ $config.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.global.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml .Values.global.rolloutStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "mcp-gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aip.podLabels" (dict "root" . "component" "mcp-gateway") | nindent 8 }}
+      {{- $annotations := include "aip.podAnnotations" (dict "root" . "language" "python") }}
+      {{- if $annotations }}
+      annotations:
+        {{- $annotations | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "aip.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.global.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.global.terminationGracePeriodSeconds }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.global.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.global.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.global.topologySpread.topologyKey | quote }}
+          whenUnsatisfiable: {{ .Values.global.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "aip.selectorLabels" (dict "root" . "component" "mcp-gateway") | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: mcp-gateway
+          image: {{ include "aip.image" (dict "root" . "image" $config.image "tag" $config.tag) | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | quote }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            {{- include "aip.commonEnv" (dict "root" . "serviceName" "mcp-gateway") | nindent 12 }}
+            - name: HOME
+              value: /tmp
+            - name: AIP_MCP_SERVICE_NAME
+              value: mcp-gateway
+            - name: AIP_MCP_TRANSPORT
+              value: {{ $config.transport | quote }}
+            - name: AIP_MCP_HOST
+              value: "0.0.0.0"
+            - name: AIP_MCP_PORT
+              value: {{ $config.port | quote }}
+            - name: AIP_MCP_HTTP_PATH
+              value: {{ $config.httpPath | quote }}
+            - name: AIP_MCP_MAX_REQUEST_BODY_BYTES
+              value: {{ $config.maxRequestBodyBytes | quote }}
+            - name: AIP_MCP_ALLOWED_HOSTS
+              value: {{ join "," $allowedHosts | quote }}
+            - name: AIP_MCP_ALLOWED_ORIGINS
+              value: {{ join "," $config.allowedOrigins | quote }}
+            - name: AIP_MCP_RESEARCH_BASE_URL
+              value: {{ default .Values.serviceEndpoints.researchEngine $config.researchBaseUrl | quote }}
+            - name: AIP_MCP_INVOCATION_TIMEOUT_SECONDS
+              value: {{ $config.timeouts.invocationSeconds | quote }}
+            - name: AIP_MCP_HTTP_CONNECT_TIMEOUT_SECONDS
+              value: {{ $config.timeouts.connectSeconds | quote }}
+            - name: AIP_MCP_HTTP_READ_TIMEOUT_SECONDS
+              value: {{ $config.timeouts.readSeconds | quote }}
+            - name: AIP_MCP_HTTP_MAX_CONNECTIONS
+              value: {{ $config.httpPool.maxConnections | quote }}
+            - name: AIP_MCP_HTTP_MAX_KEEPALIVE_CONNECTIONS
+              value: {{ $config.httpPool.maxKeepaliveConnections | quote }}
+            - name: AIP_MCP_SERVICE_IDENTITY
+              value: {{ $config.serviceIdentity | quote }}
+            - name: AIP_MCP_AUTHENTICATION_TYPE
+              value: {{ $config.authenticationType | quote }}
+            {{- with $config.localUserId }}
+            - name: AIP_MCP_LOCAL_USER_ID
+              value: {{ . | quote }}
+            {{- end }}
+            - name: AIP_MCP_ROLES
+              value: {{ join "," $config.roles | quote }}
+            - name: AIP_MCP_SCOPES
+              value: {{ join "," $config.scopes | quote }}
+            - name: AIP_MCP_EXTERNAL_PROVIDERS_ENABLED
+              value: {{ $config.externalProvidersEnabled | quote }}
+            - name: AIP_MCP_EXTERNAL_CALLER_IDENTITIES
+              value: {{ join "," $config.externalCallerIdentities | quote }}
+            - name: AIP_MCP_YAHOO_ENABLED
+              value: {{ $config.yahooFinance.enabled | quote }}
+            - name: AIP_MCP_YAHOO_TRANSPORT
+              value: {{ $config.yahooFinance.transport | quote }}
+            - name: AIP_MCP_YAHOO_ENDPOINT
+              value: {{ $config.yahooFinance.endpoint | quote }}
+            - name: AIP_MCP_YAHOO_STDIO_COMMAND
+              value: {{ $config.yahooFinance.stdioCommand | quote }}
+            - name: AIP_MCP_YAHOO_STDIO_ARGS_JSON
+              value: {{ $config.yahooFinance.stdioArgs | toJson | quote }}
+            - name: AIP_MCP_YAHOO_AUTH_TYPE
+              value: {{ $config.yahooFinance.authType | quote }}
+            - name: AIP_MCP_YAHOO_AUTH_HEADER_NAME
+              value: {{ $config.yahooFinance.authHeaderName | quote }}
+            - name: AIP_MCP_YAHOO_STDIO_TOKEN_ENV_NAME
+              value: {{ $config.yahooFinance.stdioTokenEnvName | quote }}
+            - name: AIP_MCP_YAHOO_CAPABILITIES_JSON
+              value: {{ $yahooCapabilities | toJson | quote }}
+            - name: AIP_MCP_YAHOO_TIMEOUT_SECONDS
+              value: {{ $config.yahooFinance.timeoutSeconds | quote }}
+            - name: AIP_MCP_YAHOO_MAX_RETRIES
+              value: {{ $config.yahooFinance.maxRetries | quote }}
+            - name: AIP_MCP_YAHOO_RETRY_BACKOFF_SECONDS
+              value: {{ $config.yahooFinance.retryBackoffSeconds | quote }}
+            - name: AIP_MCP_YAHOO_MAX_CONCURRENCY
+              value: {{ $config.yahooFinance.maxConcurrency | quote }}
+            {{- if and $config.yahooFinance.enabled $config.yahooFinance.authSecretName }}
+            - name: AIP_MCP_YAHOO_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $config.yahooFinance.authSecretName | quote }}
+                  key: {{ $config.yahooFinance.authSecretKey | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $config.port }}
+          {{- if $config.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ $config.probes.startup.path }}
+              port: http
+            periodSeconds: {{ $config.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.startup.failureThreshold }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ $config.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ $config.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml $config.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.global.temporaryStorage.enabled }}
+            - name: temporary-storage
+              mountPath: {{ .Values.global.temporaryStorage.mountPath | quote }}
+            {{- end }}
+            {{- include "aip.keyVaultVolumeMount" (dict "root" . "component" "mcp-gateway") | nindent 12 }}
+      volumes:
+        {{- if .Values.global.temporaryStorage.enabled }}
+        - name: temporary-storage
+          emptyDir:
+            {{- with .Values.global.temporaryStorage.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
+        {{- end }}
+        {{- include "aip.keyVaultVolume" (dict "root" . "component" "mcp-gateway") | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-gateway
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "mcp-gateway") | nindent 4 }}
+spec:
+  type: {{ $config.service.type }}
+  selector:
+    {{- include "aip.selectorLabels" (dict "root" . "component" "mcp-gateway") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $config.service.port }}
+      targetPort: http
+---
+{{- if $config.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mcp-gateway
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "mcp-gateway") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mcp-gateway
+  minReplicas: {{ $config.autoscaling.minReplicas }}
+  maxReplicas: {{ $config.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $config.autoscaling.targetCPUUtilizationPercentage }}
+---
+{{- end }}
+{{- if $config.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mcp-gateway
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "mcp-gateway") | nindent 4 }}
+spec:
+  minAvailable: {{ $config.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "mcp-gateway") | nindent 6 }}
+---
+{{- end }}
+{{- end }}

@@ -5,7 +5,7 @@ metadata:
 servers: 1
 agents: 2
 ports:
-  - port: 8080:80
+  - port: 18080:80
     nodeFilters:
       - loadbalancer
 registries:
@@ -13,9 +13,3 @@ registries:
     name: ai-investment-registry
     host: 0.0.0.0
     hostPort: "5001"
-options:
-  k3s:
-    extraArgs:
-      - arg: --disable=traefik
-        nodeFilters:
-          - server:*

@@ -1,0 +1,133 @@
+{{- if .Values.ibkrConnector.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ibkr-connector
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "ibkr-connector") | nindent 4 }}
+spec:
+  replicas: {{ .Values.ibkrConnector.replicaCount }}
+  revisionHistoryLimit: {{ .Values.global.revisionHistoryLimit }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "ibkr-connector") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aip.podLabels" (dict "root" . "component" "ibkr-connector") | nindent 8 }}
+      {{- $annotations := include "aip.podAnnotations" (dict "root" . "language" "python") }}
+      {{- if $annotations }}
+      annotations:
+        {{- $annotations | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "aip.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.global.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.global.terminationGracePeriodSeconds }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ibkr-connector
+          image: {{ include "aip.image" (dict "root" . "image" .Values.ibkrConnector.image "tag" .Values.ibkrConnector.tag) | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | quote }}
+          env:
+            {{- include "aip.commonEnv" (dict "root" . "serviceName" "ibkr-connector") | nindent 12 }}
+            - name: HOME
+              value: /tmp
+            - name: CONNECTOR_RUNTIME_MODE
+              value: {{ .Values.ibkrConnector.runtimeMode | quote }}
+            - name: IBKR_PRODUCTION_APPROVED
+              value: {{ .Values.ibkrConnector.productionApproved | quote }}
+            - name: AIP_IBKR_GATEWAY_PACKAGE_PATH
+              value: {{ .Values.ibkrConnector.gatewayPackagePath | quote }}
+            - name: AIP_IBKR_GATEWAY_BASE_URL
+              value: {{ .Values.ibkrConnector.gatewayBaseUrl | quote }}
+            - name: AIP_IBKR_GATEWAY_TLS_VERIFY
+              value: {{ .Values.ibkrConnector.gatewayTlsVerify | quote }}
+            - name: AIP_IBKR_LOGIN_PUBLIC_BASE_URL
+              value: {{ .Values.ibkrConnector.loginPublicBaseUrl | quote }}
+            - name: AIP_CONNECTOR_REQUIRE_INTERNAL_TOKEN
+              value: "true"
+            {{- if .Values.ibkrConnector.internalTokenSecretName }}
+            - name: AIP_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ibkrConnector.internalTokenSecretName | quote }}
+                  key: {{ .Values.ibkrConnector.internalTokenSecretKey | quote }}
+            {{- else }}
+            - name: AIP_INTERNAL_TOKEN
+              value: {{ .Values.ibkrConnector.internalToken | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ibkrConnector.port }}
+          {{- if .Values.ibkrConnector.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.ibkrConnector.probes.startup.path }}
+              port: http
+            periodSeconds: {{ .Values.ibkrConnector.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.ibkrConnector.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.ibkrConnector.probes.startup.failureThreshold }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.ibkrConnector.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ .Values.ibkrConnector.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.ibkrConnector.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.ibkrConnector.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.ibkrConnector.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ .Values.ibkrConnector.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.ibkrConnector.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.ibkrConnector.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.ibkrConnector.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: temporary-storage
+              mountPath: /tmp
+            {{- if .Values.ibkrConnector.packageVolumeClaim }}
+            - name: ibkr-gateway-package
+              mountPath: {{ .Values.ibkrConnector.gatewayPackagePath | quote }}
+              readOnly: true
+            - name: ibkr-gateway-logs
+              mountPath: {{ printf "%s/logs" .Values.ibkrConnector.gatewayPackagePath | quote }}
+            {{- end }}
+      volumes:
+        - name: temporary-storage
+          emptyDir:
+            sizeLimit: {{ .Values.global.temporaryStorage.sizeLimit | quote }}
+        {{- if .Values.ibkrConnector.packageVolumeClaim }}
+        - name: ibkr-gateway-package
+          persistentVolumeClaim:
+            claimName: {{ .Values.ibkrConnector.packageVolumeClaim | quote }}
+        - name: ibkr-gateway-logs
+          emptyDir: {}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ibkr-connector
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "ibkr-connector") | nindent 4 }}
+spec:
+  type: {{ .Values.ibkrConnector.service.type }}
+  selector:
+    {{- include "aip.selectorLabels" (dict "root" . "component" "ibkr-connector") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.ibkrConnector.service.port }}
+      targetPort: http
+{{- end }}

@@ -3,6 +3,7 @@ package com.aiinvestment.portfolio.domain;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.UUID;
+import com.aiinvestment.shared.domain.broker.BrokerType;
 
 public record Portfolio(
         UUID portfolioId,
@@ -10,8 +11,22 @@ public record Portfolio(
         String name,
         String baseCurrency,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        UUID brokerConnectionId,
+        String brokerAccountId,
+        BrokerType brokerProvider,
+        Instant lastSuccessfulBrokerSyncAt,
+        Instant lastBrokerSyncAttemptAt,
+        String lastBrokerSyncErrorCode,
+        String acquisitionSource,
+        String sourceAccountReference,
+        Instant lastImportedAt,
+        String lastImportedFilename
 ) {
+    public Portfolio(UUID portfolioId, UUID userId, String name, String baseCurrency, Instant createdAt, Instant updatedAt) {
+        this(portfolioId, userId, name, baseCurrency, createdAt, updatedAt, null, null, null, null, null, null,
+                null, null, null, null);
+    }
     public Portfolio {
         Objects.requireNonNull(portfolioId, "portfolioId is required");
         Objects.requireNonNull(userId, "userId is required");

@@ -66,3 +66,24 @@ override.tf.json
 *.pfx
 *.p12
 secrets/
+
+# Externally supplied IBKR Client Portal Gateway artifacts.
+clientportal.gw/
+ibkr-gateway/
+*.zip
+
+# Local AI coding/runtime artifacts
+.codex/
+.poolside/
+.tmp/
+*.tmp
+*.bak
+*-tag.tmp
+.ui-*-image.txt
+
+# Local secrets
+smtp.password
+
+# Local runtime/debug artifacts
+kafka-deployment.txt
+services/running-broker-jar-inspect/

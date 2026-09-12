@@ -1,0 +1,33 @@
+{{- if .Values.apiGateway.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-gateway
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "api-gateway") | nindent 4 }}
+  {{- with .Values.apiGateway.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.apiGateway.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.apiGateway.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - {{- with .Values.apiGateway.ingress.host }}
+      host: {{ . | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: {{ .Values.apiGateway.ingress.path }}
+            pathType: {{ .Values.apiGateway.ingress.pathType }}
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 80
+{{- end }}

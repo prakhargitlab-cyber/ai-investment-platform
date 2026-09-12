@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ibkr-runtime-spec
+data:
+  application.yml: |
+    broker:
+      ibkr:
+        runtime:
+          kubernetes:
+            spec:
+              runtime-image: {{ include "aip.image" (dict "root" . "image" .Values.ibkrRuntime.image.repository "tag" .Values.ibkrRuntime.image.tag) | quote }}
+              image-pull-policy: {{ .Values.ibkrRuntime.image.pullPolicy | quote }}
+              init-container:
+                name: {{ .Values.ibkrRuntime.kubernetesSpec.initContainer.name | quote }}
+                image: {{ default (include "aip.image" (dict "root" . "image" .Values.ibkrRuntime.image.repository "tag" .Values.ibkrRuntime.image.tag)) .Values.ibkrRuntime.kubernetesSpec.initContainer.image | quote }}
+                image-pull-policy: {{ .Values.ibkrRuntime.kubernetesSpec.initContainer.imagePullPolicy | quote }}
+                command: {{ .Values.ibkrRuntime.kubernetesSpec.initContainer.command | toJson }}
+                args: {{ .Values.ibkrRuntime.kubernetesSpec.initContainer.args | toJson }}
+              resources:
+                {{- toYaml .Values.ibkrRuntime.resources | nindent 16 }}
+              service-account-name: {{ .Values.ibkrRuntime.serviceAccount.name | quote }}
+              image-pull-secrets: {{ .Values.ibkrRuntime.imagePullSecrets | toJson }}
+              pod-labels: {{ .Values.ibkrRuntime.podLabels | toJson }}
+              pod-annotations: {{ .Values.ibkrRuntime.podAnnotations | toJson }}
+              service-labels: {{ .Values.ibkrRuntime.serviceLabels | toJson }}
+              service-annotations: {{ .Values.ibkrRuntime.serviceAnnotations | toJson }}
+              startup-probe:
+                {{- toYaml .Values.ibkrRuntime.kubernetesSpec.startupProbe | nindent 16 }}
+              readiness-probe:
+                {{- toYaml .Values.ibkrRuntime.kubernetesSpec.readinessProbe | nindent 16 }}
+              liveness-probe:
+                {{- toYaml .Values.ibkrRuntime.kubernetesSpec.livenessProbe | nindent 16 }}
+              ports:
+                {{- toYaml .Values.ibkrRuntime.kubernetesSpec.ports | nindent 16 }}
+              gateway-package:
+                {{- toYaml .Values.ibkrRuntime.gatewayPackage | nindent 16 }}
+              workspace:
+                {{- toYaml .Values.ibkrRuntime.workspace | nindent 16 }}
+              internal-token:
+                secret-name: {{ .Values.ibkrRuntime.internalToken.secretName | quote }}
+                secret-key: {{ .Values.ibkrRuntime.internalToken.secretKey | quote }}
+              gateway-base-url: {{ .Values.ibkrRuntime.gateway.baseUrl | quote }}
+              gateway-tls-verify: {{ .Values.ibkrRuntime.gateway.tlsVerify | quote }}
+              login-public-base-url: {{ .Values.ibkrRuntime.gateway.loginPublicBaseUrl | quote }}
+              security:
+                {{- toYaml .Values.ibkrRuntime.kubernetesSpec.security | nindent 16 }}
+              node-selector: {{ .Values.ibkrRuntime.nodeSelector | toJson }}
+              tolerations: {{ .Values.ibkrRuntime.tolerations | toJson }}
+              affinity: {{ .Values.ibkrRuntime.affinity | toJson }}
+              topology-spread-constraints: {{ .Values.ibkrRuntime.topologySpreadConstraints | toJson }}

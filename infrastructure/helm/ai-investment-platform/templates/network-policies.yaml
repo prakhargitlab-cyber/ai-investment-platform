@@ -1,0 +1,129 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-ingress
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "network-policy") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "aip.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicy.allowSameNamespace }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+    {{- else }}
+    []
+    {{- end }}
+---
+{{- if .Values.networkPolicy.ingressController.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-gateway-from-ingress-controller
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "api-gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "api-gateway") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.ingressController.namespace is required" .Values.networkPolicy.ingressController.namespace | quote }}
+          {{- with .Values.networkPolicy.ingressController.podLabels }}
+          podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+{{- end }}
+{{- if .Values.networkPolicy.egress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-egress
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "network-policy") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "aip.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.networkPolicy.egress.allowDns }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.additionalRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.yahooFinanceMcp.enabled .Values.yahooFinanceMcp.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: yahoo-finance-mcp-internal-only
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "aip.selectorLabels" (dict "root" . "component" "mcp-gateway") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.yahooFinanceMcp.port }}
+{{- end }}
+{{- if and .Values.mcpGateway.enabled .Values.mcpGateway.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-gateway-internal-only
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "mcp-gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "mcp-gateway") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpGateway.port }}
+{{- end }}

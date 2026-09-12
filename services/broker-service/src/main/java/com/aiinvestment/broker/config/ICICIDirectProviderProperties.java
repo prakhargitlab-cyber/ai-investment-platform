@@ -6,9 +6,11 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public record ICICIDirectProviderProperties(
         boolean enabled,
         String baseUrl,
-        String clientId,
-        String callbackUrl,
+        String loginUrl,
+        String appKey,
+        String redirectUrl,
         String authMethod,
+        String secretKeyReference,
         boolean officialDocumentationVerified
 ) {
 }

@@ -26,4 +26,19 @@ public record BrokerConnectionCapabilities(Set<BrokerCapability> capabilities) {
                 BrokerCapability.DELAYED_QUOTES
         ));
     }
+
+    public static BrokerConnectionCapabilities ibkrReadOnly(boolean marketDataEntitled) {
+        EnumSet<BrokerCapability> capabilities = EnumSet.of(
+                BrokerCapability.ACCOUNTS_READ,
+                BrokerCapability.ACCOUNT_METADATA_READ,
+                BrokerCapability.PORTFOLIO_READ,
+                BrokerCapability.POSITIONS_READ,
+                BrokerCapability.CASH_READ
+        );
+        if (marketDataEntitled) {
+            capabilities.add(BrokerCapability.MARKET_DATA_READ);
+            capabilities.add(BrokerCapability.DELAYED_QUOTES);
+        }
+        return new BrokerConnectionCapabilities(capabilities);
+    }
 }

@@ -1,56 +1,317 @@
-{{- range .Values.aiServices }}
+{{- range $service := .Values.aiServices }}
+{{ $workloadOverride := default (dict) (index (default (dict) $.Values.workloadOverrides) $service.name) -}}
+{{ $imageOverride := default (dict) (index (default (dict) $.Values.aiServiceImageOverrides) $service.name) -}}
+{{ $config := mergeOverwrite (deepCopy $.Values.aiServiceDefaults) (deepCopy $service) (deepCopy $imageOverride) (deepCopy $workloadOverride) -}}
+{{ $strategy := default $.Values.global.rolloutStrategy $config.rolloutStrategy -}}
+{{ $isResearch := eq $service.name "research-engine" -}}
+{{ $databaseSecretName := default $.Values.database.passwordSecretName $.Values.research.persistence.passwordSecretName -}}
+{{ $databaseSecretKey := default $.Values.database.passwordSecretKey $.Values.research.persistence.passwordSecretKey -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .name }}
+  name: {{ $service.name }}
   labels:
-    app.kubernetes.io/component: {{ .name }}
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
 spec:
-  replicas: 1
+  {{- if not $config.autoscaling.enabled }}
+  replicas: {{ $config.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ $.Values.global.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml $strategy | nindent 4 }}
   selector:
     matchLabels:
-      app.kubernetes.io/component: {{ .name }}
+      {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/component: {{ .name }}
+        {{- include "aip.podLabels" (dict "root" $ "component" $service.name) | nindent 8 }}
+      {{- $annotations := include "aip.podAnnotations" (dict "root" $ "language" "python") }}
+      {{- if $annotations }}
+      annotations:
+        {{- $annotations | nindent 8 }}
+      {{- end }}
     spec:
+      serviceAccountName: {{ include "aip.serviceAccountName" $ }}
+      automountServiceAccountToken: {{ $.Values.global.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml $.Values.global.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $.Values.global.terminationGracePeriodSeconds }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.global.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.global.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.global.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $.Values.global.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ $.Values.global.topologySpread.maxSkew }}
+          topologyKey: {{ $.Values.global.topologySpread.topologyKey | quote }}
+          whenUnsatisfiable: {{ $.Values.global.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 14 }}
+      {{- end }}
+      {{- if and $isResearch $.Values.research.persistence.enabled }}
+      initContainers:
+        - name: wait-for-research-migrations
+          image: {{ include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) | quote }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy | quote }}
+          command: ["python", "-c"]
+          args:
+            - |
+              import time
+              import urllib.request
+              url = "{{ $.Values.serviceEndpoints.research }}/actuator/health/readiness"
+              for _ in range(120):
+                  try:
+                      with urllib.request.urlopen(url, timeout=2) as response:
+                          if 200 <= response.status < 300:
+                              raise SystemExit(0)
+                  except Exception:
+                      time.sleep(2)
+              raise SystemExit("research-service did not become ready after the migration window")
+          securityContext:
+            {{- toYaml $.Values.global.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml $config.resources | nindent 12 }}
+          volumeMounts:
+            {{- if $.Values.global.temporaryStorage.enabled }}
+            - name: temporary-storage
+              mountPath: {{ $.Values.global.temporaryStorage.mountPath | quote }}
+            {{- end }}
+      {{- end }}
       containers:
-        - name: {{ .name }}
-          image: {{ include "aip.image" (dict "root" $ "image" .image "tag" .tag) }}
-          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+        - name: {{ $service.name }}
+          image: {{ include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) | quote }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy | quote }}
+          securityContext:
+            {{- toYaml $.Values.global.containerSecurityContext | nindent 12 }}
           env:
-            - name: AIP_ENVIRONMENT
-              value: {{ $.Values.global.environment | quote }}
-            {{- if eq .name "research-engine" }}
+            {{- include "aip.commonEnv" (dict "root" $ "serviceName" $service.name) | nindent 12 }}
+            - name: HOME
+              value: /tmp
+            {{- if $isResearch }}
             - name: AIP_RESEARCH_LIVE_ENABLED
-              value: {{ default false $.Values.research.liveEnabled | quote }}
+              value: {{ $.Values.research.liveEnabled | quote }}
             - name: AIP_RESEARCH_DEMO_ENABLED
-              value: {{ default true $.Values.research.demoEnabled | quote }}
+              value: {{ $.Values.research.demoEnabled | quote }}
+            - name: AIP_RESEARCH_LOG_LEVEL
+              value: {{ $.Values.research.logLevel | quote }}
+            - name: AIP_RESEARCH_PERSISTENCE_ENABLED
+              value: {{ $.Values.research.persistence.enabled | quote }}
+            - name: AIP_RESEARCH_DATABASE_BACKEND
+              value: {{ $.Values.research.persistence.databaseBackend | quote }}
+            - name: AIP_RESEARCH_DATABASE_HOST
+              value: {{ $.Values.database.host | quote }}
+            - name: AIP_RESEARCH_DATABASE_PORT
+              value: {{ $.Values.database.port | quote }}
+            - name: AIP_RESEARCH_DATABASE_NAME
+              value: {{ $.Values.database.name | quote }}
+            - name: AIP_RESEARCH_DATABASE_USER
+              value: {{ $.Values.database.username | quote }}
+            - name: AIP_RESEARCH_DATABASE_SCHEMA
+              value: {{ $.Values.research.persistence.databaseSchema | quote }}
+            - name: AIP_RESEARCH_DATABASE_SSL_MODE
+              value: {{ $.Values.database.sslMode | quote }}
+            - name: AIP_RESEARCH_DATABASE_CONNECT_TIMEOUT_SECONDS
+              value: {{ $.Values.database.connectTimeoutSeconds | quote }}
+            - name: AIP_RESEARCH_DATABASE_STATEMENT_TIMEOUT_SECONDS
+              value: {{ $.Values.database.socketTimeoutSeconds | quote }}
+            {{- if and $.Values.research.persistence.enabled (eq $.Values.database.authMode "password") }}
+            - name: AIP_RESEARCH_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "A database password secret is required when research persistence uses password auth" $databaseSecretName | quote }}
+                  key: {{ $databaseSecretKey | quote }}
+            {{- end }}
+            - name: AIP_RESEARCH_DISTRIBUTED_LOCK_BACKEND
+              value: {{ $.Values.research.distributedLock.backend | quote }}
+            - name: AIP_RESEARCH_DISTRIBUTED_LOCK_ACQUIRE_TIMEOUT_SECONDS
+              value: {{ $.Values.research.distributedLock.acquireTimeoutSeconds | quote }}
+            - name: AIP_RESEARCH_MCP_FIRST_ENABLED
+              value: {{ $.Values.research.mcpAcquisition.enabled | quote }}
+            - name: AIP_RESEARCH_MCP_GATEWAY_BASE_URL
+              value: {{ $.Values.research.mcpAcquisition.gatewayBaseUrl | quote }}
+            - name: AIP_RESEARCH_MCP_GATEWAY_TIMEOUT_SECONDS
+              value: {{ $.Values.research.mcpAcquisition.timeoutSeconds | quote }}
+            - name: AIP_RESEARCH_MCP_SERVICE_IDENTITY
+              value: {{ $.Values.research.mcpAcquisition.serviceIdentity | quote }}
+            - name: AIP_RESEARCH_READINESS_ENSURE_TIMEOUT_SECONDS
+              value: {{ $.Values.research.readinessEnsureTimeoutSeconds | quote }}
+            - name: AIP_PORTFOLIO_SERVICE_BASE_URL
+              value: {{ $.Values.serviceEndpoints.portfolio | quote }}
+            - name: AIP_RESEARCH_REQUEST_TIMEOUT_SECONDS
+              value: {{ $.Values.research.http.requestTimeoutSeconds | quote }}
+            - name: AIP_RESEARCH_CONNECT_TIMEOUT_SECONDS
+              value: {{ $.Values.research.http.connectTimeoutSeconds | quote }}
+            - name: AIP_RESEARCH_MAX_RETRIES
+              value: {{ $.Values.research.http.maxRetries | quote }}
+            - name: AIP_SEC_EDGAR_TICKER_ENDPOINT
+              value: {{ $.Values.research.providers.secTickerUrl | quote }}
+            - name: AIP_SEC_EDGAR_COMPANYFACTS_ENDPOINT
+              value: {{ $.Values.research.providers.secCompanyFactsUrl | quote }}
+            - name: AIP_EODHD_BASE_URL
+              value: {{ $.Values.research.providers.eodhdBaseUrl | quote }}
+            - name: AIP_YAHOO_SEARCH_URL
+              value: {{ $.Values.research.providers.yahooSearchUrl | quote }}
+            - name: AIP_YAHOO_QUOTE_URL
+              value: {{ $.Values.research.providers.yahooQuoteUrl | quote }}
+            - name: AIP_YAHOO_SUMMARY_URL
+              value: {{ $.Values.research.providers.yahooSummaryUrl | quote }}
+            - name: AIP_NSE_ANNOUNCEMENTS_URL
+              value: {{ $.Values.research.providers.nseAnnouncementsUrl | quote }}
+            - name: AIP_NSE_SHAREHOLDINGS_URL
+              value: {{ $.Values.research.providers.nseShareholdingsUrl | quote }}
+            {{- if $.Values.research.providers.eodhdCredentialSecretName }}
+            - name: AIP_EODHD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.research.providers.eodhdCredentialSecretName | quote }}
+                  key: {{ $.Values.research.providers.eodhdApiKeySecretKey | quote }}
+            {{- end }}
+            - name: AIP_RESEARCH_SEARCH_ENABLED
+              value: {{ $.Values.research.search.enabled | quote }}
+            - name: AIP_RESEARCH_SEARCH_PROVIDER
+              value: {{ $.Values.research.search.provider | quote }}
+            - name: AIP_RESEARCH_SEARCH_ENDPOINT
+              value: {{ $.Values.research.search.endpoint | quote }}
+            {{- if $.Values.research.search.engineIdSecretName }}
+            - name: AIP_RESEARCH_SEARCH_ENGINE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.research.search.engineIdSecretName | quote }}
+                  key: {{ $.Values.research.search.engineIdSecretKey | quote }}
+            {{- else }}
+            - name: AIP_RESEARCH_SEARCH_ENGINE_ID
+              value: {{ $.Values.research.search.engineId | quote }}
+            {{- end }}
+            {{- if $.Values.research.search.apiKeySecretName }}
+            - name: AIP_RESEARCH_SEARCH_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.research.search.apiKeySecretName | quote }}
+                  key: {{ $.Values.research.search.apiKeySecretKey | quote }}
+            {{- end }}
+            - name: AIP_RESEARCH_SEARCH_WINDOW_MONTHS
+              value: {{ $.Values.research.search.windowMonths | quote }}
+            - name: AIP_RESEARCH_SEARCH_MAX_QUERIES_PER_CATEGORY
+              value: {{ $.Values.research.search.maxQueriesPerCategory | quote }}
+            - name: AIP_RESEARCH_SEARCH_MAX_RESULTS_PER_QUERY
+              value: {{ $.Values.research.search.maxResultsPerQuery | quote }}
+            - name: AIP_RESEARCH_SEARCH_MAX_DOCUMENTS_PER_REFRESH
+              value: {{ $.Values.research.search.maxDocumentsPerRefresh | quote }}
+            - name: AIP_RESEARCH_SEARCH_REFRESH_COOLDOWN_SECONDS
+              value: {{ $.Values.research.search.refreshCooldownSeconds | quote }}
+            - name: AIP_RESEARCH_SEARCH_CACHE_TTL_SECONDS
+              value: {{ $.Values.research.search.cacheTtlSeconds | quote }}
+            - name: AIP_RESEARCH_SEARCH_ALLOWED_DOMAINS
+              value: {{ $.Values.research.search.allowedDomains | toJson | quote }}
             {{- end }}
           ports:
-            - containerPort: {{ .port }}
+            - name: http
+              containerPort: {{ $config.port }}
+          {{- if $config.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ $config.probes.startup.path }}
+              port: http
+            periodSeconds: {{ $config.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.startup.failureThreshold }}
+          {{- end }}
           readinessProbe:
             httpGet:
-              path: /health
-              port: {{ .port }}
+              path: {{ $config.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
-              path: /health
-              port: {{ .port }}
+              path: {{ $config.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.liveness.failureThreshold }}
           resources:
-            {{- toYaml (default $.Values.aiServiceDefaults.resources .resources) | nindent 12 }}
+            {{- toYaml $config.resources | nindent 12 }}
+          volumeMounts:
+            {{- if $.Values.global.temporaryStorage.enabled }}
+            - name: temporary-storage
+              mountPath: {{ $.Values.global.temporaryStorage.mountPath | quote }}
+            {{- end }}
+            {{- include "aip.keyVaultVolumeMount" (dict "root" $ "component" $service.name) | nindent 12 }}
+      volumes:
+        {{- if $.Values.global.temporaryStorage.enabled }}
+        - name: temporary-storage
+          emptyDir:
+            {{- with $.Values.global.temporaryStorage.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
+        {{- end }}
+        {{- include "aip.keyVaultVolume" (dict "root" $ "component" $service.name) | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .name }}
+  name: {{ $service.name }}
+  labels:
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
 spec:
+  type: {{ $config.service.type }}
   selector:
-    app.kubernetes.io/component: {{ .name }}
+    {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
   ports:
     - name: http
-      port: 80
-      targetPort: {{ .port }}
+      port: {{ $config.service.port }}
+      targetPort: http
 ---
-{{- end }}
+{{ if $config.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $service.name }}
+  labels:
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $service.name }}
+  minReplicas: {{ $config.autoscaling.minReplicas }}
+  maxReplicas: {{ $config.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $config.autoscaling.targetCPUUtilizationPercentage }}
+---
+{{ end }}
+{{ if $config.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $service.name }}
+  labels:
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
+spec:
+  minAvailable: {{ $config.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 6 }}
+---
+{{ end }}
+{{ end }}

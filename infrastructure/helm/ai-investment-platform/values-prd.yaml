@@ -1,10 +1,64 @@
 global:
-  environment: PRD
+  # Compatibility overlay. Use values-azure.yaml for the complete non-secret
+  # example; Azure validation intentionally rejects this file on its own.
+  environment: AZURE
+  springProfile: AZURE
   imageRegistry: ""
+
+auth:
+  issuer: https://replace-with-production-oidc-issuer.example.invalid
+  devLoginEnabled: false
+  createDevSecret: false
+  devJwtSecret: ""
+  jwtSecretName: aip-auth-jwt
+  jwtSecretKey: jwt-secret
 
 devDependencies:
   enabled: false
+  postgres:
+    passwordSecretName: prd-postgres
+    persistence:
+      enabled: false
+      existingClaim: ""
+      storageClass: ""
+      size: 5Gi
 
 research:
   liveEnabled: false
   demoEnabled: false
+  persistence:
+    enabled: false
+    passwordSecretName: ""
+    passwordSecretKey: ""
+
+ibkr:
+  enabled: false
+  authMethod: client-portal-gateway
+  officialDocumentationVerified: true
+  marketDataEnabled: false
+  insecureTls: false
+  connectorBaseUrl: http://ibkr-connector
+  connectorRuntimeMode: LOCAL_AGENT
+  connectorLoginUrl: ""
+  connectorInternalToken: ""
+
+ibkrConnector:
+  enabled: false
+  runtimeMode: LOCAL_AGENT
+  productionApproved: false
+  gatewayPackagePath: ""
+  gatewayBaseUrl: ""
+  gatewayTlsVerify: true
+  loginPublicBaseUrl: ""
+  internalToken: ""
+  packageVolumeClaim: ""
+
+ibkrRuntime:
+  mode: STATIC
+  namespace: ""
+  image:
+    repository: replace-with-acr.azurecr.io/ibkr-connector
+    tag: replace-with-immutable-tag
+  kubernetesSpec:
+    initContainer:
+      image: ""

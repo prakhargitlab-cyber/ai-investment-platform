@@ -1,0 +1,30 @@
+{{- if eq .Values.ibkrRuntime.mode "KUBERNETES" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.ibkrRuntime.serviceAccount.name }}
+  {{- with .Values.ibkrRuntime.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ibkr-runtime-orchestrator
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ibkr-runtime-orchestrator
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.ibkrRuntime.serviceAccount.name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ibkr-runtime-orchestrator
+{{- end }}

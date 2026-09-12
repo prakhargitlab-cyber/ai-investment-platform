@@ -1,6 +1,188 @@
 global:
-  environment: DEV
+  environment: LOCAL
+  springProfile: LOCAL
   imageRegistry: localhost:5001
+  imageTag: dev
+  imagePullPolicy: IfNotPresent
+
+apiGateway:
+  cors:
+    allowedOrigins:
+      - http://localhost:3000
+      - http://127.0.0.1:3000
+      - http://localhost:13000
+  ingress:
+    enabled: true
+
+auth:
+  issuer: ai-investment-dev
+  devLoginEnabled: true
+  email:
+    mode: SMTP
+    smtpHost: smtp.gmail.com
+    smtpPort: 587
+    smtpFrom: prakhar.unique@gmail.com
+    publicUrl: http://localhost:18080
+    credentialSecretName: auth-smtp-credentials
+    usernameSecretKey: SMTP_USERNAME
+    passwordSecretKey: SMTP_PASSWORD
+  createDevSecret: true
+  devJwtSecret: dev-phase5a-local-jwt-secret-change-me-32
+  jwtSecretName: aip-auth-jwt
+  jwtSecretKey: jwt-secret
 
 devDependencies:
   enabled: true
+  postgres:
+    password: dev-local-postgres-password
+    persistence:
+      enabled: true
+      existingClaim: ""
+      storageClass: local-path
+      size: 5Gi
+  searxng:
+    enabled: true
+
+research:
+  liveEnabled: true
+  demoEnabled: false
+  logLevel: INFO
+  persistence:
+    enabled: true
+    databaseBackend: postgres
+    databaseHost: postgres
+    databasePort: 5432
+    databaseName: investment
+    databaseUser: investment
+    databaseSchema: research
+    passwordSecretName: dev-postgres
+    passwordSecretKey: POSTGRES_PASSWORD
+  portfolioServiceBaseUrl: http://portfolio-service
+  mcpAcquisition:
+    enabled: true
+    gatewayBaseUrl: http://mcp-gateway
+    timeoutSeconds: 10
+    serviceIdentity: research-engine
+  search:
+    enabled: true
+    provider: searxng
+    endpoint: http://searxng/search
+    engineId: ""
+    engineIdSecretName: research-search-secret
+    engineIdSecretKey: google-engine-id
+    apiKeySecretName: research-search-secret
+    apiKeySecretKey: google-api-key
+
+ibkr:
+  enabled: true
+  authMethod: client-portal-gateway
+  officialDocumentationVerified: true
+  marketDataEnabled: false
+  insecureTls: false
+  connectorBaseUrl: http://ibkr-connector
+  connectorRuntimeMode: LOCAL_AGENT
+  connectorLoginUrl: /api/v1/broker-connectors/login
+  connectorInternalToken: dev-internal-connector-token-change-me
+  connectorInternalTokenSecretName: ibkr-runtime-internal-token
+  connectorInternalTokenSecretKey: AIP_INTERNAL_TOKEN
+
+ibkrConnector:
+  enabled: true
+  runtimeMode: LOCAL_AGENT
+  productionApproved: false
+  gatewayPackagePath: /opt/ibkr/clientportal.gw
+  gatewayBaseUrl: https://127.0.0.1:5000/v1/api
+  gatewayTlsVerify: false
+  loginPublicBaseUrl: http://localhost:18080
+  internalToken: dev-internal-connector-token-change-me
+  internalTokenSecretName: ibkr-runtime-internal-token
+  internalTokenSecretKey: AIP_INTERNAL_TOKEN
+  packageVolumeClaim: ibkr-gateway-package-dev
+
+ibkrRuntime:
+  mode: KUBERNETES
+  serviceAccount:
+    create: true
+    name: broker-service-runtime-orchestrator
+  image:
+    repository: ai-investment/ibkr-connector
+    tag: dev
+  gatewayPackage:
+    claimName: ibkr-gateway-package-dev
+  gateway:
+    baseUrl: https://127.0.0.1:5000/v1/api
+    tlsVerify: false
+    loginPublicBaseUrl: http://localhost:18080
+  internalToken:
+    secretName: ibkr-runtime-internal-token
+    secretKey: AIP_INTERNAL_TOKEN
+  kubernetesSpec:
+    initContainer:
+      image: ai-investment/ibkr-connector:dev
+
+database:
+  host: postgres
+  port: 5432
+  name: investment
+  username: investment
+  passwordSecretName: dev-postgres
+  passwordSecretKey: POSTGRES_PASSWORD
+  sslMode: disable
+
+redis:
+  host: redis
+  port: 6379
+  tlsEnabled: false
+
+kafka:
+  enabled: false
+  bootstrapServers: kafka:9092
+  securityProtocol: PLAINTEXT
+
+keyVault:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+featureFlags:
+  mcpEnabled: true
+  globalResearchAcquisitionEnabled: true
+
+mcpGateway:
+  enabled: true
+  serviceIdentity: local-mcp-gateway
+  authenticationType: LOCAL_SERVICE
+  # Stable ID for the existing LOCAL dev-login user-a. Azure never uses this.
+  localUserId: 653d39bb-f827-30c5-94cb-8296b3a56a56
+  scopes:
+    - mcp:read
+    - watchlist:read
+  externalProvidersEnabled: true
+  yahooFinance:
+    enabled: true
+    transport: streamable-http
+    endpoint: http://yahoo-finance-mcp/mcp
+    authType: NONE
+    authSecretName: ""
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+
+yahooFinanceMcp:
+  enabled: true
+  image: ai-investment/yahoo-finance-mcp
+  tag: dev
+  transport: streamable-http
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: false
+  networkPolicy:
+    enabled: false
+
+marketData:
+  demoMode: true
+  quoteCacheMode: redis

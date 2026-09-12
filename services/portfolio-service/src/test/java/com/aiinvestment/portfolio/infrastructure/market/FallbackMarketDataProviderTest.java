@@ -91,6 +91,22 @@ class FallbackMarketDataProviderTest {
         assertThat(quote.source()).isEqualTo("TestCache");
     }
 
+    @Test
+    void rejectsHistoricalCachedZeroInsteadOfTreatingItAsLatestPrice() {
+        InMemoryQuoteCache cache = new InMemoryQuoteCache();
+        Instrument instrument = instrument();
+        cache.put(new Quote(instrument.instrumentId(), null, null, new Money(BigDecimal.ZERO, "USD"),
+                new Money(new BigDecimal("147.58"), "USD"), "USD", Instant.now(), "OldMock",
+                MarketDataFreshness.MOCK, MarketStatus.UNKNOWN), Duration.ofMinutes(5));
+        FallbackMarketDataProvider provider = new FallbackMarketDataProvider(
+                cache, new MockMarketDataProvider(cache), false);
+
+        Quote quote = provider.getQuote(instrument);
+
+        assertThat(quote.freshness()).isEqualTo(MarketDataFreshness.UNAVAILABLE);
+        assertThat(quote.last()).isNull();
+    }
+
     private static Instrument instrument() {
         return new Instrument(UUID.randomUUID(), "US67066G1040", "NVDA", "XNAS", "XNAS",
                 "NVIDIA Corporation", AssetType.EQUITY, "US", "USD", "Technology", "Semiconductors");

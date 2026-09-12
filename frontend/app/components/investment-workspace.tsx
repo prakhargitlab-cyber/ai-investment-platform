@@ -1,4 +1,6 @@
-﻿"use client";
+"use client";
+
+/* eslint-disable react-hooks/set-state-in-effect -- these resets delimit authenticated async request lifecycles */
 
 import {
   Bell,
@@ -20,10 +22,13 @@ import {
   TrendingUp,
   UploadCloud,
   CheckCircle2,
+  Eye,
+  EyeOff,
   WalletCards,
   X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { frontendConfig } from "../config";
 import {
   type AuthenticatedUser,
@@ -34,26 +39,53 @@ import {
   type PortfolioHistory,
   type PortfolioHistoryRange,
   type PortfolioDashboard,
+  type MarketUniverseSector,
+  type SectorPerformance,
+  type SectorPerformanceStock,
   type PortfolioListItem,
   type PortfolioImportPreview,
   type PortfolioPosition,
   type PortfolioResearchCompany,
   type PortfolioResearchSummary,
+  type FinancialResultPeriod,
+  type FinancialStatementPeriod,
+  type ProvenancedValue,
   type PortfolioSummary,
   type ResearchDocument,
   type ResearchEvent,
   type ResearchSummary,
+  type CatalystScore,
+  type ResearchReadiness,
+  type ResearchReadinessRequirement,
+  type StockRuleEngineAnalysis,
+  type ResearchWatchlist,
+  type WatchlistResearchInstrument,
+  type WatchlistResearchPresentation,
+  type ResearchInstrumentMatch,
   brokerApi,
   authApi,
   portfolioApi,
   researchApi
 } from "../lib/portfolio-api";
+import {
+  type MarketIntelligenceSelection,
+  formatSignedPerformancePct,
+  marketIntelligenceSelection,
+  performanceDirectionLabel,
+  performanceRowTone,
+  regionalWatchlistName
+} from "../lib/market-intelligence";
 import { Badge, Button, Card, EmptyState, ErrorState, Field, MetricCard, Skeleton } from "./ui";
 
 type View = "dashboard" | "portfolio" | "research" | "brokers" | "settings";
 type Theme = "system" | "light" | "dark";
 type SortKey = "company" | "ticker" | "marketValue" | "profitLoss" | "allocation";
 type ResearchSectionId = "overview" | "growth" | "orders" | "capex" | "customers" | "guidance" | "news" | "sources";
+type ResearchContext =
+  | { kind: "PORTFOLIO"; portfolioId: string }
+  | { kind: "WATCHLIST"; watchlistId: string; name: string; region: SectorPerformance["region"] }
+  | { kind: "SEARCH"; region: SectorPerformance["region"]; globalInstrumentId: string }
+  | { kind: "WATCHLIST_PENDING"; name: string; region: SectorPerformance["region"] };
 const portfolioHistoryRanges: PortfolioHistoryRange[] = ["1D", "5D", "1W", "1M", "1Y", "2Y", "3Y", "4Y", "5Y", "MAX"];
 const brokerAuthenticationPollMs = 2000;
 const brokerAuthenticationTimeoutMs = 5 * 60 * 1000;
@@ -79,12 +111,12 @@ function formatMoney(amount?: number, currency?: string) {
 }
 
 function formatBackendMoney(money?: { amount: number; currency: string } | null) {
-  return formatMoney(money?.amount, money?.currency);
+  return money ? formatMoney(money.amount, money.currency) : "N/A";
 }
 
-function formatPercent(value?: number) {
-  if (value === undefined || Number.isNaN(value)) {
-    return "--";
+function formatPercent(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) {
+    return "N/A";
   }
 
   return `${value.toFixed(2)}%`;
@@ -98,11 +130,22 @@ function formatChangePercent(start?: number, end?: number) {
 }
 
 function getAllocationValue(summary: PortfolioSummary | null, position: PortfolioPosition) {
-  if (!summary || summary.totalMarketValue.amount === 0) {
-    return 0;
+  if (!summary?.totalMarketValue || !position.marketValue || summary.totalMarketValue.amount === 0) {
+    return null;
   }
 
   return (position.marketValue.amount / summary.totalMarketValue.amount) * 100;
+}
+
+function compareNullableDescending(left?: number | null, right?: number | null) {
+  if (left == null && right == null) return 0;
+  if (left == null) return 1;
+  if (right == null) return -1;
+  return right - left;
+}
+
+function valueTone(value?: number | null): "positive" | "negative" | undefined {
+  return value == null ? undefined : value >= 0 ? "positive" : "negative";
 }
 
 function getApiFailure(error: unknown): ApiFailure {
@@ -111,6 +154,14 @@ function getApiFailure(error: unknown): ApiFailure {
   }
 
   return { message: "The portfolio API is not reachable. Confirm the gateway or portfolio service is running." };
+}
+
+function marketEnsureErrorCategory(error: unknown): string {
+  if (typeof error === "object" && error !== null && "status" in error) {
+    const status = (error as { status?: unknown }).status;
+    if (typeof status === "number") return `HTTP_${status}`;
+  }
+  return error instanceof TypeError ? "NETWORK_OR_CLIENT" : "UNKNOWN";
 }
 
 function hasRealBrokerPositions(positions: PortfolioPosition[]) {
@@ -140,6 +191,16 @@ function storedSelectedPortfolioId(userId: string | undefined) {
 }
 
 function portfolioSourceLabels(positions: PortfolioPosition[]) {
+  if (positions.some((position) => position.sourceType === "MANUAL_CSV_IMPORT")) {
+    return {
+      badge: "Imported positions", syncMeta: "CSV position snapshot", totalProfitLoss: "Unrealized P/L",
+      returnLabel: "Unrealized return", marketValue: "Latest market value", costBasis: "Acquisition cost",
+      unrealizedProfitLoss: "Unrealized P/L", lastUpdated: "from latest accepted public quote",
+      source: "CSV positions with public market data", syncButton: "Refresh prices",
+      emptyMessage: "Import a broker statement to populate this view.", sortMarketValue: "Latest market value",
+      sortProfitLoss: "Unrealized P/L"
+    };
+  }
   if (hasRealBrokerPositions(positions)) {
     return {
       badge: "Real broker data",
@@ -187,11 +248,19 @@ export function InvestmentWorkspace() {
     return storedUser ? (JSON.parse(storedUser) as AuthenticatedUser) : null;
   });
   const [authLoading, setAuthLoading] = useState(false);
+  const marketEnsureAuthReady = authenticatedUser !== null && Boolean(accessToken);
   const [view, setView] = useState<View>("dashboard");
   const [theme, setTheme] = useState<Theme>("system");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [portfolios, setPortfolios] = useState<PortfolioListItem[]>([]);
   const [portfolioDashboard, setPortfolioDashboard] = useState<PortfolioDashboard | null>(null);
+  const [sectorPerformance, setSectorPerformance] = useState<SectorPerformance | null>(null);
+  const [sectorPerformanceRegion, setSectorPerformanceRegion] = useState<SectorPerformance["region"]>("EUROPE");
+  const [sectorPerformanceSector, setSectorPerformanceSector] = useState("");
+  const [sectorOptions, setSectorOptions] = useState<MarketUniverseSector[]>([]);
+  const [sectorOptionsRegion, setSectorOptionsRegion] = useState<SectorPerformance["region"] | null>(null);
+  const [sectorOptionsLoading, setSectorOptionsLoading] = useState(false);
+  const [sectorPerformancePeriod, setSectorPerformancePeriod] = useState<SectorPerformance["period"]>("WEEK");
   const [portfolioScope, setPortfolioScope] = useState<"ALL" | string>("ALL");
   const [selectedPortfolio, setSelectedPortfolio] = useState<Portfolio | undefined>();
   const [selectedPortfolioId, setSelectedPortfolioId] = useState<string>("");
@@ -219,13 +288,48 @@ export function InvestmentWorkspace() {
   const brokerAuthPollBusyRef = useRef(false);
   const pendingBrokerAuthRef = useRef<{ connectionId: string; provider: string } | null>(null);
   const brokerAuthStartedAtRef = useRef(0);
+  const ibkrBootstrapSyncsRef = useRef(new Map<string, Promise<boolean>>());
   const [selectedResearchInstrumentId, setSelectedResearchInstrumentId] = useState("");
+  const [selectedMarketIntelligenceStock, setSelectedMarketIntelligenceStock] = useState<SectorPerformanceStock | null>(null);
+  const [selectedMarketIntelligenceRegion, setSelectedMarketIntelligenceRegion] = useState<SectorPerformance["region"] | null>(null);
   const [researchSummary, setResearchSummary] = useState<ResearchSummary | null>(null);
   const [researchLoading, setResearchLoading] = useState(false);
   const [portfolioResearchSummary, setPortfolioResearchSummary] = useState<PortfolioResearchSummary | null>(null);
   const [portfolioResearchLoading, setPortfolioResearchLoading] = useState(false);
+  const [portfolioResearchError, setPortfolioResearchError] = useState<string | null>(null);
+  const [researchReadinessDialog, setResearchReadinessDialog] = useState<{
+    globalInstrumentId: string;
+    companyName: string;
+  } | null>(null);
+  const [researchReadiness, setResearchReadiness] = useState<ResearchReadiness | null>(null);
+  const [researchReadinessLoading, setResearchReadinessLoading] = useState(false);
+  const [researchReadinessError, setResearchReadinessError] = useState<string | null>(null);
+  const [ensuringResearchRequirements, setEnsuringResearchRequirements] = useState<string[]>([]);
+  const [stockRuleEngineAnalysis, setStockRuleEngineAnalysis] = useState<StockRuleEngineAnalysis | null>(null);
+  const [stockRuleEngineLoading, setStockRuleEngineLoading] = useState(false);
+  const [stockRuleEngineError, setStockRuleEngineError] = useState<string | null>(null);
   const [researchEventType, setResearchEventType] = useState("");
   const [researchImpact, setResearchImpact] = useState("");
+  const [watchlists, setWatchlists] = useState<ResearchWatchlist[]>([]);
+  const [savedWatchlistIds, setSavedWatchlistIds] = useState<Record<string, string[]>>({});
+  const [watchlistMutation, setWatchlistMutation] = useState<string | null>(null);
+  const [watchlistActionError, setWatchlistActionError] = useState<string | null>(null);
+  const [watchlistRevision, setWatchlistRevision] = useState(0);
+  const watchlistMutationRef = useRef(false);
+  const [researchContext, setResearchContext] = useState<ResearchContext>({ kind: "PORTFOLIO", portfolioId: "" });
+  const [watchlistResearch, setWatchlistResearch] = useState<WatchlistResearchPresentation | null>(null);
+  const [watchlistResearchLoading, setWatchlistResearchLoading] = useState(false);
+  const [watchlistResearchError, setWatchlistResearchError] = useState<string | null>(null);
+  const positionsRef = useRef<PortfolioPosition[]>([]);
+  const researchContextRef = useRef<ResearchContext>(researchContext);
+
+  useEffect(() => {
+    positionsRef.current = positions;
+  }, [positions]);
+
+  useEffect(() => {
+    researchContextRef.current = researchContext;
+  }, [researchContext]);
 
   const clearUserScopedState = useCallback(() => {
     rememberSelectedPortfolioId(authenticatedUser?.userId, "");
@@ -240,6 +344,19 @@ export function InvestmentWorkspace() {
     setBrokerConnections([]);
     setBrokerProviders([]);
     setSelectedResearchInstrumentId("");
+    setSelectedMarketIntelligenceStock(null);
+    setSelectedMarketIntelligenceRegion(null);
+    setWatchlists([]);
+    setSavedWatchlistIds({});
+    setWatchlistActionError(null);
+    setResearchContext({ kind: "PORTFOLIO", portfolioId: "" });
+    setWatchlistResearch(null);
+    setWatchlistResearchError(null);
+    setResearchReadinessDialog(null);
+    setResearchReadiness(null);
+    setResearchReadinessError(null);
+    setStockRuleEngineAnalysis(null);
+    setStockRuleEngineError(null);
     setResearchSummary(null);
     setPortfolioResearchSummary(null);
     setSearchText("");
@@ -335,13 +452,90 @@ export function InvestmentWorkspace() {
       }
     }
 
-    if (accessToken) {
+    if (accessToken && authenticatedUser) {
       void loadPortfolios();
     }
     return () => {
       cancelled = true;
     };
   }, [accessToken, authenticatedUser?.userId]);
+
+  useEffect(() => {
+    console.info("[AIP_MARKET_ENSURE]", { event: "EFFECT", authReady: marketEnsureAuthReady });
+    if (!marketEnsureAuthReady) return;
+
+    console.info("[AIP_MARKET_ENSURE]", { event: "DISPATCH" });
+    void portfolioApi.ensureMarketData("INDIA")
+      .then(() => console.info("[AIP_MARKET_ENSURE]", { event: "RESOLVED" }))
+      .catch((error: unknown) => console.info(
+        "[AIP_MARKET_ENSURE]",
+        { event: "REJECTED", category: marketEnsureErrorCategory(error) }
+      ));
+  }, [marketEnsureAuthReady]);
+
+  useEffect(() => {
+    if (!marketEnsureAuthReady) return;
+    let cancelled = false;
+    void researchApi.listWatchlists()
+      .then(async (values) => {
+        const memberships = await Promise.all(values.map(async (list) => {
+          const detail = await researchApi.getWatchlistResearch(list.watchlistId);
+          return [list.watchlistId, detail.instruments.map((item) => item.globalInstrumentId)] as const;
+        }));
+        if (!cancelled) {
+          setWatchlists(values);
+          setSavedWatchlistIds(Object.fromEntries(memberships));
+        }
+      })
+      .catch(() => { if (!cancelled) setWatchlistActionError("Saved watchlists could not be loaded. Please retry."); });
+    return () => { cancelled = true; };
+  }, [marketEnsureAuthReady]);
+
+  useEffect(() => {
+    setResearchContext((current) => current.kind === "PORTFOLIO"
+      ? { kind: "PORTFOLIO", portfolioId: selectedPortfolioId }
+      : current);
+  }, [selectedPortfolioId]);
+
+  useEffect(() => {
+    if (!accessToken || !authenticatedUser) return;
+    let cancelled = false;
+    setSectorOptions([]);
+    setSectorOptionsRegion(null);
+    setSectorPerformanceSector("");
+    setSectorPerformance(null);
+    setSectorOptionsLoading(true);
+    void portfolioApi.getMarketUniverseSectors(sectorPerformanceRegion)
+      .then((value) => {
+        if (cancelled) return;
+        setSectorOptions(value.sectors);
+        setSectorOptionsRegion(value.region);
+        setSectorPerformanceSector(value.sectors[0]?.name ?? "");
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSectorOptions([]);
+          setSectorOptionsRegion(sectorPerformanceRegion);
+        }
+      })
+      .finally(() => { if (!cancelled) setSectorOptionsLoading(false); });
+    return () => { cancelled = true; };
+  }, [accessToken, authenticatedUser, sectorPerformanceRegion]);
+
+  useEffect(() => {
+    const validSector = sectorOptionsRegion === sectorPerformanceRegion
+      && sectorOptions.some((option) => option.name === sectorPerformanceSector);
+    if (!accessToken || !authenticatedUser || !validSector) {
+      setSectorPerformance(null);
+      return;
+    }
+    let cancelled = false;
+    setSectorPerformance(null);
+    void portfolioApi.getSectorPerformance(sectorPerformanceRegion, sectorPerformanceSector, sectorPerformancePeriod)
+      .then((value) => { if (!cancelled) setSectorPerformance(value); })
+      .catch(() => { if (!cancelled) setSectorPerformance(null); });
+    return () => { cancelled = true; };
+  }, [accessToken, authenticatedUser, sectorOptions, sectorOptionsRegion, sectorPerformanceRegion, sectorPerformanceSector, sectorPerformancePeriod]);
 
   useEffect(() => {
     let cancelled = false;
@@ -351,10 +545,10 @@ export function InvestmentWorkspace() {
         setResearchSummary(null);
         return;
       }
-      const selectedPortfolioCompany = portfolioResearchSummary?.companies.find(
-        (company) => company.instrumentId === selectedResearchInstrumentId
-      );
-      if (selectedPortfolioCompany && !isResearchSummaryLoadable(selectedPortfolioCompany.status)) {
+      const selectedCompany = researchContext.kind === "WATCHLIST"
+        ? watchlistResearch?.instruments.find((value) => value.globalInstrumentId === selectedResearchInstrumentId)?.company
+        : portfolioResearchSummary?.companies.find((company) => company.instrumentId === selectedResearchInstrumentId);
+      if (selectedCompany && !canRefreshResearch(selectedCompany)) {
         setResearchSummary(null);
         setResearchLoading(false);
         return;
@@ -380,7 +574,34 @@ export function InvestmentWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [portfolioResearchSummary, selectedResearchInstrumentId]);
+  }, [portfolioResearchSummary, researchContext, selectedResearchInstrumentId, watchlistResearch]);
+
+  useEffect(() => {
+    if (!marketEnsureAuthReady || researchContext.kind !== "WATCHLIST") {
+      setWatchlistResearch(null);
+      setWatchlistResearchError(null);
+      return;
+    }
+    let cancelled = false;
+    setWatchlistResearchLoading(true);
+    setWatchlistResearchError(null);
+    void researchApi.getWatchlistResearch(researchContext.watchlistId)
+      .then((value) => {
+        if (cancelled) return;
+        setWatchlistResearch(value);
+        setSelectedResearchInstrumentId((current) => value.instruments.some(
+          (item) => item.globalInstrumentId === current
+        ) ? current : value.instruments[0]?.globalInstrumentId ?? "");
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setWatchlistResearch(null);
+          setWatchlistResearchError("Watchlist research is temporarily unavailable.");
+        }
+      })
+      .finally(() => { if (!cancelled) setWatchlistResearchLoading(false); });
+    return () => { cancelled = true; };
+  }, [marketEnsureAuthReady, researchContext, watchlistRevision]);
 
   useEffect(() => {
     let cancelled = false;
@@ -392,22 +613,27 @@ export function InvestmentWorkspace() {
         return;
       }
       setPortfolioResearchLoading(true);
+      setPortfolioResearchError(null);
       try {
         const loaded = await researchApi.getPortfolioSummary(selectedPortfolioId);
         if (cancelled) {
           return;
         }
         setPortfolioResearchSummary(loaded);
-        setSelectedResearchInstrumentId((current) => {
-          if (current && loaded.companies.some((company) => company.instrumentId === current)) {
-            return current;
-          }
-          return loaded.companies.find((company) => company.instrumentId && isResearchSummaryLoadable(company.status))?.instrumentId ?? "";
-        });
+        if (researchContextRef.current.kind === "PORTFOLIO") {
+          setSelectedResearchInstrumentId((current) => current
+            && loaded.companies.some((company) => company.instrumentId === current)
+            ? current : loaded.companies.find((company) => canRefreshResearch(company))?.instrumentId ?? "");
+        }
       } catch {
         if (!cancelled) {
           setPortfolioResearchSummary(null);
-          setSelectedResearchInstrumentId("");
+          setPortfolioResearchError("Portfolio research summary unavailable. Existing company research remains available.");
+          if (researchContextRef.current.kind === "PORTFOLIO") {
+            setSelectedResearchInstrumentId((current) => current || positionsRef.current.find(
+              (position) => position.instrument.globalInstrumentId
+            )?.instrument.globalInstrumentId || "");
+          }
         }
       } finally {
         if (!cancelled) {
@@ -486,7 +712,7 @@ export function InvestmentWorkspace() {
       }
     }
 
-    if (accessToken) {
+    if (accessToken && authenticatedUser) {
       void loadPortfolioHistory();
     }
     return () => {
@@ -517,7 +743,7 @@ export function InvestmentWorkspace() {
       }
     }
 
-    if (accessToken) {
+    if (accessToken && authenticatedUser) {
       void loadBrokers();
     }
     return () => {
@@ -550,12 +776,12 @@ export function InvestmentWorkspace() {
           case "ticker":
             return a.instrument.ticker.localeCompare(b.instrument.ticker);
           case "profitLoss":
-            return b.unrealizedProfitLoss.amount - a.unrealizedProfitLoss.amount;
+            return compareNullableDescending(a.unrealizedProfitLoss?.amount, b.unrealizedProfitLoss?.amount);
           case "allocation":
-            return getAllocationValue(summary, b) - getAllocationValue(summary, a);
+            return compareNullableDescending(getAllocationValue(summary, a), getAllocationValue(summary, b));
           case "marketValue":
           default:
-            return b.marketValue.amount - a.marketValue.amount;
+            return compareNullableDescending(a.marketValue?.amount, b.marketValue?.amount);
         }
       });
   }, [positions, searchText, sortKey, summary]);
@@ -564,6 +790,229 @@ export function InvestmentWorkspace() {
     const updated = await portfolioApi.updateHoldingDisplayName(position.portfolioId, position.positionId, customDisplayName);
     setPositions((current) => current.map((item) => item.positionId === updated.positionId ? updated : item));
     setPortfolioDashboard(await portfolioApi.getDashboard());
+  }
+
+  function clearMarketIntelligenceContext() {
+    setSelectedMarketIntelligenceStock(null);
+    setSelectedMarketIntelligenceRegion(null);
+    setWatchlistResearch(null);
+    setWatchlistResearchError(null);
+    setResearchContext({ kind: "PORTFOLIO", portfolioId: selectedPortfolioId });
+    setSelectedResearchInstrumentId(
+      portfolioResearchSummary?.companies.find((company) => canRefreshResearch(company))?.instrumentId ?? ""
+    );
+    setResearchSummary(null);
+  }
+
+  async function openResearchReadiness(
+    globalInstrumentId: string,
+    companyName: string
+  ) {
+    setResearchReadinessDialog({ globalInstrumentId, companyName });
+    setResearchReadiness(null);
+    setResearchReadinessError(null);
+    setResearchReadinessLoading(true);
+    try {
+      setResearchReadiness(await researchApi.getReadiness(globalInstrumentId));
+    } catch {
+      setResearchReadinessError("Research readiness is temporarily unavailable.");
+    } finally {
+      setResearchReadinessLoading(false);
+    }
+  }
+
+  async function findResearchData(requirements: string[]) {
+    const dialog = researchReadinessDialog;
+    if (!dialog || requirements.length === 0) return;
+    setEnsuringResearchRequirements(requirements);
+    setResearchReadinessError(null);
+    try {
+      setResearchReadiness(
+        await researchApi.ensureReadiness(dialog.globalInstrumentId, requirements)
+      );
+      setStockRuleEngineAnalysis(null);
+    } catch {
+      setResearchReadinessError("Targeted research acquisition could not be completed.");
+    } finally {
+      setEnsuringResearchRequirements([]);
+    }
+  }
+
+  async function runStockRuleEngineAnalysis(allowPartial: boolean) {
+    const dialog = researchReadinessDialog;
+    if (!dialog) return;
+    setStockRuleEngineLoading(true);
+    setStockRuleEngineError(null);
+    try {
+      setStockRuleEngineAnalysis(
+        await researchApi.analyze(dialog.globalInstrumentId, allowPartial)
+      );
+    } catch {
+      setStockRuleEngineError("Deterministic analysis could not be completed.");
+    } finally {
+      setStockRuleEngineLoading(false);
+    }
+  }
+
+  function openMarketIntelligenceResearch(selection: MarketIntelligenceSelection) {
+    const { stock, region } = selection;
+    setSelectedMarketIntelligenceStock(stock);
+    setSelectedMarketIntelligenceRegion(region);
+    setSelectedResearchInstrumentId(stock.globalInstrumentId);
+    setResearchContext({ kind: "SEARCH", region, globalInstrumentId: stock.globalInstrumentId });
+    void openResearchReadiness(stock.globalInstrumentId, stock.companyName);
+    void loadSearchPresentation(stock.globalInstrumentId, stock.companyName, region);
+  }
+
+  async function openRegionalWatchlist(region: SectorPerformance["region"]) {
+    setWatchlistActionError(null);
+    try {
+      const list = await researchApi.ensureDefaultWatchlist(region);
+      setWatchlists((current) => [...current.filter((item) => item.watchlistId !== list.watchlistId), list]);
+      setSelectedResearchInstrumentId("");
+      setResearchContext({ kind: "WATCHLIST", watchlistId: list.watchlistId, name: list.name, region: list.region });
+    } catch (error) {
+      setWatchlistActionError(getApiFailure(error).message);
+    }
+  }
+
+  async function addRankedStockToWatchlist(selection: MarketIntelligenceSelection) {
+    if (watchlistMutationRef.current || !selection.stock.globalInstrumentId?.trim()) return;
+    watchlistMutationRef.current = true;
+    setWatchlistMutation(selection.stock.globalInstrumentId);
+    setWatchlistActionError(null);
+    try {
+      const list = await researchApi.ensureDefaultWatchlist(selection.region);
+      await researchApi.addWatchlistInstrument(list.watchlistId, {
+        globalInstrumentId: selection.stock.globalInstrumentId,
+        sourcePeriod: selection.period,
+        sourcePerformancePct: selection.stock.performancePct,
+      });
+      const detail = await researchApi.getWatchlistResearch(list.watchlistId);
+      setWatchlists((current) => [...current.filter((item) => item.watchlistId !== list.watchlistId), detail.watchlist]);
+      setSavedWatchlistIds((current) => ({ ...current, [list.watchlistId]: detail.instruments.map((item) => item.globalInstrumentId) }));
+      setWatchlistRevision((value) => value + 1);
+    } catch (error) {
+      setWatchlistActionError(getApiFailure(error).message);
+    } finally {
+      watchlistMutationRef.current = false;
+      setWatchlistMutation(null);
+    }
+  }
+
+  async function removeWatchlistStock(globalInstrumentId: string) {
+    if (researchContext.kind !== "WATCHLIST" || watchlistMutationRef.current) return;
+    const { watchlistId } = researchContext;
+    watchlistMutationRef.current = true;
+    setWatchlistMutation(globalInstrumentId);
+    setWatchlistActionError(null);
+    try {
+      await researchApi.removeWatchlistInstrument(watchlistId, globalInstrumentId);
+      setSavedWatchlistIds((current) => ({ ...current, [watchlistId]: (current[watchlistId] ?? []).filter((id) => id !== globalInstrumentId) }));
+      setWatchlists((current) => current.map((list) => list.watchlistId === watchlistId ? { ...list, instrumentCount: Math.max(0, list.instrumentCount - 1) } : list));
+      setWatchlistRevision((value) => value + 1);
+    } catch (error) {
+      setWatchlistActionError(getApiFailure(error).message);
+    } finally {
+      watchlistMutationRef.current = false;
+      setWatchlistMutation(null);
+    }
+  }
+
+  function selectResearchContext(value: string) {
+    setSelectedMarketIntelligenceStock(null);
+    setSelectedMarketIntelligenceRegion(null);
+    setResearchSummary(null);
+    setSelectedResearchInstrumentId("");
+    if (value.startsWith("portfolio:")) {
+      const portfolioId = value.slice("portfolio:".length);
+      setResearchContext({ kind: "PORTFOLIO", portfolioId });
+      rememberSelectedPortfolioId(authenticatedUser?.userId, portfolioId);
+      setSelectedPortfolioId(portfolioId);
+      return;
+    }
+    const watchlistId = value.slice("watchlist:".length);
+    const watchlist = watchlists.find((candidate) => candidate.watchlistId === watchlistId);
+    if (watchlist) {
+      setResearchContext({
+        kind: "WATCHLIST", watchlistId: watchlist.watchlistId,
+        name: watchlist.name, region: watchlist.region,
+      });
+    }
+  }
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<ResearchInstrumentMatch[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchPresentation, setSearchPresentation] = useState<PortfolioResearchCompany | null>(null);
+  const [searchSelectedMatch, setSearchSelectedMatch] = useState<ResearchInstrumentMatch | null>(null);
+  const searchWatchlistSaved = Boolean(searchSelectedMatch && watchlists.some((list) =>
+    list.systemDefault && list.region === searchSelectedMatch.region
+    && (savedWatchlistIds[list.watchlistId] ?? []).includes(searchSelectedMatch.globalInstrumentId)));
+  const searchPresentationRequest = useRef(0);
+  const [searchWatchlistBusy, setSearchWatchlistBusy] = useState(false);
+  const [searchWatchlistError, setSearchWatchlistError] = useState<string | null>(null);
+
+  async function loadSearchPresentation(
+    globalInstrumentId: string, _companyName: string, region: SectorPerformance["region"]
+  ) {
+    const requestId = ++searchPresentationRequest.current;
+    setSearchPresentation(null);
+    setResearchLoading(true);
+    try {
+      const presentation = await researchApi.getCompanyPresentation(globalInstrumentId, region);
+      if (requestId === searchPresentationRequest.current) setSearchPresentation(presentation);
+    } catch {
+      if (requestId === searchPresentationRequest.current) setSearchPresentation(null);
+    } finally {
+      if (requestId === searchPresentationRequest.current) setResearchLoading(false);
+    }
+  }
+
+  function handleSearchSelect(match: ResearchInstrumentMatch) {
+    setSelectedMarketIntelligenceStock(null);
+    setSelectedMarketIntelligenceRegion(null);
+    setSearchQuery("");
+    setSearchResults([]);
+    setSearchSelectedMatch(match);
+    setSelectedResearchInstrumentId(match.globalInstrumentId);
+    setResearchContext({ kind: "SEARCH", region: match.region, globalInstrumentId: match.globalInstrumentId });
+    void openResearchReadiness(match.globalInstrumentId, match.companyName);
+    void loadSearchPresentation(match.globalInstrumentId, match.companyName, match.region);
+  }
+
+  async function toggleSearchWatchlist() {
+    const match = searchSelectedMatch;
+    if (searchWatchlistBusy || !match?.globalInstrumentId?.trim()) return;
+    setSearchWatchlistBusy(true);
+    setSearchWatchlistError(null);
+    try {
+      const list = await researchApi.ensureDefaultWatchlist(match.region);
+      const already = (savedWatchlistIds[list.watchlistId] ?? []).includes(match.globalInstrumentId);
+      if (already) {
+        await researchApi.removeWatchlistInstrument(list.watchlistId, match.globalInstrumentId);
+        setSavedWatchlistIds((current) => ({
+          ...current,
+          [list.watchlistId]: (current[list.watchlistId] ?? []).filter((id) => id !== match.globalInstrumentId),
+        }));
+      } else {
+        await researchApi.addWatchlistInstrument(list.watchlistId, {
+          globalInstrumentId: match.globalInstrumentId,
+          sourcePeriod: "DAY",
+          sourcePerformancePct: null,
+        });
+        setSavedWatchlistIds((current) => ({
+          ...current,
+          [list.watchlistId]: [...(current[list.watchlistId] ?? []), match.globalInstrumentId],
+        }));
+      }
+      setWatchlists((current) => current.some((item) => item.watchlistId === list.watchlistId) ? current : [...current, list]);
+    } catch (error) {
+      setSearchWatchlistError(getApiFailure(error).message);
+    } finally {
+      setSearchWatchlistBusy(false);
+    }
   }
 
   async function createPortfolio() {
@@ -578,6 +1027,7 @@ export function InvestmentWorkspace() {
       setPortfolios(loaded);
       rememberSelectedPortfolioId(authenticatedUser?.userId, created.portfolioId);
       setSelectedPortfolioId(created.portfolioId);
+      clearMarketIntelligenceContext();
       setView("portfolio");
     } catch (err) {
       setError(getApiFailure(err));
@@ -637,15 +1087,31 @@ export function InvestmentWorkspace() {
       }
       authWindow?.close();
       const dashboard = await portfolioApi.getDashboard();
-      const [loadedSummary, loadedPositions] = await Promise.all([
-        portfolioApi.getSummary(selectedPortfolioId), portfolioApi.getPositions(selectedPortfolioId)
+      const [loadedSummary, loadedPositions, loadedHistory] = await Promise.all([
+        portfolioApi.getSummary(selectedPortfolioId), portfolioApi.getPositions(selectedPortfolioId),
+        portfolioApi.getHistory(selectedPortfolioId, portfolioHistoryRange)
       ]);
       setPortfolioDashboard(dashboard);
       setPortfolios(dashboard.portfolios);
       setSummary(loadedSummary);
       setPositions(loadedPositions);
+      setPortfolioHistory(loadedHistory);
     } catch (err) {
       authWindow?.close();
+      setError(getApiFailure(err));
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function refreshSelectedPrices() {
+    if (!selectedPortfolioId) return;
+    setSyncing(true);
+    setError(null);
+    try {
+      await portfolioApi.refreshPrices(selectedPortfolioId);
+      setPositions(await portfolioApi.getPositions(selectedPortfolioId));
+    } catch (err) {
       setError(getApiFailure(err));
     } finally {
       setSyncing(false);
@@ -700,6 +1166,9 @@ export function InvestmentWorkspace() {
   async function refreshAuthenticatedBroker(connectionId: string): Promise<boolean> {
     const authStatus = await brokerApi.getAuthStatus(connectionId);
     if (!authStatus.authenticated || authStatus.state !== "CONNECTED") return false;
+    if (pendingBrokerAuthRef.current?.provider === "IBKR") {
+      await bootstrapIbkrPortfolio(connectionId);
+    }
     const [connections, dashboard] = await Promise.all([
       brokerApi.listConnections(),
       portfolioApi.getDashboard()
@@ -707,7 +1176,58 @@ export function InvestmentWorkspace() {
     setBrokerConnections(connections);
     setPortfolioDashboard(dashboard);
     setPortfolios(dashboard.portfolios);
+    const linkedPortfolio = dashboard.portfolios.find((portfolio) =>
+      portfolio.brokerConnectionId === connectionId && portfolio.portfolioId === selectedPortfolioId
+    );
+    if (linkedPortfolio) {
+      const [loadedPortfolio, loadedSummary, loadedPositions, loadedHistory] = await Promise.all([
+        portfolioApi.getPortfolio(linkedPortfolio.portfolioId),
+        portfolioApi.getSummary(linkedPortfolio.portfolioId),
+        portfolioApi.getPositions(linkedPortfolio.portfolioId),
+        portfolioApi.getHistory(linkedPortfolio.portfolioId, portfolioHistoryRange)
+      ]);
+      setSelectedPortfolio(loadedPortfolio);
+      setSummary(loadedSummary);
+      setPositions(loadedPositions);
+      setPortfolioHistory(loadedHistory);
+    }
     return true;
+  }
+
+  async function bootstrapIbkrPortfolio(connectionId: string): Promise<boolean> {
+    const existing = ibkrBootstrapSyncsRef.current.get(connectionId);
+    if (existing) return existing;
+    const sync = (async () => {
+      try {
+        const result = await portfolioApi.syncBrokerConnection(connectionId);
+        if (result.status !== "CONNECTED") {
+          throw new Error("Broker portfolio synchronization did not complete.");
+        }
+        const dashboard = await portfolioApi.getDashboard();
+        setPortfolioDashboard(dashboard);
+        setPortfolios(dashboard.portfolios);
+        const returnedPortfolioId = result.portfolios.find((portfolio) =>
+          portfolio.brokerConnectionId === connectionId
+        )?.portfolioId;
+        const portfolioId = returnedPortfolioId ?? dashboard.portfolios.find((portfolio) =>
+          portfolio.brokerConnectionId === connectionId
+        )?.portfolioId;
+        if (portfolioId) {
+          setSelectedPortfolioId((current) => {
+            if (current) return current;
+            rememberSelectedPortfolioId(authenticatedUser?.userId, portfolioId);
+            return portfolioId;
+          });
+        }
+        setBrokerCardError("IBKR", null);
+        return true;
+      } catch {
+        setBrokerCardError("IBKR", "Interactive Brokers connected, but portfolio sync failed. Try syncing again.");
+        return false;
+      }
+    })();
+    ibkrBootstrapSyncsRef.current.set(connectionId, sync);
+    return sync;
   }
 
   async function finishBrokerAuthentication(connectionId: string) {
@@ -725,6 +1245,9 @@ export function InvestmentWorkspace() {
   }
 
   function startBrokerAuthenticationMonitoring(authWindow: Window, connectionId: string, provider: string) {
+    if (provider === "IBKR") {
+      ibkrBootstrapSyncsRef.current.delete(connectionId);
+    }
     pendingBrokerAuthRef.current = { connectionId, provider };
     setAuthenticatingBroker(provider);
     setBrokerAuthenticationTimedOut(false);
@@ -757,6 +1280,7 @@ export function InvestmentWorkspace() {
       await finishBrokerAuthentication(connectionId);
     };
     brokerAuthPollRef.current = window.setInterval(() => void poll(), brokerAuthenticationPollMs);
+    void poll();
   }
 
   function continueBrokerAuthenticationChecking() {
@@ -796,6 +1320,10 @@ export function InvestmentWorkspace() {
       }
       authWindow.close();
       if (action.action === "NONE") {
+        if (brokerType === "IBKR" && action.status === "CONNECTED") {
+          ibkrBootstrapSyncsRef.current.delete(action.connectionId);
+          await bootstrapIbkrPortfolio(action.connectionId);
+        }
         setBrokerConnections(await brokerApi.listConnections());
       } else {
         setBrokerCardError(brokerType, action.message);
@@ -816,9 +1344,9 @@ export function InvestmentWorkspace() {
       const session = await authApi.loginDev(userKey);
       window.localStorage.setItem("aip.accessToken", session.accessToken);
       window.localStorage.setItem("aip.user", JSON.stringify(session.user));
-      clearUserScopedState();
-      setAccessToken(session.accessToken);
-      setAuthenticatedUser(session.user);
+      // Authentication can complete in a tab that was opened before a frontend rollout.
+      // Reload the root document so Dashboard effects always mount from the active build.
+      window.location.replace("/");
     } catch (err) {
       setError(getApiFailure(err));
     } finally {
@@ -826,9 +1354,21 @@ export function InvestmentWorkspace() {
     }
   }
 
+  async function loginEmail(email: string, password: string) {
+    setAuthLoading(true); setError(null);
+    try {
+      const session = await authApi.login(email, password);
+      window.localStorage.setItem("aip.accessToken", session.accessToken);
+      window.localStorage.setItem("aip.user", JSON.stringify(session.user));
+      window.location.replace("/");
+    } catch (err) { setError(getApiFailure(err)); } finally { setAuthLoading(false); }
+  }
+
   function logout() {
     window.localStorage.removeItem("aip.accessToken");
     window.localStorage.removeItem("aip.user");
+    window.history.replaceState({}, "", "/");
+    setError(null);
     setAccessToken(null);
     setAuthenticatedUser(null);
     clearUserScopedState();
@@ -839,7 +1379,7 @@ export function InvestmentWorkspace() {
   }
 
   if (!accessToken || !authenticatedUser) {
-    return <SignInView error={error} onLogin={login} />;
+    return <SignInView error={error} onLogin={login} onEmailLogin={loginEmail} />;
   }
 
   return (
@@ -861,6 +1401,7 @@ export function InvestmentWorkspace() {
                 className={`nav-item ${view === item.id ? "nav-item-active" : ""}`}
                 key={item.id}
                 onClick={() => {
+                  clearMarketIntelligenceContext();
                   setView(item.id);
                   setSidebarOpen(false);
                 }}
@@ -934,21 +1475,26 @@ export function InvestmentWorkspace() {
               <p className="eyebrow">{view === "research" ? "Research intelligence" : "Brokers & Portfolios"}</p>
               <h1>{view === "dashboard" ? "Portfolio command center" : navItems.find((item) => item.id === view)?.label}</h1>
               <p>
-                Backend: <code>{frontendConfig.apiBaseUrl}</code>
+                Backend: <code>{frontendConfig.apiBaseUrl || "same-origin gateway"}</code>
               </p>
             </div>
-            <PortfolioSelector
-              portfolios={portfolios}
-              selectedPortfolioId={selectedPortfolioId}
-              onChange={(portfolioId) => {
-                setPortfolioResearchSummary(null);
-                setSelectedResearchInstrumentId("");
-                setResearchSummary(null);
-                setPortfolioHistory(null);
-                rememberSelectedPortfolioId(authenticatedUser?.userId, portfolioId);
-                setSelectedPortfolioId(portfolioId);
-              }}
-            />
+            {view === "research" ? (
+              null
+            ) : (
+              <PortfolioSelector
+                portfolios={portfolios}
+                selectedPortfolioId={selectedPortfolioId}
+                onChange={(portfolioId) => {
+                  setPortfolioResearchSummary(null);
+                  setSelectedResearchInstrumentId("");
+                  clearMarketIntelligenceContext();
+                  setResearchSummary(null);
+                  setPortfolioHistory(null);
+                  rememberSelectedPortfolioId(authenticatedUser?.userId, portfolioId);
+                  setSelectedPortfolioId(portfolioId);
+                }}
+              />
+            )}
           </section>
 
           {error ? (
@@ -963,6 +1509,7 @@ export function InvestmentWorkspace() {
             />
           ) : null}
 
+          {view !== "research" && watchlistActionError ? <p role="alert">{watchlistActionError}</p> : null}
           {loading ? <LoadingView /> : null}
 
           {!loading && !error ? (
@@ -978,7 +1525,30 @@ export function InvestmentWorkspace() {
                     }}
                   />
                   {portfolioScope === "ALL" ? (
-                    <MultiPortfolioDashboard dashboard={portfolioDashboard} onCreate={createPortfolio} creating={creating} />
+                    <MultiPortfolioDashboard
+                      dashboard={portfolioDashboard}
+                      onAddWatchlist={(selection) => { void addRankedStockToWatchlist(selection); }}
+                      savedInstrumentIds={watchlists.filter((list) => list.region === sectorPerformanceRegion && list.systemDefault).flatMap((list) => savedWatchlistIds[list.watchlistId] ?? [])}
+                      watchlistBusy={watchlistMutation !== null}
+                      performance={sectorPerformance}
+                      performanceRegion={sectorPerformanceRegion}
+                      performanceSector={sectorPerformanceSector}
+                      performancePeriod={sectorPerformancePeriod}
+                      sectorOptions={sectorOptions}
+                      sectorOptionsLoading={sectorOptionsLoading}
+                      onPerformanceRegion={(region) => {
+                        if (selectedMarketIntelligenceRegion && selectedMarketIntelligenceRegion !== region) {
+                          clearMarketIntelligenceContext();
+                        }
+                        setSectorPerformanceRegion(region);
+                      }}
+                      onPerformanceSector={setSectorPerformanceSector}
+                      onPerformancePeriod={setSectorPerformancePeriod}
+                      onCreate={createPortfolio}
+                      creating={creating}
+                      selectedResearchInstrumentId={selectedResearchInstrumentId}
+                      onOpenResearch={(selection) => { void openMarketIntelligenceResearch(selection); }}
+                    />
                   ) : (
                     <DashboardView
                       portfolio={selectedPortfolio}
@@ -986,6 +1556,7 @@ export function InvestmentWorkspace() {
                       positions={positions}
                       onCreate={createPortfolio}
                       onSync={selectedPortfolio?.brokerConnectionId ? syncSelectedPortfolio : undefined}
+                      onRefreshPrices={selectedPortfolio?.acquisitionSource === "MANUAL_CSV_IMPORT" ? refreshSelectedPrices : undefined}
                       creating={creating}
                       syncing={syncing}
                       newPortfolioName={newPortfolioName}
@@ -1012,6 +1583,7 @@ export function InvestmentWorkspace() {
                   onSort={setSortKey}
                   onCreate={createPortfolio}
                   onSync={selectedPortfolio?.brokerConnectionId ? syncSelectedPortfolio : undefined}
+                  onRefreshPrices={selectedPortfolio?.acquisitionSource === "MANUAL_CSV_IMPORT" ? refreshSelectedPrices : undefined}
                   creating={creating}
                   syncing={syncing}
                   newPortfolioName={newPortfolioName}
@@ -1019,6 +1591,7 @@ export function InvestmentWorkspace() {
                   setNewPortfolioName={setNewPortfolioName}
                   setNewPortfolioCurrency={setNewPortfolioCurrency}
                   onUpdateDisplayName={updateHoldingDisplayName}
+                  portfolioResearch={portfolioResearchSummary}
                 />
               ) : null}
               {view === "brokers" ? (
@@ -1100,6 +1673,7 @@ export function InvestmentWorkspace() {
                     setSelectedPortfolioId(portfolioId);
                     setPortfolioScope(portfolioId);
                     rememberSelectedPortfolioId(authenticatedUser?.userId, portfolioId);
+                    clearMarketIntelligenceContext();
                     setView("portfolio");
                   }}
                   onDisconnect={async (connectionId) => {
@@ -1115,13 +1689,43 @@ export function InvestmentWorkspace() {
                 />
               ) : null}
               {view === "research" ? (
+                <>
+                <Card className="wide-panel research-discovery">
+                  <h2>Research intelligence</h2>
+                  <StockSearchField selectedGlobalInstrumentId={selectedResearchInstrumentId} onSelect={handleSearchSelect} />
+                </Card>
+                <Card className="wide-panel research-saved-lists">
+                  <h3>Saved lists</h3>
+                  <div className="button-row" role="group" aria-label="Regional watchlists">
+                    {(["INDIA", "USA", "EUROPE"] as const).map((region) => <Button key={region} variant="secondary" onClick={() => { void openRegionalWatchlist(region); }}>{regionalWatchlistName(region)}</Button>)}
+                  </div>
+<ResearchContextSelector
+                portfolios={portfolios}
+                watchlists={watchlists}
+                context={researchContext}
+                onChange={selectResearchContext}
+              />
+                  {watchlistActionError ? <p role="alert">{watchlistActionError}</p> : null}
+                  {researchContext.kind === "WATCHLIST" && selectedResearchInstrumentId ? <Button variant="secondary" disabled={watchlistMutation !== null} onClick={() => { void removeWatchlistStock(selectedResearchInstrumentId); }}>Remove selected company from {researchContext.name}</Button> : null}
+                </Card>
                 <ResearchView
                   positions={positions}
-                  selectedPortfolioId={selectedPortfolioId}
                   portfolioResearchSummary={portfolioResearchSummary}
                   portfolioResearchLoading={portfolioResearchLoading}
-                  selectedInstrumentId={selectedResearchInstrumentId}
+                  portfolioResearchError={portfolioResearchError}
+                  researchContext={researchContext}
+                  watchlistResearch={watchlistResearch}
+                  watchlistResearchLoading={watchlistResearchLoading}
+                  watchlistResearchError={watchlistResearchError}
+                  selectedResearchInstrumentId={selectedResearchInstrumentId}
                   onSelectInstrument={setSelectedResearchInstrumentId}
+                  searchPresentation={searchPresentation}
+                  onSearchSelect={handleSearchSelect}
+                  searchSelectedMatch={searchSelectedMatch}
+                  searchWatchlistSaved={searchWatchlistSaved}
+                  searchWatchlistBusy={searchWatchlistBusy}
+                  searchWatchlistError={searchWatchlistError}
+                  onToggleSearchWatchlist={toggleSearchWatchlist}
                   summary={researchSummary}
                   loading={researchLoading}
                   eventType={researchEventType}
@@ -1132,49 +1736,358 @@ export function InvestmentWorkspace() {
                     if (!selectedResearchInstrumentId) {
                       return;
                     }
-                    setResearchLoading(true);
-                    try {
-                      setResearchSummary(await researchApi.refresh(selectedResearchInstrumentId));
-                    } finally {
-                      setResearchLoading(false);
-                    }
-                  }}
-                  onPortfolioRefresh={async () => {
-                    if (!selectedPortfolioId) {
-                      return;
-                    }
-                    setPortfolioResearchLoading(true);
-                    try {
-                      const refreshed = await researchApi.refreshPortfolio(selectedPortfolioId);
-                      setPortfolioResearchSummary(refreshed);
-                      const firstLoadable = refreshed.companies.find((company) =>
-                        company.instrumentId && isResearchSummaryLoadable(company.status)
-                      );
-                      if (firstLoadable?.instrumentId) {
-                        setSelectedResearchInstrumentId(firstLoadable.instrumentId);
-                      }
-                    } finally {
-                      setPortfolioResearchLoading(false);
-                    }
+                    const selectedCompany = portfolioResearchSummary?.companies.find(
+                      (company) => company.instrumentId === selectedResearchInstrumentId
+                    );
+                    await openResearchReadiness(
+                      selectedResearchInstrumentId,
+                      selectedCompany?.companyName ?? researchSummary?.profile.companyName ?? "Company research"
+                    );
                   }}
                 />
+                </>
               ) : null}
               {view === "settings" ? <SettingsView /> : null}
             </>
           ) : null}
         </div>
       </section>
+      {researchReadinessDialog ? (
+        <ResearchReadinessDialog
+          companyName={researchReadinessDialog.companyName}
+          readiness={researchReadiness}
+          loading={researchReadinessLoading}
+          error={researchReadinessError}
+          ensuringRequirementIds={ensuringResearchRequirements}
+          analysis={stockRuleEngineAnalysis}
+          analysisLoading={stockRuleEngineLoading}
+          analysisError={stockRuleEngineError}
+          onClose={() => {
+            setResearchReadinessDialog(null);
+            setResearchReadiness(null);
+            setResearchReadinessError(null);
+            setStockRuleEngineAnalysis(null);
+            setStockRuleEngineError(null);
+          }}
+          onFindData={(requirements) => { void findResearchData(requirements); }}
+          onRunAnalysis={(allowPartial) => { void runStockRuleEngineAnalysis(allowPartial); }}
+        />
+      ) : null}
     </main>
   );
 }
 
+function ResearchReadinessDialog({
+  companyName,
+  readiness,
+  loading,
+  error,
+  ensuringRequirementIds,
+  analysis,
+  analysisLoading,
+  analysisError,
+  onClose,
+  onFindData,
+  onRunAnalysis
+}: {
+  companyName: string;
+  readiness: ResearchReadiness | null;
+  loading: boolean;
+  error: string | null;
+  ensuringRequirementIds: string[];
+  analysis: StockRuleEngineAnalysis | null;
+  analysisLoading: boolean;
+  analysisError: string | null;
+  onClose: () => void;
+  onFindData: (requirements: string[]) => void;
+  onRunAnalysis: (allowPartial: boolean) => void;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const findable = readiness?.requirements.filter((item) =>
+    item.supportedActions.includes("FIND_DATA") && item.status !== "READY_FRESH"
+  ) ?? [];
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const appShell = document.querySelector<HTMLElement>(".app-shell");
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyPaddingRight = document.body.style.paddingRight;
+    const previousAppInert = appShell?.inert ?? false;
+    const previousAppAriaHidden = appShell?.getAttribute("aria-hidden") ?? null;
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+
+    document.body.style.overflow = "hidden";
+    if (scrollbarWidth > 0) {
+      const currentPadding = Number.parseFloat(window.getComputedStyle(document.body).paddingRight) || 0;
+      document.body.style.paddingRight = `${currentPadding + scrollbarWidth}px`;
+    }
+    if (appShell) {
+      appShell.inert = true;
+      appShell.setAttribute("aria-hidden", "true");
+    }
+    dialogRef.current?.querySelector<HTMLElement>("[data-readiness-close]")?.focus();
+
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.body.style.paddingRight = previousBodyPaddingRight;
+      if (appShell) {
+        appShell.inert = previousAppInert;
+        if (previousAppAriaHidden === null) appShell.removeAttribute("aria-hidden");
+        else appShell.setAttribute("aria-hidden", previousAppAriaHidden);
+      }
+      previouslyFocused?.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
+      )).filter((element) => !element.hidden && element.getClientRects().length > 0);
+      if (!focusable.length) {
+        event.preventDefault();
+        dialogRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div className="readiness-popup-backdrop" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section
+        ref={dialogRef}
+        className="readiness-popup"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="research-readiness-title"
+        tabIndex={-1}
+      >
+        <header className="readiness-popup-header">
+          <div>
+            <p className="eyebrow">Research readiness</p>
+            <h2 id="research-readiness-title">{companyName}</h2>
+          </div>
+          <button data-readiness-close type="button" className="icon-button" aria-label="Close research readiness" onClick={onClose}>
+            <X size={20} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="readiness-popup-body">
+          {loading ? <Skeleton rows={5} /> : null}
+          {error ? <p className="readiness-popup-error" role="alert">{error}</p> : null}
+          {readiness ? <>
+            <div className="readiness-summary" aria-label="Research data completeness">
+              <div><span>Overall status</span><strong>{readiness.overallStatus.replaceAll("_", " ")}</strong></div>
+              <div><span>Completeness</span><strong>{readiness.overallCompletenessPct}%</strong></div>
+              <div><span>Critical completeness</span><strong>{readiness.criticalCompletenessPct}%</strong></div>
+              <div><span>Data confidence</span><strong>{readiness.confidence} · {readiness.confidencePct}%</strong></div>
+            </div>
+            <div className="readiness-primary-actions">
+              {findable.length ? <Button
+                onClick={() => onFindData(findable.map((item) => item.requirementId))}
+                disabled={ensuringRequirementIds.length > 0}
+              >{ensuringRequirementIds.length ? "Finding targeted data…" : "Find required data"}</Button> : null}
+              <div className="readiness-analysis-actions">
+                {readiness.analysisEligibility?.fullAnalysisAllowed ? (
+                  <Button onClick={() => onRunAnalysis(false)} disabled={analysisLoading || ensuringRequirementIds.length > 0}>
+                    {analysisLoading ? "Running deterministic analysis…" : "Run Analysis"}
+                  </Button>
+                ) : readiness.analysisEligibility?.partialAnalysisAllowed ? (
+                  <Button variant="secondary" onClick={() => onRunAnalysis(true)} disabled={analysisLoading || ensuringRequirementIds.length > 0}>
+                    {analysisLoading ? "Running deterministic analysis…" : "Run Partial Analysis"}
+                  </Button>
+                ) : (
+                  <p className="readiness-refresh-state">Analysis needs more critical data. Use Find Data for the listed requirements.</p>
+                )}
+              </div>
+            </div>
+            {analysisError ? <p className="readiness-popup-error" role="alert">{analysisError}</p> : null}
+            {analysis ? <StockRuleEngineBreakdown analysis={analysis} /> : null}
+            {readiness.refreshState?.executedCapabilities.length ? <p className="readiness-refresh-state" role="status">
+              Targeted capabilities: {readiness.refreshState.executedCapabilities.join(", ").replaceAll("_", " ")}
+            </p> : null}
+            <div className="readiness-requirements">
+              {readiness.requirements.map((requirement) => (
+                <ResearchReadinessRow
+                  key={requirement.requirementId}
+                  requirement={requirement}
+                  ensuring={ensuringRequirementIds.includes(requirement.requirementId)}
+                  onFindData={() => onFindData([requirement.requirementId])}
+                />
+              ))}
+            </div>
+          </> : null}
+          </div>
+      </section>
+    </div>,
+    document.body
+  );
+}
+
+function ResearchReadinessRow({
+  requirement,
+  ensuring,
+  onFindData
+}: {
+  requirement: ResearchReadinessRequirement;
+  ensuring: boolean;
+  onFindData: () => void;
+}) {
+  const tone = readinessStatusTone(requirement.status);
+  return <article className={`readiness-requirement readiness-requirement-${tone}`}>
+    <div className="readiness-requirement-heading">
+      <div>
+        <strong>{requirement.area.replaceAll("_", " ")}</strong>
+        <small>{requirement.requirementId.replaceAll("_", " ")} · {requirement.importance}</small>
+      </div>
+      <span className={`readiness-status readiness-status-${tone}`}>{requirement.status.replaceAll("_", " ")}</span>
+    </div>
+    <p>{requirement.asOf ? `As of ${new Date(requirement.asOf).toLocaleString()}` : "No eligible as-of date"}</p>
+    <p>{requirement.sourceProvider ? <>Source: {requirement.sourceProvider.replaceAll("_", " ")}{requirement.sourceUrl ? <> · <a href={requirement.sourceUrl} target="_blank" rel="noreferrer">View source ↗</a></> : null}</> : "Source unavailable"}</p>
+    {requirement.applicabilityReason ? <p>Applicability: {requirement.applicability?.replaceAll("_", " ")} · {requirement.applicabilityReason.replaceAll("_", " ")}{requirement.businessClassification ? ` (${requirement.businessClassification})` : ""}</p> : null}
+    {requirement.status === "NOT_APPLICABLE" ? <p>Excluded from completeness. No score assigned.</p> : null}
+    {requirement.requirementId === "CURRENT_NEWS" && requirement.acquisitionObservation?.history?.some((scan) => scan.outcome === "SUCCESS_EMPTY") ? <p>The latest successful provider scan found no qualifying current events. No news score was inferred.</p> : null}
+    {requirement.acquisitionObservation ? <p>Last acquisition: {requirement.acquisitionObservation.outcome.replaceAll("_", " ")} · {requirement.acquisitionObservation.provider.replaceAll("_", " ")}{requirement.acquisitionObservation.failure_reason ? `: ${requirement.acquisitionObservation.failure_reason}` : ""}</p> : null}
+    {requirement.missingInputIds.length ? <p>Missing inputs: {requirement.missingInputIds.map((id) => id.replaceAll("_", " ")).join(", ")}</p> : null}
+    {requirement.concreteRequirements?.some((input) => input.applicability === "NOT_APPLICABLE") ? <p>Not applicable: {requirement.concreteRequirements.filter((input) => input.applicability === "NOT_APPLICABLE").map((input) => input.inputId.replaceAll("_", " ")).join(", ")}</p> : null}
+    {requirement.missingReason ? <p className="readiness-reason">{requirement.missingReason.replaceAll("_", " ")}</p> : null}
+    {requirement.conflictReason ? <p className="readiness-reason">{requirement.conflictReason.replaceAll("_", " ")}</p> : null}
+    <div className="readiness-actions">
+      {requirement.supportedActions.includes("FIND_DATA") ? <Button onClick={onFindData} disabled={ensuring}>{ensuring ? "Finding…" : "Find Data"}</Button> : null}
+      {requirement.supportedActions.includes("UPLOAD_EVIDENCE") ? <Button variant="secondary" disabled title="Evidence upload arrives in a later iteration">Upload Evidence</Button> : null}
+    </div>
+  </article>;
+}
+
+function StockRuleEngineBreakdown({ analysis }: { analysis: StockRuleEngineAnalysis }) {
+  const tone = analysis.riskOverrides.length
+    ? "danger"
+    : analysis.overallScore != null && analysis.overallScore >= 65
+      ? "ready"
+      : analysis.overallScore != null && analysis.overallScore < 50
+        ? "danger"
+        : "neutral";
+  return <section className={`rule-engine-result rule-engine-result-${tone}`} aria-label="Deterministic stock analysis">
+    <header>
+      <div>
+        <p className="eyebrow">{analysis.ruleEngineVersion.replaceAll("_", " ")}</p>
+        <h3>{analysis.overallScore == null ? "Insufficient data" : `${analysis.overallScore.toFixed(2)}/100`}</h3>
+      </div>
+      <span className={`readiness-status readiness-status-${tone}`}>{analysis.decisionSignal.replaceAll("_", " ")}</span>
+    </header>
+    <div className="rule-engine-score-grid">
+      <div><span>Quality</span><strong>{scoreText(analysis.qualityScore)}</strong></div>
+      <div><span>Opportunity</span><strong>{scoreText(analysis.opportunityScore)}</strong></div>
+      <div><span>Risk</span><strong>{scoreText(analysis.riskScore)}</strong></div>
+      <div><span>Confidence</span><strong>{analysis.confidence} · {analysis.confidenceScore.toFixed(2)}%</strong></div>
+    </div>
+    <p className="rule-engine-meta">
+      Calculated {new Date(analysis.calculatedAt).toLocaleString()} · input fingerprint {analysis.inputFingerprint.slice(0, 12)} · {analysis.cacheHit ? "cached exact-input result" : "new calculation"}
+    </p>
+    {analysis.riskOverrides.length ? <div className="rule-engine-overrides" role="alert">
+      <strong>Risk override</strong>
+      {analysis.riskOverrides.map((override) => <p key={override.code}>{override.severity}: {override.code.replaceAll("_", " ")} · {override.effect.replaceAll("_", " ")}</p>)}
+    </div> : null}
+    <div className="rule-engine-area-table" role="table" aria-label="Rule Engine area score breakdown">
+      <div className="rule-engine-area-row rule-engine-area-header" role="row">
+        <span>Area</span><span>Weight</span><span>Score</span><span>Contribution</span><span>Status</span>
+      </div>
+      {analysis.areaScores.map((area) => <details key={area.area} className="rule-engine-area-row">
+        <summary>
+          <span>{area.area.replaceAll("_", " ")}</span>
+          <span>{area.weight}%</span>
+          <span>{scoreText(area.rawScore)}</span>
+          <span>{area.rawScore == null ? "—" : area.weightedContribution.toFixed(2)}</span>
+          <span>{area.status.replaceAll("_", " ")}</span>
+        </summary>
+        <div className="rule-engine-area-detail">
+          {area.metrics.length ? <div className="rule-engine-metrics">
+            {area.metrics.map((metric, index) => <article key={`${metric.rule}-${index}`}>
+              <strong>{metric.metric.replaceAll("_", " ")} · {metric.score.toFixed(2)}/100</strong>
+              <p>{formatRuleMetricValue(metric.value, metric.unit)} · rule {metric.rule} · applied weight {metric.appliedWeightPct.toFixed(2)}%</p>
+              <p>Source: {metric.source.replaceAll("_", " ")}{metric.asOf ? ` · as of ${new Date(metric.asOf).toLocaleDateString()}` : ""}{metric.sourceUrl ? <> · <a href={metric.sourceUrl} target="_blank" rel="noreferrer">View source ↗</a></> : null}</p>
+            </article>)}
+          </div> : <p>No scoreable metric is available for this area.</p>}
+          {area.sourceReferences.length ? <p><strong>Area evidence sources:</strong>{" "}{area.sourceReferences.map((source, index) => <span key={`${source.sourceUrl}-${index}`}>{index ? " · " : ""}<a href={source.sourceUrl} target="_blank" rel="noreferrer">{source.sourceProvider?.replaceAll("_", " ") ?? "Source"} ↗</a>{source.asOf ? ` (${new Date(source.asOf).toLocaleDateString()})` : ""}</span>)}</p> : null}
+          {area.positiveFactors.length ? <p><strong>Positive:</strong> {area.positiveFactors.join(" · ")}</p> : null}
+          {area.negativeFactors.length ? <p><strong>Negative:</strong> {area.negativeFactors.join(" · ")}</p> : null}
+          {area.missingInputs.length ? <p><strong>Missing:</strong> {area.missingInputs.join(", ").replaceAll("_", " ")}</p> : null}
+        </div>
+      </details>)}
+    </div>
+  </section>;
+}
+
+function scoreText(value?: number | null): string {
+  return value == null ? "—" : value.toFixed(2);
+}
+
+function formatRuleMetricValue(value: unknown, unit?: string | null): string {
+  const rendered = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value ?? "—");
+  return unit ? `${rendered} ${unit.replaceAll("_", " ")}` : rendered;
+}
+
+function readinessStatusTone(status: ResearchReadinessRequirement["status"]): "ready" | "warning" | "danger" | "neutral" {
+  if (status === "READY_FRESH") return "ready";
+  if (["READY_STALE", "PARTIAL", "REFRESHING"].includes(status)) return "warning";
+  if (status === "UNSUPPORTED" || status === "NOT_APPLICABLE") return "neutral";
+  return "danger";
+}
+
+function filingSourceLabel(sourceName: string): string {
+  return sourceName.trim().split(/\s+/)[0] || "Official";
+}
+
+function AuthPasswordInput({ name, placeholder }: { name: string; placeholder: string }) {
+  const [visible, setVisible] = useState(false);
+  return <span className="password-input"><input name={name} type={visible ? "text" : "password"} required minLength={12} placeholder={placeholder} /><button className="password-toggle" type="button" aria-label={visible ? "Hide password" : "Show password"} onClick={() => setVisible(!visible)}>{visible ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}</button></span>;
+}
+
 function SignInView({
   error,
-  onLogin
+  onLogin,
+  onEmailLogin
 }: {
   error: ApiFailure | null;
   onLogin: (userKey: "user-a" | "user-b") => void;
+  onEmailLogin: (email: string, password: string) => void;
 }) {
+  const [mode, setMode] = useState<"LOGIN" | "REGISTER" | "VERIFY" | "FORGOT" | "RESET" | "RESEND">("LOGIN");
+  const [message, setMessage] = useState<string | null>(null);
+  const [verificationEmail, setVerificationEmail] = useState("");
+  useEffect(() => { const token = new URLSearchParams(window.location.search).get("token"); if (window.location.pathname === "/verify-email" && token) { queueMicrotask(() => { setMode("VERIFY"); setMessage("Verifying your email..."); authApi.verifyEmail(token).then(() => setMessage("Email verified successfully. You can now sign in.")).catch(() => setMessage("Verification link is invalid or expired.")); }); } }, []);
+  async function submit(form: FormData) {
+    const email = String(form.get("email") || ""), password = String(form.get("password") || "");
+    if (mode === "LOGIN") return onEmailLogin(email, password);
+    if (mode === "VERIFY") { await authApi.verifyEmail(String(form.get("token") || "")); setMessage("Email verified. You can now sign in."); setMode("LOGIN"); return; }
+    if (mode === "FORGOT") { const result = await authApi.requestPasswordReset(email); setMessage(result.message); setMode("RESET"); return; }
+    if (mode === "RESET") { if (password !== String(form.get("confirmPassword") || "")) { setMessage("Passwords do not match."); return; } await authApi.confirmPasswordReset(String(form.get("token") || ""), password); setMessage("Password reset. You can now sign in."); setMode("LOGIN"); return; }
+    if (mode === "RESEND") { await authApi.resendVerification(email); setMessage("If this account is awaiting verification, a new verification email has been sent."); return; }
+    if (password !== String(form.get("confirmPassword") || "")) { setMessage("Passwords do not match."); return; }
+    await authApi.register({ email, password, firstName: String(form.get("firstName") || ""), lastName: String(form.get("lastName") || "") });
+    setVerificationEmail(email); setMessage("We sent a verification link to your email address."); setMode("VERIFY");
+  }
   return (
     <main className="signin-shell">
       <section className="signin-panel">
@@ -1185,13 +2098,21 @@ function SignInView({
             <span>Secure workspace</span>
           </div>
         </div>
-        <h1>Sign in</h1>
-        <p>Choose a DEV identity to validate authentication and data isolation.</p>
+        <h1>{mode === "LOGIN" ? "Sign in" : mode === "REGISTER" ? "Create account" : mode === "VERIFY" ? "Verify email" : mode === "FORGOT" ? "Forgot password" : mode === "RESEND" ? "Resend verification email" : "Reset password"}</h1>
+        <p>{mode === "LOGIN" ? "Use your verified account." : "Complete the account verification step to continue."}</p>
         {error ? <ErrorState message={error.message} correlationId={error.correlationId} /> : null}
-        <div className="signin-actions">
+        {message ? <p role="status">{message}</p> : null}
+        <form className="signin-actions" action={(form) => void submit(form).catch((err) => setMessage(getApiFailure(err).message))}>
+          {mode === "VERIFY" ? (frontendConfig.authDevLoginEnabled ? <input name="token" required placeholder="Verification token" /> : <p>Check your email and open the verification link.</p>) : mode === "RESET" ? <><input name="token" required placeholder="Reset token" /><AuthPasswordInput name="password" placeholder="New password" /><AuthPasswordInput name="confirmPassword" placeholder="Confirm new password" /></> : mode === "FORGOT" || mode === "RESEND" ? <input name="email" type="email" required placeholder="Email" /> : <><input name="email" type="email" required placeholder="Email" />{mode === "REGISTER" ? <><input name="firstName" required placeholder="First name" /><input name="lastName" required placeholder="Last name" /></> : null}<AuthPasswordInput name="password" placeholder="Password (minimum 12 characters)" />{mode === "REGISTER" ? <AuthPasswordInput name="confirmPassword" placeholder="Confirm password" /> : null}</>}
+          <Button type="submit">{mode === "LOGIN" ? "Sign in" : mode === "REGISTER" ? "Register" : mode === "RESEND" ? "Resend verification email" : "Verify email"}</Button>
+        </form>
+        <p><button type="button" onClick={() => setMode(mode === "LOGIN" ? "REGISTER" : "LOGIN")}>{mode === "LOGIN" ? "Create an account" : "Back to sign in"}</button></p>
+        {mode === "VERIFY" ? <p><button type="button" onClick={() => authApi.resendVerification(verificationEmail).then((result) => setMessage(result.message))}>Resend verification email</button></p> : null}
+        {mode === "LOGIN" ? <><p><button type="button" onClick={() => setMode("FORGOT")}>Forgot password?</button></p><p><button type="button" onClick={() => setMode("RESEND")}>Resend verification email</button></p></> : null}
+        {frontendConfig.authDevLoginEnabled ? <div className="signin-actions">
           <Button onClick={() => onLogin("user-a")}>Sign in as User A</Button>
           <Button variant="secondary" onClick={() => onLogin("user-b")}>Sign in as User B</Button>
-        </div>
+        </div> : null}
       </section>
     </main>
   );
@@ -1219,6 +2140,48 @@ function PortfolioSelector({
             {portfolio.name}
           </option>
         ))}
+      </select>
+    </label>
+  );
+}
+
+function ResearchContextSelector({
+  portfolios,
+  watchlists,
+  context,
+  onChange,
+}: {
+  portfolios: PortfolioListItem[];
+  watchlists: ResearchWatchlist[];
+  context: ResearchContext;
+  onChange: (value: string) => void;
+}) {
+  const value = context.kind === "PORTFOLIO"
+    ? `portfolio:${context.portfolioId}`
+    : context.kind === "WATCHLIST"
+      ? `watchlist:${context.watchlistId}`
+      : `pending:${context.region}`;
+  return (
+    <label className="portfolio-select research-context-select">
+      <span>Research context</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        {context.kind === "WATCHLIST_PENDING" ? (
+          <option value={value}>Opening {context.name}…</option>
+        ) : null}
+        <optgroup label="Portfolios">
+          {portfolios.map((portfolio) => (
+            <option value={`portfolio:${portfolio.portfolioId}`} key={`portfolio:${portfolio.portfolioId}`}>
+              {portfolio.name}
+            </option>
+          ))}
+        </optgroup>
+        <optgroup label="Watchlists">
+          {watchlists.map((watchlist) => (
+            <option value={`watchlist:${watchlist.watchlistId}`} key={`watchlist:${watchlist.watchlistId}`}>
+              {watchlist.name}
+            </option>
+          ))}
+        </optgroup>
       </select>
     </label>
   );
@@ -1262,23 +2225,47 @@ function PortfolioTabs({
 
 function MultiPortfolioDashboard({
   dashboard,
+  performance,
+  performanceRegion,
+  performanceSector,
+  performancePeriod,
+  sectorOptions,
+  sectorOptionsLoading,
+  onPerformanceRegion,
+  onPerformanceSector,
+  onPerformancePeriod,
   onCreate,
-  creating
+  creating,
+  selectedResearchInstrumentId,
+  onOpenResearch,
+  onAddWatchlist,
+  savedInstrumentIds,
+  watchlistBusy,
+  researchOnly = false,
 }: {
+  onAddWatchlist: (selection: MarketIntelligenceSelection) => void;
+  savedInstrumentIds: string[];
+  watchlistBusy: boolean;
+  researchOnly?: boolean;
   dashboard: PortfolioDashboard | null;
+  performance: SectorPerformance | null;
+  performanceRegion: SectorPerformance["region"];
+  performanceSector: string;
+  performancePeriod: SectorPerformance["period"];
+  sectorOptions: MarketUniverseSector[];
+  sectorOptionsLoading: boolean;
+  onPerformanceRegion: (value: SectorPerformance["region"]) => void;
+  onPerformanceSector: (value: string) => void;
+  onPerformancePeriod: (value: SectorPerformance["period"]) => void;
   onCreate: () => void;
   creating: boolean;
+  selectedResearchInstrumentId: string;
+  onOpenResearch: (selection: MarketIntelligenceSelection) => void;
 }) {
-  if (!dashboard || dashboard.portfolios.length === 0) {
-    return (
-      <Card className="wide-panel">
-        <EmptyState title="No portfolios" message="Connect a broker or create a portfolio to begin." />
-        <Button onClick={onCreate} disabled={creating}>{creating ? "Creating..." : "Create portfolio"}</Button>
-      </Card>
-    );
-  }
+  if (!dashboard && !researchOnly) return null;
   return (
     <div className="dashboard-grid">
+      {!researchOnly && dashboard ? <>
       <Card className="wide-panel">
         <div className="panel-header"><div><p className="eyebrow">My portfolios</p><h2>Total portfolio value</h2></div></div>
         <div className="currency-total-grid">
@@ -1303,27 +2290,63 @@ function MultiPortfolioDashboard({
           </Card>
         ))}
       </section>
+      {dashboard.portfolios.length === 0 ? <Card className="wide-panel"><EmptyState title="No portfolios" message="Connect a broker or create a portfolio to begin." /><Button onClick={onCreate} disabled={creating}>{creating ? "Creating..." : "Create portfolio"}</Button></Card> : null}
+      </> : null}
       <Card className="wide-panel">
-        <div className="panel-header"><div><h2>All holdings</h2><p>Matching ISINs are combined with quantity-weighted average cost. Imported prices remain snapshots.</p></div></div>
-        <div className="table-wrap">
-          <table>
-            <thead><tr><th>Instrument</th><th>ISIN</th><th>Quantity</th><th>Weighted average cost</th><th>Value</th><th>Provenance</th></tr></thead>
-            <tbody>
-              {dashboard.combinedHoldings.map((holding) => (
-                  <tr key={holding.securityKey + holding.averageCost.currency}>
-                    <td>{holding.companyName}<small>{holding.symbol}</small></td>
-                    <td>{holding.isin}</td>
-                    <td>{holding.quantity}</td>
-                    <td>{formatBackendMoney(holding.averageCost)}</td>
-                    <td>{formatBackendMoney(holding.marketValue)}</td>
-                    <td>{holding.dataFreshness === "IMPORTED_SNAPSHOT" ? "Imported snapshot" : "Mixed sources"}</td>
-                  </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="panel-header"><div><p className="eyebrow">Market intelligence</p><h2>Sector Performance</h2><p>Top gainers from durable market-price observations.</p></div></div>
+        <div className="form-grid">
+          <Field label="Region"><select aria-label="Sector performance region" value={performanceRegion} onChange={(event) => onPerformanceRegion(event.target.value as SectorPerformance["region"])}>{["USA", "EUROPE", "INDIA"].map((value) => <option key={value}>{value}</option>)}</select></Field>
+          <Field label="Sector"><select aria-label="Sector performance sector" value={performanceSector} disabled={sectorOptionsLoading || sectorOptions.length === 0} onChange={(event) => onPerformanceSector(event.target.value)}>{sectorOptions.length ? sectorOptions.map((value) => <option key={value.name} value={value.name}>{value.name} ({value.instrumentCount})</option>) : <option value="">{sectorOptionsLoading ? "Loading durable sectors…" : "No durable sectors"}</option>}</select></Field>
+          <Field label="Period"><select aria-label="Sector performance period" value={performancePeriod} onChange={(event) => onPerformancePeriod(event.target.value as SectorPerformance["period"])}>{["DAY", "WEEK", "MONTH", "YEAR"].map((value) => <option key={value}>{value}</option>)}</select></Field>
         </div>
+        {sectorOptionsLoading ? <p className="broker-note">Loading durable sector universe…</p>
+          : sectorOptions.length === 0 ? <p className="broker-note">No durable sector-classified universe is available for this region.</p>
+          : performance ? <div className="stack-gap">
+            <div><h3>Top 5 Performers</h3>{performance.bestPerformers.length ? <section className="portfolio-card-grid" aria-label="Sector performance top performers">{performance.bestPerformers.map((stock) => <MarketPerformanceRow stock={stock} key={`best-${stock.globalInstrumentId}`} onOpenResearch={(value) => onOpenResearch(marketIntelligenceSelection(performance, value))} selected={selectedResearchInstrumentId === stock.globalInstrumentId} watchlistName={regionalWatchlistName(performance.region)} saved={savedInstrumentIds.includes(stock.globalInstrumentId)} busy={watchlistBusy} onAddWatchlist={() => onAddWatchlist(marketIntelligenceSelection(performance, stock))} />)}</section> : <p className="broker-note">Insufficient historical data for top performers.</p>}</div>
+            <div><h3>Worst 5 Performers</h3>{performance.worstPerformers.length ? <section className="portfolio-card-grid" aria-label="Sector performance worst performers">{performance.worstPerformers.map((stock) => <MarketPerformanceRow stock={stock} key={`worst-${stock.globalInstrumentId}`} onOpenResearch={(value) => onOpenResearch(marketIntelligenceSelection(performance, value))} selected={selectedResearchInstrumentId === stock.globalInstrumentId} watchlistName={regionalWatchlistName(performance.region)} saved={savedInstrumentIds.includes(stock.globalInstrumentId)} busy={watchlistBusy} onAddWatchlist={() => onAddWatchlist(marketIntelligenceSelection(performance, stock))} />)}</section> : <p className="broker-note">Insufficient historical data for worst performers.</p>}</div>
+          </div> : <p className="broker-note">Loading sector performance…</p>}
       </Card>
     </div>
+  );
+}
+
+function MarketPerformanceRow({
+  stock,
+  selected,
+  onOpenResearch,
+  onAddWatchlist,
+  watchlistName,
+  saved,
+  busy,
+}: {
+  onAddWatchlist: () => void;
+  watchlistName: string;
+  saved: boolean;
+  busy: boolean;
+  stock: SectorPerformanceStock;
+  selected: boolean;
+  onOpenResearch: (stock: SectorPerformanceStock) => void;
+}) {
+  const tone = performanceRowTone(stock.performancePct);
+  const signedPerformance = formatSignedPerformancePct(stock.performancePct);
+  return (
+    <article className="stack-gap" data-global-instrument-id={stock.globalInstrumentId}>
+    <button
+      className={`market-performance-row market-performance-row-${tone}`}
+      type="button"
+      data-performance-direction={tone}
+      aria-current={selected ? "true" : undefined}
+      aria-label={`${stock.companyName}, ${signedPerformance}, ${performanceDirectionLabel(stock)}`}
+      onClick={() => onOpenResearch(stock)}
+    >
+      <strong>{stock.companyName}</strong>
+      <span className="market-performance-identity">{stock.ticker} · {stock.exchange}</span>
+      <span className="market-performance-return">{signedPerformance}</span>
+    </button>
+    <Button variant="secondary" disabled={saved || busy || !stock.globalInstrumentId?.trim()} onClick={onAddWatchlist}>
+      {saved ? `Saved in ${watchlistName}` : `Add to ${watchlistName}`}
+    </Button>
+    </article>
   );
 }
 
@@ -1373,6 +2396,7 @@ function DashboardView({
   positions,
   onCreate,
   onSync,
+  onRefreshPrices,
   creating,
   syncing,
   newPortfolioName,
@@ -1385,6 +2409,7 @@ function DashboardView({
   positions: PortfolioPosition[];
   onCreate: () => void;
   onSync?: () => void;
+  onRefreshPrices?: () => void;
   creating: boolean;
   syncing: boolean;
   newPortfolioName: string;
@@ -1405,14 +2430,24 @@ function DashboardView({
     );
   }
 
-  const topGainers = [...positions].sort((a, b) => b.unrealizedProfitLossPercent - a.unrealizedProfitLossPercent).slice(0, 3);
-  const topLosers = [...positions].sort((a, b) => a.unrealizedProfitLossPercent - b.unrealizedProfitLossPercent).slice(0, 3);
+  const pricedPositions = positions.filter((position) => position.unrealizedProfitLossPercent != null);
+  const topGainers = [...pricedPositions].sort((a, b) => (b.unrealizedProfitLossPercent ?? 0) - (a.unrealizedProfitLossPercent ?? 0)).slice(0, 3);
+  const topLosers = [...pricedPositions].sort((a, b) => (a.unrealizedProfitLossPercent ?? 0) - (b.unrealizedProfitLossPercent ?? 0)).slice(0, 3);
   const sourceLabels = portfolioSourceLabels(positions);
+  const liveTotals = onRefreshPrices && positions.every((position) => position.marketValue && position.unrealizedProfitLoss)
+    ? positions.reduce((totals, position) => ({
+    marketValue: totals.marketValue + (position.marketValue?.amount ?? 0),
+    pnl: totals.pnl + (position.unrealizedProfitLoss?.amount ?? 0),
+    cost: totals.cost + position.costBasis.amount,
+  }), { marketValue: 0, pnl: 0, cost: 0 }) : null;
   const syncAction = onSync ? (
     <Button onClick={onSync} disabled={syncing} variant="secondary">
       <RefreshCw size={16} />
       {syncing ? "Syncing..." : sourceLabels.syncButton}
     </Button>
+  ) : null;
+  const refreshAction = onRefreshPrices ? (
+    <Button onClick={onRefreshPrices} disabled={syncing} variant="secondary"><RefreshCw size={16} />{syncing ? "Refreshing..." : "Refresh Prices"}</Button>
   ) : null;
 
   return (
@@ -1420,11 +2455,11 @@ function DashboardView({
       <section className="metrics-grid" aria-label="Portfolio summary">
         <MetricCard
           label="Portfolio value"
-          value={formatBackendMoney(summary?.totalMarketValue)}
+          value={liveTotals ? formatMoney(liveTotals.marketValue, portfolio.baseCurrency) : formatBackendMoney(summary?.totalMarketValue)}
           meta={sourceLabels.syncMeta}
         />
-        <MetricCard label={sourceLabels.totalProfitLoss} value={formatBackendMoney(summary?.unrealizedProfitLoss)} tone={(summary?.unrealizedProfitLoss.amount ?? 0) >= 0 ? "positive" : "negative"} />
-        <MetricCard label={sourceLabels.returnLabel} value={formatPercent(summary?.unrealizedProfitLossPercent)} tone={(summary?.unrealizedProfitLossPercent ?? 0) >= 0 ? "positive" : "negative"} />
+        <MetricCard label={sourceLabels.totalProfitLoss} value={liveTotals ? formatMoney(liveTotals.pnl, portfolio.baseCurrency) : formatBackendMoney(summary?.unrealizedProfitLoss)} tone={valueTone(liveTotals?.pnl ?? summary?.unrealizedProfitLoss?.amount)} />
+        <MetricCard label={sourceLabels.returnLabel} value={formatPercent(liveTotals && liveTotals.cost ? liveTotals.pnl / liveTotals.cost * 100 : summary?.unrealizedProfitLossPercent)} tone={valueTone(liveTotals?.pnl ?? summary?.unrealizedProfitLossPercent)} />
         <MetricCard label="Cash" value={formatBackendMoney(summary?.cash)} />
         <MetricCard label="Holdings" value={String(summary?.positions ?? 0)} />
         <MetricCard label="Portfolio risk" value="Pending" meta="Risk service not implemented" tone="warning" />
@@ -1436,9 +2471,9 @@ function DashboardView({
             <h2>{portfolio.name}</h2>
             <p>Last updated: {summary ? sourceLabels.lastUpdated : "not synced"} - Source: {sourceLabels.source}</p>
           </div>
-          {syncAction}
+          {syncAction}{refreshAction}
         </div>
-        {summary ? <AllocationCharts summary={summary} /> : <EmptyState title="No positions" message="This portfolio currently has no positions." />}
+        {summary && !onRefreshPrices ? <AllocationCharts summary={summary} /> : positions.length ? <p>Allocation uses refreshed holding values in the Portfolio view.</p> : <EmptyState title="No positions" message="This portfolio currently has no positions." />}
       </Card>
 
       <MovementPanel title="Top gainers" icon={TrendingUp} positions={topGainers} sourceLabels={sourceLabels} />
@@ -1482,7 +2517,7 @@ function MovementPanel({
           {positions.map((position) => (
             <div key={position.positionId}>
               <span>{position.instrument.ticker}</span>
-              <strong className={position.unrealizedProfitLossPercent >= 0 ? "positive-text" : "negative-text"}>
+              <strong className={position.unrealizedProfitLossPercent == null ? undefined : position.unrealizedProfitLossPercent >= 0 ? "positive-text" : "negative-text"}>
                 {formatPercent(position.unrealizedProfitLossPercent)}
               </strong>
             </div>
@@ -1508,13 +2543,15 @@ function PortfolioView({
   onSort,
   onCreate,
   onSync,
+  onRefreshPrices,
   creating,
   syncing,
   newPortfolioName,
   newPortfolioCurrency,
   setNewPortfolioName,
   setNewPortfolioCurrency,
-  onUpdateDisplayName
+  onUpdateDisplayName,
+  portfolioResearch
 }: {
   portfolio?: Portfolio;
   summary: PortfolioSummary | null;
@@ -1530,6 +2567,7 @@ function PortfolioView({
   onSort: (value: SortKey) => void;
   onCreate: () => void;
   onSync?: () => void;
+  onRefreshPrices?: () => void;
   creating: boolean;
   syncing: boolean;
   newPortfolioName: string;
@@ -1537,6 +2575,7 @@ function PortfolioView({
   setNewPortfolioName: (value: string) => void;
   setNewPortfolioCurrency: (value: string) => void;
   onUpdateDisplayName: (position: PortfolioPosition, customDisplayName: string | null) => Promise<void>;
+  portfolioResearch: PortfolioResearchSummary | null;
 }) {
   if (!portfolio) {
     return (
@@ -1552,6 +2591,16 @@ function PortfolioView({
   }
 
   const sourceLabels = portfolioSourceLabels(rawPositions);
+  const manualMarketTotals = onRefreshPrices && rawPositions.every((position) => position.marketValue && position.unrealizedProfitLoss)
+    ? rawPositions.reduce((totals, position) => ({
+    marketValue: totals.marketValue + (position.marketValue?.amount ?? 0),
+    costBasis: totals.costBasis + position.costBasis.amount,
+    pnl: totals.pnl + (position.unrealizedProfitLoss?.amount ?? 0)
+  }), { marketValue: 0, costBasis: 0, pnl: 0 }) : null;
+  const displayCurrency = summary?.baseCurrency ?? portfolio.baseCurrency;
+  const displayReturn = manualMarketTotals && manualMarketTotals.costBasis !== 0
+    ? manualMarketTotals.pnl / manualMarketTotals.costBasis * 100
+    : summary?.unrealizedProfitLossPercent;
 
   return (
     <div className="portfolio-layout">
@@ -1560,18 +2609,19 @@ function PortfolioView({
           <div>
             <p className="eyebrow">{portfolio.provider ? brokerDisplayName(portfolio.provider) : "Manual portfolio"}</p>
             <h2>{portfolio.name}</h2>
-            <p>Broker holdings synced: {portfolio.lastBrokerSyncAt ? new Date(portfolio.lastBrokerSyncAt).toLocaleString() : portfolio.brokerConnectionId ? "Imported previously; sync time unknown" : "Not applicable"}</p>
-            <p>Market price updated: {rawPositions.map((position) => position.quote?.sourceTimestamp).filter(Boolean).sort().at(-1) ? new Date(rawPositions.map((position) => position.quote?.sourceTimestamp).filter(Boolean).sort().at(-1)!).toLocaleString() : "Last-known valuation"}</p>
+            {portfolio.brokerConnectionId ? <p>Last successful sync: {portfolio.lastBrokerSyncAt ? new Date(portfolio.lastBrokerSyncAt).toLocaleString() : "Not yet available"}</p> : null}
           </div>
           {onSync ? <Button onClick={onSync} disabled={syncing} variant="secondary"><RefreshCw size={16} />{syncing ? "Syncing..." : "Sync"}</Button> : null}
+          {onRefreshPrices ? <Button onClick={onRefreshPrices} disabled={syncing} variant="secondary"><RefreshCw size={16} />{syncing ? "Refreshing..." : "Refresh Prices"}</Button> : null}
         </div>
-        <p>Base currency: {portfolio.baseCurrency} · Connection: {portfolio.lastBrokerSyncErrorCode ? "Re-authentication or retry required" : portfolio.brokerConnectionId ? "Connected or previously connected" : "Not broker-backed"}</p>
+        <p>Base currency: {portfolio.baseCurrency}</p>
       </Card>
       <section className="metrics-grid" aria-label="Portfolio totals">
-        <MetricCard label={sourceLabels.marketValue} value={formatBackendMoney(summary?.totalMarketValue)} />
-        <MetricCard label={sourceLabels.costBasis} value={formatBackendMoney(summary?.totalCostBasis)} />
-        <MetricCard label={sourceLabels.unrealizedProfitLoss} value={formatBackendMoney(summary?.unrealizedProfitLoss)} tone={(summary?.unrealizedProfitLoss.amount ?? 0) >= 0 ? "positive" : "negative"} />
-        <MetricCard label={sourceLabels.returnLabel} value={formatPercent(summary?.unrealizedProfitLossPercent)} />
+        <MetricCard label="Securities market value" value={manualMarketTotals ? formatMoney(manualMarketTotals.marketValue, displayCurrency) : formatBackendMoney(summary?.totalMarketValue)} />
+        <MetricCard label="Total portfolio value" value={manualMarketTotals ? formatMoney(manualMarketTotals.marketValue + (summary?.cash.amount ?? 0), displayCurrency) : summary?.totalMarketValue ? formatMoney(summary.totalMarketValue.amount + summary.cash.amount, summary.baseCurrency) : "N/A"} />
+        <MetricCard label={sourceLabels.costBasis} value={manualMarketTotals ? formatMoney(manualMarketTotals.costBasis, displayCurrency) : formatBackendMoney(summary?.totalCostBasis)} />
+        <MetricCard label={sourceLabels.unrealizedProfitLoss} value={manualMarketTotals ? formatMoney(manualMarketTotals.pnl, displayCurrency) : formatBackendMoney(summary?.unrealizedProfitLoss)} tone={valueTone(manualMarketTotals?.pnl ?? summary?.unrealizedProfitLoss?.amount)} />
+        <MetricCard label={sourceLabels.returnLabel} value={formatPercent(displayReturn)} />
         <MetricCard label="Cash" value={formatBackendMoney(summary?.cash)} />
         <MetricCard label="Position count" value={String(summary?.positions ?? 0)} />
       </section>
@@ -1584,15 +2634,21 @@ function PortfolioView({
       />
 
       <Card className="wide-panel">
-        <div className="panel-header">
-          <div>
-            <h2>Holdings</h2>
-            <p>Search respects ticker, company, ISIN, exchange, and country.</p>
-          </div>
+          <div className="panel-header">
+            <div>
+              <h2>Holdings</h2>
+              <p>Search respects ticker, company, ISIN, exchange, and country.</p>
+              <ResearchCoverage research={portfolioResearch} />
+            </div>
           {onSync ? (
             <Button onClick={onSync} disabled={syncing} variant="secondary">
               <RefreshCw size={16} />
               {syncing ? "Syncing..." : sourceLabels.syncButton}
+            </Button>
+          ) : null}
+          {onRefreshPrices ? (
+            <Button onClick={onRefreshPrices} disabled={syncing} variant="secondary">
+              <RefreshCw size={16} />{syncing ? "Refreshing..." : "Refresh Prices"}
             </Button>
           ) : null}
         </div>
@@ -1625,11 +2681,11 @@ function PortfolioView({
             action={onSync ? <Button onClick={onSync}>{sourceLabels.syncButton}</Button> : undefined}
           />
         ) : (
-          <HoldingsTable positions={positions} summary={summary} onUpdateDisplayName={onUpdateDisplayName} />
+          <HoldingsTable positions={positions} summary={summary} portfolioResearch={portfolioResearch} onUpdateDisplayName={onUpdateDisplayName} />
         )}
       </Card>
 
-      {summary ? (
+      {summary && !onRefreshPrices ? (
         <Card className="wide-panel">
           <div className="panel-header">
             <div>
@@ -1785,32 +2841,47 @@ function FreshnessBadge({ freshness }: { freshness: string }) {
   return <Badge tone={tone}>{label}</Badge>;
 }
 
-function HoldingsTable({ positions, summary, onUpdateDisplayName }: {
+function ResearchStatusBadge({ status }: { status?: string | null }) {
+  const normalized = status ?? "UNAVAILABLE";
+  const label = normalized === "RESOLVED_RESEARCH_AVAILABLE" ? "Available"
+    : normalized === "RESOLVED_PARTIAL_DATA" ? "Partial"
+    : normalized === "ETF_UNSUPPORTED" || normalized === "RESEARCH_NOT_APPLICABLE" ? "ETF unsupported"
+    : normalized.replaceAll("_", " ");
+  const tone = normalized === "RESOLVED_RESEARCH_AVAILABLE" ? "positive"
+    : normalized === "RESOLVED_PARTIAL_DATA" ? "warning"
+    : normalized === "ETF_UNSUPPORTED" || normalized === "RESEARCH_NOT_APPLICABLE" ? "neutral" : "negative";
+  return <Badge tone={tone}>Research: {label}</Badge>;
+}
+
+function ResearchCoverage({ research }: { research: PortfolioResearchSummary | null }) {
+  if (!research) return null;
+  const companies = research.companies;
+  const available = companies.filter((company) => company.status === "RESOLVED_RESEARCH_AVAILABLE").length;
+  const partial = companies.filter((company) => company.status === "RESOLVED_PARTIAL_DATA").length;
+  const etfUnsupported = companies.filter((company) => company.status === "ETF_UNSUPPORTED" || company.status === "RESEARCH_NOT_APPLICABLE").length;
+  const fresh = companies.filter((company) => company.priceFreshness === "FRESH").length;
+  const stale = companies.filter((company) => company.priceFreshness === "STALE").length;
+  return <p className="research-coverage" aria-label="Portfolio research coverage"><strong>Research coverage:</strong> {companies.length} holdings · {available} available · {partial} partial · {etfUnsupported} ETF unsupported · {fresh} fresh · {stale} stale</p>;
+}
+
+function HoldingsTable({ positions, summary, portfolioResearch, onUpdateDisplayName }: {
   positions: PortfolioPosition[];
   summary: PortfolioSummary | null;
+  portfolioResearch: PortfolioResearchSummary | null;
   onUpdateDisplayName: (position: PortfolioPosition, customDisplayName: string | null) => Promise<void>;
 }) {
-  const [editingPositionId, setEditingPositionId] = useState<string | null>(null);
-  const [editingName, setEditingName] = useState("");
-  const [savingPositionId, setSavingPositionId] = useState<string | null>(null);
-  const [renameError, setRenameError] = useState<string | null>(null);
+  const [detail, setDetail] = useState<{ position: PortfolioPosition; researchInstrumentId?: string | null } | null>(null);
+  const manualMarketTotal = positions.some((position) => position.sourceType === "MANUAL_CSV_IMPORT")
+    && positions.every((position) => position.marketValue)
+    ? positions.reduce((total, position) => total + (position.marketValue?.amount ?? 0), 0) : null;
 
-  async function saveName(position: PortfolioPosition, reset = false) {
-    const nextName = reset ? null : editingName.trim();
-    if (!reset && !nextName) {
-      setRenameError("Enter a name, or use Reset to remove the custom name.");
-      return;
-    }
-    setSavingPositionId(position.positionId);
-    setRenameError(null);
-    try {
-      await onUpdateDisplayName(position, nextName);
-      setEditingPositionId(null);
-    } catch (error) {
-      setRenameError(getApiFailure(error).message);
-    } finally {
-      setSavingPositionId(null);
-    }
+  function researchFor(position: PortfolioPosition) {
+    return portfolioResearch?.companies.find((company) =>
+      company.instrumentId === position.instrument.globalInstrumentId
+      || company.instrumentId === position.instrument.instrumentId
+      || Boolean(position.instrument.isin && company.isin === position.instrument.isin)
+      || (company.ticker === position.instrument.ticker && company.exchange === position.instrument.exchange)
+    );
   }
 
   return (
@@ -1820,89 +2891,261 @@ function HoldingsTable({ positions, summary, onUpdateDisplayName }: {
           <tr>
             <th>Company</th>
             <th>Ticker</th>
-            <th>Exchange</th>
             <th>Quantity</th>
             <th>Average cost</th>
-            <th>Broker current price</th>
-            <th>Quote last price</th>
-            <th>Bid</th>
-            <th>Ask</th>
+            <th>Latest price</th>
             <th>Market value</th>
             <th>Unrealized P/L</th>
             <th>Unrealized P/L %</th>
             <th>Allocation</th>
             <th>Currency</th>
-            <th>Data status</th>
-            <th>Last updated</th>
-            <th>Source</th>
-            <th>Broker</th>
-            <th>AI rating</th>
+            <th>Research & price status</th>
           </tr>
         </thead>
         <tbody>
           {positions.map((position) => {
-            const allocation = getAllocationValue(summary, position);
+            const allocation = manualMarketTotal !== null
+              ? (manualMarketTotal === 0 || !position.marketValue ? null : position.marketValue.amount / manualMarketTotal * 100)
+              : getAllocationValue(summary, position);
+            const research = researchFor(position);
+            const ownershipClass = research?.ownershipIncreases?.length
+              ? `ownership-${research.ownershipIncreases.map((value) => value.toLowerCase().replace("_fpi", "")).join("-")}`
+              : "";
+            const valuationClass = `valuation-${(research?.valuation.state ?? "UNKNOWN").toLowerCase()}`;
             return (
-              <tr key={position.positionId}>
+              <tr className={`${valuationClass} ${ownershipClass}`.trim()} key={position.positionId} onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
                 <td>
-                  <button className="security-button" type="button">
+                  <button className="security-button" type="button" onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
                     <strong>{position.displayName}</strong>
                     <span>{position.instrument.isin ?? "No ISIN"}</span>
                   </button>
-                  {position.sourceType === "MANUAL_CSV_IMPORT" ? editingPositionId === position.positionId ? (
-                    <div className="holding-name-editor">
-                      <label>
-                        Display name
-                        <input maxLength={160} value={editingName} onChange={(event) => setEditingName(event.target.value)} />
-                      </label>
-                      <Button disabled={savingPositionId === position.positionId} onClick={() => void saveName(position)}>Save</Button>
-                      <Button variant="secondary" disabled={savingPositionId === position.positionId} onClick={() => { setEditingPositionId(null); setRenameError(null); }}>Cancel</Button>
-                      {position.customDisplayName ? <Button variant="secondary" disabled={savingPositionId === position.positionId} onClick={() => void saveName(position, true)}>Reset</Button> : null}
-                      {renameError ? <small role="alert">{renameError}</small> : null}
-                    </div>
-                  ) : (
-                    <button className="text-action" type="button" onClick={() => { setEditingPositionId(position.positionId); setEditingName(position.customDisplayName ?? position.displayName); setRenameError(null); }}>
-                      Edit name
-                    </button>
-                  ) : null}
                 </td>
                 <td>{position.instrument.ticker}</td>
-                <td>{position.instrument.exchange}</td>
                 <td>{position.quantity.toLocaleString("en")}</td>
                 <td>{formatMoney(position.averageCost.amount, position.averageCost.currency)}</td>
-                <td>{formatMoney(position.currentPrice.amount, position.currentPrice.currency)}</td>
-                <td>{formatMoney(position.quote?.last?.amount, position.quote?.last?.currency)}</td>
-                <td>{formatMoney(position.quote?.bid?.amount, position.quote?.bid?.currency)}</td>
-                <td>{formatMoney(position.quote?.ask?.amount, position.quote?.ask?.currency)}</td>
-                <td>{formatMoney(position.marketValue.amount, position.marketValue.currency)}</td>
-                <td className={position.unrealizedProfitLoss.amount >= 0 ? "positive-text" : "negative-text"}>
-                  {formatMoney(position.unrealizedProfitLoss.amount, position.unrealizedProfitLoss.currency)}
+                <td>{formatBackendMoney(position.currentPrice)}</td>
+                <td>{formatBackendMoney(position.marketValue)}</td>
+                <td className={position.unrealizedProfitLoss == null ? undefined : position.unrealizedProfitLoss.amount >= 0 ? "positive-text" : "negative-text"}>
+                  {formatBackendMoney(position.unrealizedProfitLoss)}
                 </td>
-                <td className={position.unrealizedProfitLossPercent >= 0 ? "positive-text" : "negative-text"}>
+                <td className={position.unrealizedProfitLossPercent == null ? undefined : position.unrealizedProfitLossPercent >= 0 ? "positive-text" : "negative-text"}>
                   {formatPercent(position.unrealizedProfitLossPercent)}
                 </td>
                 <td>{formatPercent(allocation)}</td>
                 <td>{position.instrument.tradingCurrency}</td>
-                <td>
-                  {position.dataFreshness === "REAL_BROKER" ? (
-                    <FreshnessBadge freshness="REAL_BROKER" />
-                  ) : position.quote?.freshness ? (
-                    <FreshnessBadge freshness={position.quote.freshness} />
-                  ) : (
-                    <FreshnessBadge freshness="UNAVAILABLE" />
-                  )}
-                </td>
-                <td>{position.lastUpdated ? new Date(position.lastUpdated).toLocaleString() : position.quote?.receivedAt ? new Date(position.quote.receivedAt).toLocaleString() : position.quote?.timestamp ? new Date(position.quote.timestamp).toLocaleString() : "Unavailable"}</td>
-                <td>{position.dataFreshness === "REAL_BROKER" ? `${brokerDisplayName(position.brokerType)} / REAL_BROKER` : position.quote?.source ?? "--"}</td>
-                <td>{brokerDisplayName(position.brokerType)}</td>
-                <td>
-                  <Badge tone="neutral">Not rated</Badge>
+                <td className="holding-status-cell">
+                  <ResearchStatusBadge status={research?.status} />
+                  <span>Position price: {position.dataFreshness === "IMPORTED_SNAPSHOT" ? "Imported snapshot" : position.dataFreshness.replaceAll("_", " ")}</span>
+                  <span>Live quote: <FreshnessBadge freshness={position.quote?.freshness ?? "UNAVAILABLE"} /></span>
+                  <span>Research price: <FreshnessBadge freshness={research?.priceFreshness ?? "UNKNOWN"} /></span>
+                  <span>Valuation: {(research?.valuation.state ?? "UNKNOWN").replaceAll("_", " ")}</span>
+                  {research?.ownershipIncreases?.length ? <span>Ownership increase: {research.ownershipIncreases.map((value) => value.replaceAll("_", "/")).join(", ")}</span> : <span>Ownership increase: None reported</span>}
                 </td>
               </tr>
             );
           })}
         </tbody>
       </table>
+      {detail ? <StockResearchDrawer position={detail.position} research={detail.researchInstrumentId ? portfolioResearch?.companies.find((company) => company.instrumentId === detail.researchInstrumentId) : researchFor(detail.position)} onUpdateDisplayName={onUpdateDisplayName} onClose={() => setDetail(null)} /> : null}
+    </div>
+  );
+}
+
+type MetricDisplay = { text: string; title?: string };
+
+function metricDisplay(metric?: ProvenancedValue | null): MetricDisplay {
+  if (!metric || metric.value === null || metric.value === undefined || metric.value === "") return { text: "N/A" };
+  const numeric = Number(metric.value);
+  const unit = metric.unit?.trim();
+  if (unit?.toUpperCase() === "INR" && Number.isFinite(numeric)) {
+    const exact = `₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2, minimumFractionDigits: 2 }).format(numeric)}`;
+    const absolute = Math.abs(numeric);
+    if (absolute >= 10_000_000) return { text: `₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2, minimumFractionDigits: 2 }).format(numeric / 10_000_000)} Cr`, title: exact };
+    if (absolute >= 100_000) return { text: `₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2, minimumFractionDigits: 2 }).format(numeric / 100_000)} Lakh`, title: exact };
+    return { text: exact };
+  }
+  const value = Number.isFinite(numeric) ? new Intl.NumberFormat("en", { maximumFractionDigits: 2, minimumFractionDigits: 2 }).format(numeric) : String(metric.value);
+  return { text: `${value}${unit === "percent" || unit === "%" ? "%" : unit && unit !== "ratio" ? ` ${unit}` : ""}` };
+}
+
+function metricText(metric?: ProvenancedValue | null) {
+  return metricDisplay(metric).text;
+}
+
+function MetricValue({ metric }: { metric?: ProvenancedValue | null }) {
+  const display = metricDisplay(metric);
+  return <span title={display.title}>{display.text}</span>;
+}
+
+function statementPeriod(value?: string | null) {
+  return value ? value.slice(0, 10) : "N/A";
+}
+
+function latestResultText(research?: PortfolioResearchCompany) {
+  const result = research?.latestQuarterlyResult;
+  if (!result) return research ? "Not publicly available" : "Awaiting research";
+  const growth = result.patYoYPercent ? ` PAT ${metricText(result.patYoYPercent)} YoY` : result.revenueYoYPercent ? ` Revenue ${metricText(result.revenueYoYPercent)} YoY` : "";
+  return `${statementPeriod(result.period)}${growth}`;
+}
+
+function valuationTone(state?: string): "neutral" | "positive" | "negative" | "warning" | "info" {
+  if (state === "CHEAP") return "info";
+  if (state === "FAIR") return "positive";
+  if (state === "EXPENSIVE") return "negative";
+  return "neutral";
+}
+
+function EvidenceMetric({ label, metric }: { label: string; metric?: ProvenancedValue | null }) {
+  return (
+    <div className="research-metric">
+      <span>{label}</span><strong><MetricValue metric={metric} /></strong>
+      {metric?.sourceUrl ? <a href={metric.sourceUrl} target="_blank" rel="noreferrer">{metric.sourceName}</a> : <small>Not publicly available</small>}
+      {metric?.calculationBasis ? <small>{metric.calculationBasis}{metric.period ? ` · ${metric.period}` : ""}</small> : null}
+    </div>
+  );
+}
+
+function structuredFact(research: PortfolioResearchCompany | undefined, key: string): ProvenancedValue | undefined {
+  return research?.structuredMarket?.facts[key];
+}
+
+function FinancialHistoryTable({ periods }: { periods: FinancialResultPeriod[] }) {
+  if (!periods.length) return <p>Not publicly available.</p>;
+  return <table className="shareholding-table financial-history-table"><thead><tr><th>Period</th><th>Basis</th><th>Revenue / Total Income</th><th>Operating Income</th><th>EBIT</th><th>EBITDA</th><th>PAT</th><th>EPS</th></tr></thead><tbody>
+    {periods.map((period) => <tr key={`${period.periodType}:${period.period}:${period.reportingBasis ?? "UNKNOWN"}`}><td>{statementPeriod(period.period)}</td><td>{period.reportingBasis ?? "N/A"}</td><td><MetricValue metric={period.revenue} /></td><td><MetricValue metric={period.operatingIncome} /></td><td><MetricValue metric={period.ebit} /></td><td><MetricValue metric={period.ebitda} /></td><td><MetricValue metric={period.pat} /></td><td><MetricValue metric={period.eps} /></td></tr>)}
+  </tbody></table>;
+}
+
+function StatementHistoryTable({ periods, labels }: { periods: FinancialStatementPeriod[]; labels: Array<[string[], string]> }) {
+  if (!periods.length) return <p>Not publicly available.</p>;
+  return <table className="shareholding-table financial-history-table"><thead><tr><th>Period</th><th>Basis</th>{labels.map(([, label]) => <th key={label}>{label}</th>)}</tr></thead><tbody>
+    {periods.map((period) => <tr key={`${period.periodType}:${period.period}:${period.reportingBasis ?? "UNKNOWN"}`}><td>{statementPeriod(period.period)}</td><td>{period.reportingBasis ?? "N/A"}</td>{labels.map(([keys]) => <td key={keys.join("/")}><MetricValue metric={keys.map((key) => period.metrics[key]).find(Boolean)} /></td>)}</tr>)}
+  </tbody></table>;
+}
+
+function DurableEvidenceSection({ title, evidence }: { title: string; evidence?: NonNullable<CatalystScore["categoryEvidence"]>[string] }) {
+  const events = evidence?.supportingEvents ?? [];
+  return <section><h3>{title}</h3>{events.length ? <><p>{events.length} verified item{events.length === 1 ? "" : "s"}</p>{events.map((event) => <article key={event.eventId}><strong>{statementPeriod(event.eventDate ?? event.publishedAt)} · {event.eventType.replaceAll("_", " ")}</strong>{event.summary ? <p>{event.summary}</p> : null}<a href={event.sourceUrl} target="_blank" rel="noreferrer">Source: {event.sourceType}</a></article>)}</> : <p>N/A — No verified evidence.</p>}</section>;
+}
+
+const shareholdingCategoryRows = [
+  ["PROMOTER", "Promoters"],
+  ["PROMOTER_PLEDGE", "Promoter Pledge*"],
+  ["FII_FPI", "FII / FPI"],
+  ["DII", "DII"],
+  ["PUBLIC_RETAIL", "Retail Public"],
+  ["MUTUAL_FUNDS", "Mutual Funds"],
+  ["INSURANCE", "Insurance"],
+  ["GOVERNMENT", "Government"],
+  ["OTHERS", "Others"],
+] as const;
+
+const coreShareholdingCategories = new Set(["PROMOTER", "FII_FPI", "DII", "PUBLIC_RETAIL"]);
+
+function shareholdingPeriodLabel(periodEnd: string): string {
+  return new Intl.DateTimeFormat("en", { month: "short", year: "numeric", timeZone: "UTC" }).format(new Date(periodEnd));
+}
+
+function shareholdingPercentage(value: string | undefined): string {
+  if (value === undefined) return "—";
+  const percentage = Number(value);
+  return Number.isFinite(percentage) ? `${percentage.toFixed(2)}%` : "—";
+}
+
+function ShareholdingPatternTable({ snapshots }: { snapshots: NonNullable<PortfolioResearchCompany["shareholdingSnapshots"]> }) {
+  const periods = [...snapshots].slice(0, 4).sort((left, right) =>
+    new Date(left.periodEnd).getTime() - new Date(right.periodEnd).getTime());
+  const rows = shareholdingCategoryRows.filter(([category]) =>
+    coreShareholdingCategories.has(category) || periods.some((snapshot) => snapshot.values.some((value) => value.category === category)));
+  const newest = periods[periods.length - 1];
+  const hasPromoterPledge = rows.some(([category]) => category === "PROMOTER_PLEDGE");
+
+  return <>
+    <div className="shareholding-table-frame">
+      <table className="shareholding-table">
+        <thead><tr><th scope="col">Category</th>{periods.map((snapshot) => <th scope="col" key={snapshot.id}>{shareholdingPeriodLabel(snapshot.periodEnd)}</th>)}</tr></thead>
+        <tbody>{rows.map(([category, label]) => <tr key={category}>
+          <th scope="row" title={category === "PUBLIC_RETAIL" ? "Resident individual shareholders holding nominal share capital up to ₹2 lakh." : undefined}>{label}</th>
+          {periods.map((snapshot) => {
+            const value = snapshot.values.find((candidate) => candidate.category === category);
+            return <td key={snapshot.id}>{shareholdingPercentage(value?.percentage)}</td>;
+          })}
+        </tr>)}</tbody>
+      </table>
+    </div>
+    {hasPromoterPledge ? <p className="shareholding-note">* % of promoter holding</p> : null}
+    {newest?.sourceUrl ? <p className="shareholding-source">Source: <a href={newest.sourceUrl} target="_blank" rel="noreferrer">{newest.sourceProvider} Shareholding XBRL</a></p> : null}
+  </>;
+}
+
+function isFinancialCompany(research: PortfolioResearchCompany | undefined): boolean {
+  const identity = `${structuredFact(research, "sector")?.value ?? ""} ${structuredFact(research, "industry")?.value ?? ""}`.toLowerCase();
+  return /financial|bank|insurance|credit|capital market/.test(identity);
+}
+
+function StructuredMetric({ label, research, fact }: { label: string; research?: PortfolioResearchCompany; fact: string }) {
+  return <EvidenceMetric label={label} metric={structuredFact(research, fact)} />;
+}
+
+function StockResearchDrawer({ position, watchlistItem, research, onUpdateDisplayName, onClose }: { position?: PortfolioPosition; watchlistItem?: WatchlistResearchInstrument; research?: PortfolioResearchCompany; onUpdateDisplayName?: (position: PortfolioPosition, customDisplayName: string | null) => Promise<void>; onClose: () => void }) {
+  const instrument = position?.instrument;
+  const displayName = position?.displayName ?? research?.companyName ?? "Watchlist instrument";
+  const ticker = instrument?.ticker ?? research?.ticker ?? "Ticker N/A";
+  const exchange = instrument?.exchange ?? research?.exchange ?? "Exchange N/A";
+  const isin = instrument?.isin ?? research?.isin;
+  const country = instrument?.country ?? watchlistItem?.country ?? undefined;
+  const currency = research?.structuredMarket?.resolution.currency ?? instrument?.tradingCurrency ?? watchlistItem?.currency ?? undefined;
+  const assetType = instrument?.assetType ?? research?.assetType ?? watchlistItem?.assetType ?? "EQUITY";
+  const result = research?.latestQuarterlyResult;
+  const financial = isFinancialCompany(research);
+  const isEtf = assetType === "ETF" || research?.structuredMarket?.resolution.quoteType === "ETF";
+  const market = research?.structuredMarket;
+  const latestPriceFact = structuredFact(research, "latestPrice");
+  const researchCurrentPrice =
+    latestPriceFact?.value != null
+      ? Number(latestPriceFact.value)
+      : research?.currentPrice == null
+        ? null
+        : Number(research.currentPrice);
+  const currentPrice = researchCurrentPrice != null && Number.isFinite(researchCurrentPrice) && researchCurrentPrice > 0
+    ? formatMoney(researchCurrentPrice, currency)
+    : position?.currentPrice && position.currentPrice.amount > 0
+      ? formatBackendMoney(position.currentPrice)
+      : "N/A";
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(position?.customDisplayName ?? displayName);
+  const [saving, setSaving] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  async function saveName() {
+    if (!name.trim()) { setRenameError("Enter a display name."); return; }
+    setSaving(true); setRenameError(null);
+    try { if (onUpdateDisplayName && position) await onUpdateDisplayName(position, name.trim()); setEditing(false); }
+    catch (error) { setRenameError(getApiFailure(error).message); }
+    finally { setSaving(false); }
+  }
+  return (
+    <div className="research-drawer-backdrop" role="presentation" onClick={onClose}>
+      <aside className="research-drawer" role="dialog" aria-modal="true" aria-label={`${displayName} research details`} onClick={(event) => event.stopPropagation()}>
+        <div className="panel-header"><div><p className="eyebrow">Stock research</p><h2>{displayName}</h2><p>{ticker} · {exchange} · {isin ?? "ISIN N/A"}</p></div><button className="icon-button" type="button" aria-label="Close stock research" onClick={onClose}><X size={20} /></button></div>
+        <section><h3>Overview</h3>{editing && position ? <div className="holding-name-editor"><label>Display name<input maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><Button disabled={saving} onClick={() => void saveName()}>Save</Button><Button variant="secondary" disabled={saving} onClick={() => { setEditing(false); setName(position.customDisplayName ?? position.displayName); setRenameError(null); }}>Cancel</Button>{renameError ? <small role="alert">{renameError}</small> : null}</div> : <p><strong>{displayName}</strong> {position?.sourceType === "MANUAL_CSV_IMPORT" && onUpdateDisplayName ? <button className="text-action" type="button" onClick={() => setEditing(true)}>Edit</button> : null}</p>}<p>{ticker} · {isin ?? "ISIN N/A"} · {market?.resolution.exchange ?? exchange} · {country ?? "Country N/A"} · {currency ?? "Currency N/A"} · {market?.resolution.quoteType ?? assetType}</p><p>Provider ticker: {market?.resolution.providerTicker ?? "N/A"} · Provider identity: {market?.resolution.companyName ?? "N/A"}</p><p>Sector: {metricText(structuredFact(research, "sector"))} · Industry: {metricText(structuredFact(research, "industry"))}</p><p>{position ? <>Broker/source: {brokerDisplayName(position.brokerType)} · {position.sourceType}</> : <>Watchlist status: Not held</>}</p></section>
+        {position ? <section><h3>Position</h3><div className="research-metric-grid"><div className="research-metric"><span>Quantity</span><strong>{position.quantity}</strong></div><div className="research-metric"><span>Average Cost</span><strong>{formatBackendMoney(position.averageCost)}</strong></div><div className="research-metric"><span>Cost Basis</span><strong>{formatBackendMoney(position.costBasis)}</strong></div><div className="research-metric"><span>Imported Price</span><strong>{formatBackendMoney(position.importedPrice)}</strong></div><div className="research-metric"><span>Latest Market Price</span><strong>{formatBackendMoney(position.currentPrice)}</strong></div><div className="research-metric"><span>Market Value</span><strong>{formatBackendMoney(position.marketValue)}</strong></div><div className="research-metric"><span>Unrealized P/L</span><strong>{formatBackendMoney(position.unrealizedProfitLoss)}</strong></div></div></section> : <section><h3>Watchlist status</h3><p>Public company research</p><div className="research-metric-grid">{watchlistItem?.sourcePeriod ? <div className="research-metric"><span>Market return ({watchlistItem.sourcePeriod})</span><strong className={`${performanceRowTone(watchlistItem.sourcePerformancePct)}-text`}>{formatSignedPerformancePct(watchlistItem.sourcePerformancePct)}</strong></div> : null}</div></section>}
+        <section><h3>Market Data</h3><div className="research-metric-grid"><div className="research-metric"><span>Latest Price</span><strong>{currentPrice}</strong></div><EvidenceMetric label="Previous close" metric={structuredFact(research, "previousClose")} /><EvidenceMetric label="Bid" metric={structuredFact(research, "bid")} /><EvidenceMetric label="Ask" metric={structuredFact(research, "ask")} /><EvidenceMetric label="Volume" metric={structuredFact(research, "volume")} /><EvidenceMetric label="10-day avg volume" metric={structuredFact(research, "averageVolume10Day")} /><EvidenceMetric label="3-month avg volume" metric={structuredFact(research, "averageVolume")} /><EvidenceMetric label="52-week low" metric={structuredFact(research, "fiftyTwoWeekLow")} /><EvidenceMetric label="52-week high" metric={structuredFact(research, "fiftyTwoWeekHigh")} /><div className="research-metric"><span>Price freshness</span><strong>{research?.priceFreshness ?? "UNKNOWN"}</strong></div><div className="research-metric"><span>Market As Of</span><strong>{market?.marketAsOf ? new Date(market.marketAsOf).toLocaleString() : position?.quote?.sourceTimestamp ? new Date(position.quote.sourceTimestamp).toLocaleString() : "N/A"}</strong></div><div className="research-metric"><span>Retrieved At</span><strong>{market?.retrievedAt ? new Date(market.retrievedAt).toLocaleString() : position?.quote?.receivedAt ? new Date(position.quote.receivedAt).toLocaleString() : "N/A"}</strong></div><div className="research-metric"><span>Provider</span><strong>{market?.sourceName ?? position?.quote?.source ?? "N/A"}</strong></div></div></section>
+        <section><h3>Valuation</h3><div className="research-metric-grid"><StructuredMetric label="Market cap" research={research} fact="marketCap" /><StructuredMetric label="Enterprise value" research={research} fact="enterpriseValue" /><StructuredMetric label="Trailing P/E" research={research} fact="trailingPE" /><StructuredMetric label="Forward P/E" research={research} fact="forwardPE" /><StructuredMetric label="P/B" research={research} fact="priceToBook" /><StructuredMetric label="P/S" research={research} fact="priceToSales" /><StructuredMetric label="PEG" research={research} fact="pegRatio" />{!financial && !isEtf ? <><StructuredMetric label="EV/revenue" research={research} fact="evToRevenue" /><StructuredMetric label="EV/EBITDA" research={research} fact="evToEbitda" /></> : null}<StructuredMetric label="Trailing EPS" research={research} fact="trailingEps" /><StructuredMetric label="Forward EPS" research={research} fact="forwardEps" /></div><p><Badge tone={valuationTone(research?.valuation.state)}>{research?.valuation.state ?? "UNKNOWN"}</Badge> {research?.valuation.reason ?? "Awaiting contextual public research."}</p></section>
+        {!isEtf ? <section><h3>Quality / Fundamentals</h3><div className="research-metric-grid"><EvidenceMetric label="ROE" metric={structuredFact(research, "roe") ?? research?.valuation.roe} /><StructuredMetric label="ROA" research={research} fact="roa" />{!financial ? <EvidenceMetric label="ROCE" metric={structuredFact(research, "roce") ?? research?.valuation.roce} /> : null}<StructuredMetric label="Operating margin" research={research} fact="operatingMargin" /><StructuredMetric label="Net margin" research={research} fact="profitMargin" /><StructuredMetric label="Revenue growth" research={research} fact="revenueGrowth" /><StructuredMetric label="Earnings growth" research={research} fact="earningsGrowth" /><StructuredMetric label="Cash" research={research} fact="totalCash" /><StructuredMetric label="Debt" research={research} fact="totalDebt" /><StructuredMetric label="Debt / equity" research={research} fact="debtToEquity" /><StructuredMetric label="Free cash flow" research={research} fact="freeCashFlow" /><StructuredMetric label="Operating cash flow" research={research} fact="operatingCashFlow" /></div></section> : null}
+        <section><h3>Analyst View</h3><p>External public analyst consensus; not an application recommendation.</p><div className="research-metric-grid"><div className="research-metric"><span>Current Price</span><strong>{currentPrice}</strong></div><StructuredMetric label="Target low" research={research} fact="publicAnalystTargetLowPrice" /><StructuredMetric label="Target median" research={research} fact="publicAnalystTargetMedianPrice" /><StructuredMetric label="Target mean" research={research} fact="publicAnalystTargetMeanPrice" /><StructuredMetric label="Target high" research={research} fact="publicAnalystTargetHighPrice" /><StructuredMetric label="Number of analysts" research={research} fact="publicAnalystCount" /><StructuredMetric label="Consensus" research={research} fact="publicAnalystConsensus" /><StructuredMetric label="Consensus score" research={research} fact="publicAnalystRecommendationMean" /></div></section>
+        <section><h3>Latest Quarterly Result</h3>{result ? <><p>{result.documentTitle ?? "Quarterly financial result"} · {statementPeriod(result.period)} · {result.reportingBasis ?? "Reporting basis N/A"} · {result.resultDate ? statementPeriod(result.resultDate) : "Result date N/A"}</p><div className="research-metric-grid">{financial ? <><EvidenceMetric label="Total income" metric={result.revenue} /><EvidenceMetric label="PAT / net profit" metric={result.pat} /><EvidenceMetric label="EPS" metric={result.eps} /><EvidenceMetric label="NIM" metric={result.nim} /><EvidenceMetric label="ROA" metric={result.roa} /><EvidenceMetric label="ROE" metric={result.roe} /><EvidenceMetric label="Gross NPA" metric={result.grossNpa} /><EvidenceMetric label="Net NPA" metric={result.netNpa} /><EvidenceMetric label="Deposits" metric={result.deposits} /><EvidenceMetric label="Advances" metric={result.advances} /><EvidenceMetric label="Capital adequacy" metric={result.capitalAdequacy} /><EvidenceMetric label="Credit cost" metric={result.creditCost} /></> : <><EvidenceMetric label="Revenue" metric={result.revenue} /><EvidenceMetric label="Revenue YoY" metric={result.revenueYoYPercent} /><EvidenceMetric label="EBITDA / operating profit" metric={result.ebitda} /><EvidenceMetric label="EBITDA / operating margin" metric={result.ebitdaMargin} /><EvidenceMetric label="PAT / net profit" metric={result.pat} /><EvidenceMetric label="PAT YoY" metric={result.patYoYPercent} /><EvidenceMetric label="EPS" metric={result.eps} /><EvidenceMetric label="Debt / borrowings" metric={result.debtOrBorrowings} /></>}</div>{result.yoySummary ? <p>{result.yoySummary}</p> : null}<p>Source: {filingSourceLabel(result.sourceName)} · Published {result.publishedAt ? new Date(result.publishedAt).toLocaleDateString() : "N/A"} · Retrieved {new Date(result.retrievedAt).toLocaleString()}</p><a href={result.sourceUrl} target="_blank" rel="noreferrer">View {filingSourceLabel(result.sourceName)} Filing ↗</a></> : <p>{research?.quarterlyResultStatus === "PDF_SCANNED_OCR_REQUIRED" ? "PDF scanned; OCR required." : "Not publicly available."}</p>}</section>
+        {!isEtf ? <section><h3>Financial History</h3><h4>Quarterly</h4><FinancialHistoryTable periods={(research?.financialResultHistory ?? []).filter((period) => period.periodType === "QUARTERLY").slice(0, 4)} /><h4>Annual</h4><FinancialHistoryTable periods={(research?.financialResultHistory ?? []).filter((period) => period.periodType === "ANNUAL")} /></section> : null}
+        {(country === "IN" || exchange === "NSE" || exchange === "XNSE") ? <section><h3>Shareholding Pattern</h3>{research?.shareholdingSnapshots?.length ? <ShareholdingPatternTable snapshots={research.shareholdingSnapshots} /> : research?.shareholdingChanges?.length ? research.shareholdingChanges.map((change) => <p className={Number(change.changePercentagePoints) >= 0.1 ? `ownership-increase ownership-${change.category.toLowerCase()}` : undefined} key={change.category}><strong>{change.category.replaceAll("_", "/")}</strong>: {metricText(change.current)} ({Number(change.changePercentagePoints) >= 0 ? "+" : ""}{change.changePercentagePoints} pp), {change.previousPeriod} → {change.currentPeriod} · <a href={change.current.sourceUrl} target="_blank" rel="noreferrer">Source</a></p>) : <p>Unavailable.</p>}</section> : null}
+        {!isEtf ? <section><h3>Debt & Balance Sheet</h3><StatementHistoryTable periods={research?.balanceSheetHistory ?? []} labels={[[["total_assets"], "Total Assets"], [["total_liabilities"], "Total Liabilities"], [["total_equity", "equity"], "Equity / Net Worth"], [["cash_and_cash_equivalents", "cash_and_equivalents"], "Cash / Cash Equivalents"], [["total_debt", "debt_or_borrowings"], "Total Debt"], [["current_assets"], "Current Assets"], [["current_liabilities"], "Current Liabilities"]]} /></section> : null}
+        {!isEtf ? <section><h3>Cash Flow</h3><StatementHistoryTable periods={research?.cashFlowHistory ?? []} labels={[[["operating_cash_flow", "cash_flow_from_operating_activities"], "Operating Cash Flow"], [["investing_cash_flow", "cash_flow_from_investing_activities"], "Investing Cash Flow"], [["financing_cash_flow", "cash_flow_from_financing_activities"], "Financing Cash Flow"], [["capex"], "Capital Expenditure / Capex"]]} /></section> : null}
+        <section><h3>Current Quarter Catalysts</h3>{research?.currentQuarterCatalysts?.length ? research.currentQuarterCatalysts.map((event) => <article key={event.eventId}><strong>{event.eventDate ?? event.publishedAt?.slice(0, 10) ?? "Date unavailable"} · {event.eventType.replaceAll("_", " ")}</strong><p>{event.summary}</p><a href={event.sourceUrl} target="_blank" rel="noreferrer">Source: {event.sourceType}</a></article>) : <p>No verified current-quarter catalyst.</p>}</section>
+        <DurableEvidenceSection title="Orders & Backlog" evidence={research?.durableCategoryEvidence?.ORDERS_BACKLOG} />
+        <DurableEvidenceSection title="CAPEX & Capacity" evidence={research?.durableCategoryEvidence?.CAPEX} />
+        <DurableEvidenceSection title="Customers" evidence={research?.durableCategoryEvidence?.CLIENTS} />
+        <DurableEvidenceSection title="Catalysts" evidence={research?.durableCategoryEvidence?.CATALYSTS} />
+        <section><h3>News</h3>{market?.news?.length ? market.news.map((article) => <article key={article.url}><strong>{article.headline}</strong><p>{article.publisher} · {article.publishedAt ? new Date(article.publishedAt).toLocaleString() : "Date unavailable"}</p><a href={article.url} target="_blank" rel="noreferrer">Open source</a></article>) : <p>No public provider news available.</p>}</section>
+        <section><h3>Research & Evidence</h3><p>Status: {research?.status?.replaceAll("_", " ") ?? "Awaiting research"}; {research?.sourceDiversity.domainsFound ?? 0} unique domains, {research?.sourceDiversity.exchangeSources ?? 0} exchange sources, {research?.sourceDiversity.companySources ?? 0} company sources, {research?.sourceDiversity.secondarySources ?? 0} secondary sources.</p>{research?.latestEvent ? <a href={research.latestEvent.sourceUrl} target="_blank" rel="noreferrer">Latest evidence source</a> : null}</section>
+      </aside>
     </div>
   );
 }
@@ -2193,10 +3436,14 @@ function researchCompanyName(position: PortfolioPosition, resolved?: PortfolioRe
 
 function ResearchView({
   positions,
-  selectedPortfolioId,
   portfolioResearchSummary,
   portfolioResearchLoading,
-  selectedInstrumentId,
+  portfolioResearchError,
+  researchContext,
+  watchlistResearch,
+  watchlistResearchLoading,
+  watchlistResearchError,
+  selectedResearchInstrumentId,
   onSelectInstrument,
   summary,
   loading,
@@ -2205,13 +3452,23 @@ function ResearchView({
   onEventType,
   onImpact,
   onRefresh,
-  onPortfolioRefresh
+  searchPresentation,
+  onSearchSelect,
+  searchSelectedMatch,
+  searchWatchlistSaved,
+  searchWatchlistBusy,
+  searchWatchlistError,
+  onToggleSearchWatchlist
 }: {
   positions: PortfolioPosition[];
-  selectedPortfolioId: string;
   portfolioResearchSummary: PortfolioResearchSummary | null;
   portfolioResearchLoading: boolean;
-  selectedInstrumentId: string;
+  portfolioResearchError: string | null;
+  researchContext: ResearchContext;
+  watchlistResearch: WatchlistResearchPresentation | null;
+  watchlistResearchLoading: boolean;
+  watchlistResearchError: string | null;
+  selectedResearchInstrumentId: string;
   onSelectInstrument: (value: string) => void;
   summary: ResearchSummary | null;
   loading: boolean;
@@ -2220,20 +3477,62 @@ function ResearchView({
   onEventType: (value: string) => void;
   onImpact: (value: string) => void;
   onRefresh: () => Promise<void>;
-  onPortfolioRefresh: () => Promise<void>;
+  searchPresentation: PortfolioResearchCompany | null;
+  onSearchSelect: (match: ResearchInstrumentMatch) => void;
+  searchSelectedMatch: ResearchInstrumentMatch | null;
+  searchWatchlistSaved: boolean;
+  searchWatchlistBusy: boolean;
+  searchWatchlistError: string | null;
+  onToggleSearchWatchlist: () => void;
 }) {
   const [openSection, setOpenSection] = useState<ResearchSectionId | null>(null);
   const [openEventId, setOpenEventId] = useState<string | null>(null);
+  const [researchDetail, setResearchDetail] = useState<{
+    position?: PortfolioPosition;
+    watchlistInstrumentId?: string;
+    researchInstrumentId: string;
+  } | null>(null);
+  useEffect(() => {
+    setResearchDetail(null);
+  }, [researchContext.kind, selectedResearchInstrumentId]);
   const filteredEvents = (summary?.recentEvents ?? []).filter((event) => {
     return (!eventType || event.eventType === eventType) && (!impact || event.impact === impact);
   });
   const eventTypes = [...new Set((summary?.recentEvents ?? []).map((event) => event.eventType))].sort();
   const impacts = [...new Set((summary?.recentEvents ?? []).map((event) => event.impact))].sort();
   const documentsById = new Map((summary?.documents ?? []).map((document) => [document.documentId, document]));
-  const researchSections = summary ? getResearchSections(summary, filteredEvents) : [];
+  const researchSections = summary ? getResearchSections(summary, filteredEvents, eventType, impact) : [];
   const selectedPortfolioResearchCompany =
-    portfolioResearchSummary?.companies.find((company) => company.instrumentId === selectedInstrumentId) ?? null;
+    portfolioResearchSummary?.companies.find((company) => company.instrumentId === selectedResearchInstrumentId) ?? null;
+  const selectedWatchlistItem = watchlistResearch?.instruments.find(
+    (item) => item.globalInstrumentId === selectedResearchInstrumentId
+  ) ?? null;
+  const selectedContextResearchCompany = researchContext.kind === "WATCHLIST"
+    ? selectedWatchlistItem?.company ?? null
+    : researchContext.kind === "SEARCH" ? searchPresentation : selectedPortfolioResearchCompany;
+  const detailWatchlistItem = researchDetail?.watchlistInstrumentId
+    ? watchlistResearch?.instruments.find((item) => item.globalInstrumentId === researchDetail.watchlistInstrumentId)
+    : undefined;
+  const detailResearch = researchDetail
+    ? (detailWatchlistItem?.company
+      ?? portfolioResearchSummary?.companies.find((company) => company.instrumentId === researchDetail.researchInstrumentId)
+      ?? (researchContext.kind === "SEARCH" ? searchPresentation ?? null : null))
+    : undefined;
   const researchOptions = useMemo(() => {
+    if (researchContext.kind === "WATCHLIST") {
+      return (watchlistResearch?.instruments ?? []).map((item) => ({
+        value: item.globalInstrumentId,
+        globalInstrumentId: item.globalInstrumentId,
+        companyName: item.company.companyName,
+        ticker: item.company.ticker,
+        exchange: item.company.exchange,
+        status: item.company.status,
+        assetType: item.company.assetType,
+        loadable: isResearchSummaryLoadable(item.company.status),
+        held: false,
+        quantity: 0,
+      }));
+    }
     const resolvedByHoldingKey = new Map<string, PortfolioResearchCompany>();
     const tickerCounts = new Map<string, number>();
     for (const company of portfolioResearchSummary?.companies ?? []) {
@@ -2255,29 +3554,52 @@ function ResearchView({
       }
     }
 
-    return positions.map((position) => {
+    const options = positions.map((position) => {
       const instrument = position.instrument;
+      const globalInstrumentId = instrument.globalInstrumentId?.trim();
       const keys = [
+        globalInstrumentId ? `global:${globalInstrumentId}` : "",
         instrument.provider && instrument.providerInstrumentId ? `${instrument.provider}:${instrument.providerInstrumentId}` : "",
         instrument.isin ? `isin:${instrument.isin}` : "",
         `${instrument.ticker}:${instrument.exchange}`,
         `ticker:${instrument.ticker}`
       ].filter(Boolean);
-      const resolved = keys.map((key) => resolvedByHoldingKey.get(key.toUpperCase())).find(Boolean);
-      const status = resolved?.status ?? "COMPANY_NOT_RESOLVED";
+      const resolved = globalInstrumentId
+        ? portfolioResearchSummary?.companies.find((company) => company.instrumentId === globalInstrumentId)
+        : keys.map((key) => resolvedByHoldingKey.get(key.toUpperCase())).find(Boolean);
+      const status = resolved?.status ?? (globalInstrumentId ? "GLOBAL_INSTRUMENT_RESOLVED" : "COMPANY_NOT_RESOLVED");
       const displayTicker = resolved?.ticker ?? instrument.ticker;
       const displayExchange = resolved?.exchange ?? instrument.exchange;
       return {
-        value: resolved?.instrumentId ?? instrument.instrumentId,
+        // The selected value is always the stable global research identity when
+        // one is available; display/provider aliases are presentation metadata.
+        value: globalInstrumentId ?? resolved?.instrumentId ?? instrument.instrumentId,
+        globalInstrumentId,
         companyName: researchCompanyName(position, resolved),
         ticker: displayTicker,
         exchange: displayExchange,
         status,
-        loadable: Boolean(resolved?.instrumentId) && isResearchSummaryLoadable(status)
+        assetType: resolved?.assetType ?? instrument.assetType,
+        loadable: Boolean(resolved?.instrumentId) && isResearchSummaryLoadable(status),
+        held: true,
+        quantity: position.quantity
       };
     });
-  }, [portfolioResearchSummary, positions]);
-  const selectedResearchOption = researchOptions.find((option) => option.value === selectedInstrumentId);
+    return options;
+  }, [portfolioResearchSummary, positions, researchContext.kind, watchlistResearch]);
+  const selectedResearchOption = researchContext.kind === "SEARCH" && searchSelectedMatch
+    ? { value: searchSelectedMatch.globalInstrumentId, globalInstrumentId: searchSelectedMatch.globalInstrumentId,
+        companyName: searchSelectedMatch.companyName, status: searchPresentation?.status,
+        assetType: searchSelectedMatch.assetType, ticker: searchSelectedMatch.canonicalSymbol,
+        exchange: searchSelectedMatch.exchange, held: false, quantity: 0 }
+    : researchOptions.find((option) => option.value === selectedResearchInstrumentId);
+  const refreshEligible = canRefreshResearchIdentity(
+    selectedResearchOption?.globalInstrumentId ?? "",
+    selectedContextResearchCompany?.status
+      ?? (selectedContextResearchCompany ? undefined : selectedResearchOption?.status),
+    selectedContextResearchCompany?.assetType
+      ?? (selectedContextResearchCompany ? undefined : selectedResearchOption?.assetType),
+  );
 
   function toggleSection(sectionId: ResearchSectionId) {
     setOpenSection((current) => (current === sectionId ? null : sectionId));
@@ -2292,27 +3614,83 @@ function ResearchView({
       <Card className="wide-panel">
         <div className="panel-header">
           <div>
-            <h2>Portfolio research</h2>
-            <p>Company-level research status across current holdings.</p>
+            <h2>Company research</h2>
+            <p>{researchContext.kind === "PORTFOLIO"
+              ? "This research context contains actual portfolio holdings only."
+              : researchContext.kind === "WATCHLIST"
+                ? `${researchContext.name} · ${researchContext.region} · non-held public research`
+                : researchContext.kind === "SEARCH"
+                  ? `Opening ${searchSelectedMatch?.companyName ?? searchPresentation?.companyName ?? selectedResearchInstrumentId} without attaching it to a portfolio.`
+                  : `Opening ${researchContext.name} without attaching it to a portfolio.`}</p>
           </div>
-          <Button variant="secondary" onClick={onPortfolioRefresh} disabled={portfolioResearchLoading || !selectedPortfolioId}>
-            <RefreshCw size={16} />
-            {portfolioResearchLoading ? "Refreshing..." : "Refresh portfolio research"}
-          </Button>
         </div>
-        {portfolioResearchSummary ? (
-          <div className="portfolio-research-table" role="table" aria-label="Portfolio research summary">
+        {researchContext.kind === "SEARCH" && searchSelectedMatch ? <section>
+          <h3>{searchSelectedMatch.companyName}</h3>
+          <p>Public company research · Not held</p>
+          <p>{[searchSelectedMatch.canonicalSymbol ?? searchSelectedMatch.symbol, searchSelectedMatch.exchange, searchSelectedMatch.isin].filter(Boolean).join(" · ")}</p>
+          <Button variant="secondary" disabled={!searchPresentation} onClick={() => setResearchDetail({ researchInstrumentId: selectedResearchInstrumentId })}>Open company research</Button>
+        </section> : null}
+        {researchContext.kind === "PORTFOLIO" && portfolioResearchError ? <p className="research-refresh-notice" role="alert">{portfolioResearchError}</p> : null}
+        {watchlistResearchError ? <p className="research-refresh-notice" role="alert">{watchlistResearchError}</p> : null}
+        {researchContext.kind === "WATCHLIST_PENDING" || watchlistResearchLoading ? <Skeleton rows={3} /> : null}
+        {(researchContext.kind === "PORTFOLIO" && portfolioResearchSummary)
+          || (researchContext.kind === "WATCHLIST" && watchlistResearch?.instruments.length) ? (
+          <div className="portfolio-research-table" role="table" aria-label="Company research summary">
             <div className="portfolio-research-row portfolio-research-head" role="row">
               <span role="columnheader">Company</span>
+              <span role="columnheader">Price / P/E</span>
+              <span role="columnheader">Valuation</span>
+              <span role="columnheader">Latest result</span>
+              <span role="columnheader">Ownership</span>
               <span role="columnheader">Catalyst</span>
-              <span role="columnheader">Confidence</span>
-              <span role="columnheader">Evidence</span>
               <span role="columnheader">Sources</span>
               <span role="columnheader">Status</span>
             </div>
-            {portfolioResearchSummary.companies.map((company) => {
-              const evidenceTotal = Object.keys(company.evidenceCoverage).length || 5;
-              const evidenceCount = Object.values(company.evidenceCoverage).filter((value) => value !== "NO_EVIDENCE").length;
+            {researchContext.kind === "WATCHLIST" ? (watchlistResearch?.instruments ?? []).map((item) => {
+              const company = item.company;
+              const performanceTone = performanceRowTone(item.sourcePerformancePct);
+              return (
+                <button
+                  className={`portfolio-research-row portfolio-research-company market-intelligence-research-row market-intelligence-research-row-${performanceTone}`}
+                  key={`watchlist-${item.globalInstrumentId}`}
+                  role="row"
+                  type="button"
+                  data-held="false"
+                  data-region={researchContext.region}
+                  data-global-instrument-id={item.globalInstrumentId}
+                  aria-current={selectedResearchInstrumentId === item.globalInstrumentId ? "true" : undefined}
+                  aria-label={`${company.companyName}, public research${item.sourcePeriod ? `, market return ${formatSignedPerformancePct(item.sourcePerformancePct)}` : ""}`}
+                  onClick={() => {
+                    onSelectInstrument(item.globalInstrumentId);
+                    setResearchDetail({
+                      watchlistInstrumentId: item.globalInstrumentId,
+                      researchInstrumentId: company.instrumentId ?? item.globalInstrumentId,
+                    });
+                  }}
+                >
+                  <span role="cell">
+                    <strong>{company.companyName} <span className={`research-status-dot research-status-${researchStatusTone(company.status)}`} role="img" aria-label={researchStatusDescription(company.status)} title={researchStatusDescription(company.status)} /></strong>
+                    <small>{[company.ticker, company.exchange, company.isin].filter(Boolean).join(" / ")}</small>
+                    <small>{researchContext.name} · Public company research · Not held</small>
+                  </span>
+                  <span role="cell">{company.currentPrice == null ? "—" : formatMoney(Number(company.currentPrice), company.structuredMarket?.resolution.currency ?? item.currency ?? undefined)}<small>P/E {metricText(company.valuation.currentPe)}</small></span>
+                  <span role="cell"><Badge tone={valuationTone(company.valuation.state)}>{company.valuation.state}</Badge><small>{company.valuation.reason}</small></span>
+                  <span role="cell">{latestResultText(company)}</span>
+                  <span role="cell">{company.ownershipIncreases.length ? company.ownershipIncreases.map((value) => value === "FII_FPI" ? "FII/FPI" : value.replaceAll("_", " ")).join(" · ") : "Unavailable"}<small>{company.shareholdingChanges.length ? `${company.shareholdingChanges.length} comparable trends` : "Previous comparable period not found"}</small></span>
+                  <span role="cell">{company.currentQuarterCatalysts.length ? `${company.currentQuarterCatalysts.length} current` : company.catalystScore ?? "None verified"}</span>
+                  <span role="cell">{company.sourceCount} sources / {company.documentCount} docs</span>
+                  <span role="cell">
+                    <Badge tone={researchStatusTone(company.status)}>{company.status.replaceAll("_", " ")}</Badge>
+                    {item.sourcePeriod ? <strong className={`market-intelligence-table-return ${performanceTone}-text`}>Market return ({item.sourcePeriod}) {formatSignedPerformancePct(item.sourcePerformancePct)}</strong> : null}
+                  </span>
+                </button>
+              );
+            }) : null}
+            {researchContext.kind === "PORTFOLIO" ? (portfolioResearchSummary?.companies ?? []).map((company) => {
+              const holding = positions.find((position) => position.instrument.globalInstrumentId === company.instrumentId
+                || position.instrument.instrumentId === company.instrumentId
+                || Boolean(position.instrument.isin && position.instrument.isin === company.isin)
+                || (position.instrument.ticker === company.ticker && position.instrument.exchange === company.exchange));
               return (
                 <button
                   className="portfolio-research-row portfolio-research-company"
@@ -2323,17 +3701,21 @@ function ResearchView({
                     if (company.instrumentId) {
                       onSelectInstrument(company.instrumentId);
                     }
+                    if (holding && company.assetType === "EQUITY" && company.instrumentId) {
+                      setResearchDetail({ position: holding, researchInstrumentId: company.instrumentId });
+                    }
                   }}
                 >
                   <span role="cell">
-                    <strong>{company.companyName}</strong>
+                    <strong>{company.companyName} <span className={`research-status-dot research-status-${researchStatusTone(company.status)}`} role="img" aria-label={researchStatusDescription(company.status)} title={researchStatusDescription(company.status)} /></strong>
                     <small>{[company.ticker, company.exchange, company.isin].filter(Boolean).join(" / ")}</small>
+                    {holding ? <small>Held · Qty {holding.quantity.toLocaleString("en")}</small> : null}
                   </span>
-                  <span role="cell">{company.catalystScore ?? "N/A"}</span>
-                  <span role="cell">{company.confidence != null ? `${company.confidence}%` : "N/A"}</span>
-                  <span role="cell">
-                    {evidenceCount}/{evidenceTotal}
-                  </span>
+                  <span role="cell">{metricText(company.valuation.currentPe)}</span>
+                  <span role="cell"><Badge tone={valuationTone(company.valuation.state)}>{company.valuation.state}</Badge><small>{company.valuation.reason}</small></span>
+                  <span role="cell">{latestResultText(company)}</span>
+                  <span role="cell">{company.ownershipIncreases.length ? company.ownershipIncreases.map((value) => value === "FII_FPI" ? "FII/FPI" : value.replaceAll("_", " ")).join(" · ") : "Unavailable"}<small>{company.shareholdingChanges.length ? `${company.shareholdingChanges.length} comparable trends` : "Previous comparable period not found"}</small></span>
+                  <span role="cell">{company.currentQuarterCatalysts.length ? `${company.currentQuarterCatalysts.length} current` : company.catalystScore ?? "None verified"}</span>
                   <span role="cell">
                     {company.sourceCount} sources / {company.documentCount} docs
                   </span>
@@ -2343,11 +3725,17 @@ function ResearchView({
                   </span>
                 </button>
               );
-            })}
+            }) : null}
           </div>
-        ) : (
-          <EmptyState title="No portfolio research run" message="Refresh portfolio research to summarize current holdings." />
+        ) : summary || researchContext.kind === "SEARCH" ? null : (
+          <EmptyState
+            title={researchContext.kind === "PORTFOLIO" ? "No company research available" : "No watchlist instruments"}
+            message={researchContext.kind === "PORTFOLIO"
+              ? "Select a company and open Research readiness to find only the data it needs."
+              : "Choose a Market Intelligence stock to add it to this regional watchlist."}
+          />
         )}
+        {researchDetail && detailResearch ? <StockResearchDrawer position={researchDetail.position} watchlistItem={detailWatchlistItem} research={detailResearch} onClose={() => setResearchDetail(null)} /> : null}
       </Card>
 
       <Card className="wide-panel research-sticky-panel">
@@ -2362,20 +3750,35 @@ function ResearchView({
             <Button
               variant="secondary"
               onClick={onRefresh}
-              disabled={loading || !selectedInstrumentId || !canRefreshResearch(selectedPortfolioResearchCompany?.status)}
+              disabled={loading || !refreshEligible}
             >
               <RefreshCw size={16} />
-              {loading ? "Refreshing..." : "Refresh research"}
+              Research readiness
             </Button>
           </div>
         </div>
         <div className="research-controls">
+          {researchContext.kind === "SEARCH" && searchSelectedMatch && selectedResearchInstrumentId ? (
+            <small className="research-search-selected">
+              <span className="research-search-identity" style={{ display: "flex", flexDirection: "column" }}>
+                <span className="research-search-name">{searchPresentation?.companyName ?? searchSelectedMatch?.companyName ?? selectedResearchInstrumentId}</span>
+                <span className="research-search-symbol">{[searchSelectedMatch?.canonicalSymbol ?? searchSelectedMatch?.symbol, searchSelectedMatch?.exchange, searchSelectedMatch?.isin].filter(Boolean).join(" · ") || selectedResearchInstrumentId}</span>
+                <span className="research-search-status">Public company research · Not held</span>
+              </span>
+              <Button variant="secondary" disabled={searchWatchlistBusy || searchWatchlistSaved} onClick={() => onToggleSearchWatchlist()}>
+                {searchWatchlistSaved ? `Saved to ${regionalWatchlistName(searchSelectedMatch.region)}` : `Add to ${regionalWatchlistName(searchSelectedMatch.region)}`}
+              </Button>
+              {searchWatchlistError ? <small role="alert">{searchWatchlistError}</small> : null}
+            </small>
+          ) : null}
+          <div className="research-controls-filters" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap", alignItems: "center", flexBasis: "100%" }}>
+          {researchContext.kind !== "SEARCH" ? (
           <label className="sort-control research-company-control">
             <Search size={16} aria-hidden="true" />
             <span>Company</span>
             <select
               className="research-company-select"
-              value={selectedInstrumentId}
+              value={selectedResearchInstrumentId}
               title={selectedResearchOption?.companyName}
               onChange={(event) => onSelectInstrument(event.target.value)}
             >
@@ -2387,10 +3790,14 @@ function ResearchView({
             </select>
             {selectedResearchOption ? (
               <small className="research-company-meta">
-                {[selectedResearchOption.ticker, selectedResearchOption.exchange].filter(Boolean).join(" · ")}
+                {[selectedResearchOption.ticker, selectedResearchOption.exchange,
+                  selectedResearchOption.held
+                    ? `Held · quantity ${selectedResearchOption.quantity.toLocaleString("en")}`
+                    : "Public company research · Not held"].filter(Boolean).join(" · ")}
               </small>
             ) : null}
           </label>
+          ) : null}
           <label className="sort-control">
             <span>Event</span>
             <select value={eventType} onChange={(event) => onEventType(event.target.value)}>
@@ -2414,6 +3821,7 @@ function ResearchView({
             </select>
           </label>
         </div>
+      </div>
       </Card>
 
       {loading ? <Skeleton rows={5} /> : null}
@@ -2499,8 +3907,8 @@ function ResearchView({
       {!loading && !summary ? (
         <Card className="wide-panel">
           <EmptyState
-            title={researchEmptyTitle(selectedPortfolioResearchCompany?.status)}
-            message={researchEmptyMessage(selectedPortfolioResearchCompany?.status)}
+            title={researchEmptyTitle(selectedContextResearchCompany?.status)}
+            message={researchContext.kind === "SEARCH" ? "Open Research readiness to check the data available for this company." : researchEmptyMessage(selectedContextResearchCompany?.status)}
           />
         </Card>
       ) : null}
@@ -2517,7 +3925,7 @@ function ResearchOverview({ summary }: { summary: ResearchSummary }) {
     <div className="research-overview-grid">
       {categoryRows.map(([label, value, status]) => (
         <div className="score-row compact" key={label}>
-          <span>{label}</span>
+          <span>{researchCategoryLabel(label)}</span>
           <strong>{value ?? "N/A"}</strong>
           <div className="bar-track" aria-hidden="true">
             <span style={{ width: `${value ?? 0}%` }} />
@@ -2534,6 +3942,16 @@ function ResearchOverview({ summary }: { summary: ResearchSummary }) {
       </div>
     </div>
   );
+}
+
+function researchCategoryLabel(category: string) {
+  return ({
+    GROWTH: "Growth",
+    ORDERS_BACKLOG: "Orders & Backlog",
+    CAPEX: "CAPEX & Capacity",
+    CLIENTS: "Customers",
+    GUIDANCE: "Guidance",
+  } as Record<string, string>)[category] ?? category.replaceAll("_", " ");
 }
 
 function ResearchEventRows({
@@ -2683,25 +4101,33 @@ function ResearchSources({ documents }: { documents: ResearchDocument[] }) {
   );
 }
 
-function getResearchSections(summary: ResearchSummary, filteredEvents: ResearchEvent[]) {
-  const orders = eventsMatching(filteredEvents, ["NEW_ORDER", "ORDER_BACKLOG_CHANGE", "MAJOR_CONTRACT", "GOVERNMENT_CONTRACT"]);
-  const capex = eventsMatching(filteredEvents, ["CAPEX", "CAPACITY_EXPANSION", "NEW_FACILITY", "FACTORY_EXPANSION", "PROJECT_DELAY"]);
-  const customers = eventsMatching(filteredEvents, ["NEW_CUSTOMER", "CUSTOMER_EXPANSION", "MAJOR_CUSTOMER", "CUSTOMER_LOSS"]);
-  const guidance = eventsMatching(filteredEvents, ["GUIDANCE_RAISED", "GUIDANCE_LOWERED", "GUIDANCE_CUT", "GUIDANCE_MAINTAINED", "REVENUE_GUIDANCE", "MARGIN_GUIDANCE"]);
-  const growth = filteredEvents.filter((event) =>
-    ["GEOGRAPHIC_EXPANSION", "PARTNERSHIP", "PRODUCT_LAUNCH"].includes(event.eventType)
-  );
+function getResearchSections(summary: ResearchSummary, filteredEvents: ResearchEvent[], eventType: string, impact: string) {
+  const growth = categorySupportingEvents(summary, "GROWTH", filteredEvents, eventType, impact, ["GEOGRAPHIC_EXPANSION", "PARTNERSHIP", "PRODUCT_LAUNCH"]);
+  const orders = categorySupportingEvents(summary, "ORDERS_BACKLOG", filteredEvents, eventType, impact, ["NEW_ORDER", "ORDER_BACKLOG_CHANGE", "MAJOR_CONTRACT", "GOVERNMENT_CONTRACT"]);
+  const capex = categorySupportingEvents(summary, "CAPEX", filteredEvents, eventType, impact, ["CAPEX", "CAPACITY_EXPANSION", "NEW_FACILITY", "FACTORY_EXPANSION", "PROJECT_DELAY"]);
+  const customers = categorySupportingEvents(summary, "CLIENTS", filteredEvents, eventType, impact, ["NEW_CUSTOMER", "CUSTOMER_EXPANSION", "MAJOR_CUSTOMER", "CUSTOMER_LOSS"]);
+  const guidance = categorySupportingEvents(summary, "GUIDANCE", filteredEvents, eventType, impact, ["GUIDANCE_RAISED", "GUIDANCE_LOWERED", "GUIDANCE_CUT", "GUIDANCE_MAINTAINED", "REVENUE_GUIDANCE", "MARGIN_GUIDANCE"]);
 
   return [
     { id: "overview" as const, title: "Overview", metricLabel: `Score ${summary.catalystScore.overallScore}`, events: filteredEvents },
-    { id: "growth" as const, title: "Growth", metricLabel: categoryMetricLabel(summary, "Growth"), events: growth },
-    { id: "orders" as const, title: "Orders & Backlog", metricLabel: categoryMetricLabel(summary, "Orders & Backlog"), events: orders },
-    { id: "capex" as const, title: "CAPEX & Capacity", metricLabel: categoryMetricLabel(summary, "CAPEX & Capacity"), events: capex },
-    { id: "customers" as const, title: "Customers", metricLabel: categoryMetricLabel(summary, "Customers"), events: customers },
-    { id: "guidance" as const, title: "Guidance", metricLabel: categoryMetricLabel(summary, "Guidance"), events: guidance },
+    { id: "growth" as const, title: "Growth", metricLabel: categoryMetricLabel(summary, "GROWTH"), events: growth },
+    { id: "orders" as const, title: "Orders & Backlog", metricLabel: categoryMetricLabel(summary, "ORDERS_BACKLOG"), events: orders },
+    { id: "capex" as const, title: "CAPEX & Capacity", metricLabel: categoryMetricLabel(summary, "CAPEX"), events: capex },
+    { id: "customers" as const, title: "Customers", metricLabel: categoryMetricLabel(summary, "CLIENTS"), events: customers },
+    { id: "guidance" as const, title: "Guidance", metricLabel: categoryMetricLabel(summary, "GUIDANCE"), events: guidance },
     { id: "news" as const, title: "News / Events", metricLabel: `Events ${filteredEvents.length}`, events: filteredEvents },
     { id: "sources" as const, title: "Sources", metricLabel: `Documents ${summary.documents.length}`, events: [] }
   ];
+}
+
+function categorySupportingEvents(summary: ResearchSummary, category: string, filteredRecentEvents: ResearchEvent[], eventType: string, impact: string, fallbackTypes: string[]) {
+  const evidence = summary.catalystScore.categoryEvidence?.[category];
+  if (evidence?.supportingEvents) {
+    return evidence.supportingEvents.filter((event) =>
+      (!eventType || event.eventType === eventType) && (!impact || event.impact === impact)
+    );
+  }
+  return eventsMatching(filteredRecentEvents, fallbackTypes);
 }
 
 function categoryMetricLabel(summary: ResearchSummary, category: string) {
@@ -2735,16 +4161,17 @@ function impactTone(impact: string): "neutral" | "positive" | "negative" | "warn
 }
 
 function researchStatusTone(status: string): "neutral" | "positive" | "negative" | "warning" | "info" {
-  if (status === "AVAILABLE") {
+  if (status === "AVAILABLE" || status === "RESOLVED_RESEARCH_AVAILABLE") {
     return "positive";
   }
-  if (status === "DEGRADED" || status === "RESEARCH_NOT_REFRESHED" || status === "NO_EVIDENCE") {
+  if (status === "DEGRADED" || status === "RESOLVED_PARTIAL_DATA" || status === "RESOLVED_NO_SOURCES" || status === "RESEARCH_NOT_REFRESHED" || status === "NO_EVIDENCE") {
     return "warning";
   }
-  if (status === "COMPANY_NOT_RESOLVED" || status === "RESEARCH_PROVIDER_UNAVAILABLE") {
+  if (["COMPANY_NOT_RESOLVED", "RESEARCH_PROVIDER_UNAVAILABLE", "SOURCE_DISCOVERY_UNAVAILABLE", "SEARCH_PROVIDER_UNAVAILABLE", "DOCUMENT_FETCH_FAILED"].includes(status)) {
     return "negative";
   }
-  if (status === "RESEARCH_NOT_APPLICABLE") {
+  if (["SEARCH_RETURNED_ZERO_RESULTS", "RESULTS_REJECTED", "EXTRACTION_EMPTY"].includes(status)) return "warning";
+  if (status === "RESEARCH_NOT_APPLICABLE" || status === "ETF_UNSUPPORTED") {
     return "info";
   }
   if (status?.startsWith("ETF_RESEARCH_")) {
@@ -2753,15 +4180,42 @@ function researchStatusTone(status: string): "neutral" | "positive" | "negative"
   return "neutral";
 }
 
-function isResearchSummaryLoadable(status?: string | null) {
-  return status === "AVAILABLE" || status === "DEGRADED";
+function researchStatusDescription(status: string): string {
+  if (status === "RESOLVED_RESEARCH_AVAILABLE") return "Research available";
+  if (status === "RESOLVED_PARTIAL_DATA") return "Partial research data — some research sections are unavailable.";
+  if (status === "ETF_UNSUPPORTED" || status === "RESEARCH_NOT_APPLICABLE") return "ETF research unsupported";
+  return status.replaceAll("_", " ");
 }
 
-function canRefreshResearch(status?: string | null) {
-  return Boolean(status) && !status?.startsWith("ETF_RESEARCH_") && !["COMPANY_NOT_RESOLVED", "RESEARCH_NOT_APPLICABLE"].includes(status ?? "");
+function isResearchSummaryLoadable(status?: string | null) {
+  return ["AVAILABLE", "DEGRADED", "RESOLVED_RESEARCH_AVAILABLE", "RESOLVED_PARTIAL_DATA"].includes(status ?? "");
+}
+
+function canRefreshResearch(company?: PortfolioResearchCompany | null) {
+  const status = company?.status ?? "";
+  return Boolean(company?.instrumentId)
+    && status !== "ETF_UNSUPPORTED"
+    && !status.startsWith("ETF_RESEARCH_")
+    && !["COMPANY_NOT_RESOLVED", "RESEARCH_NOT_APPLICABLE"].includes(status);
+}
+
+function canRefreshResearchIdentity(
+  globalInstrumentId?: string | null,
+  status?: string | null,
+  assetType?: string | null,
+) {
+  const normalizedStatus = status ?? "";
+  const normalizedAssetType = (assetType ?? "").toUpperCase();
+  return Boolean(globalInstrumentId?.trim())
+    && !["COMPANY_NOT_RESOLVED", "RESEARCH_NOT_APPLICABLE", "ETF_UNSUPPORTED"].includes(normalizedStatus)
+    && !normalizedStatus.startsWith("ETF_RESEARCH_")
+    && !["ETF", "FUND", "BOND", "CASH", "CRYPTO"].includes(normalizedAssetType);
 }
 
 function researchEmptyTitle(status?: string | null) {
+  if (status === "ETF_UNSUPPORTED") {
+    return "ETF company research unsupported";
+  }
   if (status === "ETF_RESEARCH_NOT_REFRESHED") {
     return "ETF research not refreshed";
   }
@@ -2842,4 +4296,154 @@ function brokerDisplayName(brokerType: string) {
     return "Demo Broker";
   }
   return brokerType;
+}
+
+function StockSearchField({
+  selectedGlobalInstrumentId,
+  onSelect,
+}: {
+  selectedGlobalInstrumentId?: string;
+  onSelect: (match: ResearchInstrumentMatch) => void;
+}) {
+  const DEBOUNCE_MS = 300;
+  const [region, setRegion] = useState<SectorPerformance["region"]>("INDIA");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<ResearchInstrumentMatch[]>([]);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [highlight, setHighlight] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const cache = useRef(new Map<string, ResearchInstrumentMatch[]>());
+  const trimmed = query.trim();
+  useEffect(() => {
+    let cancelled = false;
+    setResults([]);
+    setOpen(false);
+    setLoading(false);
+    setError(null);
+    if (trimmed.length < 3) return;
+    const key = `${region}:${trimmed.toLowerCase()}`;
+    const show = (items: ResearchInstrumentMatch[]) => {
+      if (cancelled) return;
+      setResults(items);
+      setOpen(true);
+      setHighlight(0);
+    };
+    const cached = cache.current.get(key);
+    if (cached) { show(cached); return; }
+    const active = setTimeout(() => {
+      setLoading(true);
+      void researchApi.searchInstruments(region, trimmed, 20)
+        .then((items) => {
+          if (cancelled) return;
+          if (cache.current.size >= 50) cache.current.delete(cache.current.keys().next().value!);
+          cache.current.set(key, items);
+          show(items);
+        })
+        .catch(() => {
+          if (!cancelled) setError("Stock search unavailable. Please try again.");
+        })
+        .finally(() => { if (!cancelled) setLoading(false); });
+    }, DEBOUNCE_MS);
+    return () => { cancelled = true; clearTimeout(active); };
+  }, [trimmed, region]);
+
+  useEffect(() => {
+    if (open) document.getElementById(`research-option-${highlight}`)?.scrollIntoView({ block: "nearest" });
+  }, [highlight, open]);
+
+  function commit(highlighted: number) {
+    const item = results[highlighted];
+    if (!item) return;
+    onSelect(item);
+    setQuery("");
+    setResults([]);
+    setOpen(false);
+  }
+
+  const rows = results.slice(0, 20);
+  const rowCount = Math.max(1, rows.length);
+
+  return (
+    <div className="research-search-control">
+      <div className="research-region-control" role="group" aria-label="Region">
+      <span>Region</span>
+      {(["INDIA", "USA", "EUROPE"] as const).map((r) => (
+        <button
+          key={r}
+          type="button"
+          aria-pressed={r === region}
+          className={r === region ? "active" : ""}
+          onClick={() => { setRegion(r); setQuery(""); setResults([]); setOpen(false); }}
+        >
+          {r}
+        </button>
+      ))}
+      </div>
+      <label htmlFor="research-stock-query">Search stocks</label>
+      <input
+        id="research-stock-query"
+        role="combobox"
+        aria-activedescendant={open && rows.length ? `research-option-${highlight}` : undefined}
+        ref={inputRef}
+        type="search"
+        className="research-search-input"
+        placeholder="Search by company name, symbol or ISIN..."
+        value={query}
+        autoComplete="off"
+        aria-autocomplete="list"
+        aria-expanded={open}
+        aria-controls={open ? "research-search-listbox" : undefined}
+        onBlur={() => setOpen(false)}
+        onFocus={() => { if (trimmed.length >= 3 && results.length) setOpen(true); }}
+        onChange={(event) => setQuery(event.target.value)}
+        onKeyDown={(event) => {
+          if (!open) return;
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setHighlight((current) => (current + 1) % rowCount);
+          } else if (event.key === "ArrowUp") {
+            event.preventDefault();
+            setHighlight((current) => (current - 1 + rowCount) % rowCount);
+          } else if (event.key === "Enter") {
+            event.preventDefault();
+            commit(highlight);
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            setOpen(false);
+          }
+        }}
+      />
+      {open && !loading && rows.length === 0 ? <small role="status">No stocks found.</small> : null}
+      {loading ? <small role="status">Searching…</small> : null}
+      {error ? <small role="alert">{error}</small> : null}
+      <ul
+        id="research-search-listbox"
+        className="research-search-listbox"
+        role="listbox"
+        hidden={!open || rows.length === 0}
+        style={{ position: "absolute", background: "var(--surface-raised)", border: "1px solid var(--border)", maxHeight: "240px", overflowY: "auto", zIndex: 1000 }}
+      >
+        {rows.map((item, index) => (
+          <li
+            id={`research-option-${index}`}
+            key={item.globalInstrumentId}
+            role="option"
+            aria-selected={index === highlight}
+            className={index === highlight ? "highlighted" : ""}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              commit(index);
+            }}
+          >
+            <strong>{item.companyName}</strong>
+            <small>{[item.canonicalSymbol ?? item.symbol, item.exchange, item.isin].filter(Boolean).join(" · ")}</small>
+            {item.sector ? <small>{item.sector}</small> : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }

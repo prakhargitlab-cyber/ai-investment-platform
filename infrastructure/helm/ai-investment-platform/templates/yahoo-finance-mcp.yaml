@@ -1,0 +1,188 @@
+{{- if .Values.yahooFinanceMcp.enabled }}
+{{- $config := .Values.yahooFinanceMcp -}}
+{{- $serviceFqdn := printf "yahoo-finance-mcp.%s.svc" .Release.Namespace -}}
+{{- $serviceClusterFqdn := printf "%s.cluster.local" $serviceFqdn -}}
+{{- $allowedHosts := concat $config.allowedHosts (list $serviceFqdn (printf "%s:*" $serviceFqdn) $serviceClusterFqdn (printf "%s:*" $serviceClusterFqdn)) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yahoo-finance-mcp
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 4 }}
+spec:
+  {{- if not $config.autoscaling.enabled }}
+  replicas: {{ $config.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.global.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml .Values.global.rolloutStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aip.podLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 8 }}
+      {{- $annotations := include "aip.podAnnotations" (dict "root" . "language" "python") }}
+      {{- if $annotations }}
+      annotations:
+        {{- $annotations | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "aip.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.global.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.global.terminationGracePeriodSeconds }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.global.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.global.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.global.topologySpread.topologyKey | quote }}
+          whenUnsatisfiable: {{ .Values.global.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "aip.selectorLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: yahoo-finance-mcp
+          image: {{ include "aip.image" (dict "root" . "image" $config.image "tag" $config.tag) | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | quote }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            {{- include "aip.commonEnv" (dict "root" . "serviceName" "yahoo-finance-mcp") | nindent 12 }}
+            - name: HOME
+              value: /tmp
+            - name: AIP_YAHOO_MCP_SERVICE_NAME
+              value: yahoo-finance-mcp
+            - name: AIP_YAHOO_MCP_TRANSPORT
+              value: {{ $config.transport | quote }}
+            - name: AIP_YAHOO_MCP_HOST
+              value: "0.0.0.0"
+            - name: AIP_YAHOO_MCP_PORT
+              value: {{ $config.port | quote }}
+            - name: AIP_YAHOO_MCP_HTTP_PATH
+              value: {{ $config.httpPath | quote }}
+            - name: AIP_YAHOO_MCP_MAX_REQUEST_BODY_BYTES
+              value: {{ $config.maxRequestBodyBytes | quote }}
+            - name: AIP_YAHOO_MCP_MAX_RESPONSE_ITEMS
+              value: {{ $config.maxResponseItems | quote }}
+            - name: AIP_YAHOO_MCP_UPSTREAM_TIMEOUT_SECONDS
+              value: {{ $config.upstreamTimeoutSeconds | quote }}
+            - name: AIP_YAHOO_MCP_MAX_CONCURRENCY
+              value: {{ $config.maxConcurrency | quote }}
+            - name: AIP_YAHOO_MCP_USER_AGENT
+              value: {{ $config.userAgent | quote }}
+            - name: AIP_YAHOO_MCP_ALLOWED_HOSTS
+              value: {{ join "," $allowedHosts | quote }}
+            - name: AIP_YAHOO_MCP_ALLOWED_ORIGINS
+              value: {{ join "," $config.allowedOrigins | quote }}
+          ports:
+            - name: http
+              containerPort: {{ $config.port }}
+          {{- if $config.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ $config.probes.startup.path }}
+              port: http
+            periodSeconds: {{ $config.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.startup.failureThreshold }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ $config.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ $config.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml $config.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.global.temporaryStorage.enabled }}
+            - name: temporary-storage
+              mountPath: {{ .Values.global.temporaryStorage.mountPath | quote }}
+            {{- end }}
+            {{- include "aip.keyVaultVolumeMount" (dict "root" . "component" "yahoo-finance-mcp") | nindent 12 }}
+      volumes:
+        {{- if .Values.global.temporaryStorage.enabled }}
+        - name: temporary-storage
+          emptyDir:
+            {{- with .Values.global.temporaryStorage.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
+        {{- end }}
+        {{- include "aip.keyVaultVolume" (dict "root" . "component" "yahoo-finance-mcp") | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yahoo-finance-mcp
+  labels:
+    {{- include "aip.componentLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 4 }}
+spec:
+  type: {{ $config.service.type }}
+  selector:
+    {{- include "aip.selectorLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $config.service.port }}
+      targetPort: http
+---
+{{- if $config.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: yahoo-finance-mcp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: yahoo-finance-mcp
+  minReplicas: {{ $config.autoscaling.minReplicas }}
+  maxReplicas: {{ $config.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $config.autoscaling.targetCPUUtilizationPercentage }}
+---
+{{- end }}
+{{- if $config.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: yahoo-finance-mcp
+spec:
+  minAvailable: {{ $config.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" . "component" "yahoo-finance-mcp") | nindent 6 }}
+---
+{{- end }}
+{{- end }}

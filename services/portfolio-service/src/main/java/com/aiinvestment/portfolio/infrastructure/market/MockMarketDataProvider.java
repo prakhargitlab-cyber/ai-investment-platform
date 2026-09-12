@@ -22,12 +22,14 @@ public class MockMarketDataProvider implements MarketDataProvider {
 
     @Override
     public Quote getQuote(Instrument instrument) {
-        return quoteCache.get(instrument.instrumentId()).orElseGet(() -> {
+        return quoteCache.get(instrument.instrumentId()).filter(MockMarketDataProvider::hasUsableLast).orElseGet(() -> {
             Quote quote = buildMockQuote(instrument);
-            try {
-                quoteCache.put(quote, MOCK_TTL);
-            } catch (RuntimeException exception) {
-                // Quote caching is an infrastructure optimization; demo quote generation must remain usable without it.
+            if (hasUsableLast(quote)) {
+                try {
+                    quoteCache.put(quote, MOCK_TTL);
+                } catch (RuntimeException exception) {
+                    // Quote caching is an infrastructure optimization; demo quote generation must remain usable without it.
+                }
             }
             return quote;
         });
@@ -52,12 +54,20 @@ public class MockMarketDataProvider implements MarketDataProvider {
             case "NVDA" -> new BigDecimal("920.00");
             case "RELIANCE" -> new BigDecimal("2850.00");
             case "ZENTEC" -> new BigDecimal("1025.00");
-            default -> BigDecimal.ZERO;
+            default -> null;
         };
         String currency = instrument.tradingCurrency();
+        if (last == null) {
+            return new Quote(instrument.instrumentId(), null, null, null, null, currency, timestamp,
+                    "MockMarketDataProvider", MarketDataFreshness.UNAVAILABLE, MarketStatus.UNKNOWN);
+        }
         return new Quote(instrument.instrumentId(), new Money(last.subtract(new BigDecimal("0.10")), currency),
                 new Money(last.add(new BigDecimal("0.10")), currency), new Money(last, currency),
                 new Money(last.multiply(new BigDecimal("0.98")), currency), currency, timestamp,
                 "MockMarketDataProvider", MarketDataFreshness.MOCK, MarketStatus.UNKNOWN);
+    }
+
+    private static boolean hasUsableLast(Quote quote) {
+        return quote != null && quote.last() != null && quote.last().amount().signum() > 0;
     }
 }

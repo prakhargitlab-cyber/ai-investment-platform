@@ -3,6 +3,7 @@ spring:
     name: risk-service
 server:
   port: ${SERVER_PORT:8087}
+  shutdown: graceful
 management:
   endpoints:
     web:
@@ -14,4 +15,4 @@ management:
         enabled: true
 logging:
   pattern:
-    level: "%5p [correlationId:%X{correlationId:-}]"
+    console: "timestamp=%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX,UTC} service=${spring.application.name} environment=${AIP_ENVIRONMENT:LOCAL} level=%p requestId=%X{correlationId:-} logger=%logger{36} message=%replace(%msg){'[\\r\\n]',' '}%n"

@@ -1,6 +1,8 @@
 package com.aiinvestment.broker.provider.ibkr;
 
 import com.aiinvestment.broker.config.IBKRProviderProperties;
+import com.aiinvestment.broker.connector.BrokerConnector;
+import com.aiinvestment.broker.connector.BrokerConnectorState;
 import com.aiinvestment.shared.domain.broker.*;
 import org.springframework.stereotype.Component;
 
@@ -9,14 +11,21 @@ import java.util.UUID;
 
 @Component
 public class IBKRBrokerProvider implements BrokerProvider {
-    private final IBKRProviderProperties properties;
+    public static final String INDIVIDUAL_AUTH_METHOD = "client-portal-gateway";
+    public static final String OAUTH2_AUTH_METHOD = "oauth2-private-key-jwt";
 
-    public IBKRBrokerProvider(IBKRProviderProperties properties) {
+    private final IBKRProviderProperties properties;
+    private final BrokerConnector connector;
+
+    public IBKRBrokerProvider(IBKRProviderProperties properties, BrokerConnector connector) {
         this.properties = properties;
+        this.connector = connector;
     }
 
     public IBKRBrokerProvider() {
-        this(new IBKRProviderProperties(false, "", "", "", "", false));
+        this(new IBKRProviderProperties(false, "", "", "", "", "", "", INDIVIDUAL_AUTH_METHOD,
+                        false, false, false, "", "LOCAL_AGENT", "", "", 1800, 86400, "", ""),
+                new UnconfiguredIBKRConnector());
     }
 
     @Override
@@ -26,7 +35,10 @@ public class IBKRBrokerProvider implements BrokerProvider {
 
     @Override
     public BrokerConnectionCapabilities connectionCapabilities() {
-        return BrokerConnectionCapabilities.none();
+        if (!readyForReadOnlyCalls()) {
+            return BrokerConnectionCapabilities.none();
+        }
+        return BrokerConnectionCapabilities.ibkrReadOnly(properties.marketDataEnabled());
     }
 
     @Override
@@ -37,30 +49,50 @@ public class IBKRBrokerProvider implements BrokerProvider {
         if (!properties.officialDocumentationVerified()) {
             return BrokerConnectionStatus.documentationRequired(BrokerType.IBKR);
         }
-        if (isBlank(properties.baseUrl()) || isBlank(properties.clientId()) || isBlank(properties.authMethod())) {
+        if (OAUTH2_AUTH_METHOD.equalsIgnoreCase(properties.authMethod())) {
+            return BrokerConnectionStatus.documentationRequired(BrokerType.IBKR);
+        }
+        if (!readyForReadOnlyCalls()) {
             return BrokerConnectionStatus.notConfigured(BrokerType.IBKR);
         }
-        return BrokerConnectionStatus.authenticationRequired(BrokerType.IBKR);
+        var status = connector.status(UUID.fromString("00000000-0000-0000-0000-000000000000"),
+                UUID.fromString("00000000-0000-0000-0000-000000000000"));
+        if (status.authStatus() == BrokerConnectorState.CONNECTED) {
+            return new BrokerConnectionStatus(BrokerType.IBKR, BrokerConnectionState.CONNECTED,
+                    BrokerProviderStatus.CONNECTED, "CONNECTED", status.message());
+        }
+        if (status.authStatus() == BrokerConnectorState.AUTHENTICATION_REQUIRED) {
+            return BrokerConnectionStatus.authenticationRequired(BrokerType.IBKR);
+        }
+        return new BrokerConnectionStatus(BrokerType.IBKR, BrokerConnectionState.ERROR,
+                BrokerProviderStatus.UNAVAILABLE, status.code(), status.message());
     }
 
     @Override
     public List<BrokerAccount> fetchAccounts(UUID userId) {
-        throw new UnsupportedOperationException("IBKR integration is intentionally unsupported until official API documentation is provided and verified.");
+        return connector.fetchAccounts(userId, UUID.fromString("00000000-0000-0000-0000-000000000000"));
     }
 
     @Override
     public List<BrokerPosition> fetchPositions(BrokerAccount account) {
-        throw new UnsupportedOperationException("IBKR positions are intentionally unsupported until official API documentation is provided and verified.");
+        return connector.fetchPositions(account.userId(), UUID.fromString("00000000-0000-0000-0000-000000000000"), account);
     }
 
     @Override
     public List<BrokerCashBalance> fetchCashBalances(BrokerAccount account) {
-        throw new UnsupportedOperationException("IBKR cash balances are intentionally unsupported until official API research is complete.");
+        return connector.fetchCashBalances(account.userId(), UUID.fromString("00000000-0000-0000-0000-000000000000"), account);
     }
 
     @Override
     public void disconnect(UUID connectionId) {
-        throw new UnsupportedOperationException("IBKR disconnect is unavailable because the provider is not configured.");
+        // Connector runtime lifecycle is tracked separately from broker metadata.
+    }
+
+    private boolean readyForReadOnlyCalls() {
+        return properties.enabled()
+                && properties.officialDocumentationVerified()
+                && INDIVIDUAL_AUTH_METHOD.equalsIgnoreCase(properties.authMethod())
+                && !isBlank(properties.connectorBaseUrl());
     }
 
     private static boolean isBlank(String value) {

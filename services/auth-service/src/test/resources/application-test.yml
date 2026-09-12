@@ -1,0 +1,21 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:auth;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;INIT=CREATE SCHEMA IF NOT EXISTS auth
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+auth:
+  issuer: test-auth-issuer
+  jwt-secret: test-auth-jwt-secret-at-least-32-characters
+  token-ttl-seconds: 300
+  verification-token-ttl-seconds: 3600
+  password-reset-token-ttl-seconds: 3600
+  dev-login-enabled: false
+  email-mode: DISABLED
+  smtp-port: 587

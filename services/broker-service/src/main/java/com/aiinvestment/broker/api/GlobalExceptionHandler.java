@@ -1,6 +1,7 @@
 package com.aiinvestment.broker.api;
 
 import com.aiinvestment.broker.application.BrokerConnectionNotFoundException;
+import com.aiinvestment.broker.application.BrokerProviderException;
 import org.slf4j.MDC;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -24,6 +25,11 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(IllegalStateException.class)
     public ResponseEntity<ApiErrorResponse> unavailable(IllegalStateException exception) {
         return error(HttpStatus.BAD_REQUEST, "BROKER_PROVIDER_UNAVAILABLE", exception.getMessage());
+    }
+
+    @ExceptionHandler(BrokerProviderException.class)
+    public ResponseEntity<ApiErrorResponse> brokerProvider(BrokerProviderException exception) {
+        return error(exception.status(), exception.code(), exception.getMessage());
     }
 
     private ResponseEntity<ApiErrorResponse> error(HttpStatus status, String code, String message) {

@@ -1,13 +1,206 @@
 global:
+  # Deployment profile is intentionally separate from the Spring profile so
+  # existing DEV behavior remains available while LOCAL/TEST/AZURE are explicit.
+  environment: LOCAL
+  springProfile: LOCAL
   imageRegistry: localhost:5001
   imagePullPolicy: IfNotPresent
-  environment: DEV
+  imageTag: ""
+  imagePullSecrets: []
+  timezone: UTC
+  serviceAccount:
+    create: true
+    name: ai-investment-platform
+    annotations: {}
+    automountServiceAccountToken: false
+  azure:
+    workloadIdentity:
+      enabled: false
+      clientId: ""
+      tenantId: ""
+      workloads: []
+  podAnnotations: {}
+  podLabels: {}
+  revisionHistoryLimit: 3
+  terminationGracePeriodSeconds: 30
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop:
+        - ALL
+  temporaryStorage:
+    enabled: true
+    mountPath: /tmp
+    sizeLimit: 256Mi
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  topologySpread:
+    enabled: false
+    topologyKey: topology.kubernetes.io/zone
+    maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  observability:
+    otel:
+      enabled: false
+      tracesEnabled: false
+      metricsEnabled: false
+      exporterOtlpEndpoint: ""
+      exporterOtlpProtocol: grpc
+      resourceAttributes: ""
+      javaAgentInjection: false
+      pythonAgentInjection: false
+
+serviceEndpoints:
+  auth: http://auth-service
+  portfolio: http://portfolio-service
+  broker: http://broker-service
+  ibkrConnector: http://ibkr-connector
+  company: http://company-service
+  research: http://research-service
+  researchEngine: http://research-engine
+  mcpGateway: http://mcp-gateway
+  yahooFinanceMcp: http://yahoo-finance-mcp
+  frontend: http://frontend
+
+database:
+  host: postgres
+  port: 5432
+  name: investment
+  username: investment
+  authMode: password
+  passwordSecretName: dev-postgres
+  passwordSecretKey: POSTGRES_PASSWORD
+  sslMode: disable
+  connectTimeoutSeconds: 10
+  socketTimeoutSeconds: 30
+  pool:
+    maximumSize: 8
+    minimumIdle: 1
+    connectionTimeoutMs: 10000
+    idleTimeoutMs: 600000
+    maxLifetimeMs: 1800000
+
+redis:
+  url: ""
+  host: redis
+  port: 6379
+  tlsEnabled: false
+  username: ""
+  passwordSecretName: ""
+  passwordSecretKey: REDIS_PASSWORD
+  connectTimeout: 3s
+  readTimeout: 3s
+  pool:
+    maxActive: 8
+    maxIdle: 8
+    minIdle: 0
+    maxWait: 2s
+
+kafka:
+  enabled: false
+  bootstrapServers: kafka:9092
+  securityProtocol: PLAINTEXT
+  saslMechanism: PLAIN
+  username: ""
+  consumerGroupPrefix: ai-investment-local
+  credentialSecretName: ""
+  passwordSecretKey: KAFKA_PASSWORD
+  sslTruststoreSecretName: ""
+  sslTruststoreSecretKey: KAFKA_TRUSTSTORE
+  sslTruststoreMountPath: /etc/ai-investment/kafka
+  sslTruststoreType: PEM
+  clientDnsLookup: use_all_dns_ips
+  requestTimeoutMs: 30000
+  deliveryTimeoutMs: 120000
+  retries: 5
+
+objectStorage:
+  enabled: false
+  provider: disabled
+  accountName: ""
+  endpoint: ""
+  container: ""
+  authMode: workloadIdentity
+  temporary:
+    enabled: false
+    ttlSeconds: 3600
+
+keyVault:
+  enabled: false
+  name: ""
+  tenantId: ""
+  clientId: ""
+  secretProviderClassName: aip-key-vault
+  mountPath: /mnt/secrets-store
+  cloudName: ""
+  workloads:
+    - api-gateway
+    - auth-service
+    - portfolio-service
+    - broker-service
+    - research-service
+    - research-engine
+    - mcp-gateway
+  objects: []
+  secretObjects: []
+
+networkPolicy:
+  enabled: false
+  allowSameNamespace: true
+  ingressController:
+    enabled: false
+    namespace: ""
+    podLabels: {}
+  egress:
+    enabled: false
+    allowDns: true
+    additionalRules: []
 
 frontend:
   enabled: true
   image: ai-investment/frontend
   tag: latest
   port: 3000
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 80
+  probes:
+    startup:
+      enabled: true
+      path: /api/health
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 30
+    readiness:
+      path: /api/health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    liveness:
+      path: /api/health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       cpu: 100m
@@ -15,46 +208,275 @@ frontend:
     limits:
       cpu: 500m
       memory: 512Mi
+  cache:
+    enabled: true
+    mountPath: /app/.next/cache
+    sizeLimit: 256Mi
+
+apiGateway:
+  http:
+    connectTimeout: 3s
+    readTimeout: 30s
+  cors:
+    allowedOrigins: []
+  ingress:
+    enabled: false
+    className: traefik
+    annotations: {}
+    host: ""
+    path: /
+    pathType: Prefix
+    tls: []
+  rateLimiting:
+    enabled: false
+    # Controller-specific annotations belong in ingress.annotations once an
+    # ingress controller has been selected.
+    requestsPerSecond: 0
+    burst: 0
+
+auth:
+  issuer: ""
+  devLoginEnabled: false
+  tokenTtlSeconds: 28800
+  email:
+    mode: DISABLED
+    smtpHost: ""
+    smtpPort: 587
+    smtpFrom: ""
+    publicUrl: ""
+    credentialSecretName: ""
+    usernameSecretKey: SMTP_USERNAME
+    passwordSecretKey: SMTP_PASSWORD
+  createDevSecret: false
+  devJwtSecret: ""
+  jwtSecretName: aip-auth-jwt
+  jwtSecretKey: jwt-secret
+
+ibkr:
+  enabled: false
+  baseUrl: ""
+  oauth2BaseUrl: ""
+  gatewayBaseUrl: ""
+  clientId: ""
+  clientKeyId: ""
+  callbackUrl: ""
+  authMethod: client-portal-gateway
+  officialDocumentationVerified: false
+  marketDataEnabled: false
+  insecureTls: false
+  connectorBaseUrl: ""
+  connectorRuntimeMode: LOCAL_AGENT
+  connectorLoginUrl: ""
+  connectorInternalToken: ""
+  connectorInternalTokenSecretName: ""
+  connectorInternalTokenSecretKey: AIP_INTERNAL_TOKEN
+  connectorIdleTimeoutSeconds: 1800
+  connectorSessionTimeoutSeconds: 86400
+  privateKeyReference: ""
+  sessionReference: ""
+
+iciciDirect:
+  enabled: false
+  officialDocumentationVerified: false
+  baseUrl: https://api.icicidirect.com/breezeapi/api/v1/
+  loginUrl: https://api.icicidirect.com/apiuser/login
+  redirectUrl: ""
+  authMethod: breeze-interactive-session
+  credentialSecretName: ""
+  appKeySecretKey: app-key
+  secretKeySecretKey: secret-key
+  secretKeyEnvironmentVariable: ICICI_DIRECT_SECRET_KEY
+
+ibkrConnector:
+  enabled: false
+  image: ai-investment/ibkr-connector
+  tag: latest
+  port: 8080
+  replicaCount: 1
+  runtimeMode: LOCAL_AGENT
+  productionApproved: false
+  gatewayPackagePath: ""
+  gatewayBaseUrl: ""
+  gatewayTlsVerify: true
+  loginPublicBaseUrl: ""
+  internalToken: ""
+  internalTokenSecretName: ""
+  internalTokenSecretKey: AIP_INTERNAL_TOKEN
+  packageVolumeClaim: ""
+  service:
+    type: ClusterIP
+    port: 80
+  probes:
+    startup:
+      enabled: true
+      path: /health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 30
+    readiness:
+      path: /health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    liveness:
+      path: /health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 1
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: false
+    minAvailable: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# The Client Portal Gateway package PVC is DEV_ONLY. It is not an AKS package
+# distribution design and remains disabled in the Azure overlay.
+ibkrRuntime:
+  mode: STATIC
+  namespace: ""
+  image:
+    repository: ai-investment/ibkr-connector
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  serviceAccount:
+    create: true
+    name: ibkr-runtime-orchestrator
+    annotations: {}
+  startupTimeoutSeconds: 120
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  imagePullSecrets: []
+  podAnnotations: {}
+  podLabels: {}
+  serviceAnnotations: {}
+  serviceLabels: {}
+  azure:
+    workloadIdentity:
+      enabled: false
+      clientId: ""
+  gatewayPackage:
+    classification: DEV_ONLY
+    claimName: ""
+    mountPath: /opt/ibkr/clientportal.gw-source
+    readOnly: true
+  workspace:
+    classification: EPHEMERAL
+    mountPath: /opt/ibkr/runtime
+    medium: ""
+    sizeLimit: ""
+  internalToken:
+    secretName: ""
+    secretKey: ""
+  gateway:
+    baseUrl: https://127.0.0.1:5000/v1/api
+    tlsVerify: true
+    loginPublicBaseUrl: ""
+  kubernetesSpec:
+    initContainer:
+      name: copy-gateway-package
+      image: ""
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c"]
+      args: ["cp -a /opt/ibkr/clientportal.gw-source/. /opt/ibkr/runtime/ && chown -R 1000:1000 /opt/ibkr/runtime && chmod u+x /opt/ibkr/runtime/bin/run.sh"]
+    startupProbe: { path: /actuator/health/readiness, initialDelaySeconds: 0, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 30, successThreshold: 1 }
+    readinessProbe: { path: /actuator/health/readiness, initialDelaySeconds: 0, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3, successThreshold: 1 }
+    livenessProbe: { path: /actuator/health/liveness, initialDelaySeconds: 0, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3, successThreshold: 1 }
+    ports: { containerPort: 8080, servicePort: 80, serviceTargetPort: 8080, gatewayPort: 5000 }
+    security: { runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, dropCapabilities: ["ALL"] }
 
 javaServices:
   - name: api-gateway
     image: ai-investment/api-gateway
     tag: latest
     port: 8080
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: auth-service
     image: ai-investment/auth-service
     tag: latest
     port: 8080
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: portfolio-service
     image: ai-investment/portfolio-service
     tag: latest
     port: 8080
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: broker-service
     image: ai-investment/broker-service
     tag: latest
     port: 8080
+    scalingClass: NEEDS_DISTRIBUTED_LOCK
   - name: company-service
     image: ai-investment/company-service
     tag: latest
     port: 8080
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: research-service
     image: ai-investment/research-service
     tag: latest
     port: 8080
+    scalingClass: SINGLETON_MIGRATION_OWNER
   - name: recommendation-service
     image: ai-investment/recommendation-service
     tag: latest
     port: 8080
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: risk-service
     image: ai-investment/risk-service
     tag: latest
     port: 8080
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: notification-service
     image: ai-investment/notification-service
     tag: latest
     port: 8080
+    scalingClass: HORIZONTALLY_SCALABLE
 
 javaServiceDefaults:
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 80
+  probes:
+    startup:
+      enabled: true
+      path: /actuator/health/liveness
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 36
+    readiness:
+      path: /actuator/health/readiness
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    liveness:
+      path: /actuator/health/liveness
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       cpu: 100m
@@ -63,25 +485,63 @@ javaServiceDefaults:
       cpu: 500m
       memory: 768Mi
 
+# Map-based overrides keep image lists stable across environment overlays.
+workloadOverrides: {}
+
 aiServices:
   - name: research-engine
     image: ai-investment/research-engine
     tag: latest
     port: 8000
+    scalingClass: NEEDS_DISTRIBUTED_LOCK
   - name: valuation-engine
     image: ai-investment/valuation-engine
     tag: latest
     port: 8000
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: ranking-engine
     image: ai-investment/ranking-engine
     tag: latest
     port: 8000
+    scalingClass: HORIZONTALLY_SCALABLE
   - name: portfolio-optimizer
     image: ai-investment/portfolio-optimizer
     tag: latest
     port: 8000
+    scalingClass: HORIZONTALLY_SCALABLE
+
+aiServiceImageOverrides: {}
 
 aiServiceDefaults:
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 80
+  probes:
+    startup:
+      enabled: true
+      path: /health
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 36
+    readiness:
+      path: /health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    liveness:
+      path: /health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       cpu: 100m
@@ -93,6 +553,321 @@ aiServiceDefaults:
 research:
   liveEnabled: false
   demoEnabled: true
+  logLevel: WARNING
+  persistence:
+    enabled: false
+    databaseBackend: postgres
+    databaseSchema: research
+  distributedLock:
+    backend: process
+    acquireTimeoutSeconds: 30
+  mcpAcquisition:
+    enabled: false
+    gatewayBaseUrl: http://mcp-gateway
+    timeoutSeconds: 10
+    serviceIdentity: research-engine
+  readinessEnsureTimeoutSeconds: 25
+  portfolioServiceBaseUrl: http://portfolio-service
+  providers:
+    nseAnnouncementsUrl: https://www.nseindia.com/api/corporate-announcements
+    nseShareholdingsUrl: https://www.nseindia.com/api/corporate-share-holdings-master
+    yahooSearchUrl: https://query1.finance.yahoo.com/v1/finance/search
+    yahooQuoteUrl: https://query1.finance.yahoo.com/v7/finance/quote
+    yahooSummaryUrl: https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}
+    secTickerUrl: https://www.sec.gov/files/company_tickers.json
+    secCompanyFactsUrl: https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
+    eodhdBaseUrl: https://eodhd.com/api
+    eodhdCredentialSecretName: ""
+    eodhdApiKeySecretKey: api-key
+  http:
+    requestTimeoutSeconds: 10
+    connectTimeoutSeconds: 3
+    maxRetries: 2
+  search:
+    enabled: false
+    provider: disabled
+    endpoint: ""
+    engineId: ""
+    engineIdSecretName: ""
+    engineIdSecretKey: engine-id
+    apiKeySecretName: ""
+    apiKeySecretKey: api-key
+    windowMonths: 12
+    maxQueriesPerCategory: 6
+    maxResultsPerQuery: 5
+    maxDocumentsPerRefresh: 6
+    refreshCooldownSeconds: 3600
+    cacheTtlSeconds: 86400
+    allowedDomains: []
+
+featureFlags:
+  mcpEnabled: false
+  llmEnabled: false
+  scheduledJobsEnabled: false
+  globalResearchAcquisitionEnabled: false
+
+marketData:
+  demoMode: true
+  quoteCacheMode: memory
+  quoteCacheTtl: PT5M
+  nifty500Url: https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv
+
+mcpGateway:
+  implemented: true
+  enabled: false
+  exposure: INTERNAL_ONLY
+  image: ai-investment/mcp-gateway
+  tag: latest
+  port: 8000
+  replicaCount: 1
+  transport: streamable-http
+  httpPath: /mcp
+  maxRequestBodyBytes: 262144
+  # Empty means the chart's centralized serviceEndpoints.researchEngine value.
+  researchBaseUrl: ""
+  serviceIdentity: local-mcp-gateway
+  authenticationType: LOCAL_SERVICE
+  localUserId: ""
+  roles:
+    - MCP_READER
+  scopes:
+    - mcp:read
+  externalProvidersEnabled: false
+  externalCallerIdentities:
+    - research-engine
+  yahooFinance:
+    enabled: false
+    transport: streamable-http
+    endpoint: ""
+    stdioCommand: ""
+    stdioArgs: []
+    authType: NONE
+    authHeaderName: Authorization
+    authSecretName: ""
+    authSecretKey: yahoo-mcp-token
+    stdioTokenEnvName: ""
+    # A capability remains UNKNOWN (SHAREHOLDING defaults UNSUPPORTED) until
+    # an approved server contract supplies an exact region/requirement/tool mapping.
+    capabilities: []
+    timeoutSeconds: 8
+    maxRetries: 1
+    retryBackoffSeconds: 0.2
+    maxConcurrency: 4
+  allowedHosts:
+    - mcp-gateway
+    - mcp-gateway:*
+    - localhost
+    - localhost:*
+  allowedOrigins: []
+  timeouts:
+    invocationSeconds: 10
+    connectSeconds: 3
+    readSeconds: 8
+  httpPool:
+    maxConnections: 50
+    maxKeepaliveConnections: 20
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: false
+  probes:
+    startup:
+      enabled: true
+      path: /health
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 30
+    readiness:
+      path: /health/ready
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    liveness:
+      path: /health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 384Mi
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: false
+    minAvailable: 1
+  networkPolicy:
+    enabled: false
+
+yahooFinanceMcp:
+  implemented: true
+  enabled: false
+  exposure: INTERNAL_ONLY
+  image: ai-investment/yahoo-finance-mcp
+  tag: latest
+  port: 8002
+  replicaCount: 1
+  transport: streamable-http
+  httpPath: /mcp
+  maxRequestBodyBytes: 131072
+  maxResponseItems: 1000
+  upstreamTimeoutSeconds: 8
+  maxConcurrency: 4
+  userAgent: AIInvestmentResearchBot/0.1 contact=research-compliance@example.invalid
+  # Executable first-party contracts. Tool success is still subject to strict
+  # identity, freshness, and requirement-completeness validation at runtime.
+  capabilities:
+    - &yahoo_quote
+      region: INDIA
+      requirementId: LATEST_PRICE
+      capability: LATEST_PRICE
+      tool: get_quote
+      state: SUPPORTED
+      maxAgeSeconds: 900
+    - &yahoo_history
+      region: INDIA
+      requirementId: HISTORICAL_PRICE_SERIES
+      capability: MARKET_HISTORY
+      tool: get_price_history
+      state: SUPPORTED
+      minimumItems: 2
+      toolArguments: {lookbackDays: 400}
+    - &yahoo_valuation
+      region: INDIA
+      requirementId: VALUATION_INPUTS
+      capability: VALUATION_INPUTS
+      tool: get_financials
+      state: SUPPORTED
+    - &yahoo_business
+      region: INDIA
+      requirementId: BUSINESS_QUALITY_FACTS
+      capability: ANNUAL_FINANCIALS
+      tool: get_financials
+      state: SUPPORTED
+    - &yahoo_growth
+      region: INDIA
+      requirementId: GROWTH_FACTS
+      capability: GROWTH_INPUTS
+      tool: get_financials
+      state: SUPPORTED
+    - &yahoo_balance
+      region: INDIA
+      requirementId: BALANCE_SHEET_FACTS
+      capability: BALANCE_SHEET
+      tool: get_financials
+      state: SUPPORTED
+    - &yahoo_quarterly
+      region: INDIA
+      requirementId: QUARTERLY_FINANCIALS
+      capability: QUARTERLY_FINANCIALS
+      tool: get_quarterly_financials
+      state: SUPPORTED
+    - &yahoo_news
+      region: INDIA
+      requirementId: CURRENT_NEWS
+      capability: NEWS
+      tool: get_news
+      state: SUPPORTED
+      toolArguments: {days: 30}
+    - &yahoo_sector
+      region: INDIA
+      requirementId: SECTOR_MACRO
+      capability: SECTOR_INDUSTRY
+      tool: get_sector_industry
+      state: SUPPORTED
+    - &yahoo_profile
+      region: INDIA
+      requirementId: COMPANY_PROFILE
+      capability: COMPANY_PROFILE
+      tool: get_company_profile
+      state: SUPPORTED
+    - &yahoo_analyst
+      region: INDIA
+      requirementId: ANALYST_DATA
+      capability: ANALYST_DATA
+      tool: get_analyst_data
+      state: SUPPORTED
+    - &yahoo_shareholding
+      region: INDIA
+      requirementId: SHAREHOLDING
+      capability: SHAREHOLDING
+      state: UNSUPPORTED
+    - {<<: *yahoo_quote, region: USA}
+    - {<<: *yahoo_history, region: USA}
+    - {<<: *yahoo_valuation, region: USA}
+    - {<<: *yahoo_business, region: USA}
+    - {<<: *yahoo_growth, region: USA}
+    - {<<: *yahoo_balance, region: USA}
+    - {<<: *yahoo_quarterly, region: USA}
+    - {<<: *yahoo_news, region: USA}
+    - {<<: *yahoo_sector, region: USA}
+    - {<<: *yahoo_profile, region: USA}
+    - {<<: *yahoo_analyst, region: USA}
+    - {<<: *yahoo_shareholding, region: USA}
+    - {<<: *yahoo_quote, region: EUROPE}
+    - {<<: *yahoo_history, region: EUROPE}
+    - {<<: *yahoo_valuation, region: EUROPE}
+    - {<<: *yahoo_business, region: EUROPE}
+    - {<<: *yahoo_growth, region: EUROPE}
+    - {<<: *yahoo_balance, region: EUROPE}
+    - {<<: *yahoo_quarterly, region: EUROPE}
+    - {<<: *yahoo_news, region: EUROPE}
+    - {<<: *yahoo_sector, region: EUROPE}
+    - {<<: *yahoo_profile, region: EUROPE}
+    - {<<: *yahoo_analyst, region: EUROPE}
+    - {<<: *yahoo_shareholding, region: EUROPE}
+  allowedHosts:
+    - yahoo-finance-mcp
+    - yahoo-finance-mcp:*
+    - localhost
+    - localhost:*
+  allowedOrigins: []
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: false
+  probes:
+    startup:
+      enabled: true
+      path: /health
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 30
+    readiness:
+      path: /health/ready
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    liveness:
+      path: /health
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 384Mi
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: false
+    minAvailable: 1
+  networkPolicy:
+    enabled: false
 
 devDependencies:
   enabled: true
@@ -102,6 +877,12 @@ devDependencies:
     username: investment
     password: ""
     passwordSecretName: dev-postgres
+    persistence:
+      enabled: true
+      classification: DURABLE_DEV_ONLY
+      existingClaim: ""
+      storageClass: local-path
+      size: 5Gi
     resources:
       requests:
         cpu: 100m
@@ -111,6 +892,7 @@ devDependencies:
         memory: 512Mi
   redis:
     image: redis:7-alpine
+    classification: CACHE
     resources:
       requests:
         cpu: 50m
@@ -119,7 +901,8 @@ devDependencies:
         cpu: 250m
         memory: 256Mi
   kafka:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.7.0
+    classification: DEV_ONLY
     resources:
       requests:
         cpu: 250m
@@ -127,3 +910,17 @@ devDependencies:
       limits:
         cpu: 1000m
         memory: 1Gi
+  searxng:
+    enabled: false
+    image: searxng/searxng:latest
+    port: 8080
+    secretKey: ""
+    secretName: dev-searxng
+    secretKeyName: SEARXNG_SECRET
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 768Mi

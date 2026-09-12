@@ -17,7 +17,9 @@ public record BrokerAccount(
         Objects.requireNonNull(userId, "userId is required");
         Objects.requireNonNull(brokerType, "brokerType is required");
         requireText(displayName, "displayName");
-        requireCurrency(baseCurrency, "baseCurrency");
+        if (baseCurrency != null) {
+            requireCurrency(baseCurrency, "baseCurrency");
+        }
         Objects.requireNonNull(status, "status is required");
     }
 

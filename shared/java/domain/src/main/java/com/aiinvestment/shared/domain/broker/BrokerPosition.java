@@ -13,6 +13,8 @@ public record BrokerPosition(
         BigDecimal quantity,
         Money averageCost,
         Money currentPrice,
+        Money marketValue,
+        Money unrealizedProfitLoss,
         Instant observedAt
 ) {
     public BrokerPosition {
@@ -24,8 +26,11 @@ public record BrokerPosition(
         if (quantity.signum() < 0) {
             throw new IllegalArgumentException("quantity cannot be negative");
         }
-        Objects.requireNonNull(averageCost, "averageCost is required");
-        Objects.requireNonNull(currentPrice, "currentPrice is required");
         Objects.requireNonNull(observedAt, "observedAt is required");
+    }
+
+    public BrokerPosition(String brokerAccountId, Instrument instrument, BigDecimal quantity, Money averageCost,
+                          Money currentPrice, Instant observedAt) {
+        this(brokerAccountId, instrument, quantity, averageCost, currentPrice, null, null, observedAt);
     }
 }

@@ -8,10 +8,18 @@ import com.aiinvestment.shared.domain.broker.BrokerType;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 
 @Component
 public class IBKRInstrumentNormalizer implements BrokerInstrumentNormalizer {
+    private static final Map<String, String> IBKR_EXCHANGE_TO_MIC = Map.of(
+            "IBIS", "XETR",
+            "IBIS2", "XETR",
+            "AEB", "XAMS"
+    );
+
     @Override
     public BrokerType supportedBroker() {
         return BrokerType.IBKR;
@@ -20,11 +28,25 @@ public class IBKRInstrumentNormalizer implements BrokerInstrumentNormalizer {
     @Override
     public Instrument normalize(BrokerInstrumentIdentity identity) {
         requireIdentity(identity);
+        String exchange = normalizeExchange(identity.exchange());
+        String mic = normalizeMic(identity.mic(), exchange);
+        String ticker = identity.ticker().toUpperCase(Locale.ROOT);
+        String currency = identity.currency().toUpperCase(Locale.ROOT);
         String stableKey = String.join("|", BrokerType.IBKR.name(), safe(identity.brokerContractId()),
-                safe(identity.isin()), identity.ticker(), identity.exchange(), identity.currency());
-        return new Instrument(UUID.nameUUIDFromBytes(stableKey.getBytes(StandardCharsets.UTF_8)), identity.isin(),
-                identity.ticker(), identity.exchange(), identity.mic(), identity.ticker(), assetType(identity),
-                identity.country(), identity.currency(), null, null);
+                safe(identity.isin()), ticker, exchange, currency);
+        String companyName = companyName(identity);
+        return new Instrument(UUID.nameUUIDFromBytes(stableKey.getBytes(StandardCharsets.UTF_8)),
+                BrokerType.IBKR.name(), identity.brokerContractId(), blankToNull(identity.isin()),
+                ticker, exchange, mic, companyName, assetType(identity),
+                blankToNull(identity.country()), currency, null, null,
+                blankToNull(identity.brokerSymbol()),
+                blankToNull(identity.brokerDescription()),
+                blankToNull(identity.brokerExchange()),
+                ticker,
+                companyName,
+                exchange,
+                mic,
+                securityType(identity));
     }
 
     private static void requireIdentity(BrokerInstrumentIdentity identity) {
@@ -43,7 +65,34 @@ public class IBKRInstrumentNormalizer implements BrokerInstrumentNormalizer {
         return value == null ? "" : value;
     }
 
+    private static String blankToNull(String value) {
+        return isBlank(value) ? null : value;
+    }
+
+    private static String normalizeExchange(String value) {
+        String upper = value.toUpperCase(Locale.ROOT);
+        return IBKR_EXCHANGE_TO_MIC.getOrDefault(upper, upper);
+    }
+
+    private static String normalizeMic(String mic, String exchange) {
+        if (isBlank(mic)) {
+            return exchange;
+        }
+        return IBKR_EXCHANGE_TO_MIC.getOrDefault(mic.toUpperCase(Locale.ROOT), mic.toUpperCase(Locale.ROOT));
+    }
+
+    private static String companyName(BrokerInstrumentIdentity identity) {
+        return isBlank(identity.companyName()) ? identity.ticker() : identity.companyName();
+    }
+
     private static AssetType assetType(BrokerInstrumentIdentity identity) {
         return identity.assetType() == null ? AssetType.EQUITY : identity.assetType();
+    }
+
+    private static String securityType(BrokerInstrumentIdentity identity) {
+        if (!isBlank(identity.securityType())) {
+            return identity.securityType().toUpperCase(Locale.ROOT);
+        }
+        return assetType(identity).name();
     }
 }

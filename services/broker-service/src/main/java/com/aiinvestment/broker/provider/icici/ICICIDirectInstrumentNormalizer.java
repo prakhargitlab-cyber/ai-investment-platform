@@ -22,7 +22,8 @@ public class ICICIDirectInstrumentNormalizer implements BrokerInstrumentNormaliz
         requireIdentity(identity);
         String stableKey = String.join("|", BrokerType.ICICI_DIRECT.name(), safe(identity.brokerSecurityId()),
                 safe(identity.isin()), identity.ticker(), identity.exchange(), identity.currency());
-        return new Instrument(UUID.nameUUIDFromBytes(stableKey.getBytes(StandardCharsets.UTF_8)), identity.isin(),
+        return new Instrument(UUID.nameUUIDFromBytes(stableKey.getBytes(StandardCharsets.UTF_8)),
+                BrokerType.ICICI_DIRECT.name(), identity.brokerSecurityId(), identity.isin(),
                 identity.ticker(), identity.exchange(), identity.mic(), identity.ticker(), assetType(identity),
                 "IN", identity.currency(), null, null);
     }

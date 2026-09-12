@@ -24,4 +24,18 @@ class MockMarketDataProviderTest {
         assertThat(cache.get(instrument.instrumentId())).contains(quote);
         assertThat(provider.getMarketDataStatus(instrument).source()).isEqualTo("MockMarketDataProvider");
     }
+
+    @Test
+    void unknownInstrumentReturnsUnavailableWithoutCachingZeroPrice() {
+        InMemoryQuoteCache cache = new InMemoryQuoteCache();
+        MockMarketDataProvider provider = new MockMarketDataProvider(cache);
+        Instrument instrument = new Instrument(UUID.randomUUID(), "INE000A01001", "UNKNOWN_LIVE", "NSE", "XNSE",
+                "Unknown Live Limited", AssetType.EQUITY, "IN", "INR", null, null);
+
+        var quote = provider.getQuote(instrument);
+
+        assertThat(quote.freshness()).isEqualTo(MarketDataFreshness.UNAVAILABLE);
+        assertThat(quote.last()).isNull();
+        assertThat(cache.get(instrument.instrumentId())).isEmpty();
+    }
 }

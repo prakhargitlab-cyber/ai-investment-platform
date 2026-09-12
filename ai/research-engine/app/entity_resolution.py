@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from urllib.parse import urlparse
 
 from app.models import CompanyResearchProfile, EntityResolution
@@ -19,18 +20,18 @@ class EntityResolver:
             if profile.isin and profile.isin.lower() in haystack:
                 score += 0.45
                 matched.append("isin")
-            if profile.company_name.lower() in haystack:
+            if _contains_identity(haystack, profile.company_name):
                 score += 0.30
                 matched.append("company_name")
             for alias in profile.aliases:
-                if alias.lower() in haystack:
-                    score += 0.18
+                if _contains_identity(haystack, alias):
+                    score += 0.30 if len(alias.strip()) >= 4 else 0.18
                     matched.append("alias")
                     break
-            if profile.ticker.lower() in haystack and profile.exchange.lower() in haystack:
+            if _contains_identity(haystack, profile.ticker) and _contains_identity(haystack, profile.exchange):
                 score += 0.18
                 matched.append("ticker_exchange")
-            if profile.country.lower() in haystack:
+            if _contains_identity(haystack, profile.country):
                 score += 0.04
                 matched.append("country")
             if any(host.endswith(domain.lower()) for domain in profile.known_domains):
@@ -45,3 +46,11 @@ class EntityResolver:
                     matched_on=matched,
                 )
         return best
+
+
+def _contains_identity(haystack: str, value: str) -> bool:
+    identity = value.strip().lower()
+    if not identity:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(identity) + r"(?![a-z0-9])"
+    return re.search(pattern, haystack) is not None

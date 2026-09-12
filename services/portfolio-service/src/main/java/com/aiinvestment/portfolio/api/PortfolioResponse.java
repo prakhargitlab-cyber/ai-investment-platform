@@ -7,14 +7,26 @@ import java.util.UUID;
 
 public record PortfolioResponse(
         UUID portfolioId,
-        UUID userId,
         String name,
         String baseCurrency,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        String provider,
+        UUID brokerConnectionId,
+        Instant lastBrokerSyncAt,
+        Instant lastBrokerSyncAttemptAt,
+        String lastBrokerSyncErrorCode,
+        String acquisitionSource,
+        String sourceAccountReference,
+        Instant lastImportedAt,
+        String lastImportedFilename
 ) {
     public static PortfolioResponse from(Portfolio portfolio) {
-        return new PortfolioResponse(portfolio.portfolioId(), portfolio.userId(), portfolio.name(),
-                portfolio.baseCurrency(), portfolio.createdAt(), portfolio.updatedAt());
+        return new PortfolioResponse(portfolio.portfolioId(), PortfolioPresentationName.forPortfolio(portfolio),
+                portfolio.baseCurrency(), portfolio.createdAt(), portfolio.updatedAt(),
+                portfolio.brokerProvider() == null ? null : portfolio.brokerProvider().name(),
+                portfolio.brokerConnectionId(), portfolio.lastSuccessfulBrokerSyncAt(),
+                portfolio.lastBrokerSyncAttemptAt(), portfolio.lastBrokerSyncErrorCode(), portfolio.acquisitionSource(),
+                portfolio.sourceAccountReference(), portfolio.lastImportedAt(), portfolio.lastImportedFilename());
     }
 }

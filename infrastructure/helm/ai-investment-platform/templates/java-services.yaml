@@ -1,70 +1,508 @@
-{{- range .Values.javaServices }}
+{{- range $service := .Values.javaServices }}
+{{ $override := default (dict) (index (default (dict) $.Values.workloadOverrides) $service.name) -}}
+{{ $config := mergeOverwrite (deepCopy $.Values.javaServiceDefaults) (deepCopy $service) (deepCopy $override) -}}
+{{ $strategy := default $.Values.global.rolloutStrategy $config.rolloutStrategy -}}
+{{ $databaseClient := or (eq $service.name "auth-service") (eq $service.name "broker-service") (eq $service.name "portfolio-service") (eq $service.name "research-service") -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .name }}
+  name: {{ $service.name }}
   labels:
-    app.kubernetes.io/component: {{ .name }}
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
 spec:
-  replicas: 1
+  {{- if not $config.autoscaling.enabled }}
+  replicas: {{ $config.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ $.Values.global.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml $strategy | nindent 4 }}
   selector:
     matchLabels:
-      app.kubernetes.io/component: {{ .name }}
+      {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/component: {{ .name }}
+        {{- include "aip.podLabels" (dict "root" $ "component" $service.name) | nindent 8 }}
+      {{- $annotations := include "aip.podAnnotations" (dict "root" $ "language" "java") }}
+      {{- if $annotations }}
+      annotations:
+        {{- $annotations | nindent 8 }}
+      {{- end }}
     spec:
+      serviceAccountName: {{ ternary $.Values.ibkrRuntime.serviceAccount.name (include "aip.serviceAccountName" $) (and (eq $service.name "broker-service") (eq $.Values.ibkrRuntime.mode "KUBERNETES")) }}
+      automountServiceAccountToken: {{ ternary true $.Values.global.serviceAccount.automountServiceAccountToken (and (eq $service.name "broker-service") (eq $.Values.ibkrRuntime.mode "KUBERNETES")) }}
+      securityContext:
+        {{- toYaml $.Values.global.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $.Values.global.terminationGracePeriodSeconds }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.global.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.global.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.global.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $.Values.global.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ $.Values.global.topologySpread.maxSkew }}
+          topologyKey: {{ $.Values.global.topologySpread.topologyKey | quote }}
+          whenUnsatisfiable: {{ $.Values.global.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 14 }}
+      {{- end }}
       containers:
-        - name: {{ .name }}
-          image: {{ include "aip.image" (dict "root" $ "image" .image "tag" .tag) }}
-          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+        - name: {{ $service.name }}
+          image: {{ include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) | quote }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy | quote }}
+          securityContext:
+            {{- toYaml $.Values.global.containerSecurityContext | nindent 12 }}
           env:
+            {{- include "aip.commonEnv" (dict "root" $ "serviceName" $service.name) | nindent 12 }}
             - name: SPRING_PROFILES_ACTIVE
-              value: {{ $.Values.global.environment | quote }}
+              value: {{ $.Values.global.springProfile | quote }}
             - name: SERVER_PORT
-              value: {{ .port | quote }}
-            {{- if eq .name "api-gateway" }}
+              value: {{ $config.port | quote }}
+            - name: JAVA_TOOL_OPTIONS
+              value: "-Djava.io.tmpdir=/tmp"
+            {{- if eq $service.name "api-gateway" }}
+            - name: GATEWAY_HTTP_CONNECT_TIMEOUT
+              value: {{ $.Values.apiGateway.http.connectTimeout | quote }}
+            - name: GATEWAY_HTTP_READ_TIMEOUT
+              value: {{ $.Values.apiGateway.http.readTimeout | quote }}
+            - name: AUTH_SERVICE_BASE_URL
+              value: {{ $.Values.serviceEndpoints.auth | quote }}
+            - name: PORTFOLIO_SERVICE_BASE_URL
+              value: {{ $.Values.serviceEndpoints.portfolio | quote }}
+            - name: BROKER_SERVICE_BASE_URL
+              value: {{ $.Values.serviceEndpoints.broker | quote }}
+            - name: IBKR_CONNECTOR_PROXY_BASE_URL
+              value: {{ $.Values.serviceEndpoints.ibkrConnector | quote }}
+            - name: COMPANY_SERVICE_BASE_URL
+              value: {{ $.Values.serviceEndpoints.company | quote }}
             - name: RESEARCH_ENGINE_BASE_URL
-              value: "http://research-engine"
+              value: {{ $.Values.serviceEndpoints.researchEngine | quote }}
+            - name: FRONTEND_BASE_URL
+              value: {{ $.Values.serviceEndpoints.frontend | quote }}
+            - name: AUTH_ISSUER
+              value: {{ $.Values.auth.issuer | quote }}
+            - name: AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.jwtSecretName is required" $.Values.auth.jwtSecretName | quote }}
+                  key: {{ $.Values.auth.jwtSecretKey | quote }}
+            - name: GATEWAY_CORS_ALLOWED_ORIGINS
+              value: {{ join "," $.Values.apiGateway.cors.allowedOrigins | quote }}
             {{- end }}
-            {{- if eq .name "broker-service" }}
+            {{- if eq $service.name "auth-service" }}
+            - name: AUTH_ISSUER
+              value: {{ $.Values.auth.issuer | quote }}
+            - name: AUTH_DEV_LOGIN_ENABLED
+              value: {{ $.Values.auth.devLoginEnabled | quote }}
+            - name: AUTH_TOKEN_TTL_SECONDS
+              value: {{ $.Values.auth.tokenTtlSeconds | quote }}
+            - name: AUTH_EMAIL_MODE
+              value: {{ $.Values.auth.email.mode | quote }}
+            - name: SMTP_HOST
+              value: {{ $.Values.auth.email.smtpHost | quote }}
+            - name: SMTP_PORT
+              value: {{ $.Values.auth.email.smtpPort | quote }}
+            - name: SMTP_FROM
+              value: {{ $.Values.auth.email.smtpFrom | quote }}
+            - name: APP_PUBLIC_URL
+              value: {{ $.Values.auth.email.publicUrl | quote }}
+            {{- if and (eq $.Values.auth.email.mode "SMTP") $.Values.auth.email.credentialSecretName }}
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.auth.email.credentialSecretName | quote }}
+                  key: {{ $.Values.auth.email.usernameSecretKey | quote }}
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.auth.email.credentialSecretName | quote }}
+                  key: {{ $.Values.auth.email.passwordSecretKey | quote }}
+            {{- end }}
+            - name: AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.jwtSecretName is required" $.Values.auth.jwtSecretName | quote }}
+                  key: {{ $.Values.auth.jwtSecretKey | quote }}
+            {{- end }}
+            {{- if $databaseClient }}
+            - name: DB_HOST
+              value: {{ $.Values.database.host | quote }}
+            - name: DB_PORT
+              value: {{ $.Values.database.port | quote }}
+            - name: DB_NAME
+              value: {{ $.Values.database.name | quote }}
+            - name: DB_USER
+              value: {{ $.Values.database.username | quote }}
+            - name: DB_SSL_MODE
+              value: {{ $.Values.database.sslMode | quote }}
+            - name: DB_CONNECT_TIMEOUT_SECONDS
+              value: {{ $.Values.database.connectTimeoutSeconds | quote }}
+            - name: DB_SOCKET_TIMEOUT_SECONDS
+              value: {{ $.Values.database.socketTimeoutSeconds | quote }}
+            - name: DB_POOL_MAXIMUM_SIZE
+              value: {{ $.Values.database.pool.maximumSize | quote }}
+            - name: DB_POOL_MINIMUM_IDLE
+              value: {{ $.Values.database.pool.minimumIdle | quote }}
+            - name: DB_POOL_CONNECTION_TIMEOUT_MS
+              value: {{ $.Values.database.pool.connectionTimeoutMs | quote }}
+            - name: DB_POOL_IDLE_TIMEOUT_MS
+              value: {{ $.Values.database.pool.idleTimeoutMs | quote }}
+            - name: DB_POOL_MAX_LIFETIME_MS
+              value: {{ $.Values.database.pool.maxLifetimeMs | quote }}
+            - name: SPRING_DATASOURCE_URL
+              value: {{ printf "jdbc:postgresql://%s:%v/%s?sslmode=%s&connectTimeout=%v&socketTimeout=%v" $.Values.database.host $.Values.database.port $.Values.database.name $.Values.database.sslMode $.Values.database.connectTimeoutSeconds $.Values.database.socketTimeoutSeconds | quote }}
+            - name: SPRING_DATASOURCE_USERNAME
+              value: {{ $.Values.database.username | quote }}
+            {{- if eq $.Values.database.authMode "password" }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "database.passwordSecretName is required for password auth" $.Values.database.passwordSecretName | quote }}
+                  key: {{ $.Values.database.passwordSecretKey | quote }}
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.database.passwordSecretName | quote }}
+                  key: {{ $.Values.database.passwordSecretKey | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $.Values.kafka.enabled }}
+            - name: AIP_KAFKA_BOOTSTRAP_SERVERS
+              value: {{ $.Values.kafka.bootstrapServers | quote }}
+            - name: AIP_KAFKA_SECURITY_PROTOCOL
+              value: {{ $.Values.kafka.securityProtocol | quote }}
+            - name: AIP_KAFKA_SASL_MECHANISM
+              value: {{ $.Values.kafka.saslMechanism | quote }}
+            - name: AIP_KAFKA_USERNAME
+              value: {{ $.Values.kafka.username | quote }}
+            - name: AIP_KAFKA_CONSUMER_GROUP_PREFIX
+              value: {{ $.Values.kafka.consumerGroupPrefix | quote }}
+            - name: AIP_KAFKA_CLIENT_DNS_LOOKUP
+              value: {{ $.Values.kafka.clientDnsLookup | quote }}
+            - name: AIP_KAFKA_REQUEST_TIMEOUT_MS
+              value: {{ $.Values.kafka.requestTimeoutMs | quote }}
+            - name: AIP_KAFKA_DELIVERY_TIMEOUT_MS
+              value: {{ $.Values.kafka.deliveryTimeoutMs | quote }}
+            - name: AIP_KAFKA_RETRIES
+              value: {{ $.Values.kafka.retries | quote }}
+            {{- if $.Values.kafka.credentialSecretName }}
+            - name: AIP_KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.kafka.credentialSecretName | quote }}
+                  key: {{ $.Values.kafka.passwordSecretKey | quote }}
+            {{- end }}
+            {{- if $.Values.kafka.sslTruststoreSecretName }}
+            - name: AIP_KAFKA_SSL_TRUSTSTORE_LOCATION
+              value: {{ printf "%s/%s" $.Values.kafka.sslTruststoreMountPath $.Values.kafka.sslTruststoreSecretKey | quote }}
+            - name: AIP_KAFKA_SSL_TRUSTSTORE_TYPE
+              value: {{ $.Values.kafka.sslTruststoreType | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if eq $service.name "broker-service" }}
             - name: IBKR_ENABLED
-              value: "false"
+              value: {{ $.Values.ibkr.enabled | quote }}
+            - name: IBKR_BASE_URL
+              value: {{ $.Values.ibkr.baseUrl | quote }}
+            - name: IBKR_OAUTH2_BASE_URL
+              value: {{ $.Values.ibkr.oauth2BaseUrl | quote }}
+            - name: IBKR_GATEWAY_BASE_URL
+              value: {{ $.Values.ibkr.gatewayBaseUrl | quote }}
+            - name: IBKR_CLIENT_ID
+              value: {{ $.Values.ibkr.clientId | quote }}
+            - name: IBKR_CLIENT_KEY_ID
+              value: {{ $.Values.ibkr.clientKeyId | quote }}
+            - name: IBKR_CALLBACK_URL
+              value: {{ $.Values.ibkr.callbackUrl | quote }}
+            - name: IBKR_AUTH_METHOD
+              value: {{ $.Values.ibkr.authMethod | quote }}
             - name: IBKR_OFFICIAL_DOCUMENTATION_VERIFIED
-              value: "false"
-            - name: ICICI_DIRECT_ENABLED
-              value: "false"
-            - name: ICICI_DIRECT_OFFICIAL_DOCUMENTATION_VERIFIED
-              value: "false"
+              value: {{ $.Values.ibkr.officialDocumentationVerified | quote }}
+            - name: IBKR_MARKET_DATA_ENABLED
+              value: {{ $.Values.ibkr.marketDataEnabled | quote }}
+            - name: IBKR_INSECURE_TLS
+              value: {{ $.Values.ibkr.insecureTls | quote }}
+            - name: IBKR_CONNECTOR_BASE_URL
+              value: {{ $.Values.ibkr.connectorBaseUrl | quote }}
+            - name: IBKR_CONNECTOR_RUNTIME_MODE
+              value: {{ $.Values.ibkr.connectorRuntimeMode | quote }}
+            - name: IBKR_CONNECTOR_LOGIN_URL
+              value: {{ $.Values.ibkr.connectorLoginUrl | quote }}
+            {{- if $.Values.ibkr.connectorInternalTokenSecretName }}
+            - name: IBKR_CONNECTOR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.ibkr.connectorInternalTokenSecretName | quote }}
+                  key: {{ $.Values.ibkr.connectorInternalTokenSecretKey | quote }}
+            {{- else }}
+            - name: IBKR_CONNECTOR_INTERNAL_TOKEN
+              value: {{ $.Values.ibkr.connectorInternalToken | quote }}
             {{- end }}
-            {{- if eq .name "portfolio-service" }}
+            - name: IBKR_CONNECTOR_IDLE_TIMEOUT_SECONDS
+              value: {{ $.Values.ibkr.connectorIdleTimeoutSeconds | quote }}
+            - name: IBKR_CONNECTOR_SESSION_TIMEOUT_SECONDS
+              value: {{ $.Values.ibkr.connectorSessionTimeoutSeconds | quote }}
+            - name: IBKR_PRIVATE_KEY_REFERENCE
+              value: {{ $.Values.ibkr.privateKeyReference | quote }}
+            - name: IBKR_SESSION_REFERENCE
+              value: {{ $.Values.ibkr.sessionReference | quote }}
+            - name: IBKR_RUNTIME_MODE
+              value: {{ $.Values.ibkrRuntime.mode | quote }}
+            - name: IBKR_RUNTIME_NAMESPACE
+              value: {{ default $.Release.Namespace $.Values.ibkrRuntime.namespace | quote }}
+            - name: IBKR_RUNTIME_IMAGE
+              value: {{ include "aip.image" (dict "root" $ "image" $.Values.ibkrRuntime.image.repository "tag" $.Values.ibkrRuntime.image.tag) | quote }}
+            - name: IBKR_RUNTIME_IMAGE_PULL_POLICY
+              value: {{ $.Values.ibkrRuntime.image.pullPolicy | quote }}
+            - name: IBKR_RUNTIME_SERVICE_ACCOUNT
+              value: {{ $.Values.ibkrRuntime.serviceAccount.name | quote }}
+            - name: IBKR_RUNTIME_PORT
+              value: {{ $.Values.ibkrConnector.port | quote }}
+            - name: IBKR_RUNTIME_STARTUP_TIMEOUT_SECONDS
+              value: {{ $.Values.ibkrRuntime.startupTimeoutSeconds | quote }}
+            - name: IBKR_RUNTIME_GATEWAY_PACKAGE_CLAIM_NAME
+              value: {{ $.Values.ibkrRuntime.gatewayPackage.claimName | quote }}
+            - name: IBKR_RUNTIME_GATEWAY_PACKAGE_MOUNT_PATH
+              value: {{ $.Values.ibkrRuntime.gatewayPackage.mountPath | quote }}
+            - name: IBKR_RUNTIME_GATEWAY_PACKAGE_READ_ONLY
+              value: {{ $.Values.ibkrRuntime.gatewayPackage.readOnly | quote }}
+            - name: IBKR_RUNTIME_WORKSPACE_MOUNT_PATH
+              value: {{ $.Values.ibkrRuntime.workspace.mountPath | quote }}
+            - name: IBKR_RUNTIME_WORKSPACE_MEDIUM
+              value: {{ $.Values.ibkrRuntime.workspace.medium | quote }}
+            - name: IBKR_RUNTIME_WORKSPACE_SIZE_LIMIT
+              value: {{ $.Values.ibkrRuntime.workspace.sizeLimit | quote }}
+            - name: IBKR_RUNTIME_INTERNAL_TOKEN_SECRET_NAME
+              value: {{ $.Values.ibkrRuntime.internalToken.secretName | quote }}
+            - name: IBKR_RUNTIME_INTERNAL_TOKEN_SECRET_KEY
+              value: {{ $.Values.ibkrRuntime.internalToken.secretKey | quote }}
+            - name: IBKR_RUNTIME_GATEWAY_BASE_URL
+              value: {{ $.Values.ibkrRuntime.gateway.baseUrl | quote }}
+            - name: IBKR_RUNTIME_GATEWAY_TLS_VERIFY
+              value: {{ $.Values.ibkrRuntime.gateway.tlsVerify | quote }}
+            - name: IBKR_RUNTIME_LOGIN_PUBLIC_BASE_URL
+              value: {{ $.Values.ibkrRuntime.gateway.loginPublicBaseUrl | quote }}
+            - name: IBKR_RUNTIME_SPEC_RUNTIME_IMAGE
+              value: {{ include "aip.image" (dict "root" $ "image" $.Values.ibkrRuntime.image.repository "tag" $.Values.ibkrRuntime.image.tag) | quote }}
+            - name: IBKR_RUNTIME_SPEC_INIT_IMAGE
+              value: {{ default (include "aip.image" (dict "root" $ "image" $.Values.ibkrRuntime.image.repository "tag" $.Values.ibkrRuntime.image.tag)) $.Values.ibkrRuntime.kubernetesSpec.initContainer.image | quote }}
+            - name: IBKR_RUNTIME_SPEC_GATEWAY_PACKAGE_CLAIM_NAME
+              value: {{ $.Values.ibkrRuntime.gatewayPackage.claimName | quote }}
+            - name: IBKR_RUNTIME_SPEC_INTERNAL_TOKEN_SECRET_NAME
+              value: {{ $.Values.ibkrRuntime.internalToken.secretName | quote }}
+            - name: IBKR_RUNTIME_SPEC_INTERNAL_TOKEN_SECRET_KEY
+              value: {{ $.Values.ibkrRuntime.internalToken.secretKey | quote }}
+            - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+              value: "optional:file:/etc/ai-investment/ibkr-runtime-spec/"
+            - name: ICICI_DIRECT_ENABLED
+              value: {{ $.Values.iciciDirect.enabled | quote }}
+            - name: ICICI_DIRECT_OFFICIAL_DOCUMENTATION_VERIFIED
+              value: {{ $.Values.iciciDirect.officialDocumentationVerified | quote }}
+            - name: ICICI_DIRECT_BASE_URL
+              value: {{ $.Values.iciciDirect.baseUrl | quote }}
+            - name: ICICI_DIRECT_LOGIN_URL
+              value: {{ $.Values.iciciDirect.loginUrl | quote }}
+            - name: ICICI_DIRECT_REDIRECT_URL
+              value: {{ $.Values.iciciDirect.redirectUrl | quote }}
+            - name: ICICI_DIRECT_AUTH_METHOD
+              value: {{ $.Values.iciciDirect.authMethod | quote }}
+            - name: ICICI_DIRECT_SECRET_KEY_REFERENCE
+              value: {{ $.Values.iciciDirect.secretKeyEnvironmentVariable | quote }}
+            {{- if $.Values.iciciDirect.enabled }}
+            - name: ICICI_DIRECT_APP_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "iciciDirect.credentialSecretName is required when ICICI Direct is enabled" $.Values.iciciDirect.credentialSecretName | quote }}
+                  key: {{ $.Values.iciciDirect.appKeySecretKey | quote }}
+            - name: {{ $.Values.iciciDirect.secretKeyEnvironmentVariable }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.iciciDirect.credentialSecretName | quote }}
+                  key: {{ $.Values.iciciDirect.secretKeySecretKey | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if eq $service.name "portfolio-service" }}
+            - name: BROKER_SERVICE_BASE_URL
+              value: {{ $.Values.serviceEndpoints.broker | quote }}
+            - name: RESEARCH_ENGINE_BASE_URL
+              value: {{ $.Values.serviceEndpoints.researchEngine | quote }}
             - name: MARKET_DATA_DEMO_MODE
-              value: {{ ternary "true" "false" (eq $.Values.global.environment "DEV") | quote }}
+              value: {{ $.Values.marketData.demoMode | quote }}
+            - name: MARKET_QUOTE_CACHE_MODE
+              value: {{ $.Values.marketData.quoteCacheMode | quote }}
+            - name: MARKET_QUOTE_CACHE_TTL
+              value: {{ $.Values.marketData.quoteCacheTtl | quote }}
+            - name: MARKET_NIFTY500_URL
+              value: {{ $.Values.marketData.nifty500Url | quote }}
+            {{- if $.Values.redis.url }}
+            - name: SPRING_DATA_REDIS_URL
+              value: {{ $.Values.redis.url | quote }}
+            {{- else }}
+            - name: REDIS_HOST
+              value: {{ $.Values.redis.host | quote }}
+            - name: REDIS_PORT
+              value: {{ $.Values.redis.port | quote }}
+            - name: SPRING_DATA_REDIS_HOST
+              value: {{ $.Values.redis.host | quote }}
+            - name: SPRING_DATA_REDIS_PORT
+              value: {{ $.Values.redis.port | quote }}
+            {{- end }}
+            - name: SPRING_DATA_REDIS_SSL_ENABLED
+              value: {{ $.Values.redis.tlsEnabled | quote }}
+            - name: SPRING_DATA_REDIS_CONNECT_TIMEOUT
+              value: {{ $.Values.redis.connectTimeout | quote }}
+            - name: SPRING_DATA_REDIS_TIMEOUT
+              value: {{ $.Values.redis.readTimeout | quote }}
+            - name: SPRING_DATA_REDIS_LETTUCE_POOL_MAX_ACTIVE
+              value: {{ $.Values.redis.pool.maxActive | quote }}
+            - name: SPRING_DATA_REDIS_LETTUCE_POOL_MAX_IDLE
+              value: {{ $.Values.redis.pool.maxIdle | quote }}
+            - name: SPRING_DATA_REDIS_LETTUCE_POOL_MIN_IDLE
+              value: {{ $.Values.redis.pool.minIdle | quote }}
+            - name: SPRING_DATA_REDIS_LETTUCE_POOL_MAX_WAIT
+              value: {{ $.Values.redis.pool.maxWait | quote }}
+            {{- if $.Values.redis.username }}
+            - name: SPRING_DATA_REDIS_USERNAME
+              value: {{ $.Values.redis.username | quote }}
+            {{- end }}
+            {{- if $.Values.redis.passwordSecretName }}
+            - name: SPRING_DATA_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.redis.passwordSecretName | quote }}
+                  key: {{ $.Values.redis.passwordSecretKey | quote }}
+            {{- end }}
             {{- end }}
           ports:
-            - containerPort: {{ .port }}
+            - name: http
+              containerPort: {{ $config.port }}
+          {{- if $config.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ $config.probes.startup.path }}
+              port: http
+            periodSeconds: {{ $config.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.startup.failureThreshold }}
+          {{- end }}
           readinessProbe:
             httpGet:
-              path: /actuator/health/readiness
-              port: {{ .port }}
+              path: {{ $config.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
-              path: /actuator/health/liveness
-              port: {{ .port }}
+              path: {{ $config.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ $config.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $config.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $config.probes.liveness.failureThreshold }}
           resources:
-            {{- toYaml (default $.Values.javaServiceDefaults.resources .resources) | nindent 12 }}
+            {{- toYaml $config.resources | nindent 12 }}
+          volumeMounts:
+            {{- if $.Values.global.temporaryStorage.enabled }}
+            - name: temporary-storage
+              mountPath: {{ $.Values.global.temporaryStorage.mountPath | quote }}
+            {{- end }}
+            {{- include "aip.keyVaultVolumeMount" (dict "root" $ "component" $service.name) | nindent 12 }}
+            {{- if and $.Values.kafka.enabled $.Values.kafka.sslTruststoreSecretName }}
+            - name: kafka-truststore
+              mountPath: {{ $.Values.kafka.sslTruststoreMountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if eq $service.name "broker-service" }}
+            - name: ibkr-runtime-spec
+              mountPath: /etc/ai-investment/ibkr-runtime-spec
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if $.Values.global.temporaryStorage.enabled }}
+        - name: temporary-storage
+          emptyDir:
+            {{- with $.Values.global.temporaryStorage.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- end }}
+        {{- end }}
+        {{- include "aip.keyVaultVolume" (dict "root" $ "component" $service.name) | nindent 8 }}
+        {{- if and $.Values.kafka.enabled $.Values.kafka.sslTruststoreSecretName }}
+        - name: kafka-truststore
+          secret:
+            secretName: {{ $.Values.kafka.sslTruststoreSecretName | quote }}
+            items:
+              - key: {{ $.Values.kafka.sslTruststoreSecretKey | quote }}
+                path: {{ $.Values.kafka.sslTruststoreSecretKey | quote }}
+        {{- end }}
+        {{- if eq $service.name "broker-service" }}
+        - name: ibkr-runtime-spec
+          configMap:
+            name: ibkr-runtime-spec
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .name }}
+  name: {{ $service.name }}
+  labels:
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
 spec:
+  type: {{ $config.service.type }}
   selector:
-    app.kubernetes.io/component: {{ .name }}
+    {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
   ports:
     - name: http
-      port: 80
-      targetPort: {{ .port }}
+      port: {{ $config.service.port }}
+      targetPort: http
 ---
-{{- end }}
+{{ if $config.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $service.name }}
+  labels:
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $service.name }}
+  minReplicas: {{ $config.autoscaling.minReplicas }}
+  maxReplicas: {{ $config.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $config.autoscaling.targetCPUUtilizationPercentage }}
+---
+{{ end }}
+{{ if $config.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $service.name }}
+  labels:
+    {{- include "aip.componentLabels" (dict "root" $ "component" $service.name) | nindent 4 }}
+spec:
+  minAvailable: {{ $config.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "aip.selectorLabels" (dict "root" $ "component" $service.name) | nindent 6 }}
+---
+{{ end }}
+{{ end }}

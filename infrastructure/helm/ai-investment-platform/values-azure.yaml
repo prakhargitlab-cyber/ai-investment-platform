@@ -1,0 +1,466 @@
+# Non-secret AKS example. Replace every REPLACE_WITH_* value during release
+# configuration; secret values belong in Key Vault and never in this file.
+global:
+  environment: AZURE
+  springProfile: AZURE
+  imageRegistry: REPLACE_WITH_ACR_NAME.azurecr.io
+  imageTag: REPLACE_WITH_GIT_SHA
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []
+  serviceAccount:
+    create: true
+    name: ai-investment-platform
+    annotations:
+      azure.workload.identity/client-id: REPLACE_WITH_WORKLOAD_IDENTITY_CLIENT_ID
+      azure.workload.identity/tenant-id: REPLACE_WITH_TENANT_ID
+    automountServiceAccountToken: false
+  azure:
+    workloadIdentity:
+      enabled: true
+      clientId: REPLACE_WITH_WORKLOAD_IDENTITY_CLIENT_ID
+      tenantId: REPLACE_WITH_TENANT_ID
+      workloads:
+        - api-gateway
+        - auth-service
+        - portfolio-service
+        - broker-service
+        - research-service
+        - research-engine
+        - mcp-gateway
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  topologySpread:
+    enabled: true
+    topologyKey: topology.kubernetes.io/zone
+    maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+  observability:
+    otel:
+      enabled: true
+      tracesEnabled: true
+      metricsEnabled: true
+      exporterOtlpEndpoint: https://REPLACE_WITH_OTEL_COLLECTOR:4317
+      exporterOtlpProtocol: grpc
+      resourceAttributes: cloud.provider=azure,cloud.platform=azure_aks
+      javaAgentInjection: false
+      pythonAgentInjection: false
+
+database:
+  host: REPLACE_WITH_POSTGRES_FQDN.postgres.database.azure.com
+  port: 5432
+  name: investment
+  username: REPLACE_WITH_POSTGRES_USER
+  authMode: password
+  passwordSecretName: aip-postgresql
+  passwordSecretKey: DB_PASSWORD
+  sslMode: verify-full
+  connectTimeoutSeconds: 10
+  socketTimeoutSeconds: 30
+  pool:
+    maximumSize: 6
+    minimumIdle: 1
+    connectionTimeoutMs: 10000
+    idleTimeoutMs: 300000
+    maxLifetimeMs: 1500000
+
+redis:
+  host: REPLACE_WITH_REDIS_FQDN
+  port: 6380
+  tlsEnabled: true
+  username: ""
+  passwordSecretName: aip-redis
+  passwordSecretKey: REDIS_PASSWORD
+  connectTimeout: 3s
+  readTimeout: 3s
+  pool:
+    maxActive: 8
+    maxIdle: 4
+    minIdle: 1
+    maxWait: 2s
+
+kafka:
+  enabled: false
+  bootstrapServers: REPLACE_WITH_KAFKA_BOOTSTRAP_HOST:9093
+  securityProtocol: SASL_SSL
+  saslMechanism: PLAIN
+  username: REPLACE_WITH_KAFKA_USERNAME
+  consumerGroupPrefix: REPLACE_WITH_ENVIRONMENT_CONSUMER_GROUP_PREFIX
+  credentialSecretName: aip-kafka
+  passwordSecretKey: KAFKA_PASSWORD
+  # Leave empty when the provider uses a public CA. Set a Secret name only for
+  # an approved private CA bundle; the bundle is mounted as a file.
+  sslTruststoreSecretName: ""
+  sslTruststoreSecretKey: KAFKA_TRUSTSTORE
+  sslTruststoreType: PEM
+  clientDnsLookup: use_all_dns_ips
+  requestTimeoutMs: 30000
+  deliveryTimeoutMs: 120000
+  retries: 5
+
+objectStorage:
+  enabled: false
+  provider: azure-blob
+  accountName: REPLACE_WITH_STORAGE_ACCOUNT_NAME
+  endpoint: https://REPLACE_WITH_STORAGE_ACCOUNT_NAME.blob.core.windows.net
+  container: REPLACE_WITH_CONTAINER_NAME
+  authMode: workloadIdentity
+  temporary:
+    enabled: false
+    ttlSeconds: 3600
+
+keyVault:
+  enabled: true
+  name: REPLACE_WITH_KEY_VAULT_NAME
+  tenantId: REPLACE_WITH_TENANT_ID
+  clientId: REPLACE_WITH_WORKLOAD_IDENTITY_CLIENT_ID
+  secretProviderClassName: aip-key-vault
+  mountPath: /mnt/secrets-store
+  objects:
+    - objectName: postgresql-password
+      objectType: secret
+      objectAlias: postgresql-password
+    - objectName: redis-password
+      objectType: secret
+      objectAlias: redis-password
+    - objectName: kafka-password
+      objectType: secret
+      objectAlias: kafka-password
+    - objectName: auth-jwt-signing-key
+      objectType: secret
+      objectAlias: auth-jwt-signing-key
+    - objectName: smtp-username
+      objectType: secret
+      objectAlias: smtp-username
+    - objectName: smtp-password
+      objectType: secret
+      objectAlias: smtp-password
+    - objectName: research-provider-api-key
+      objectType: secret
+      objectAlias: research-provider-api-key
+    - objectName: broker-internal-token
+      objectType: secret
+      objectAlias: broker-internal-token
+  secretObjects:
+    - secretName: aip-postgresql
+      type: Opaque
+      data:
+        - objectName: postgresql-password
+          key: DB_PASSWORD
+    - secretName: aip-redis
+      type: Opaque
+      data:
+        - objectName: redis-password
+          key: REDIS_PASSWORD
+    - secretName: aip-kafka
+      type: Opaque
+      data:
+        - objectName: kafka-password
+          key: KAFKA_PASSWORD
+    - secretName: aip-auth-jwt
+      type: Opaque
+      data:
+        - objectName: auth-jwt-signing-key
+          key: jwt-secret
+    - secretName: auth-smtp-credentials
+      type: Opaque
+      data:
+        - objectName: smtp-username
+          key: SMTP_USERNAME
+        - objectName: smtp-password
+          key: SMTP_PASSWORD
+    - secretName: research-provider-credentials
+      type: Opaque
+      data:
+        - objectName: research-provider-api-key
+          key: api-key
+    - secretName: broker-runtime-credentials
+      type: Opaque
+      data:
+        - objectName: broker-internal-token
+          key: AIP_INTERNAL_TOKEN
+
+devDependencies:
+  enabled: false
+  postgres:
+    persistence:
+      enabled: false
+      storageClass: ""
+
+apiGateway:
+  cors:
+    allowedOrigins:
+      - https://REPLACE_WITH_PUBLIC_HOST
+  ingress:
+    enabled: true
+    className: REPLACE_WITH_INGRESS_CLASS
+    annotations:
+      cert-manager.io/cluster-issuer: REPLACE_WITH_CLUSTER_ISSUER
+    host: REPLACE_WITH_PUBLIC_HOST
+    path: /
+    pathType: Prefix
+    tls:
+      - secretName: aip-public-tls
+        hosts:
+          - REPLACE_WITH_PUBLIC_HOST
+
+auth:
+  issuer: https://REPLACE_WITH_PUBLIC_HOST
+  devLoginEnabled: false
+  createDevSecret: false
+  devJwtSecret: ""
+  jwtSecretName: aip-auth-jwt
+  jwtSecretKey: jwt-secret
+  email:
+    mode: SMTP
+    smtpHost: REPLACE_WITH_SMTP_HOST
+    smtpPort: 587
+    smtpFrom: REPLACE_WITH_SMTP_FROM_ADDRESS
+    publicUrl: https://REPLACE_WITH_PUBLIC_HOST
+    credentialSecretName: auth-smtp-credentials
+
+research:
+  liveEnabled: false
+  demoEnabled: false
+  persistence:
+    enabled: true
+    databaseBackend: postgres
+    databaseSchema: research
+  distributedLock:
+    # Process-local coordination is the only implemented backend today.
+    # Keep research-engine single-replica until a distributed backend exists.
+    backend: process
+    acquireTimeoutSeconds: 30
+  mcpAcquisition:
+    # Enable only after approving an endpoint and exact executable capabilities.
+    enabled: false
+    gatewayBaseUrl: http://mcp-gateway
+    timeoutSeconds: 10
+    serviceIdentity: research-engine
+  providers:
+    eodhdCredentialSecretName: research-provider-credentials
+    eodhdApiKeySecretKey: api-key
+  search:
+    enabled: false
+    provider: disabled
+    endpoint: ""
+    apiKeySecretName: research-provider-credentials
+    apiKeySecretKey: api-key
+
+workloadOverrides:
+  api-gateway:
+    replicaCount: 2
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+  auth-service:
+    replicaCount: 2
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+  portfolio-service:
+    replicaCount: 1
+    rolloutStrategy:
+      type: Recreate
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 1
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      enabled: false
+      minAvailable: 1
+  broker-service:
+    replicaCount: 1
+    rolloutStrategy:
+      type: Recreate
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 1
+    pdb:
+      enabled: false
+      minAvailable: 1
+  research-service:
+    replicaCount: 1
+    rolloutStrategy:
+      type: Recreate
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 1
+    pdb:
+      enabled: false
+      minAvailable: 1
+  research-engine:
+    replicaCount: 1
+    rolloutStrategy:
+      type: Recreate
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 1
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      enabled: false
+      minAvailable: 1
+
+frontend:
+  replicaCount: 2
+  service:
+    type: ClusterIP
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  allowSameNamespace: true
+  ingressController:
+    enabled: true
+    namespace: REPLACE_WITH_INGRESS_NAMESPACE
+    podLabels: {}
+  # Kubernetes NetworkPolicy cannot express provider FQDN allowlists. Keep
+  # egress policy off until the chosen CNI/firewall design supplies them.
+  egress:
+    enabled: false
+    allowDns: true
+
+ibkr:
+  enabled: false
+  insecureTls: false
+  connectorRuntimeMode: LOCAL_AGENT
+  connectorInternalToken: ""
+  connectorInternalTokenSecretName: broker-runtime-credentials
+  connectorInternalTokenSecretKey: AIP_INTERNAL_TOKEN
+
+ibkrConnector:
+  enabled: false
+  productionApproved: false
+  gatewayTlsVerify: true
+  internalToken: ""
+  internalTokenSecretName: broker-runtime-credentials
+  internalTokenSecretKey: AIP_INTERNAL_TOKEN
+  packageVolumeClaim: ""
+
+ibkrRuntime:
+  mode: STATIC
+  image:
+    repository: ai-investment/ibkr-connector
+    tag: REPLACE_WITH_GIT_SHA
+  azure:
+    workloadIdentity:
+      enabled: true
+      clientId: REPLACE_WITH_WORKLOAD_IDENTITY_CLIENT_ID
+  gatewayPackage:
+    classification: DEV_ONLY
+    claimName: ""
+  internalToken:
+    secretName: broker-runtime-credentials
+    secretKey: AIP_INTERNAL_TOKEN
+
+mcpGateway:
+  implemented: true
+  enabled: true
+  exposure: INTERNAL_ONLY
+  image: ai-investment/mcp-gateway
+  tag: latest
+  replicaCount: 2
+  transport: streamable-http
+  serviceIdentity: mcp-gateway
+  authenticationType: WORKLOAD_IDENTITY
+  localUserId: ""
+  externalProvidersEnabled: false
+  externalCallerIdentities:
+    - research-engine
+  yahooFinance:
+    enabled: false
+    transport: streamable-http
+    endpoint: http://yahoo-finance-mcp/mcp
+    stdioCommand: ""
+    stdioArgs: []
+    authType: NONE
+    authHeaderName: Authorization
+    authSecretName: ""
+    authSecretKey: ""
+    stdioTokenEnvName: ""
+    capabilities: []
+    timeoutSeconds: 8
+    maxRetries: 1
+    retryBackoffSeconds: 0.2
+    maxConcurrency: 4
+  allowedHosts:
+    - mcp-gateway
+    - mcp-gateway:*
+  allowedOrigins: []
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: false
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: true
+    minAvailable: 1
+  networkPolicy:
+    enabled: true
+
+yahooFinanceMcp:
+  # Production enablement remains gated on Yahoo data-rights and egress review.
+  enabled: false
+  exposure: INTERNAL_ONLY
+  image: ai-investment/yahoo-finance-mcp
+  tag: latest
+  replicaCount: 2
+  transport: streamable-http
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: false
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: true
+    minAvailable: 1
+  networkPolicy:
+    enabled: true
+
+featureFlags:
+  mcpEnabled: true
+  llmEnabled: false
+  scheduledJobsEnabled: false
+  globalResearchAcquisitionEnabled: false
+
+marketData:
+  demoMode: false
+  quoteCacheMode: redis

@@ -42,11 +42,40 @@ module "key_vault" {
 }
 
 module "aks" {
-  source              = "../../modules/aks"
-  name                = "aks-${var.project_name}-prd"
+  source                  = "../../modules/aks"
+  name                    = "aks-${var.project_name}-prd"
+  resource_group_name     = module.resource_group.name
+  location                = module.resource_group.location
+  dns_prefix              = "ai-investment-prd"
+  subnet_id               = module.networking.aks_subnet_id
+  private_cluster_enabled = var.aks_private_cluster_enabled
+  local_account_disabled  = var.aks_local_account_disabled
+  tags                    = local.tags
+}
+
+resource "azurerm_role_assignment" "aks_acr_pull" {
+  scope                = module.acr.id
+  role_definition_name = "AcrPull"
+  principal_id         = module.aks.kubelet_identity_object_id
+}
+
+resource "azurerm_user_assigned_identity" "platform_workload" {
+  name                = "id-${var.project_name}-prd-workload"
   resource_group_name = module.resource_group.name
   location            = module.resource_group.location
-  dns_prefix          = "ai-investment-prd"
-  subnet_id           = module.networking.aks_subnet_id
   tags                = local.tags
+}
+
+resource "azurerm_federated_identity_credential" "platform_workload" {
+  name      = "fic-${var.project_name}-prd"
+  parent_id = azurerm_user_assigned_identity.platform_workload.id
+  issuer    = module.aks.oidc_issuer_url
+  audience  = ["api://AzureADTokenExchange"]
+  subject   = "system:serviceaccount:${var.workload_identity_namespace}:${var.workload_identity_service_account}"
+}
+
+resource "azurerm_role_assignment" "platform_key_vault_secrets" {
+  scope                = module.key_vault.id
+  role_definition_name = "Key Vault Secrets User"
+  principal_id         = azurerm_user_assigned_identity.platform_workload.principal_id
 }

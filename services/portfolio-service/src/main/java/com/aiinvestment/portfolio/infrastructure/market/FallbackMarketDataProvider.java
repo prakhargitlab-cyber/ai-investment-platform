@@ -50,7 +50,7 @@ public class FallbackMarketDataProvider implements MarketDataProvider {
     private java.util.Optional<Quote> safeGet(Instrument instrument, boolean stale) {
         try {
             java.util.Optional<Quote> quote = stale ? quoteCache.getStale(instrument.instrumentId()) : quoteCache.get(instrument.instrumentId());
-            return quote.filter(this::isAllowedInCurrentMode);
+            return quote.filter(this::isAllowedInCurrentMode).filter(FallbackMarketDataProvider::hasNoFabricatedZeroPrice);
         } catch (RuntimeException exception) {
             return java.util.Optional.empty();
         }
@@ -58,6 +58,10 @@ public class FallbackMarketDataProvider implements MarketDataProvider {
 
     private boolean isAllowedInCurrentMode(Quote quote) {
         return demoMode || quote.freshness() != MarketDataFreshness.MOCK;
+    }
+
+    private static boolean hasNoFabricatedZeroPrice(Quote quote) {
+        return quote.last() == null || quote.last().amount().signum() > 0;
     }
 
     private static Quote unavailableQuote(Instrument instrument) {

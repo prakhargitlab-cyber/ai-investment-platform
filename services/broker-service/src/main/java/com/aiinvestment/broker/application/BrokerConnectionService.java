@@ -1,4 +1,4 @@
-﻿package com.aiinvestment.broker.application;
+package com.aiinvestment.broker.application;
 
 import com.aiinvestment.broker.domain.BrokerConnection;
 import com.aiinvestment.broker.audit.BrokerOperationAuditor;
@@ -18,13 +18,18 @@ import com.aiinvestment.broker.persistence.*;
 import com.aiinvestment.broker.partner.PartnerAuthProvider;
 import com.aiinvestment.broker.resilience.ProviderCircuitBreaker;
 import com.aiinvestment.broker.resilience.ProviderRateLimiter;
+import com.aiinvestment.broker.runtime.IBKRRuntimeLifecycleException;
+import com.aiinvestment.broker.runtime.IBKRRuntimeLifecycleService;
+import com.aiinvestment.broker.runtime.IBKRRuntimeProperties;
 import com.aiinvestment.shared.domain.broker.*;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
@@ -34,6 +39,7 @@ import java.util.stream.Collectors;
 @Service
 public class BrokerConnectionService {
     private static final Logger logger = LoggerFactory.getLogger(BrokerConnectionService.class);
+    private static final Duration IBKR_CONNECTOR_STARTUP_POLL_INTERVAL = Duration.ofMillis(250);
     private final BrokerConnectionRepository repository;
     private final List<BrokerProvider> providers;
     private final ProviderRateLimiter rateLimiter;
@@ -44,7 +50,10 @@ public class BrokerConnectionService {
     private final IBKRProviderProperties ibkrProperties;
     private final List<PartnerAuthProvider> partnerAuthProviders;
     private final CanonicalBrokerConnectionResolver canonicalConnectionResolver;
+    private final IBKRRuntimeLifecycleService ibkrRuntimeLifecycleService;
+    private final IBKRRuntimeProperties ibkrRuntimeProperties;
 
+    @Autowired
     public BrokerConnectionService(BrokerConnectionRepository repository, List<BrokerProvider> providers,
                                    ProviderRateLimiter rateLimiter, ProviderCircuitBreaker circuitBreaker,
                                    BrokerOperationAuditor auditor,
@@ -52,7 +61,9 @@ public class BrokerConnectionService {
                                    List<BrokerConnector> connectors,
                                    IBKRProviderProperties ibkrProperties,
                                    List<PartnerAuthProvider> partnerAuthProviders,
-                                   CanonicalBrokerConnectionResolver canonicalConnectionResolver) {
+                                   CanonicalBrokerConnectionResolver canonicalConnectionResolver,
+                                   IBKRRuntimeLifecycleService ibkrRuntimeLifecycleService,
+                                   IBKRRuntimeProperties ibkrRuntimeProperties) {
         this.repository = repository;
         this.providers = providers;
         this.rateLimiter = rateLimiter;
@@ -63,6 +74,34 @@ public class BrokerConnectionService {
         this.ibkrProperties = ibkrProperties;
         this.partnerAuthProviders = partnerAuthProviders;
         this.canonicalConnectionResolver = canonicalConnectionResolver;
+        this.ibkrRuntimeLifecycleService = ibkrRuntimeLifecycleService;
+        this.ibkrRuntimeProperties = ibkrRuntimeProperties;
+    }
+
+    public BrokerConnectionService(BrokerConnectionRepository repository, List<BrokerProvider> providers,
+                                   ProviderRateLimiter rateLimiter, ProviderCircuitBreaker circuitBreaker,
+                                   BrokerOperationAuditor auditor,
+                                   BrokerConnectorInstanceRepository connectorRepository,
+                                   List<BrokerConnector> connectors,
+                                   IBKRProviderProperties ibkrProperties,
+                                   List<PartnerAuthProvider> partnerAuthProviders,
+                                   CanonicalBrokerConnectionResolver canonicalConnectionResolver,
+                                   IBKRRuntimeLifecycleService ibkrRuntimeLifecycleService) {
+        this(repository, providers, rateLimiter, circuitBreaker, auditor, connectorRepository, connectors,
+                ibkrProperties, partnerAuthProviders, canonicalConnectionResolver, ibkrRuntimeLifecycleService, null);
+    }
+
+    // Retained for focused unit tests and non-Spring callers that exercise only LOCAL_AGENT behavior.
+    public BrokerConnectionService(BrokerConnectionRepository repository, List<BrokerProvider> providers,
+                                   ProviderRateLimiter rateLimiter, ProviderCircuitBreaker circuitBreaker,
+                                   BrokerOperationAuditor auditor,
+                                   BrokerConnectorInstanceRepository connectorRepository,
+                                   List<BrokerConnector> connectors,
+                                   IBKRProviderProperties ibkrProperties,
+                                   List<PartnerAuthProvider> partnerAuthProviders,
+                                   CanonicalBrokerConnectionResolver canonicalConnectionResolver) {
+        this(repository, providers, rateLimiter, circuitBreaker, auditor, connectorRepository, connectors,
+                ibkrProperties, partnerAuthProviders, canonicalConnectionResolver, null, null);
     }
 
     @Transactional(readOnly = true)
@@ -162,10 +201,13 @@ public class BrokerConnectionService {
             var status = connectorFor(BrokerType.IBKR).status(userId, connectorEntity.getConnectorId());
             updateConnectorStatus(connectorEntity, status.runtimeStatus(), status.authStatus());
             reconcileIbkrConnectionStatus(entity, status);
-            logger.info("ibkr_auth_status_reconciliation connection={} runtimeState={} authenticated={} "
-                            + "brokerStateBefore={} brokerStateAfter={}",
-                    entity.getConnectionId(), status.runtimeStatus(), status.authenticated(),
-                    brokerStateBefore, entity.getStatus());
+            logger.info("ibkr_auth_status_reconciliation connection={} connector={} runtimeExists={} "
+                            + "runtimeState={} liveAuthState={} authenticated={} authenticatedAt={} "
+                            + "persistedConnectorAuthState={} brokerStateBefore={} brokerStateAfter={}",
+                    entity.getConnectionId(), connectorEntity.getConnectorId(),
+                    status.runtimeStatus() != BrokerConnectorState.NOT_CONFIGURED,
+                    status.runtimeStatus(), status.authStatus(), status.authenticated(), status.authenticatedAt(),
+                    connectorEntity.getAuthStatus(), brokerStateBefore, entity.getStatus());
         } else if (entity.getBrokerType() == BrokerType.ICICI_DIRECT || entity.getBrokerType() == BrokerType.HDFC_SECURITIES) {
             reconcileProviderStatus(entity, providerFor(entity.getBrokerType())
                     .connectionStatus(userId, connectionId));
@@ -181,26 +223,46 @@ public class BrokerConnectionService {
         if (entity.getBrokerType() == BrokerType.IBKR) {
             BrokerConnectorInstanceEntity connectorEntity = requireConnector(userId, entity);
             BrokerConnector connector = connectorFor(BrokerType.IBKR);
+            boolean allocatedRuntime = false;
             try {
+                ConnectorRuntimeMode runtimeMode = currentIbkrRuntimeMode();
+                boolean existingRuntimeReady = !requiresKubernetesRuntimeAllocation(connectorEntity, runtimeMode)
+                        && hasReadyKubernetesRuntime(connectorEntity.getConnectorId(), userId, runtimeMode);
+                if (!existingRuntimeReady) {
+                    allocateIbkrRuntime(connectorEntity.getConnectorId(), userId);
+                    allocatedRuntime = true;
+                }
                 // This endpoint represents an explicit Connect/Re-authenticate action. Unlike ordinary status reads,
                 // start() idempotently ensures that an ephemeral runtime exists for the persisted connector ID.
                 var connectorStatus = connector.status(userId, connectorEntity.getConnectorId());
-                
+
+                // A Gateway that has completed authentication once cannot be reused for a later interactive
+                // re-authentication.  Replace it only for this explicit user action, after a ready runtime reports
+                // AUTHENTICATION_REQUIRED, so ordinary status polling and an in-progress first MFA remain untouched.
+                if (requiresFreshIbkrRuntimeForAuthentication(entity, connectorEntity, connectorStatus,
+                        runtimeMode, existingRuntimeReady)) {
+                    ibkrRuntimeLifecycleService.stop(connectorEntity.getConnectorId(), userId);
+                    allocateIbkrRuntime(connectorEntity.getConnectorId(), userId);
+                    allocatedRuntime = true;
+                    connectorStatus = startIbkrConnector(connector, userId, connectorEntity.getConnectorId());
+                }
+
                 // Only start the connector if it's not configured or in error state.
                 // If already running, preserve the existing session to avoid regenerating login URLs mid-MFA.
                 if (connectorStatus.runtimeStatus() == BrokerConnectorState.NOT_CONFIGURED 
                         || connectorStatus.runtimeStatus() == BrokerConnectorState.ERROR) {
-                    connector.start(userId, connectorEntity.getConnectorId());
+                    startIbkrConnector(connector, userId, connectorEntity.getConnectorId());
                     connectorStatus = connector.status(userId, connectorEntity.getConnectorId());
                 }
                 updateConnectorStatus(connectorEntity, connectorStatus.runtimeStatus(), connectorStatus.authStatus());
                 reconcileIbkrConnectionStatus(entity, connectorStatus);
                 String url = null;
                 if (!connectorStatus.authenticated()) {
-                    url = connectorStatus.loginUrl();
-                    if (url == null || url.isBlank()) {
-                        url = connector.loginUrl(userId, connectorEntity.getConnectorId());
-                    }
+                    // This explicit user action is the only place allowed to obtain a login URL. The connector's
+                    // login operation renews an expired Gateway runtime (while leaving an in-progress MFA runtime
+                    // alone) and returns the URL for that exact persisted connector ID. Status polling must never
+                    // reuse a stale URL as a substitute for beginning the requested authentication attempt.
+                    url = connector.loginUrl(userId, connectorEntity.getConnectorId());
                     if (url == null || url.isBlank()) {
                         throw BrokerProviderException.unavailable();
                     }
@@ -211,6 +273,9 @@ public class BrokerConnectionService {
                         connectorStatus.authenticated() ? "NONE" : "REDIRECT_REQUIRED", url,
                         connectorStatus.authenticated() ? "Broker connection is ready" : "Complete authentication with Interactive Brokers");
             } catch (RuntimeException exception) {
+                if (allocatedRuntime) {
+                    stopAllocatedIbkrRuntime(connectorEntity.getConnectorId(), userId);
+                }
                 connectorEntity.setRuntimeStatus(BrokerConnectorState.ERROR);
                 connectorEntity.setUpdatedAt(Instant.now());
                 entity.setStatus(BrokerConnectionState.ERROR);
@@ -498,8 +563,20 @@ public class BrokerConnectionService {
     public void disconnect(UUID userId, UUID connectionId) {
         BrokerConnectionEntity entity = repository.findByConnectionIdAndUserId(connectionId, userId)
                 .orElseThrow(() -> new BrokerConnectionNotFoundException(connectionId));
+        if (entity.getBrokerType() == BrokerType.IBKR && entity.getConnectorId() != null
+                && ibkrRuntimeLifecycleService != null && currentIbkrRuntimeMode() == ConnectorRuntimeMode.KUBERNETES) {
+            BrokerConnectorInstanceEntity connectorEntity = requireConnector(userId, entity);
+            // An IBKR runtime represents an active connection.  Removing it on
+            // disconnect guarantees that a later Connect starts a fresh Gateway.
+            ibkrRuntimeLifecycleService.stop(connectorEntity.getConnectorId(), userId);
+            connectorEntity.setRuntimeStatus(BrokerConnectorState.STOPPED);
+            connectorEntity.setAuthStatus(BrokerConnectorState.STOPPED);
+            connectorEntity.setLoginUrl(null);
+        }
         providerFor(entity.getBrokerType()).disconnect(userId, connectionId);
         entity.setStatus(BrokerConnectionState.DISCONNECTED);
+        entity.setProviderStatus(BrokerProviderStatus.UNAVAILABLE.name());
+        entity.setLastErrorCode(null);
         entity.setUpdatedAt(Instant.now());
     }
 
@@ -572,10 +649,111 @@ public class BrokerConnectionService {
                 BrokerConnectorState.AUTHENTICATION_REQUIRED, null,
                 ibkrProperties.connectorIdleTimeoutSeconds(), ibkrProperties.connectorSessionTimeoutSeconds(), now, now);
         BrokerConnectorInstanceEntity saved = connectorRepository.save(entity);
-        var status = connector.start(userId, connectorId);
+        boolean dedicatedKubernetesRuntime = runtimeMode == ConnectorRuntimeMode.KUBERNETES;
+        if (dedicatedKubernetesRuntime) {
+            allocateIbkrRuntime(connectorId, userId);
+        }
+        com.aiinvestment.broker.connector.BrokerConnectorStatus status;
+        try {
+            status = startIbkrConnector(connector, userId, connectorId);
+        } catch (RuntimeException startFailure) {
+            if (dedicatedKubernetesRuntime) {
+                stopAllocatedIbkrRuntime(connectorId, userId);
+            }
+            throw startFailure;
+        }
         updateConnectorStatus(saved, status.runtimeStatus(), status.authStatus());
         saved.setLoginUrl(status.loginUrl());
         return saved;
+    }
+
+    private void allocateIbkrRuntime(UUID connectorId, UUID userId) {
+        if (ibkrRuntimeLifecycleService == null) {
+            throw BrokerProviderException.unavailable();
+        }
+        try {
+            ibkrRuntimeLifecycleService.allocate(connectorId, userId);
+        } catch (IBKRRuntimeLifecycleException exception) {
+            throw new BrokerProviderException("IBKR_RUNTIME_ALLOCATION_FAILED", org.springframework.http.HttpStatus.BAD_GATEWAY,
+                    "Interactive Brokers runtime is temporarily unavailable.");
+        }
+    }
+
+    /**
+     * Kubernetes resource readiness precedes the connector HTTP server becoming reachable.  Keep this
+     * initialization retry within the same configured runtime startup budget used by allocation.
+     */
+    private com.aiinvestment.broker.connector.BrokerConnectorStatus startIbkrConnector(BrokerConnector connector,
+                                                                                          UUID userId, UUID connectorId) {
+        if (currentIbkrRuntimeMode() != ConnectorRuntimeMode.KUBERNETES || ibkrRuntimeProperties == null) {
+            return connector.start(userId, connectorId);
+        }
+        Instant deadline = Instant.now().plusSeconds(Math.max(0, ibkrRuntimeProperties.startupTimeoutSeconds()));
+        int attempts = 0;
+        while (true) {
+            try {
+                return connector.start(userId, connectorId);
+            } catch (BrokerProviderException exception) {
+                if (!"IBKR_CONNECTOR_STARTING".equals(exception.code()) || !Instant.now().isBefore(deadline)) {
+                    throw exception;
+                }
+                attempts++;
+                logger.info("ibkr_connector_startup_wait connector={} attempts={}", connectorId, attempts);
+                try {
+                    Thread.sleep(IBKR_CONNECTOR_STARTUP_POLL_INTERVAL.toMillis());
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw BrokerProviderException.unavailable();
+                }
+            }
+        }
+    }
+
+    private void stopAllocatedIbkrRuntime(UUID connectorId, UUID userId) {
+        try {
+            ibkrRuntimeLifecycleService.stop(connectorId, userId);
+        } catch (RuntimeException cleanupFailure) {
+            logger.warn("ibkr_runtime_start_cleanup_failed connector={}", connectorId);
+        }
+    }
+
+    private ConnectorRuntimeMode currentIbkrRuntimeMode() {
+        return ibkrRuntimeProperties != null && ibkrRuntimeProperties.kubernetes()
+                ? ConnectorRuntimeMode.KUBERNETES : ConnectorRuntimeMode.LOCAL_AGENT;
+    }
+
+    private static boolean requiresKubernetesRuntimeAllocation(BrokerConnectorInstanceEntity connector,
+                                                               ConnectorRuntimeMode configuredRuntimeMode) {
+        return configuredRuntimeMode == ConnectorRuntimeMode.KUBERNETES
+                && (isBlank(connector.getRuntimeEndpoint())
+                || isBlank(connector.getRuntimeIdentity())
+                || !"KUBERNETES".equals(connector.getRuntimeProvider())
+                || connector.getRuntimeCreatedAt() == null
+                || connector.getRuntimeStoppedAt() != null);
+    }
+
+    private boolean hasReadyKubernetesRuntime(UUID connectorId, UUID userId, ConnectorRuntimeMode configuredRuntimeMode) {
+        if (configuredRuntimeMode != ConnectorRuntimeMode.KUBERNETES) {
+            return true;
+        }
+        return ibkrRuntimeLifecycleService != null
+                && ibkrRuntimeLifecycleService.isReady(connectorId, userId);
+    }
+
+    private static boolean requiresFreshIbkrRuntimeForAuthentication(BrokerConnectionEntity connection,
+                                                                      BrokerConnectorInstanceEntity connector,
+                                                                      com.aiinvestment.broker.connector.BrokerConnectorStatus status,
+                                                                      ConnectorRuntimeMode runtimeMode,
+                                                                      boolean existingRuntimeReady) {
+        boolean previouslyAuthenticated = connection.getConnectedAt() != null || connector.getLastAuthenticatedAt() != null;
+        return runtimeMode == ConnectorRuntimeMode.KUBERNETES
+                && existingRuntimeReady
+                && previouslyAuthenticated
+                && status.authStatus() == BrokerConnectorState.AUTHENTICATION_REQUIRED;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     private BrokerConnectorInstanceEntity requireConnector(UUID userId, BrokerConnectionEntity connection) {

@@ -2,14 +2,29 @@ broker:
   ibkr:
     enabled: ${IBKR_ENABLED:false}
     base-url: ${IBKR_BASE_URL:}
+    oauth2-base-url: ${IBKR_OAUTH2_BASE_URL:}
+    gateway-base-url: ${IBKR_GATEWAY_BASE_URL:}
     client-id: ${IBKR_CLIENT_ID:}
+    client-key-id: ${IBKR_CLIENT_KEY_ID:}
     callback-url: ${IBKR_CALLBACK_URL:}
     auth-method: ${IBKR_AUTH_METHOD:}
     official-documentation-verified: ${IBKR_OFFICIAL_DOCUMENTATION_VERIFIED:false}
+    market-data-enabled: ${IBKR_MARKET_DATA_ENABLED:false}
+    insecure-tls: ${IBKR_INSECURE_TLS:false}
+    connector-base-url: ${IBKR_CONNECTOR_BASE_URL:}
+    connector-runtime-mode: ${IBKR_CONNECTOR_RUNTIME_MODE:LOCAL_AGENT}
+    connector-login-url: ${IBKR_CONNECTOR_LOGIN_URL:}
+    connector-internal-token: ${IBKR_CONNECTOR_INTERNAL_TOKEN:}
+    connector-idle-timeout-seconds: ${IBKR_CONNECTOR_IDLE_TIMEOUT_SECONDS:1800}
+    connector-session-timeout-seconds: ${IBKR_CONNECTOR_SESSION_TIMEOUT_SECONDS:86400}
+    private-key-reference: ${IBKR_PRIVATE_KEY_REFERENCE:}
+    session-reference: ${IBKR_SESSION_REFERENCE:}
   icici-direct:
     enabled: ${ICICI_DIRECT_ENABLED:false}
     base-url: ${ICICI_DIRECT_BASE_URL:}
-    client-id: ${ICICI_DIRECT_CLIENT_ID:}
-    callback-url: ${ICICI_DIRECT_CALLBACK_URL:}
+    login-url: ${ICICI_DIRECT_LOGIN_URL:https://api.icicidirect.com/apiuser/login}
+    app-key: ${ICICI_DIRECT_APP_KEY:}
+    redirect-url: ${ICICI_DIRECT_REDIRECT_URL:}
     auth-method: ${ICICI_DIRECT_AUTH_METHOD:}
+    secret-key-reference: ${ICICI_DIRECT_SECRET_KEY_REFERENCE:}
     official-documentation-verified: ${ICICI_DIRECT_OFFICIAL_DOCUMENTATION_VERIFIED:false}

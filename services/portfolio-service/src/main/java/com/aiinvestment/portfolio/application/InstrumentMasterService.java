@@ -89,6 +89,11 @@ public class InstrumentMasterService {
     /** Canonicalize an exact official NSE identity; never uses a name-only match. */
     @Transactional
     public InstrumentMasterEntity canonicalizeOfficialNse(String isin, String symbol, String companyName) {
+        return canonicalizeOfficialNse(isin, symbol, companyName, "OFFICIAL_NSE_NIFTY500");
+    }
+
+    @Transactional
+    public InstrumentMasterEntity canonicalizeOfficialNse(String isin, String symbol, String companyName, String source) {
         String normalized = InstrumentMasterEntity.normalizeIsin(isin);
         if (normalized == null || symbol == null || symbol.isBlank()) throw new IllegalArgumentException("OFFICIAL_NSE_IDENTITY_REQUIRED");
         lockIdentity("ISIN:" + normalized);
@@ -100,7 +105,10 @@ public class InstrumentMasterService {
         InstrumentMasterEntity master = existing.orElseGet(() -> masters.saveAndFlush(new InstrumentMasterEntity(UUID.randomUUID(), normalized,
                 firstText(companyName, symbol), com.aiinvestment.shared.domain.AssetType.EQUITY, "INR", "IN", "NSE", symbol, "ACTIVE", Instant.now())));
         master.applyVerifiedPrimaryListing("NSE", symbol, companyName);
-        persistMapping(master.getInstrumentId(), "NSE", symbol, normalized, "NSE", "INR", "VERIFIED", "OFFICIAL_NSE_NIFTY500", new BigDecimal("0.99"));
+        var verified = reusableMapping(master.getInstrumentId(), "NSE");
+        if (verified.isPresent() && !same(verified.get().getProviderSymbol(), symbol))
+            throw new IllegalStateException("NSE_IDENTITY_MISMATCH");
+        if (verified.isEmpty()) persistMapping(master.getInstrumentId(), "NSE", symbol, normalized, "NSE", "INR", "VERIFIED", source, new BigDecimal("0.99"));
         return master;
     }
 

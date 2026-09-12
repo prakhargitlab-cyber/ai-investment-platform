@@ -170,7 +170,7 @@ class YahooFinanceProvider:
         if reason is not None:
             logger.info("yahoo_mapping_resolution globalInstrumentId=%s candidateSource=VERIFIED_NSE candidate=%s outcome=REJECTED reason=%s",
                         instrument.get("instrumentId"), candidate_symbol, reason)
-            raise StructuredProviderError("COMPANY_NOT_RESOLVED")
+            raise StructuredProviderError("COMPANY_NOT_RESOLVED:" + reason)
         logger.info("yahoo_mapping_resolution globalInstrumentId=%s candidateSource=VERIFIED_NSE candidate=%s outcome=VALIDATED reason=NONE",
                     instrument.get("instrumentId"), candidate_symbol)
         return StructuredInstrumentResolution(

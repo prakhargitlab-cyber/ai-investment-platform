@@ -192,7 +192,7 @@ public class PortfolioRouteController {
             addTrustedIdentity(headers, request);
         }
         ResponseEntity<String> response = restClient.method(HttpMethod.valueOf(request.getMethod()))
-                .uri(target)
+                .uri(java.net.URI.create(target))
                 .headers(outbound -> outbound.addAll(headers))
                 .body(body)
                 .exchange((clientRequest, clientResponse) -> {

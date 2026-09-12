@@ -87,3 +87,4 @@ smtp.password
 # Local runtime/debug artifacts
 kafka-deployment.txt
 services/running-broker-jar-inspect/
+/artifacts/

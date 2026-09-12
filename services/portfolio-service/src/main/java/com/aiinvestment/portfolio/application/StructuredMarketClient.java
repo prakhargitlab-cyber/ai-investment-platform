@@ -76,6 +76,14 @@ public class StructuredMarketClient {
 
     /** Resolve public structured identity directly from the global master, never a portfolio-local instrument. */
     public Snapshot fetchGlobal(UUID globalInstrumentId) {
+        return fetchGlobal(globalInstrumentId, false);
+    }
+
+    public Snapshot resolveGlobalIdentity(UUID globalInstrumentId) {
+        return fetchGlobal(globalInstrumentId, true);
+    }
+
+    private Snapshot fetchGlobal(UUID globalInstrumentId, boolean identityOnly) {
         var global = instrumentMaster.globalInstrument(globalInstrumentId)
                 .orElseThrow(() -> new IllegalArgumentException("GLOBAL_INSTRUMENT_NOT_FOUND"));
         var master = global.master();
@@ -108,13 +116,45 @@ public class StructuredMarketClient {
             payload.put("structuredProviderStatus", mapping.getStatus());
         });
         try {
+            if (identityOnly) return resolveAndPersistIdentity(globalInstrumentId, payload, master.getCurrency(), master.getPrimaryExchange());
             return requestAndPersist(globalInstrumentId, payload, master.getCurrency(), master.getPrimaryExchange());
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("STRUCTURED_PROVIDER_INTERRUPTED", exception);
         } catch (Exception exception) {
+            if (exception instanceof IdentityRejectedException rejected) throw rejected;
             throw new IllegalStateException("STRUCTURED_PROVIDER_UNAVAILABLE", exception);
         }
+    }
+
+    private Snapshot resolveAndPersistIdentity(UUID id, Map<String, Object> payload, String currency, String exchange) throws Exception {
+        String candidate = (String) payload.get("structuredNseCandidateTicker");
+        if (candidate == null) throw new IdentityRejectedException("NSE_MAPPING_MISSING");
+        String identityEndpoint = endpoint.replace("/api/v1/research/structured-market/snapshot", "/internal/v1/research/instruments/resolve-provider");
+        HttpRequest request = HttpRequest.newBuilder(URI.create(identityEndpoint)).timeout(Duration.ofSeconds(15))
+                .header("Content-Type", "application/json").header("X-AIP-Service-Identity", "portfolio-service")
+                .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload))).build();
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() == 422) throw new IdentityRejectedException(mapper.readTree(response.body()).path("detail").asText("IDENTITY_REJECTED"));
+        if (response.statusCode() != 200) throw new IllegalStateException("PROVIDER_TEMPORARILY_UNAVAILABLE");
+        JsonNode raw = mapper.readTree(response.body());
+        String ticker = text(raw, "provider_ticker", "providerTicker");
+        String returnedId = text(raw, "instrument_id", "instrumentId");
+        if (!id.toString().equals(returnedId) || !candidate.equalsIgnoreCase(ticker)
+                || !"VERIFIED_NSE_CANDIDATE".equals(raw.path("status").asText()))
+            throw new IdentityRejectedException("PROVIDER_IDENTITY_MISMATCH");
+        // Yahoo search may omit currency. An exact validated NSE listing retains its official INR currency.
+        Snapshot identity = new Snapshot(ticker, text(raw,"exchange","exchange"), text(raw,"currency","currency",currency),
+                text(raw,"quote_type","quoteType"), null, null, null, Instant.now(), "YAHOO_FROM_VERIFIED_NSE", "VERIFIED");
+        try { validateIdentity(currency, exchange, identity); }
+        catch (IllegalArgumentException error) { throw new IdentityRejectedException(error.getMessage()); }
+        instrumentMaster.saveResolvedMapping(id, "YAHOO_FINANCE", ticker, null, exchange, currency,
+                "VERIFIED", "YAHOO_FROM_VERIFIED_NSE", new BigDecimal("0.95"));
+        return identity;
+    }
+
+    public static class IdentityRejectedException extends RuntimeException {
+        public IdentityRejectedException(String reason) { super(reason); }
     }
 
     private Snapshot requestAndPersist(UUID masterId, Map<String, Object> payload, String expectedCurrency,

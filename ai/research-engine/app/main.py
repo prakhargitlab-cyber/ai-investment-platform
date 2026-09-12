@@ -895,6 +895,21 @@ async def structured_market_snapshot(instrument: dict = Body(...)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.post("/internal/v1/research/instruments/resolve-provider")
+async def resolve_provider_identity(instrument: dict = Body(...), x_aip_service_identity: str | None = Header(default=None)):
+    """Identity-only reconciliation. Never collects or persists research data."""
+    if x_aip_service_identity != "portfolio-service":
+        raise HTTPException(status_code=403, detail="INTERNAL_SERVICE_REQUIRED")
+    if (instrument.get("structuredNseCandidateSource") != "VERIFIED_NSE"
+            or not instrument.get("isin") or instrument.get("assetType") != "EQUITY"):
+        raise HTTPException(status_code=422, detail="VERIFIED_NSE_IDENTITY_REQUIRED")
+    try:
+        resolution = await portfolio_orchestrator.structured_provider.resolve_instrument(instrument)
+        return resolution.model_dump(mode="json")
+    except StructuredProviderError as exc:
+        raise HTTPException(status_code=503 if "UNAVAILABLE" in str(exc) else 422, detail=str(exc)) from exc
+
+
 def _require_profile(instrument_id: UUID) -> None:
     try:
         repository.profile(instrument_id)

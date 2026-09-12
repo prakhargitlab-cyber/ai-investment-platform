@@ -40,7 +40,7 @@ class GlobalInstrumentReconciliationServiceTest {
         service.reconcile(id);
 
         verify(nse).reconcile(id);
-        verify(structured).fetchGlobal(id);
+        verify(structured).resolveGlobalIdentity(id);
     }
 
     @Test
@@ -66,11 +66,11 @@ class GlobalInstrumentReconciliationServiceTest {
 
     @Test
     void structuredProviderFailureIsContainedForFutureRetry() {
-        doThrow(new IllegalStateException("STRUCTURED_PROVIDER_UNAVAILABLE")).when(structured).fetchGlobal(id);
+        doThrow(new IllegalStateException("STRUCTURED_PROVIDER_UNAVAILABLE")).when(structured).resolveGlobalIdentity(id);
 
         service.reconcile(id);
 
-        verify(structured).fetchGlobal(id);
+        verify(structured).resolveGlobalIdentity(id);
         verify(instruments, never()).saveResolvedMapping(any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 

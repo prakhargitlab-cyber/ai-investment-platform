@@ -16,4 +16,6 @@ springdoc:
   swagger-ui:
     enabled: false
 market:
+  identity-bootstrap:
+    enabled: false
   demo-mode: true

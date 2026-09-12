@@ -194,6 +194,22 @@ class PortfolioRouteControllerTest {
         server.start();
     }
 
+    @Test
+    void researchSearchPreservesEncodedCompanyNamesWithoutDoubleEncoding() throws Exception {
+        AtomicReference<String> query = new AtomicReference<>();
+        startServer(exchange -> {
+            query.set(exchange.getRequestURI().getRawQuery());
+            writeResponse(exchange, 200, "application/json", "[]".getBytes(StandardCharsets.UTF_8));
+        });
+        String local = "http://127.0.0.1:" + server.getAddress().getPort();
+        var controller = new PortfolioRouteController(local,local,local,local,local,local,local);
+        var request = new MockHttpServletRequest("GET", "/api/v1/research/instruments/search");
+        request.setQueryString("q=Alpha%20%26%20Beta&region=INDIA&limit=15");
+        addTrustedIdentity(request);
+        assertThat(controller.routeResearch(request).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(query.get()).isEqualTo(request.getQueryString());
+    }
+
     private PortfolioRouteController controllerForServer() {
         return new PortfolioRouteController(
                 "http://127.0.0.1:" + server.getAddress().getPort(),

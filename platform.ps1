@@ -320,7 +320,7 @@ function Ensure-DevSecrets {
 
         $defaultUser = $env:AIP_SMTP_USERNAME
         if (-not $defaultUser) { $defaultUser = "prakhar.unique@gmail.com" }
-        $enteredUser = Read-Host "SMTP username [$defaultUser]"
+        $enteredUser = if ($env:AIP_SMTP_USERNAME) { $env:AIP_SMTP_USERNAME } else { Read-Host "SMTP username [$defaultUser]" }
         if ([string]::IsNullOrWhiteSpace($enteredUser)) { $enteredUser = $defaultUser }
 
         $smtpPasswordPlain = $env:AIP_SMTP_PASSWORD

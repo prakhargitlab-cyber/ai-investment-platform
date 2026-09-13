@@ -49,7 +49,7 @@ class ResearchPersistence(Protocol):
     def load_documents(self) -> list[ResearchDocument]:
         ...
 
-    def load_events(self) -> list[ResearchEvent]:
+    def load_events(self, instrument_ids: set[UUID] | None = None) -> list[ResearchEvent]:
         ...
 
     def upsert_document(self, document: ResearchDocument) -> bool:
@@ -67,7 +67,7 @@ class ResearchPersistence(Protocol):
     def upsert_event(self, event: ResearchEvent) -> bool:
         ...
 
-    def load_shareholding_snapshots(self) -> list[ShareholdingSnapshot]:
+    def load_shareholding_snapshots(self, instrument_ids: set[UUID] | None = None) -> list[ShareholdingSnapshot]:
         ...
 
     def upsert_shareholding_snapshot(self, snapshot: ShareholdingSnapshot) -> bool:
@@ -99,7 +99,7 @@ class ResearchPersistence(Protocol):
     ) -> None:
         ...
 
-    def load_financial_facts(self) -> list[FinancialFact]: ...
+    def load_financial_facts(self, instrument_ids: set[UUID] | None = None) -> list[FinancialFact]: ...
     def upsert_financial_fact(self, fact: FinancialFact, *, allow_same_tier_correction: bool = False) -> bool: ...
     def load_structured_market_snapshots(self, instrument_ids: set[UUID] | None = None) -> list[StructuredMarketSnapshotRecord]: ...
     def upsert_structured_market_snapshot(self, record: StructuredMarketSnapshotRecord) -> None: ...
@@ -121,7 +121,7 @@ class DisabledResearchPersistence:
     def load_documents(self) -> list[ResearchDocument]:
         return []
 
-    def load_events(self) -> list[ResearchEvent]:
+    def load_events(self, instrument_ids: set[UUID] | None = None) -> list[ResearchEvent]:
         return []
 
     def upsert_document(self, document: ResearchDocument) -> bool:
@@ -130,7 +130,7 @@ class DisabledResearchPersistence:
     def upsert_event(self, event: ResearchEvent) -> bool:
         return True
 
-    def load_shareholding_snapshots(self) -> list[ShareholdingSnapshot]:
+    def load_shareholding_snapshots(self, instrument_ids: set[UUID] | None = None) -> list[ShareholdingSnapshot]:
         return []
 
     def upsert_shareholding_snapshot(self, snapshot: ShareholdingSnapshot) -> bool:
@@ -149,7 +149,7 @@ class DisabledResearchPersistence:
     def complete_refresh_run(self, run: RefreshRun, **kwargs) -> None:
         return None
 
-    def load_financial_facts(self): return []
+    def load_financial_facts(self, instrument_ids=None): return []
     def upsert_financial_fact(self, fact, **kwargs): return True
     def load_structured_market_snapshots(self, instrument_ids=None): return []
     def upsert_structured_market_snapshot(self, record): return None
@@ -186,8 +186,25 @@ class SqliteResearchPersistence:
         self._connection.executescript(_sqlite_schema())
         self._connection.commit()
 
-    def load_financial_facts(self) -> list[FinancialFact]:
-        return [_financial_fact_from_row(row) for row in self._connection.execute("SELECT * FROM global_financial_facts").fetchall()]
+    def _filtered_rows(self, table, ids, *, column="instrument_id", order=None):
+        """Internal identifiers only; values are parameterized in bounded batches."""
+        if ids is not None:
+            ordered = sorted({str(value) for value in ids})
+            rows = []
+            for offset in range(0, len(ordered), 500):
+                batch = ordered[offset:offset + 500]
+                sql = f"SELECT * FROM {table} WHERE {column} IN ({','.join('?' for _ in batch)})"
+                if order:
+                    sql += f" ORDER BY {order}"
+                rows.extend(self._connection.execute(sql, batch).fetchall())
+            return rows
+        sql = f"SELECT * FROM {table}"
+        if order:
+            sql += f" ORDER BY {order}"
+        return self._connection.execute(sql).fetchall()
+
+    def load_financial_facts(self, instrument_ids: set[UUID] | None = None) -> list[FinancialFact]:
+        return [_financial_fact_from_row(row) for row in self._filtered_rows("global_financial_facts", instrument_ids)]
 
     def upsert_financial_fact(self, fact: FinancialFact, *, allow_same_tier_correction: bool = False) -> bool:
         key = fact.key
@@ -258,6 +275,8 @@ class SqliteResearchPersistence:
         (str(key.instrument_id), key.metric, key.period_end or "", key.period_type, key.reporting_basis or "", str(fact.value.value), fact.value.unit, fact.source_provider, fact.source_identity, fact.value.source_url, fact.value.source_name, fact.value.source_type, _dt(fact.value.published_at), _dt(fact.value.retrieved_at), fact.value.confidence, str(fact.source_mode), int(fact.source_tier)))
 
     def load_structured_market_snapshots(self, instrument_ids: set[UUID] | None = None) -> list[StructuredMarketSnapshotRecord]:
+        if instrument_ids is not None and not instrument_ids:
+            return []
         params: list[str] = []
         sql = "SELECT * FROM global_structured_market_snapshots"
         if instrument_ids:
@@ -292,6 +311,8 @@ class SqliteResearchPersistence:
                     observation.currency, observation.provider, observation.source_url, _dt(observation.retrieved_at)))
 
     def load_market_price_observations(self, instrument_ids: set[UUID] | None = None) -> list[MarketPriceObservation]:
+        if instrument_ids is not None and not instrument_ids:
+            return []
         params: list[str] = []
         sql = "SELECT * FROM global_market_price_observations"
         if instrument_ids:
@@ -405,11 +426,11 @@ class SqliteResearchPersistence:
         rows = self._connection.execute("SELECT * FROM research_documents ORDER BY retrieved_at").fetchall()
         return [_document_from_row(row) for row in rows]
 
-    def load_events(self) -> list[ResearchEvent]:
-        rows = self._connection.execute("SELECT * FROM research_events ORDER BY detected_at").fetchall()
+    def load_events(self, instrument_ids: set[UUID] | None = None) -> list[ResearchEvent]:
+        rows = self._filtered_rows("research_events", instrument_ids, order="detected_at")
         events = [_event_from_row(row) for row in rows]
         sources_by_event: dict[UUID, list[ResearchEvidenceSource]] = {}
-        for row in self._connection.execute("SELECT * FROM research_event_sources ORDER BY created_at").fetchall():
+        for row in self._filtered_rows("research_event_sources", {row["event_id"] for row in rows}, column="event_id", order="created_at"):
             event_id = _parse_uuid(row["event_id"])
             if event_id is None:
                 continue
@@ -418,12 +439,10 @@ class SqliteResearchPersistence:
             event.supporting_sources = sources_by_event.get(event.event_id, [])
         return events
 
-    def load_shareholding_snapshots(self) -> list[ShareholdingSnapshot]:
-        rows = self._connection.execute(
-            "SELECT * FROM global_shareholding_snapshots ORDER BY period_end DESC, retrieved_at DESC"
-        ).fetchall()
+    def load_shareholding_snapshots(self, instrument_ids: set[UUID] | None = None) -> list[ShareholdingSnapshot]:
+        rows = self._filtered_rows("global_shareholding_snapshots", instrument_ids, order="period_end DESC, retrieved_at DESC")
         values_by_snapshot: dict[UUID, list[ShareholdingSnapshotValue]] = {}
-        for row in self._connection.execute("SELECT * FROM global_shareholding_snapshot_values ORDER BY created_at").fetchall():
+        for row in self._filtered_rows("global_shareholding_snapshot_values", {row["id"] for row in rows}, column="snapshot_id", order="created_at"):
             snapshot_id = _required_uuid(row["snapshot_id"], "global_shareholding_snapshot_values.snapshot_id")
             values_by_snapshot.setdefault(snapshot_id, []).append(ShareholdingSnapshotValue(
                 id=_required_uuid(row["id"], "global_shareholding_snapshot_values.id"), category=ShareholdingCategory(row["category"]),

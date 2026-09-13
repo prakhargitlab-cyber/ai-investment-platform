@@ -206,11 +206,11 @@ class ResearchRepository:
         return self.etf_profiles
 
     def financial_facts_for(self, instrument_id: UUID):
-        return [fact for fact in self._persistence.load_financial_facts() if fact.key.instrument_id == instrument_id]
+        return self._persistence.load_financial_facts({instrument_id})
 
     async def financial_facts_for_instruments(self, instrument_ids: set[UUID]) -> dict[UUID, list[FinancialFact]]:
         started = time.perf_counter()
-        facts = await self._run_blocking_persistence(self._persistence.load_financial_facts)
+        facts = await self._run_blocking_persistence(self._persistence.load_financial_facts, instrument_ids)
         grouped: dict[UUID, list[FinancialFact]] = {instrument_id: [] for instrument_id in instrument_ids}
         for fact in facts:
             if fact.key.instrument_id in grouped:

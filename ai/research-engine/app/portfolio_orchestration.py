@@ -82,24 +82,13 @@ class PortfolioResearchOrchestrator:
         identity_headers: dict[str, str | None] | None = None,
     ) -> list[dict]:
         """Read the portfolio-service owned active-equity universe; never mutate it."""
+        from app.global_scanner import CanonicalEquityUniverse
+
         try:
-            page, values, total = 0, [], None
-            headers = {key: value for key, value in (identity_headers or {}).items() if value}
-            if correlation_id:
-                headers["X-Correlation-Id"] = correlation_id
-            while total is None or len(values) < total:
-                response = await self._client.get(
-                    f"{self.settings.portfolio_service_base_url}/api/v1/instruments",
-                    params={"status": "ACTIVE", "assetType": "EQUITY", "page": page, "size": 500},
-                    headers=headers or None,
-                )
-                response.raise_for_status(); payload = response.json()
-                batch = payload.get("instruments", []) if isinstance(payload, dict) else []
-                values.extend(batch); total = payload.get("totalElements", len(values)) if isinstance(payload, dict) else len(values)
-                if not batch: break
-                page += 1
-            return values
-        except httpx.HTTPError as exc:
+            return await CanonicalEquityUniverse(self._client, self.settings.portfolio_service_base_url).active_global_equities(
+                correlation_id=correlation_id, identity_headers=identity_headers,
+            )
+        except (httpx.HTTPError, ValueError) as exc:
             raise PortfolioServiceUnavailableError("Portfolio service unavailable for instrument enumeration") from exc
 
     async def india_nifty500_universe(self, *, correlation_id: str | None = None, identity_headers: dict[str, str | None] | None = None) -> list[dict]:

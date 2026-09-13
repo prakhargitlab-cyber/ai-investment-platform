@@ -793,7 +793,8 @@ def test_direct_aligned_diluted_eps_outranks_malformed_fallback_when_basic_is_un
 
 class _FactRecorder:
     def __init__(self): self.facts = []
-    def load_financial_facts(self): return self.facts
+    def load_financial_facts(self, instrument_ids=None):
+        return [fact for fact in self.facts if instrument_ids is None or fact.key.instrument_id in instrument_ids]
     def upsert_financial_fact(self, fact, **_kwargs): self.facts.append(fact); return True
 
 
@@ -1069,11 +1070,15 @@ def test_reused_trusted_nse_document_reconciles_same_document_facts_without_fetc
 
     asyncio.run(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
     facts = repository.financial_facts_for(profile.instrument_id)
-    eps = next(fact for fact in facts if fact.key.metric == "eps")
+    # Filtered SQL may use a different index; assert the reconciled period,
+    # independently of database row order and comparative-period facts.
+    current = {fact.key.metric: fact for fact in facts
+               if fact.key.period_end == "2026-06-30" and fact.key.period_type == "QUARTERLY"}
+    eps = current["eps"]
     assert eps.value.value == Decimal("1.47")
     assert eps.value.unit == "INR per share"
-    assert next(fact for fact in facts if fact.key.metric == "revenue").value.value == Decimal("8261.11")
-    assert next(fact for fact in facts if fact.key.metric == "pat").value.value == Decimal("1927.21")
+    assert current["revenue"].value.value == Decimal("8261.11")
+    assert current["pat"].value.value == Decimal("1927.21")
     assert len(repository.events) == events_before
     assert len(repository.documents) == documents_before
 
@@ -1081,7 +1086,7 @@ def test_reused_trusted_nse_document_reconciles_same_document_facts_without_fetc
     assert len(repository.financial_facts_for(profile.instrument_id)) == len(facts)
     yahoo = FinancialFact(eps.key, ProvenancedValue(value=Decimal("9"), source_url="https://yahoo.test", source_name="Yahoo", source_type="YAHOO", retrieved_at=document.retrieved_at), FactSourceTier.YAHOO, "YAHOO_FINANCE", "yahoo", SourceMode.REAL)
     assert not repository._persistence.upsert_financial_fact(yahoo)
-    assert next(fact for fact in repository.financial_facts_for(profile.instrument_id) if fact.key.metric == "eps").value.value == Decimal("1.47")
+    assert next(fact for fact in repository.financial_facts_for(profile.instrument_id) if fact.key == eps.key).value.value == Decimal("1.47")
 
 
 def test_already_persisted_official_document_recovers_zero_facts_without_redownload() -> None:

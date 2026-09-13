@@ -44,6 +44,7 @@ class PostgresResearchPersistence(SqliteResearchPersistence):
             self._connection.execute("SELECT 1 FROM global_financial_facts LIMIT 0")
             self._connection.execute("SELECT 1 FROM global_structured_market_snapshots LIMIT 0")
             self._connection.execute("SELECT 1 FROM global_market_price_observations LIMIT 0")
+            self._connection.execute("SELECT 1 FROM global_daily_market_bars LIMIT 0")
             self._connection.execute("SELECT 1 FROM global_stock_rule_engine_results LIMIT 0")
             self._connection.execute("SELECT 1 FROM market_trading_schedules LIMIT 0")
             self._connection.execute("SELECT 1 FROM market_trading_calendar_exceptions LIMIT 0")

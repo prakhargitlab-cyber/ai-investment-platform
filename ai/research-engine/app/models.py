@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AnyHttpUrl, AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _to_camel(value: str) -> str:
@@ -305,6 +305,56 @@ class MarketPriceObservation(ResearchBaseModel):
     provider: str
     source_url: str
     retrieved_at: datetime
+
+
+class DailyMarketBar(ResearchBaseModel):
+    """Public provider/day OHLCV evidence, separate from close-only history.
+
+    Decimal bounds match PostgreSQL NUMERIC(38,12); extra precision is rejected,
+    never silently rounded. Turnover is stored as supplied, without unit conversion.
+    Provider symbol is provenance, not canonical identity. Optional metrics may
+    remain missing, including all prices when only volume evidence is supplied.
+    """
+    global_instrument_id: UUID
+    trading_date: date
+    open: Decimal | None = Field(default=None, gt=0, max_digits=38, decimal_places=12, allow_inf_nan=False)
+    high: Decimal | None = Field(default=None, gt=0, max_digits=38, decimal_places=12, allow_inf_nan=False)
+    low: Decimal | None = Field(default=None, gt=0, max_digits=38, decimal_places=12, allow_inf_nan=False)
+    close: Decimal | None = Field(default=None, gt=0, max_digits=38, decimal_places=12, allow_inf_nan=False)
+    previous_close: Decimal | None = Field(default=None, gt=0, max_digits=38, decimal_places=12, allow_inf_nan=False)
+    volume: int | None = Field(default=None, strict=True, ge=0, le=9223372036854775807)
+    turnover: Decimal | None = Field(default=None, ge=0, max_digits=38, decimal_places=12, allow_inf_nan=False)
+    currency: str = Field(min_length=1, max_length=16)
+    provider: str = Field(min_length=1, max_length=120)
+    provider_symbol: str | None = Field(default=None, max_length=240)
+    source_mode: SourceMode
+    source_url: str = Field(min_length=1, max_length=1000)
+    retrieved_at: AwareDatetime
+
+    @field_validator("currency", "provider", "source_url", mode="before")
+    @classmethod
+    def strip_bar_metadata(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("trading_date", mode="before")
+    @classmethod
+    def require_bar_date(cls, value):
+        if type(value) is date:
+            return value
+        if isinstance(value, str) and len(value) == 10:
+            return date.fromisoformat(value)
+        raise ValueError("tradingDate must be a DATE, not a timestamp")
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def normalize_bar_retrieved_at(cls, value):
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def validate_bar_range(self):
+        if self.high is not None and self.low is not None and self.high < self.low:
+            raise ValueError("daily bar high must be >= low")
+        return self
 
 
 class PublicAnalyst(ResearchBaseModel):

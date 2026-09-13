@@ -1,6 +1,7 @@
 package com.aiinvestment.research;
 
 import org.junit.jupiter.api.Test;
+import org.flywaydb.core.Flyway;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -9,6 +10,7 @@ import org.springframework.test.context.ActiveProfiles;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest
 @ActiveProfiles("test")
@@ -40,6 +42,7 @@ class ResearchFlywayMigrationTest {
                 "global_financial_facts",
                 "global_structured_market_snapshots",
                 "global_market_price_observations",
+                "global_daily_market_bars",
                 "global_stock_rule_engine_results",
                 "market_trading_schedules",
                 "market_trading_calendar_exceptions"
@@ -91,7 +94,7 @@ class ResearchFlywayMigrationTest {
                 """,
                 String.class
         );
-        assertThat(version).isEqualTo("10");
+        assertThat(version).isEqualTo("11");
 
         Integer nseSessions = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM research.market_trading_schedules WHERE market_code = 'NSE'", Integer.class
@@ -106,6 +109,62 @@ class ResearchFlywayMigrationTest {
                 "SELECT count(*) FROM research.market_trading_calendar_exceptions", Integer.class
         );
         assertThat(exceptions).isZero();
+    }
+
+    @Test
+    void dailyBarBootstrapCreatesKeysIndexesDateTypesAndConstraints() throws Exception {
+        try (var connection = jdbcTemplate.getDataSource().getConnection()) {
+            var keys = new java.util.TreeMap<Short, String>();
+            try (var rows = connection.getMetaData().getPrimaryKeys(null, "research", "global_daily_market_bars")) {
+                while (rows.next()) keys.put(rows.getShort("KEY_SEQ"), rows.getString("COLUMN_NAME"));
+            }
+            assertThat(keys.values()).containsExactly("global_instrument_id", "trading_date", "provider");
+            var indexes = new java.util.HashSet<String>();
+            try (var rows = connection.getMetaData().getIndexInfo(null, "research", "global_daily_market_bars", false, false)) {
+                while (rows.next()) indexes.add(rows.getString("INDEX_NAME"));
+            }
+            assertThat(indexes).contains("idx_daily_market_bars_date_instrument");
+            try (var rows = connection.getMetaData().getColumns(null, "research", "global_daily_market_bars", "trading_date")) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt("DATA_TYPE")).isEqualTo(java.sql.Types.DATE);
+            }
+        }
+        String insert = """
+            INSERT INTO research.global_daily_market_bars
+                (global_instrument_id,trading_date,provider,currency,source_mode,source_url,retrieved_at,high_price,low_price,volume)
+            VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',DATE '2026-09-01','TEST','INR','REAL','https://example.test',CURRENT_TIMESTAMP,?,?,?)
+            """;
+        assertThatThrownBy(() -> jdbcTemplate.update(insert, 10, 20, 1)).isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThatThrownBy(() -> jdbcTemplate.update(insert, 20, 10, -1)).isInstanceOf(org.springframework.dao.DataAccessException.class);
+        jdbcTemplate.update(insert, 20, 10, 0);
+        assertThatThrownBy(() -> jdbcTemplate.update(insert, 20, 10, 0)).isInstanceOf(org.springframework.dao.DataAccessException.class);
+        jdbcTemplate.update("DELETE FROM research.global_daily_market_bars WHERE global_instrument_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'");
+    }
+
+    @Test
+    void existingVersionTenUpgradesAndRepeatedMigrationIsANoOp() {
+        // Optional disposable PostgreSQL database lets the same upgrade test run
+        // against the production dialect without changing application bootstrap.
+        String url = System.getProperty("dailyBarsUpgradeJdbcUrl",
+                "jdbc:h2:mem:dailyBarUpgrade;DB_CLOSE_DELAY=-1;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE");
+        String username = System.getProperty("dailyBarsUpgradeUsername", "sa");
+        String password = System.getProperty("dailyBarsUpgradePassword", "");
+        Flyway before = Flyway.configure().dataSource(url, username, password)
+                .schemas("research").defaultSchema("research").table("flyway_schema_history_research")
+                .target("10").load();
+        before.migrate();
+        JdbcTemplate existing = new JdbcTemplate(new org.springframework.jdbc.datasource.DriverManagerDataSource(url, username, password));
+        existing.update("""
+            INSERT INTO research.global_market_price_observations
+                (instrument_id,observed_at,price,provider,source_url,retrieved_at)
+            VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',CURRENT_TIMESTAMP,100,'EXISTING','https://example.test',CURRENT_TIMESTAMP)
+            """);
+        Flyway upgrade = Flyway.configure().dataSource(url, username, password)
+                .schemas("research").defaultSchema("research").table("flyway_schema_history_research").load();
+        assertThat(upgrade.migrate().migrationsExecuted).isEqualTo(1);
+        assertThat(upgrade.migrate().migrationsExecuted).isZero();
+        assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_daily_market_bars", Integer.class)).isZero();
+        assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_market_price_observations", Integer.class)).isEqualTo(1);
     }
 }
 

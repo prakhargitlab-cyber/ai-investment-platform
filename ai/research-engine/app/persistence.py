@@ -29,6 +29,7 @@ from app.models import (
     StructuredMarketSnapshot,
     StructuredMarketSnapshotRecord,
     MarketPriceObservation,
+    DailyMarketBar,
 )
 from app.settings import Settings
 from app.fact_precedence import FinancialFact, FinancialFactKey, FactSourceTier, merge_fact
@@ -106,6 +107,10 @@ class ResearchPersistence(Protocol):
     def load_market_price_observations(self, instrument_ids: set[UUID] | None = None) -> list[MarketPriceObservation]: ...
     def load_market_price_coverage(self, instrument_ids: set[UUID]) -> dict[UUID, tuple[datetime, datetime, int]]: ...
     def upsert_market_price_observation(self, observation: MarketPriceObservation) -> None: ...
+    def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None: ...
+    def upsert_daily_market_bars(self, bars: list[DailyMarketBar]) -> int: ...
+    def load_daily_market_bars(self, instrument_ids: set[UUID], *, start_date: date | None = None,
+                              end_date: date | None = None, provider: str | None = None) -> list[DailyMarketBar]: ...
     def record_structured_market_failure(self, instrument_id: UUID, provider: str, attempted_at: datetime, code: str, message: str) -> None: ...
     def load_market_schedules(self, markets: set[str] | None = None): ...
     def load_market_calendar_exceptions(self, markets: set[str] | None = None): ...
@@ -156,6 +161,9 @@ class DisabledResearchPersistence:
     def load_market_price_observations(self, instrument_ids=None): return []
     def load_market_price_coverage(self, instrument_ids): return {}
     def upsert_market_price_observation(self, observation): return None
+    def upsert_daily_market_bar(self, bar): return None
+    def upsert_daily_market_bars(self, bars): return 0
+    def load_daily_market_bars(self, instrument_ids, *, start_date=None, end_date=None, provider=None): return []
     def record_structured_market_failure(self, *args): return None
     def load_market_schedules(self, markets=None): return []
     def load_market_calendar_exceptions(self, markets=None): return []
@@ -185,6 +193,78 @@ class SqliteResearchPersistence:
     def migrate(self) -> None:
         self._connection.executescript(_sqlite_schema())
         self._connection.commit()
+
+    def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None:
+        self.upsert_daily_market_bars([bar])
+
+    def upsert_daily_market_bars(self, bars: list[DailyMarketBar]) -> int:
+        """Atomic correction of provider/day rows; last duplicate input wins.
+
+        Validate before writing (including model_copy/construct bypasses). Batch
+        50 rows/750 parameters to stay below older SQLite's 999-parameter limit.
+        Returns the number of distinct identities supplied, not a change count.
+        """
+        selected = {}
+        for bar in bars:
+            validated = DailyMarketBar.model_validate(bar.model_dump())
+            key = (str(validated.global_instrument_id), validated.trading_date, validated.provider)
+            selected[key] = validated
+        ordered = [selected[key] for key in sorted(selected)]
+        if not ordered:
+            return 0
+        with self._connection:
+            for offset in range(0, len(ordered), 50):
+                batch = ordered[offset:offset + 50]
+                values = ",".join("(" + ",".join("?" for _ in range(15)) + ")" for _ in batch)
+                params = []
+                for bar in batch:
+                    params.extend((str(bar.global_instrument_id), bar.trading_date.isoformat(),
+                        _decimal(bar.open), _decimal(bar.high), _decimal(bar.low), _decimal(bar.close),
+                        _decimal(bar.previous_close), bar.volume, _decimal(bar.turnover), bar.currency,
+                        bar.provider, bar.provider_symbol, str(bar.source_mode), bar.source_url, _dt(bar.retrieved_at)))
+                self._connection.execute(f"""INSERT INTO global_daily_market_bars (
+                    global_instrument_id,trading_date,open_price,high_price,low_price,close_price,
+                    previous_close,volume,turnover,currency,provider,provider_symbol,source_mode,source_url,retrieved_at
+                ) VALUES {values}
+                ON CONFLICT(global_instrument_id,trading_date,provider) DO UPDATE SET
+                    open_price=excluded.open_price,high_price=excluded.high_price,low_price=excluded.low_price,
+                    close_price=excluded.close_price,previous_close=excluded.previous_close,volume=excluded.volume,
+                    turnover=excluded.turnover,currency=excluded.currency,provider_symbol=excluded.provider_symbol,
+                    source_mode=excluded.source_mode,source_url=excluded.source_url,retrieved_at=excluded.retrieved_at""", params)
+        return len(ordered)
+
+    def load_daily_market_bars(self, instrument_ids: set[UUID], *, start_date: date | None = None,
+                              end_date: date | None = None, provider: str | None = None) -> list[DailyMarketBar]:
+        """Inclusive date bounds, explicit IDs only, stable global/date/provider order."""
+        if instrument_ids is None:
+            raise ValueError("Daily bars require an explicit instrument ID set")
+        if not instrument_ids:
+            return []
+        if any(value is not None and type(value) is not date for value in (start_date, end_date)):
+            raise ValueError("Daily bar range bounds must be DATE values")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise ValueError("Daily bar start_date must be <= end_date")
+        if provider is not None and not provider.strip():
+            raise ValueError("Provider filter must be nonblank")
+        ordered = sorted({str(UUID(str(value))) for value in instrument_ids})
+        result = []
+        for offset in range(0, len(ordered), 500):
+            batch = ordered[offset:offset + 500]
+            params = list(batch)
+            sql = "SELECT * FROM global_daily_market_bars WHERE global_instrument_id IN (" + ",".join("?" for _ in batch) + ")"
+            if start_date is not None:
+                sql += " AND trading_date >= ?"
+                params.append(start_date.isoformat())
+            if end_date is not None:
+                sql += " AND trading_date <= ?"
+                params.append(end_date.isoformat())
+            if provider is not None:
+                sql += " AND provider = ?"
+                params.append(provider.strip())
+            sql += " ORDER BY global_instrument_id, trading_date, provider"
+            result.extend(_daily_market_bar_from_row(row) for row in self._connection.execute(sql, params).fetchall())
+        # Sort once more for identical ordering across database collations.
+        return sorted(result, key=lambda bar: (str(bar.global_instrument_id), bar.trading_date, bar.provider))
 
     def _filtered_rows(self, table, ids, *, column="instrument_id", order=None):
         """Internal identifiers only; values are parameterized in bounded batches."""
@@ -763,6 +843,27 @@ def persistence_from_settings(settings: Settings) -> ResearchPersistence:
 
 def _sqlite_schema() -> str:
     return """
+    CREATE TABLE IF NOT EXISTS global_daily_market_bars (
+        global_instrument_id TEXT NOT NULL,
+        trading_date TEXT NOT NULL CHECK (length(trading_date) = 10 AND date(trading_date) IS NOT NULL AND date(trading_date) = trading_date),
+        open_price TEXT CHECK (CAST(open_price AS NUMERIC) > 0),
+        high_price TEXT CHECK (CAST(high_price AS NUMERIC) > 0),
+        low_price TEXT CHECK (CAST(low_price AS NUMERIC) > 0),
+        close_price TEXT CHECK (CAST(close_price AS NUMERIC) > 0),
+        previous_close TEXT CHECK (CAST(previous_close AS NUMERIC) > 0),
+        volume INTEGER CHECK (typeof(volume) = 'null' OR (typeof(volume) = 'integer' AND volume >= 0)),
+        turnover TEXT CHECK (CAST(turnover AS NUMERIC) >= 0),
+        currency TEXT NOT NULL CHECK (length(trim(currency)) > 0 AND length(currency) <= 16),
+        provider TEXT NOT NULL CHECK (length(trim(provider)) > 0 AND length(provider) <= 120),
+        provider_symbol TEXT CHECK (length(provider_symbol) <= 240),
+        source_mode TEXT NOT NULL CHECK (source_mode IN ('REAL', 'DEMO')),
+        source_url TEXT NOT NULL CHECK (length(trim(source_url)) > 0 AND length(source_url) <= 1000),
+        retrieved_at TEXT NOT NULL,
+        CONSTRAINT pk_global_daily_market_bars PRIMARY KEY (global_instrument_id, trading_date, provider),
+        CONSTRAINT ck_daily_bar_range CHECK (CAST(high_price AS NUMERIC) >= CAST(low_price AS NUMERIC))
+    );
+    CREATE INDEX IF NOT EXISTS idx_daily_market_bars_date_instrument
+        ON global_daily_market_bars (trading_date, global_instrument_id);
     CREATE TABLE IF NOT EXISTS research_acquisition_observations (
         instrument_id TEXT NOT NULL, requirement_id TEXT NOT NULL, provider TEXT NOT NULL,
         outcome TEXT NOT NULL, observed_at TEXT NOT NULL, source_url TEXT,
@@ -981,6 +1082,17 @@ def _sqlite_schema() -> str:
     INSERT OR IGNORE INTO market_trading_schedules (market_code,mic,country_code,timezone,trading_day,regular_open_time,regular_close_time,enabled,provenance)
     VALUES ('NSE','XNSE','IN','Asia/Kolkata',4,'09:15','15:30',1,'NSE regular session');
     """
+
+
+def _daily_market_bar_from_row(row) -> DailyMarketBar:
+    return DailyMarketBar(
+        global_instrument_id=_required_uuid(row["global_instrument_id"], "global_daily_market_bars.global_instrument_id"),
+        trading_date=row["trading_date"], open=_parse_decimal(row["open_price"]), high=_parse_decimal(row["high_price"]),
+        low=_parse_decimal(row["low_price"]), close=_parse_decimal(row["close_price"]),
+        previous_close=_parse_decimal(row["previous_close"]), volume=row["volume"], turnover=_parse_decimal(row["turnover"]),
+        currency=row["currency"], provider=row["provider"], provider_symbol=row["provider_symbol"],
+        source_mode=row["source_mode"], source_url=row["source_url"], retrieved_at=_parse_dt(row["retrieved_at"]),
+    )
 
 
 def _document_from_row(row: sqlite3.Row) -> ResearchDocument:

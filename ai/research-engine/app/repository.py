@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -33,6 +33,7 @@ from app.models import (
     ShareholdingSnapshot,
     SourceType,
     StructuredMarketSnapshotRecord,
+    DailyMarketBar,
 )
 from app.normalization import canonicalize_url, content_hash, detect_document_type, extract_published_at, extract_text, normalize_text
 from app.research_fetching import FetchError, HttpResearchFetcher, PdfExtractionTimeoutError, RestrictedFetchError, TransportFetchError
@@ -273,6 +274,25 @@ class ResearchRepository:
 
     async def upsert_market_price_observation_async(self, observation) -> None:
         await self._run_blocking_persistence(self._persistence.upsert_market_price_observation, observation)
+
+    def daily_market_bars_for(self, instrument_ids: set[UUID], *, start_date: date | None = None,
+                             end_date: date | None = None, provider: str | None = None) -> dict[UUID, list[DailyMarketBar]]:
+        grouped = {instrument_id: [] for instrument_id in instrument_ids}
+        for bar in self._persistence.load_daily_market_bars(
+                instrument_ids, start_date=start_date, end_date=end_date, provider=provider):
+            grouped[bar.global_instrument_id].append(bar)
+        return grouped
+
+    async def daily_market_bars_for_instruments(self, instrument_ids: set[UUID], *, start_date: date | None = None,
+                                               end_date: date | None = None, provider: str | None = None) -> dict[UUID, list[DailyMarketBar]]:
+        return await self._run_blocking_persistence(self.daily_market_bars_for, instrument_ids,
+            start_date=start_date, end_date=end_date, provider=provider)
+
+    async def upsert_daily_market_bar_async(self, bar: DailyMarketBar) -> None:
+        await self._run_blocking_persistence(self._persistence.upsert_daily_market_bar, bar)
+
+    async def upsert_daily_market_bars_async(self, bars: list[DailyMarketBar]) -> int:
+        return await self._run_blocking_persistence(self._persistence.upsert_daily_market_bars, bars)
 
     async def stock_rule_engine_result(
         self,

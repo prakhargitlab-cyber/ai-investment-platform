@@ -17,6 +17,8 @@ import httpx
 from app.models import ResearchBaseModel
 from app.fact_precedence import SUPPORTED_FINANCIAL_SOURCE_TIERS
 from app.persistence import ResearchPersistence
+from app.technical_features import TechnicalFeatureEngine, TechnicalFeatureSnapshot
+from app.sector_relative_strength import SectorContext, SectorRelativeStrengthEngine, SectorRelativeStrengthSnapshot
 
 
 class EvidenceState(StrEnum):
@@ -70,6 +72,21 @@ class GlobalScanResult(ResearchBaseModel):
     candidates: list[GlobalScanCandidate]
     top_candidates: list[GlobalScanCandidate]
     deep_analysis_candidate_ids: list[UUID]
+
+
+class StageBCandidate(ResearchBaseModel):
+    global_instrument_id: UUID
+    symbol: str | None
+    pre_score: float | None
+    feature_version: str = "GLOBAL_STAGE_B_V1"
+    technical_feature_snapshot: TechnicalFeatureSnapshot
+    sector_relative_strength_snapshot: SectorRelativeStrengthSnapshot
+    technical_score: float | None
+    sector_score: float | None
+    stage_b_score: float | None
+    confidence: float
+    score_coverage: float
+    score_weights: dict[str, float]
 
 
 class EquityUniverse(Protocol):
@@ -272,6 +289,63 @@ class GlobalScanner:
             raise ValueError("batch_size must be between 1 and 500")
         self.universe, self.persistence = universe, persistence
         self.pre_score, self.batch_size = pre_score or GlobalPreScore(), batch_size
+
+    def enrich_candidates(self, scan: GlobalScanResult, *, sector_contexts: dict[UUID, SectorContext] | None = None,
+                          trusted_providers: dict[UUID, frozenset[str]] | None = None,
+                          technical_engine: TechnicalFeatureEngine | None = None,
+                          sector_engine: SectorRelativeStrengthEngine | None = None,
+                          technical_weight: float = 0.7, sector_weight: float = 0.3) -> list[StageBCandidate]:
+        """Optional Stage B; no universe enumeration, providers, refresh or V1.
+
+        Enrich all deep-eligible candidates (not the entire canonical universe).
+        Prices for candidates and explicitly mapped benchmarks share bounded SQL
+        batches. Default weights emphasize technical evidence; they are selection
+        defaults, not calibrated investment weights. Missing legs renormalize the
+        score while reducing reported coverage/confidence. Phase 1 is untouched.
+        """
+        from math import isfinite
+
+        if (not all(isfinite(v) and v >= 0 for v in (technical_weight, sector_weight))
+                or technical_weight + sector_weight == 0):
+            raise ValueError("Stage-B weights must be finite, nonnegative and have positive sum")
+        technical_engine = technical_engine or TechnicalFeatureEngine()
+        sector_engine = sector_engine or SectorRelativeStrengthEngine()
+        contexts, providers = sector_contexts or {}, trusted_providers or {}
+        candidates = [c for c in scan.candidates if c.eligible_for_deep_analysis]
+        ids = {c.global_instrument_id for c in candidates}
+        for candidate in candidates:
+            context = contexts.get(candidate.global_instrument_id, SectorContext())
+            for reference in (context.sector_benchmark, context.market_benchmark):
+                if reference:
+                    ids.add(reference.instrument_id)
+        histories = defaultdict(list)
+        ordered = sorted(ids, key=str)
+        for offset in range(0, len(ordered), self.batch_size):
+            batch = set(ordered[offset:offset+self.batch_size])
+            for row in self.persistence.load_market_price_observations(batch):
+                if row.instrument_id in batch:
+                    histories[row.instrument_id].append(row)
+        output = []
+        total_weight = technical_weight + sector_weight
+        for candidate in sorted(candidates, key=lambda c: str(c.global_instrument_id)):
+            key = candidate.global_instrument_id
+            technical = technical_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
+                                                 trusted_providers=providers.get(key))
+            sector = sector_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
+                context=contexts.get(key), benchmark_histories=histories, trusted_providers=providers.get(key))
+            scores = [(technical.technical_score, technical_weight), (sector.relative_strength_score, sector_weight)]
+            available = [(score, weight) for score, weight in scores if score is not None and weight > 0]
+            available_weight = sum(weight for _, weight in available)
+            score = sum(value * weight for value, weight in available) / available_weight if available_weight else None
+            output.append(StageBCandidate(global_instrument_id=key, symbol=candidate.symbol, pre_score=candidate.pre_score,
+                technical_feature_snapshot=technical, sector_relative_strength_snapshot=sector,
+                technical_score=technical.technical_score, sector_score=sector.relative_strength_score,
+                stage_b_score=round(score, 8) if score is not None else None,
+                confidence=round((technical.confidence * technical_weight + sector.confidence * sector_weight) / total_weight, 6),
+                score_coverage=round(available_weight / total_weight * 100, 6),
+                score_weights={"technical": technical_weight, "sector": sector_weight}))
+        output.sort(key=lambda c: (-(c.stage_b_score if c.stage_b_score is not None else -1), -c.confidence, str(c.global_instrument_id)))
+        return output
 
     async def scan(self, *, as_of: datetime, top_n: int, **universe_context) -> GlobalScanResult:
         if top_n < 0:

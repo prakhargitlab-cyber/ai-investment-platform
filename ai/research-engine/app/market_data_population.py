@@ -57,6 +57,27 @@ class IndiaMarketDataPopulationJobs:
         self._tasks: dict[str, asyncio.Task] = {}
         self._active_job_id: str | None = None
         self._daily_bar_lock = asyncio.Lock()
+        self._daily_bar_failures: dict[UUID, datetime] = {}
+        self._daily_bar_throttled_at: datetime | None = None
+        self._daily_bar_completed_ranges: dict[tuple, list] = {}
+
+    async def backfill_daily_bars(
+        self, *, identity_headers: dict[str, str | None],
+        correlation_id: str | None = None, offset: int = 0,
+        instrument_ids: set[UUID] | None = None, start: date | None = None,
+        end: date | None = None, force: bool = False,
+    ) -> dict[str, Any]:
+        """Explicit bounded worker operation; never called by submit/ensure/GET.
+
+        Optional IDs restrict canonical universe membership; they do not supply
+        identity. State/cooldowns are process-local, like existing population jobs.
+        """
+        from app.nse_daily_backfill import run_backfill
+
+        async with self._daily_bar_lock:
+            return await run_backfill(self, identity_headers=identity_headers,
+                correlation_id=correlation_id, offset=offset, instrument_ids=instrument_ids,
+                start=start, end=end, force=force)
 
     async def populate_daily_bars(
         self, global_instrument_id: UUID, *, start: date, end: date,

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import UUID, uuid4
 
@@ -56,6 +56,28 @@ class IndiaMarketDataPopulationJobs:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._active_job_id: str | None = None
+        self._daily_bar_lock = asyncio.Lock()
+
+    async def populate_daily_bars(
+        self, global_instrument_id: UUID, *, start: date, end: date,
+        identity_headers: dict[str, str | None], correlation_id: str | None = None,
+    ):
+        """Explicit one-instrument acquisition; never invoked by submit/ensure.
+
+        Reuse canonical metadata and the daily persistence boundary without
+        changing historical-close provider priority or dual-writing observations.
+        """
+        from app.nse_historical_daily import NseHistoricalDailyProvider, persist_daily_result
+
+        async with self._daily_bar_lock:
+            provider = NseHistoricalDailyProvider(self.orchestrator, self.settings)
+            try:
+                result = await provider.fetch(global_instrument_id, start=start, end=end,
+                    identity_headers=identity_headers, correlation_id=correlation_id)
+                return await persist_daily_result(self.repository, result)
+            finally:
+                await provider.aclose()
+                await self._sleep(self.settings.market_data_population_request_interval_seconds)
 
     async def submit(
         self,

@@ -5,7 +5,7 @@ from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from uuid import UUID
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -106,6 +106,9 @@ class Settings(BaseSettings):
     portfolio_service_base_url: str = "http://portfolio-service"
     market_data_nifty_refresh_timeout_seconds: float = 30.0
     market_data_population_batch_size: int = 50
+    # Operational single-request bound, not a claimed NSE maximum.
+    nse_historical_request_window_days: int = Field(default=30, ge=1)
+    nse_historical_max_retries: int = Field(default=2, ge=0, le=3)
     market_data_population_request_interval_seconds: float = 0.20
     market_data_population_initial_lookback_days: int = 400
     market_data_nifty_freshness_hours: int = 12

@@ -205,6 +205,7 @@ export type WatchlistResearchInstrument = {
   sourcePeriod?: SectorPerformance["period"] | null;
   sourcePerformancePct?: number | null;
   addedAt?: string | null;
+  marketData?: WatchlistMarketData | null;
   company: PortfolioResearchCompany;
 };
 export type WatchlistResearchPresentation = {
@@ -271,6 +272,58 @@ export type Quote = {
   marketStatus?: string;
   sourceTimestamp?: string;
   receivedAt?: string;
+};
+
+export type WatchlistSnapshot = {
+  providerTicker?: string | null;
+  exchange?: string | null;
+  currency?: string | null;
+  quoteType?: string | null;
+  price?: number | null;
+  priceCurrency?: string | null;
+  marketAsOf?: string | null;
+  retrievedAt?: string | null;
+  source?: string | null;
+  status?: string | null;
+  previousClose?: number | null;
+  bid?: number | null;
+  ask?: number | null;
+  volume?: number | null;
+  averageVolume10Day?: number | null;
+  averageVolume3Month?: number | null;
+  fiftyTwoWeekHigh?: number | null;
+  fiftyTwoWeekLow?: number | null;
+  marketCap?: number | null;
+  enterpriseValue?: number | null;
+  peRatio?: number | null;
+  forwardPe?: number | null;
+  pbRatio?: number | null;
+  psRatio?: number | null;
+  pegRatio?: number | null;
+  evEbitda?: number | null;
+  trailingEps?: number | null;
+  forwardEps?: number | null;
+  roe?: number | null;
+  roa?: number | null;
+  roce?: number | null;
+  netMargin?: number | null;
+  operatingMargin?: number | null;
+  debt?: number | null;
+  cash?: number | null;
+  debtEquity?: number | null;
+  revenueGrowth?: number | null;
+  earningsGrowth?: number | null;
+  freeCashFlow?: number | null;
+  operatingCashFlow?: number | null;
+};
+
+export type WatchlistMarketData = {
+  canonicalName?: string | null;
+  isin?: string | null;
+  providerMappings?: Instrument["providerMappings"];
+  snapshot?: WatchlistSnapshot | null;
+  quote?: Quote | null;
+  marketDataError?: string | null;
 };
 
 export type PortfolioPosition = {

@@ -3130,8 +3130,8 @@ function StockResearchDrawer({ position, watchlistItem, research, onUpdateDispla
         <section><h3>Overview</h3>{editing && position ? <div className="holding-name-editor"><label>Display name<input maxLength={160} value={name} onChange={(event) => setName(event.target.value)} /></label><Button disabled={saving} onClick={() => void saveName()}>Save</Button><Button variant="secondary" disabled={saving} onClick={() => { setEditing(false); setName(position.customDisplayName ?? position.displayName); setRenameError(null); }}>Cancel</Button>{renameError ? <small role="alert">{renameError}</small> : null}</div> : <p><strong>{displayName}</strong> {position?.sourceType === "MANUAL_CSV_IMPORT" && onUpdateDisplayName ? <button className="text-action" type="button" onClick={() => setEditing(true)}>Edit</button> : null}</p>}<p>{ticker} · {isin ?? "ISIN N/A"} · {market?.resolution.exchange ?? exchange} · {country ?? "Country N/A"} · {currency ?? "Currency N/A"} · {market?.resolution.quoteType ?? assetType}</p><p>Provider ticker: {market?.resolution.providerTicker ?? "N/A"} · Provider identity: {market?.resolution.companyName ?? "N/A"}</p><p>Sector: {metricText(structuredFact(research, "sector"))} · Industry: {metricText(structuredFact(research, "industry"))}</p><p>{position ? <>Broker/source: {brokerDisplayName(position.brokerType)} · {position.sourceType}</> : <>Watchlist status: Not held</>}</p></section>
         {position ? <section><h3>Position</h3><div className="research-metric-grid"><div className="research-metric"><span>Quantity</span><strong>{position.quantity}</strong></div><div className="research-metric"><span>Average Cost</span><strong>{formatBackendMoney(position.averageCost)}</strong></div><div className="research-metric"><span>Cost Basis</span><strong>{formatBackendMoney(position.costBasis)}</strong></div><div className="research-metric"><span>Imported Price</span><strong>{formatBackendMoney(position.importedPrice)}</strong></div><div className="research-metric"><span>Latest Market Price</span><strong>{formatBackendMoney(position.currentPrice)}</strong></div><div className="research-metric"><span>Market Value</span><strong>{formatBackendMoney(position.marketValue)}</strong></div><div className="research-metric"><span>Unrealized P/L</span><strong>{formatBackendMoney(position.unrealizedProfitLoss)}</strong></div></div></section> : <section><h3>Watchlist status</h3><p>Public company research</p><div className="research-metric-grid">{watchlistItem?.sourcePeriod ? <div className="research-metric"><span>Market return ({watchlistItem.sourcePeriod})</span><strong className={`${performanceRowTone(watchlistItem.sourcePerformancePct)}-text`}>{formatSignedPerformancePct(watchlistItem.sourcePerformancePct)}</strong></div> : null}</div></section>}
         <section><h3>Market Data</h3><div className="research-metric-grid"><div className="research-metric"><span>Latest Price</span><strong>{currentPrice}</strong></div><EvidenceMetric label="Previous close" metric={structuredFact(research, "previousClose")} /><EvidenceMetric label="Bid" metric={structuredFact(research, "bid")} /><EvidenceMetric label="Ask" metric={structuredFact(research, "ask")} /><EvidenceMetric label="Volume" metric={structuredFact(research, "volume")} /><EvidenceMetric label="10-day avg volume" metric={structuredFact(research, "averageVolume10Day")} /><EvidenceMetric label="3-month avg volume" metric={structuredFact(research, "averageVolume")} /><EvidenceMetric label="52-week low" metric={structuredFact(research, "fiftyTwoWeekLow")} /><EvidenceMetric label="52-week high" metric={structuredFact(research, "fiftyTwoWeekHigh")} /><div className="research-metric"><span>Price freshness</span><strong>{research?.priceFreshness ?? "UNKNOWN"}</strong></div><div className="research-metric"><span>Market As Of</span><strong>{market?.marketAsOf ? new Date(market.marketAsOf).toLocaleString() : position?.quote?.sourceTimestamp ? new Date(position.quote.sourceTimestamp).toLocaleString() : "N/A"}</strong></div><div className="research-metric"><span>Retrieved At</span><strong>{market?.retrievedAt ? new Date(market.retrievedAt).toLocaleString() : position?.quote?.receivedAt ? new Date(position.quote.receivedAt).toLocaleString() : "N/A"}</strong></div><div className="research-metric"><span>Provider</span><strong>{market?.sourceName ?? position?.quote?.source ?? "N/A"}</strong></div></div></section>
-        <section><h3>Valuation</h3><div className="research-metric-grid"><StructuredMetric label="Market cap" research={research} fact="marketCap" /><StructuredMetric label="Enterprise value" research={research} fact="enterpriseValue" /><StructuredMetric label="Trailing P/E" research={research} fact="trailingPE" /><StructuredMetric label="Forward P/E" research={research} fact="forwardPE" /><StructuredMetric label="P/B" research={research} fact="priceToBook" /><StructuredMetric label="P/S" research={research} fact="priceToSales" /><StructuredMetric label="PEG" research={research} fact="pegRatio" />{!financial && !isEtf ? <><StructuredMetric label="EV/revenue" research={research} fact="evToRevenue" /><StructuredMetric label="EV/EBITDA" research={research} fact="evToEbitda" /></> : null}<StructuredMetric label="Trailing EPS" research={research} fact="trailingEps" /><StructuredMetric label="Forward EPS" research={research} fact="forwardEps" /></div><p><Badge tone={valuationTone(research?.valuation.state)}>{research?.valuation.state ?? "UNKNOWN"}</Badge> {research?.valuation.reason ?? "Awaiting contextual public research."}</p></section>
-        {!isEtf ? <section><h3>Quality / Fundamentals</h3><div className="research-metric-grid"><EvidenceMetric label="ROE" metric={structuredFact(research, "roe") ?? research?.valuation.roe} /><StructuredMetric label="ROA" research={research} fact="roa" />{!financial ? <EvidenceMetric label="ROCE" metric={structuredFact(research, "roce") ?? research?.valuation.roce} /> : null}<StructuredMetric label="Operating margin" research={research} fact="operatingMargin" /><StructuredMetric label="Net margin" research={research} fact="profitMargin" /><StructuredMetric label="Revenue growth" research={research} fact="revenueGrowth" /><StructuredMetric label="Earnings growth" research={research} fact="earningsGrowth" /><StructuredMetric label="Cash" research={research} fact="totalCash" /><StructuredMetric label="Debt" research={research} fact="totalDebt" /><StructuredMetric label="Debt / equity" research={research} fact="debtToEquity" /><StructuredMetric label="Free cash flow" research={research} fact="freeCashFlow" /><StructuredMetric label="Operating cash flow" research={research} fact="operatingCashFlow" /></div></section> : null}
+        <section><h3>Valuation</h3><div className="research-metric-grid"><StructuredMetric label="Market cap" research={research} fact="marketCap" /><StructuredMetric label="Enterprise value" research={research} fact="enterpriseValue" /><StructuredMetric label="Trailing P/E" research={research} fact="trailingPE" /><StructuredMetric label="Forward P/E" research={research} fact="forwardPE" /><StructuredMetric label="P/B" research={research} fact="priceToBook" /><StructuredMetric label="P/S" research={research} fact="priceToSales" /><StructuredMetric label="PEG" research={research} fact="pegRatio" />{!financial && !isEtf ? <><StructuredMetric label="EV/revenue" research={research} fact="evToRevenue" /><StructuredMetric label="EV/EBITDA" research={research} fact="evToEbitda" /></> : null}<StructuredMetric label="Trailing EPS" research={research} fact="trailingEps" /><StructuredMetric label="Forward EPS" research={research} fact="forwardEps" /></div><p><Badge tone={valuationTone(research?.valuation?.state ?? "UNKNOWN")}>{research?.valuation?.state ?? "UNKNOWN"}</Badge> {research?.valuation?.reason ?? "Awaiting contextual public research."}</p></section>
+        {!isEtf ? <section><h3>Quality / Fundamentals</h3><div className="research-metric-grid"><EvidenceMetric label="ROE" metric={structuredFact(research, "roe") ?? research?.valuation?.roe} /><StructuredMetric label="ROA" research={research} fact="roa" />{!financial ? <EvidenceMetric label="ROCE" metric={structuredFact(research, "roce") ?? research?.valuation?.roce} /> : null}<StructuredMetric label="Operating margin" research={research} fact="operatingMargin" /><StructuredMetric label="Net margin" research={research} fact="profitMargin" /><StructuredMetric label="Revenue growth" research={research} fact="revenueGrowth" /><StructuredMetric label="Earnings growth" research={research} fact="earningsGrowth" /><StructuredMetric label="Cash" research={research} fact="totalCash" /><StructuredMetric label="Debt" research={research} fact="totalDebt" /><StructuredMetric label="Debt / equity" research={research} fact="debtToEquity" /><StructuredMetric label="Free cash flow" research={research} fact="freeCashFlow" /><StructuredMetric label="Operating cash flow" research={research} fact="operatingCashFlow" /></div></section> : null}
         <section><h3>Analyst View</h3><p>External public analyst consensus; not an application recommendation.</p><div className="research-metric-grid"><div className="research-metric"><span>Current Price</span><strong>{currentPrice}</strong></div><StructuredMetric label="Target low" research={research} fact="publicAnalystTargetLowPrice" /><StructuredMetric label="Target median" research={research} fact="publicAnalystTargetMedianPrice" /><StructuredMetric label="Target mean" research={research} fact="publicAnalystTargetMeanPrice" /><StructuredMetric label="Target high" research={research} fact="publicAnalystTargetHighPrice" /><StructuredMetric label="Number of analysts" research={research} fact="publicAnalystCount" /><StructuredMetric label="Consensus" research={research} fact="publicAnalystConsensus" /><StructuredMetric label="Consensus score" research={research} fact="publicAnalystRecommendationMean" /></div></section>
         <section><h3>Latest Quarterly Result</h3>{result ? <><p>{result.documentTitle ?? "Quarterly financial result"} · {statementPeriod(result.period)} · {result.reportingBasis ?? "Reporting basis N/A"} · {result.resultDate ? statementPeriod(result.resultDate) : "Result date N/A"}</p><div className="research-metric-grid">{financial ? <><EvidenceMetric label="Total income" metric={result.revenue} /><EvidenceMetric label="PAT / net profit" metric={result.pat} /><EvidenceMetric label="EPS" metric={result.eps} /><EvidenceMetric label="NIM" metric={result.nim} /><EvidenceMetric label="ROA" metric={result.roa} /><EvidenceMetric label="ROE" metric={result.roe} /><EvidenceMetric label="Gross NPA" metric={result.grossNpa} /><EvidenceMetric label="Net NPA" metric={result.netNpa} /><EvidenceMetric label="Deposits" metric={result.deposits} /><EvidenceMetric label="Advances" metric={result.advances} /><EvidenceMetric label="Capital adequacy" metric={result.capitalAdequacy} /><EvidenceMetric label="Credit cost" metric={result.creditCost} /></> : <><EvidenceMetric label="Revenue" metric={result.revenue} /><EvidenceMetric label="Revenue YoY" metric={result.revenueYoYPercent} /><EvidenceMetric label="EBITDA / operating profit" metric={result.ebitda} /><EvidenceMetric label="EBITDA / operating margin" metric={result.ebitdaMargin} /><EvidenceMetric label="PAT / net profit" metric={result.pat} /><EvidenceMetric label="PAT YoY" metric={result.patYoYPercent} /><EvidenceMetric label="EPS" metric={result.eps} /><EvidenceMetric label="Debt / borrowings" metric={result.debtOrBorrowings} /></>}</div>{result.yoySummary ? <p>{result.yoySummary}</p> : null}<p>Source: {filingSourceLabel(result.sourceName)} · Published {result.publishedAt ? new Date(result.publishedAt).toLocaleDateString() : "N/A"} · Retrieved {new Date(result.retrievedAt).toLocaleString()}</p><a href={result.sourceUrl} target="_blank" rel="noreferrer">View {filingSourceLabel(result.sourceName)} Filing ↗</a></> : <p>{research?.quarterlyResultStatus === "PDF_SCANNED_OCR_REQUIRED" ? "PDF scanned; OCR required." : "Not publicly available."}</p>}</section>
         {!isEtf ? <section><h3>Financial History</h3><h4>Quarterly</h4><FinancialHistoryTable periods={(research?.financialResultHistory ?? []).filter((period) => period.periodType === "QUARTERLY").slice(0, 4)} /><h4>Annual</h4><FinancialHistoryTable periods={(research?.financialResultHistory ?? []).filter((period) => period.periodType === "ANNUAL")} /></section> : null}
@@ -3144,7 +3144,7 @@ function StockResearchDrawer({ position, watchlistItem, research, onUpdateDispla
         <DurableEvidenceSection title="Customers" evidence={research?.durableCategoryEvidence?.CLIENTS} />
         <DurableEvidenceSection title="Catalysts" evidence={research?.durableCategoryEvidence?.CATALYSTS} />
         <section><h3>News</h3>{market?.news?.length ? market.news.map((article) => <article key={article.url}><strong>{article.headline}</strong><p>{article.publisher} · {article.publishedAt ? new Date(article.publishedAt).toLocaleString() : "Date unavailable"}</p><a href={article.url} target="_blank" rel="noreferrer">Open source</a></article>) : <p>No public provider news available.</p>}</section>
-        <section><h3>Research & Evidence</h3><p>Status: {research?.status?.replaceAll("_", " ") ?? "Awaiting research"}; {research?.sourceDiversity.domainsFound ?? 0} unique domains, {research?.sourceDiversity.exchangeSources ?? 0} exchange sources, {research?.sourceDiversity.companySources ?? 0} company sources, {research?.sourceDiversity.secondarySources ?? 0} secondary sources.</p>{research?.latestEvent ? <a href={research.latestEvent.sourceUrl} target="_blank" rel="noreferrer">Latest evidence source</a> : null}</section>
+        <section><h3>Research & Evidence</h3><p>Status: {research?.status?.replaceAll("_", " ") ?? "Awaiting research"}; {research?.sourceDiversity?.domainsFound ?? 0} unique domains, {research?.sourceDiversity?.exchangeSources ?? 0} exchange sources, {research?.sourceDiversity?.companySources ?? 0} company sources, {research?.sourceDiversity?.secondarySources ?? 0} secondary sources.</p>{research?.latestEvent ? <a href={research.latestEvent.sourceUrl} target="_blank" rel="noreferrer">Latest evidence source</a> : null}</section>
       </aside>
     </div>
   );
@@ -3495,6 +3495,42 @@ function ResearchView({
   useEffect(() => {
     setResearchDetail(null);
   }, [researchContext.kind, selectedResearchInstrumentId]);
+  const [watchlistDetailResearch, setWatchlistDetailResearch] = useState<{
+    instrumentId: string;
+    research: PortfolioResearchCompany;
+  } | null>(null);
+  const [watchlistDetailError, setWatchlistDetailError] = useState<string | null>(null);
+  const [watchlistDetailLoading, setWatchlistDetailLoading] = useState(false);
+  const [watchlistDetailRetryKey, setWatchlistDetailRetryKey] = useState(0);
+  const watchlistDetailFetchId = useRef(0);
+  const detailRegion =
+    researchContext.kind === "WATCHLIST" ? researchContext.region : undefined;
+  useEffect(() => {
+    const detail = researchDetail;
+    const region = detailRegion;
+    if (!detail || !detail.watchlistInstrumentId || !region) {
+      setWatchlistDetailResearch(null);
+      setWatchlistDetailError(null);
+      setWatchlistDetailLoading(false);
+      return;
+    }
+    const fetchId = ++watchlistDetailFetchId.current;
+    const instrumentId = detail.researchInstrumentId;
+    setWatchlistDetailLoading(true);
+    setWatchlistDetailError(null);
+    researchApi
+      .getCompanyPresentation(instrumentId, region)
+      .then((research) => {
+        if (fetchId !== watchlistDetailFetchId.current) return;
+        setWatchlistDetailResearch({ instrumentId, research });
+        setWatchlistDetailLoading(false);
+      })
+      .catch((error) => {
+        if (fetchId !== watchlistDetailFetchId.current) return;
+        setWatchlistDetailError(getApiFailure(error).message);
+        setWatchlistDetailLoading(false);
+      });
+  }, [researchDetail?.watchlistInstrumentId, researchDetail?.researchInstrumentId, detailRegion, watchlistDetailRetryKey]);
   const filteredEvents = (summary?.recentEvents ?? []).filter((event) => {
     return (!eventType || event.eventType === eventType) && (!impact || event.impact === impact);
   });
@@ -3513,11 +3549,19 @@ function ResearchView({
   const detailWatchlistItem = researchDetail?.watchlistInstrumentId
     ? watchlistResearch?.instruments.find((item) => item.globalInstrumentId === researchDetail.watchlistInstrumentId)
     : undefined;
-  const detailResearch = researchDetail
-    ? (detailWatchlistItem?.company
-      ?? portfolioResearchSummary?.companies.find((company) => company.instrumentId === researchDetail.researchInstrumentId)
-      ?? (researchContext.kind === "SEARCH" ? searchPresentation ?? null : null))
+  const portfolioDetailResearch = researchDetail
+    ? portfolioResearchSummary?.companies.find(
+        (company) => company.instrumentId === researchDetail.researchInstrumentId
+      )
     : undefined;
+  const detailResearch: PortfolioResearchCompany | undefined = !researchDetail
+    ? undefined
+    : researchDetail.watchlistInstrumentId
+      ? watchlistDetailResearch?.instrumentId === researchDetail.researchInstrumentId
+        ? watchlistDetailResearch.research
+        : undefined
+      : portfolioDetailResearch
+        ?? (researchContext.kind === "SEARCH" ? searchPresentation ?? undefined : undefined);
   const researchOptions = useMemo(() => {
     if (researchContext.kind === "WATCHLIST") {
       return (watchlistResearch?.instruments ?? []).map((item) => ({
@@ -3648,6 +3692,33 @@ function ResearchView({
             </div>
             {researchContext.kind === "WATCHLIST" ? (watchlistResearch?.instruments ?? []).map((item) => {
               const company = item.company;
+              const companyStatus = company.status ?? "";
+
+              const watchlistPrice =
+                item.marketData?.quote?.last?.amount
+                ?? item.marketData?.snapshot?.price
+                ?? null;
+
+              const watchlistPe =
+                item.marketData?.snapshot?.peRatio
+                ?? null;
+
+              const watchlistCurrency =
+                item.marketData?.quote?.currency
+                ?? item.marketData?.snapshot?.currency
+                ?? item.currency
+                ?? undefined;
+
+              const valuationState = company.valuation?.state;
+              const valuationReason = company.valuation?.reason;
+
+              const ownershipIncreases = company.ownershipIncreases ?? [];
+              const shareholdingChanges = company.shareholdingChanges ?? [];
+              const catalysts = company.currentQuarterCatalysts ?? [];
+
+              const sourceCount = company.sourceCount;
+              const documentCount = company.documentCount;
+
               const performanceTone = performanceRowTone(item.sourcePerformancePct);
               return (
                 <button
@@ -3669,18 +3740,43 @@ function ResearchView({
                   }}
                 >
                   <span role="cell">
-                    <strong>{company.companyName} <span className={`research-status-dot research-status-${researchStatusTone(company.status)}`} role="img" aria-label={researchStatusDescription(company.status)} title={researchStatusDescription(company.status)} /></strong>
+                    <strong>{company.companyName} <span className={`research-status-dot research-status-${researchStatusTone(companyStatus)}`} role="img" aria-label={researchStatusDescription(companyStatus)} title={researchStatusDescription(companyStatus)} /></strong>
                     <small>{[company.ticker, company.exchange, company.isin].filter(Boolean).join(" / ")}</small>
                     <small>{researchContext.name} · Public company research · Not held</small>
                   </span>
-                  <span role="cell">{company.currentPrice == null ? "—" : formatMoney(Number(company.currentPrice), company.structuredMarket?.resolution.currency ?? item.currency ?? undefined)}<small>P/E {metricText(company.valuation.currentPe)}</small></span>
-                  <span role="cell"><Badge tone={valuationTone(company.valuation.state)}>{company.valuation.state}</Badge><small>{company.valuation.reason}</small></span>
-                  <span role="cell">{latestResultText(company)}</span>
-                  <span role="cell">{company.ownershipIncreases.length ? company.ownershipIncreases.map((value) => value === "FII_FPI" ? "FII/FPI" : value.replaceAll("_", " ")).join(" · ") : "Unavailable"}<small>{company.shareholdingChanges.length ? `${company.shareholdingChanges.length} comparable trends` : "Previous comparable period not found"}</small></span>
-                  <span role="cell">{company.currentQuarterCatalysts.length ? `${company.currentQuarterCatalysts.length} current` : company.catalystScore ?? "None verified"}</span>
-                  <span role="cell">{company.sourceCount} sources / {company.documentCount} docs</span>
                   <span role="cell">
-                    <Badge tone={researchStatusTone(company.status)}>{company.status.replaceAll("_", " ")}</Badge>
+                    {watchlistPrice == null
+                      ? "N/A"
+                      : formatMoney(Number(watchlistPrice), watchlistCurrency)}
+                    <small>
+                      {watchlistPe == null
+                        ? "P/E N/A"
+                        : `P/E ${new Intl.NumberFormat("en-IN", {
+                          maximumFractionDigits: 2
+                        }).format(Number(watchlistPe))}`}
+                    </small>
+                  </span>
+                  <span role="cell">
+                    <Badge tone={valuationTone(valuationState)}>{valuationState ?? "N/A"}</Badge>
+                    <small>{valuationReason ?? ""}</small>
+                  </span>
+                  <span role="cell">Not publicly available</span>
+                  <span role="cell">
+                    {ownershipIncreases.length
+                      ? ownershipIncreases.map((value) => value === "FII_FPI" ? "FII/FPI" : value.replaceAll("_", " ")).join(" · ")
+                      : "Unavailable"}
+                    <small>{shareholdingChanges.length ? `${shareholdingChanges.length} comparable trends` : "Previous comparable period not found"}</small>
+                  </span>
+                  <span role="cell">
+                    {catalysts.length ? `${catalysts.length} current` : company.catalystScore ?? "None verified"}
+                  </span>
+                  <span role="cell">
+                    {sourceCount == null && documentCount == null
+                      ? "N/A"
+                      : `${sourceCount ?? 0} sources / ${documentCount ?? 0} docs`}
+                  </span>
+                  <span role="cell">
+                    <Badge tone={researchStatusTone(companyStatus)}>{companyStatus.replaceAll("_", " ")}</Badge>
                     {item.sourcePeriod ? <strong className={`market-intelligence-table-return ${performanceTone}-text`}>Market return ({item.sourcePeriod}) {formatSignedPerformancePct(item.sourcePerformancePct)}</strong> : null}
                   </span>
                 </button>
@@ -3735,7 +3831,23 @@ function ResearchView({
               : "Choose a Market Intelligence stock to add it to this regional watchlist."}
           />
         )}
-        {researchDetail && detailResearch ? <StockResearchDrawer position={researchDetail.position} watchlistItem={detailWatchlistItem} research={detailResearch} onClose={() => setResearchDetail(null)} /> : null}
+        {researchDetail && researchDetail.watchlistInstrumentId
+          ? watchlistDetailLoading
+            ? <>
+                <Skeleton rows={4} />
+                <p>Loading public research...</p>
+              </>
+            : watchlistDetailError
+              ? <ErrorState
+                  message={watchlistDetailError}
+                  action={<Button variant="secondary" onClick={() => setWatchlistDetailRetryKey((key) => key + 1)}>Retry</Button>}
+                />
+              : detailResearch
+                ? <StockResearchDrawer position={researchDetail.position} watchlistItem={detailWatchlistItem} research={detailResearch} onClose={() => setResearchDetail(null)} />
+                : null
+          : researchDetail && detailResearch
+            ? <StockResearchDrawer position={researchDetail.position} watchlistItem={detailWatchlistItem} research={detailResearch} onClose={() => setResearchDetail(null)} />
+            : null}
       </Card>
 
       <Card className="wide-panel research-sticky-panel">

@@ -313,6 +313,13 @@ class GlobalScanner:
         contexts, providers = sector_contexts or {}, trusted_providers or {}
         candidates = [c for c in scan.candidates if c.eligible_for_deep_analysis]
         ids = {c.global_instrument_id for c in candidates}
+        daily_histories = defaultdict(list)
+        candidate_ids = sorted(ids, key=str)
+        for offset in range(0, len(candidate_ids), self.batch_size):
+            batch = set(candidate_ids[offset:offset+self.batch_size])
+            for row in self.persistence.load_daily_market_bars(batch, provider="NSE"):
+                if row.global_instrument_id in batch:
+                    daily_histories[row.global_instrument_id].append(row)
         for candidate in candidates:
             context = contexts.get(candidate.global_instrument_id, SectorContext())
             for reference in (context.sector_benchmark, context.market_benchmark):
@@ -330,7 +337,7 @@ class GlobalScanner:
         for candidate in sorted(candidates, key=lambda c: str(c.global_instrument_id)):
             key = candidate.global_instrument_id
             technical = technical_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
-                                                 trusted_providers=providers.get(key))
+                                                 trusted_providers=providers.get(key), daily_bar_history=daily_histories[key])
             sector = sector_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
                 context=contexts.get(key), benchmark_histories=histories, trusted_providers=providers.get(key))
             scores = [(technical.technical_score, technical_weight), (sector.relative_strength_score, sector_weight)]

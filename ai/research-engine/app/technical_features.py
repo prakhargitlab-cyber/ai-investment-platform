@@ -1,25 +1,26 @@
-"""Pure close-based features over durable public observations.
+"""Pure deterministic features over persisted daily candles or close fallback.
 
 No adjusted-close, OHLC or volume semantics are inferred from the price table.
-Dates are UTC observation dates, not a fabricated exchange calendar. Returns
+Candle dates remain exchange DATEs; fallback uses UTC observation dates. Returns
 use observed-session offsets; all percentages are percentage units, not ratios.
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Iterable, Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import Field
 
-from app.models import MarketPriceObservation, ResearchBaseModel
+from app.models import DailyMarketBar, MarketPriceObservation, ResearchBaseModel
 
 
-TECHNICAL_FEATURE_VERSION = "TECHNICAL_FEATURES_V1"
+TECHNICAL_FEATURE_VERSION = "TECHNICAL_FEATURES_V2"
 TechnicalState = Literal["UPTREND", "DOWNTREND", "BASE_BUILDING", "BREAKOUT",
                          "PULLBACK_IN_UPTREND", "REVERSAL_CANDIDATE", "RANGE_BOUND",
                          "OVEREXTENDED", "INSUFFICIENT_DATA"]
@@ -46,6 +47,7 @@ class TechnicalConfig:
     extension_distance_pct: float = 10.0
     extension_rsi: float = 70.0
     volume_confirmation_ratio: float = 1.5
+    volume_contraction_ratio: float = 0.75
     score_weights: tuple[float, ...] = (50.0, 30.0, 20.0)
     momentum_full_scale_pct: float = 20.0
     extension_penalty: float = 15.0
@@ -63,6 +65,8 @@ class TechnicalConfig:
                 raise ValueError(f"Invalid technical configuration: {name}")
         if self.momentum_full_scale_pct == 0:
             raise ValueError("Momentum scale must be positive")
+        if not 0 <= self.volume_contraction_ratio < 1 < self.volume_confirmation_ratio:
+            raise ValueError("Volume thresholds must bracket one")
 
 
 class PersistedVolumeObservation(ResearchBaseModel):
@@ -77,7 +81,7 @@ class PersistedVolumeObservation(ResearchBaseModel):
 
 @dataclass(frozen=True)
 class PriceHistory:
-    observations: tuple[MarketPriceObservation, ...]
+    observations: tuple[MarketPriceObservation | DailyMarketBar, ...]
     conflicting_dates: tuple[date, ...]
     current_conflict: bool
     rejected_count: int
@@ -147,6 +151,13 @@ class TechnicalFeatureSnapshot(ResearchBaseModel):
     configuration: dict
     price_basis: str = "CANONICAL_PERSISTED_PRICE_UNADJUSTED"
     extrema_basis: str = "ROLLING_CLOSE_EXTREMA"
+    technical_input_source: str = "CLOSE_ONLY_FALLBACK"
+    source_diagnostics: list[str] = Field(default_factory=list)
+    daily_bar_observation_count: int = 0
+    history_trading_start: date | None = None
+    history_trading_end: date | None = None
+    feature_readiness: dict[str, str] = Field(default_factory=dict)
+    ohlcv_feature_coverage: float = 0
     observation_count: int
     history_start: datetime | None = None
     history_end: datetime | None = None
@@ -176,7 +187,13 @@ class TechnicalFeatureSnapshot(ResearchBaseModel):
     trend_slope20: float | None = None
     trend_slope50: float | None = None
     volume_average20: float | None = None
+    current_volume: int | Decimal | None = None
     volume_ratio20: float | None = None
+    volume_state: str = "UNAVAILABLE"
+    volume_expansion: bool | None = None
+    volume_contraction: bool | None = None
+    breakout_volume_confirmed: bool | None = None
+    reversal_volume_confirmed: bool | None = None
     distance_from52_week_high_pct: float | None = Field(default=None, alias="distanceFrom52WeekHighPct")
     distance_from52_week_low_pct: float | None = Field(default=None, alias="distanceFrom52WeekLowPct")
     support_level: float | None = None
@@ -200,6 +217,75 @@ class TechnicalFeatureSnapshot(ResearchBaseModel):
 
 def percentage(value: float, reference: float) -> float:
     return (value / reference - 1) * 100
+
+
+def normalize_daily_history(instrument_id, bars, *, as_of, currency, trusted_providers):
+    """NSE REAL candles only; never assemble a candle from different sources.
+
+    Dates remain exchange DATEs. Latest known retrieval wins a correction;
+    unequal OHLCV at the same retrieval time is a conflict, not a tie-break.
+    A latest-date conflict blocks fallback to a different price source.
+    """
+    grouped = defaultdict(list)
+    rejected = duplicates = 0
+    local_day = utc(as_of).astimezone(ZoneInfo('Asia/Kolkata')).date()
+    for bar in bars:
+        if (bar.global_instrument_id != instrument_id or bar.provider != 'NSE' or bar.source_mode != 'REAL'
+                or (trusted_providers is not None and bar.provider not in trusted_providers)
+                or (currency is not None and bar.currency != currency)
+                or utc(bar.retrieved_at) > utc(as_of) or bar.trading_date > local_day):
+            rejected += 1
+            continue
+        grouped[bar.trading_date].append(bar)
+    currencies = {bar.currency for group in grouped.values() for bar in group}
+    if len(currencies) > 1:
+        return PriceHistory((), tuple(sorted(grouped)), True, rejected, 0, currency), bool(grouped)
+    output, conflicts = [], []
+    for day, group in sorted(grouped.items()):
+        duplicates += len(group) - 1
+        stamp = max(utc(bar.retrieved_at) for bar in group)
+        current = [bar for bar in group if utc(bar.retrieved_at) == stamp]
+        values = {(bar.open, bar.high, bar.low, bar.close, bar.previous_close, bar.volume, bar.turnover) for bar in current}
+        close = finite_number(current[0].close)
+        if len(values) != 1 or close is None or close <= 0:
+            conflicts.append(day)
+        else:
+            output.append(min(current, key=lambda bar: (bar.provider_symbol or '', bar.source_url)))
+    return PriceHistory(tuple(output), tuple(conflicts), bool(conflicts and max(grouped) in conflicts),
+        rejected, duplicates, currency or next(iter(currencies), None)), bool(grouped)
+
+
+def _wilder(values, period=14):
+    if len(values) < period:
+        return []
+    output = [sum(values[:period]) / period]
+    for value in values[period:]:
+        output.append((output[-1] * (period - 1) + value) / period)
+    return output
+
+
+def _atr_adx(candles, period=14):
+    """15 candles seed ATR14; 28 candles seed ADX14 (14 DX values).
+
+    First candle provides the actual prior close/high/low, not a fabricated TR.
+    Equal positive up/down movement yields neither +DM nor -DM. Zero TR or
+    zero DI sum yields DX=0, so a flat market has ATR=ADX=0 once ready.
+    """
+    tr, plus, minus = [], [], []
+    for previous, current in zip(candles, candles[1:]):
+        high, low, previous_close = float(current.high), float(current.low), float(previous.close)
+        tr.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+        up, down = high - float(previous.high), float(previous.low) - low
+        plus.append(up if up > 0 and up > down else 0.0)
+        minus.append(down if down > 0 and down > up else 0.0)
+    ranges, positive, negative = _wilder(tr, period), _wilder(plus, period), _wilder(minus, period)
+    dx = []
+    for total, up, down in zip(ranges, positive, negative):
+        plus_di, minus_di = (100 * up / total, 100 * down / total) if total else (0.0, 0.0)
+        denominator = plus_di + minus_di
+        dx.append(100 * abs(plus_di - minus_di) / denominator if denominator else 0.0)
+    adx = _wilder(dx, period)
+    return (max(0.0, ranges[-1]) if ranges else None, _clamp(adx[-1]) if adx else None)
 
 
 def _ema(values: list[float], period: int) -> list[float]:
@@ -243,24 +329,55 @@ class TechnicalFeatureEngine:
 
     def compute(self, instrument_id: UUID, observations: Iterable[MarketPriceObservation], *, as_of: datetime,
                 currency: str | None = None, trusted_providers: frozenset[str] | None = None,
-                volume_history: Iterable[PersistedVolumeObservation] = ()) -> TechnicalFeatureSnapshot:
+                volume_history: Iterable[PersistedVolumeObservation] = (),
+                daily_bar_history: Iterable[DailyMarketBar] = ()) -> TechnicalFeatureSnapshot:
         cfg = self.config
-        history = normalize_price_history(instrument_id, observations, as_of=as_of, currency=currency,
-                                          trusted_providers=trusted_providers)
+        daily_history, use_daily = normalize_daily_history(instrument_id, daily_bar_history,
+            as_of=as_of, currency=currency, trusted_providers=trusted_providers)
+        fallback = None
+        selection_reason = None
+        if use_daily and not daily_history.current_conflict:
+            daily_stale = bool(daily_history.observations) and (utc(as_of).astimezone(ZoneInfo('Asia/Kolkata')).date()
+                - daily_history.observations[-1].trading_date > timedelta(days=cfg.max_age_days))
+            if len(daily_history.observations) < 20 or daily_stale:
+                fallback = normalize_price_history(instrument_id, observations, as_of=as_of,
+                    currency=currency, trusted_providers=trusted_providers)
+                if (len(fallback.observations) >= 20 and not fallback.current_conflict and
+                        utc(as_of) - utc(fallback.observations[-1].observed_at) <= timedelta(days=cfg.max_age_days)):
+                    use_daily = False
+                    selection_reason = 'NSE_DAILY_HISTORY_STALE' if daily_stale else 'NSE_DAILY_HISTORY_BELOW_20'
+        history = daily_history if use_daily else fallback or normalize_price_history(instrument_id,
+            observations, as_of=as_of, currency=currency, trusted_providers=trusted_providers)
         rows = history.observations
-        prices = [float(row.price) for row in rows]
+        prices = [float(row.close if use_daily else row.price) for row in rows]
+        # Display metadata only; candle calculations use the exchange DATE directly.
+        def stamp(row):
+            return datetime.combine(row.trading_date, time.min, ZoneInfo('Asia/Kolkata')) if use_daily else utc(row.observed_at)
         n = len(prices)
         readiness = ("FULL_HISTORY" if n >= 200 else "EXTENDED_HISTORY" if n >= 100 else
                      "MEDIUM_HISTORY" if n >= 50 else "SHORT_HISTORY" if n >= 20 else "INSUFFICIENT_HISTORY")
         result = TechnicalFeatureSnapshot(global_instrument_id=instrument_id, as_of=utc(as_of), configuration=asdict(cfg),
             observation_count=n, history_readiness=readiness, currency=history.currency,
-            history_start=utc(rows[0].observed_at) if rows else None, history_end=utc(rows[-1].observed_at) if rows else None,
+            history_start=stamp(rows[0]) if rows else None, history_end=stamp(rows[-1]) if rows else None,
             conflicting_dates=list(history.conflicting_dates), rejected_observation_count=history.rejected_count,
             duplicate_observation_count=history.duplicate_count)
+        result.daily_bar_observation_count = len(daily_history.observations)
+        if selection_reason:
+            result.source_diagnostics.append(selection_reason)
+        if use_daily:
+            result.technical_input_source = 'DAILY_MARKET_BAR_NSE'
+            result.price_basis = 'PERSISTED_NSE_DAILY_CLOSE_UNADJUSTED'
+            result.history_trading_start = rows[0].trading_date if rows else None
+            result.history_trading_end = rows[-1].trading_date if rows else None
+        if daily_history.rejected_count:
+            result.source_diagnostics.append('INELIGIBLE_DAILY_BARS_EXCLUDED')
+        if use_daily and history.conflicting_dates:
+            result.source_diagnostics.append('MIXED_NOT_ALLOWED')
         # A latest-price conflict invalidates current features, even with a long
         # historical tail. History metadata and conflict diagnostics are retained.
         usable = bool(rows) and not history.current_conflict
-        stale = bool(rows) and utc(as_of) - utc(rows[-1].observed_at) > timedelta(days=cfg.max_age_days)
+        stale = bool(rows) and ((utc(as_of).astimezone(ZoneInfo('Asia/Kolkata')).date() - rows[-1].trading_date
+            if use_daily else utc(as_of) - utc(rows[-1].observed_at)) > timedelta(days=cfg.max_age_days))
         if stale:
             result.stale_inputs.append("PRICE_HISTORY")
         if usable:
@@ -297,10 +414,26 @@ class TechnicalFeatureEngine:
                 before, after = prices[-2*cfg.level_lookback:-cfg.level_lookback], prices[-cfg.level_lookback:]
                 result.higher_highs_higher_lows = max(after) > max(before) and min(after) > min(before)
                 result.lower_highs_lower_lows = max(after) < max(before) and min(after) < min(before)
-            self._volume(result, rows, volume_history, trusted_providers)
+            if use_daily:
+                self._candles(result, rows, history.conflicting_dates)
+            else:
+                self._volume(result, rows, volume_history, trusted_providers)
             if not stale and n >= 20:
                 self._classify(result, prices)
                 self._score(result)
+        self._volume_signals(result)
+        for name, minimum in [('RSI14', 15), ('MA20', 20), ('MA50', 50), ('MA100', 100), ('MA200', 200),
+                              ('BREAKOUT', cfg.level_lookback + 1)]:
+            result.feature_readiness[name] = 'AVAILABLE' if usable and n >= minimum else 'INSUFFICIENT_HISTORY'
+        for name in ('ATR14', 'ADX14'):
+            result.feature_readiness.setdefault(name, 'MISSING_OHLC')
+        result.feature_readiness.setdefault('VOLUME20', 'AVAILABLE' if result.volume_ratio20 is not None else 'MISSING_VOLUME')
+        if history.current_conflict:
+            result.feature_readiness = {key: 'CONFLICTING' for key in result.feature_readiness}
+        elif stale:
+            result.feature_readiness = {key: 'STALE' if value == 'AVAILABLE' else value for key, value in result.feature_readiness.items()}
+        result.ohlcv_feature_coverage = 100 * sum(value is not None for value in
+            (result.atr14, result.adx14, result.volume_ratio20)) / 3
         feature_names = ["latest_price", "dma20", "dma50", "dma100", "dma200", "rsi14", "macd", "macd_signal",
                          "macd_histogram", "adx14", "atr14", "atr_pct", "trend_slope20", "trend_slope50",
                          "return1_w", "return1_m", "return3_m", "return6_m", "return1_y",
@@ -315,7 +448,8 @@ class TechnicalFeatureEngine:
                 "MISSING" if value is None else "STALE" if stale else "AVAILABLE")
             if value is None:
                 result.missing_inputs.append(alias)
-        result.missing_inputs.extend(["PERSISTED_OHLC"])
+        if not use_daily or 'MISSING_OHLC' in result.feature_readiness.values():
+            result.missing_inputs.append("PERSISTED_OHLC")
         if result.volume_average20 is None:
             result.missing_inputs.append("PERSISTED_VOLUME_HISTORY")
         core = ["dma20", "dma50", "dma100", "dma200", "rsi14", "macd_signal", "return1_m", "return3_m",
@@ -330,6 +464,60 @@ class TechnicalFeatureEngine:
             if isinstance(value, float):
                 setattr(result, name, round(value, 8))
         return result
+
+    def _candles(self, result, rows, conflicts):
+        # Restart warmup after a missing/invalid candle or a rejected date;
+        # never bridge the missing dependency with another source's close.
+        suffix = []
+        cutoff = max(conflicts) if conflicts else None
+        missing = bool(conflicts)
+        for row in rows:
+            values = [finite_number(getattr(row, key)) for key in ('open', 'high', 'low', 'close')]
+            if (cutoff is not None and row.trading_date <= cutoff) or any(v is None or v <= 0 for v in values) or row.high < row.low:
+                suffix = []
+                missing = True
+            else:
+                suffix.append(row)
+        result.atr14, result.adx14 = _atr_adx(suffix)
+        if result.atr14 is not None:
+            result.atr_pct = 100 * result.atr14 / result.latest_price
+        for name, value in [('ATR14', result.atr14), ('ADX14', result.adx14)]:
+            result.feature_readiness[name] = 'AVAILABLE' if value is not None else 'MISSING_OHLC' if missing else 'INSUFFICIENT_HISTORY'
+        result.current_volume = rows[-1].volume
+        result.feature_readiness['VOLUME20'] = 'INSUFFICIENT_HISTORY'
+        if len(rows) >= 21:
+            recent = rows[-21:]
+            # Do not compress conflicted dates out of a volume baseline.
+            if any(recent[0].trading_date <= day <= recent[-1].trading_date for day in conflicts):
+                result.feature_readiness['VOLUME20'] = 'CONFLICTING'
+            elif any(row.volume is None for row in recent[:-1]):
+                result.feature_readiness['VOLUME20'] = 'MISSING_VOLUME'
+            else:
+                average = sum(Decimal(row.volume) for row in recent[:-1]) / 20
+                result.volume_average20 = float(average)
+                if recent[-1].volume is None:
+                    result.feature_readiness['VOLUME20'] = 'MISSING_VOLUME'
+                elif average == 0:
+                    result.feature_readiness['VOLUME20'] = 'ZERO_BASELINE'
+                    result.missing_inputs.append('NONZERO_VOLUME_BASELINE')
+                else:
+                    result.volume_ratio20 = float(Decimal(recent[-1].volume) / average)
+                    result.feature_readiness['VOLUME20'] = 'AVAILABLE'
+
+    def _volume_signals(self, result):
+        ratio = result.volume_ratio20
+        if ratio is not None:
+            result.volume_expansion = ratio >= self.config.volume_confirmation_ratio
+            result.volume_contraction = ratio <= self.config.volume_contraction_ratio
+            result.volume_state = 'EXPANSION' if result.volume_expansion else 'CONTRACTION' if result.volume_contraction else 'NORMAL'
+        price_signal = result.breakout_state in {'PRICE_BREAKOUT', 'VOLUME_CONFIRMED'}
+        reversal = result.technical_state == 'REVERSAL_CANDIDATE'
+        if ratio is not None and price_signal:
+            result.breakout_volume_confirmed = result.volume_expansion
+        if ratio is not None and reversal:
+            result.reversal_volume_confirmed = result.volume_expansion
+        result.feature_readiness['VOLUME_CONFIRMATION'] = ('NOT_APPLICABLE' if not (price_signal or reversal)
+            else 'MISSING_VOLUME' if ratio is None else 'AVAILABLE')
 
     def _volume(self, result, prices, volumes, trusted_providers):
         grouped = defaultdict(list)
@@ -348,6 +536,9 @@ class TechnicalFeatureEngine:
             else:
                 result.missing_inputs.append(f"CONFLICTING_VOLUME:{day.isoformat()}")
         # Prior 20 completed observations; current volume never enters its own baseline.
+        if prices:
+            current = daily.get(utc(prices[-1].observed_at).date())
+            result.current_volume = Decimal(str(current)) if current is not None else None
         if len(prices) >= 21:
             days = [utc(row.observed_at).date() for row in prices[-21:-1]]
             if all(day in daily for day in days):

@@ -180,6 +180,6 @@ def test_deterministic_pure_execution_and_configuration(monkeypatch):
     first = engine.compute(STOCK, rows, as_of=NOW)
     assert first == engine.compute(STOCK, reversed(rows), as_of=NOW)
     assert original == [r.model_dump() for r in rows]
-    assert first.feature_version == "TECHNICAL_FEATURES_V1"
+    assert first.feature_version == "TECHNICAL_FEATURES_V2"
     with pytest.raises(ValueError): TechnicalConfig(momentum_full_scale_pct=0)
     with pytest.raises(ValueError): TechnicalConfig(score_weights=(float("nan"), 1, 1))

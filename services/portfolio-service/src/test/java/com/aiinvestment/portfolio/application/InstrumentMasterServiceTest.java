@@ -28,6 +28,36 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class InstrumentMasterServiceTest {
+    @Test
+    void benchmarkRegistrationUsesPlatformKeyAndIsIdempotent() {
+        String key = "INDIA_FINANCIALS_PRICE";
+        UUID id = InstrumentMasterService.benchmarkId(key);
+        assertThat(id.toString()).isEqualTo("13ba7849-43e2-3e1e-a3f3-d93ee32d3d2f");
+        var first = service.registerBenchmark(key);
+        assertThat(first.master().getInstrumentId()).isEqualTo(id);
+        assertThat(first.master().getAssetType()).isEqualTo(AssetType.INDEX);
+        assertThat(first.master().getPrimarySymbol()).isEqualTo("NIFTY FINANCIAL SERVICES");
+        assertThat(savedMappings().get(0).getResolutionSource()).isEqualTo("NSE_BENCHMARK_CATALOG_V1");
+        when(masters.findById(id)).thenReturn(Optional.of(first.master()));
+        service.registerBenchmark(key);
+        verify(masters, times(1)).saveAndFlush(any());
+        verify(legacy, never()).save(any());
+        verifyNoInteractions(events);
+    }
+
+    @Test
+    void benchmarkRegistrationRejectsUnknownKeysAndConflictingIdentity() {
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> service.registerBenchmark("NIFTY 500"))
+                .isInstanceOf(IllegalArgumentException.class);
+        var mapping = mock(InstrumentProviderMappingEntity.class);
+        when(mapping.getInstrumentId()).thenReturn(UUID.randomUUID());
+        when(mappings.findByProviderAndExchangeIgnoreCaseAndProviderSymbolIgnoreCase("NSE", "NSE", "NIFTY 500"))
+                .thenReturn(Optional.of(mapping));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> service.registerBenchmark("INDIA_BROAD_PRICE"))
+                .isInstanceOf(IllegalStateException.class).hasMessage("BENCHMARK_IDENTITY_CONFLICT");
+        verify(masters, never()).saveAndFlush(any());
+    }
+
     private InstrumentMasterRepository masters;
     private InstrumentProviderMappingRepository mappings;
     private InstrumentRepository legacy;

@@ -91,6 +91,20 @@ class PortfolioResearchOrchestrator:
         except (httpx.HTTPError, ValueError) as exc:
             raise PortfolioServiceUnavailableError("Portfolio service unavailable for instrument enumeration") from exc
 
+    async def sector_benchmark_contexts(self, instrument_ids: set[UUID], *, correlation_id=None, identity_headers=None):
+        """Read-only canonical dependencies, prepared before pure Stage-B computation."""
+        if not instrument_ids:
+            return {}
+        from app.sector_benchmarks import build_sector_contexts
+        classifications = await self.india_nifty500_universe(correlation_id=correlation_id, identity_headers=identity_headers)
+        response = await self._client.get(f"{self.settings.portfolio_service_base_url}/api/v1/instruments/benchmarks",
+            headers={k:v for k,v in (identity_headers or {}).items() if v})
+        response.raise_for_status()
+        registered = response.json()
+        if not isinstance(registered, list):
+            raise PortfolioServiceUnavailableError('BENCHMARK_IDENTITY_UNAVAILABLE')
+        return build_sector_contexts(classifications, registered, instrument_ids)
+
     async def india_nifty500_universe(self, *, correlation_id: str | None = None, identity_headers: dict[str, str | None] | None = None) -> list[dict]:
         """Read portfolio-service owned NSE/Nifty universe; never uses portfolios."""
         headers = {key: value for key, value in (identity_headers or {}).items() if value}

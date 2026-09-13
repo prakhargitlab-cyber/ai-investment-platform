@@ -167,7 +167,7 @@ async def test_stage_b_batches_only_deep_eligible_and_preserves_phase1(monkeypat
     assert "instrument_id IN" in close_query
     assert all(str(UUID(int=5)) not in q for q in queries)
     assert str(SECTOR) in close_query and str(MARKET) in close_query
-    assert str(SECTOR) not in daily_query and str(MARKET) not in daily_query
+    assert str(SECTOR) in daily_query and str(MARKET) in daily_query
     assert all(c.technical_feature_snapshot.global_instrument_id == c.global_instrument_id for c in enriched)
     # Private inputs are not part of the enrichment contract.
     assert enriched == scanner.enrich_candidates(initial, sector_contexts={STOCK: context()})

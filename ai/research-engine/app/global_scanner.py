@@ -314,12 +314,6 @@ class GlobalScanner:
         candidates = [c for c in scan.candidates if c.eligible_for_deep_analysis]
         ids = {c.global_instrument_id for c in candidates}
         daily_histories = defaultdict(list)
-        candidate_ids = sorted(ids, key=str)
-        for offset in range(0, len(candidate_ids), self.batch_size):
-            batch = set(candidate_ids[offset:offset+self.batch_size])
-            for row in self.persistence.load_daily_market_bars(batch, provider="NSE"):
-                if row.global_instrument_id in batch:
-                    daily_histories[row.global_instrument_id].append(row)
         for candidate in candidates:
             context = contexts.get(candidate.global_instrument_id, SectorContext())
             for reference in (context.sector_benchmark, context.market_benchmark):
@@ -329,6 +323,9 @@ class GlobalScanner:
         ordered = sorted(ids, key=str)
         for offset in range(0, len(ordered), self.batch_size):
             batch = set(ordered[offset:offset+self.batch_size])
+            for row in self.persistence.load_daily_market_bars(batch, provider="NSE"):
+                if row.global_instrument_id in batch:
+                    daily_histories[row.global_instrument_id].append(row)
             for row in self.persistence.load_market_price_observations(batch):
                 if row.instrument_id in batch:
                     histories[row.instrument_id].append(row)
@@ -339,7 +336,8 @@ class GlobalScanner:
             technical = technical_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
                                                  trusted_providers=providers.get(key), daily_bar_history=daily_histories[key])
             sector = sector_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
-                context=contexts.get(key), benchmark_histories=histories, trusted_providers=providers.get(key))
+                context=contexts.get(key), benchmark_histories=histories, trusted_providers=providers.get(key),
+                daily_bar_histories=daily_histories)
             scores = [(technical.technical_score, technical_weight), (sector.relative_strength_score, sector_weight)]
             available = [(score, weight) for score, weight in scores if score is not None and weight > 0]
             available_weight = sum(weight for _, weight in available)

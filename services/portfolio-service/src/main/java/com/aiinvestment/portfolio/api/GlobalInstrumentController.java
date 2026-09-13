@@ -48,6 +48,24 @@ public class GlobalInstrumentController {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Global instrument not found"));
     }
 
+    @GetMapping("/benchmarks")
+    public java.util.List<GlobalInstrumentResponse> benchmarks(HttpServletRequest request) {
+        appUserProvisioner.upsert(AuthenticatedUserResolver.require(request));
+        return instrumentMasterService.registeredBenchmarks().stream().map(GlobalInstrumentResponse::from).toList();
+    }
+
+    @PostMapping("/benchmarks/{benchmarkKey}/register")
+    public GlobalInstrumentResponse registerBenchmark(@PathVariable String benchmarkKey, HttpServletRequest request) {
+        appUserProvisioner.upsert(AuthenticatedUserResolver.require(request));
+        try {
+            return GlobalInstrumentResponse.from(instrumentMasterService.registerBenchmark(benchmarkKey));
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "UNKNOWN_BENCHMARK_KEY");
+        } catch (IllegalStateException e) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "BENCHMARK_IDENTITY_CONFLICT");
+        }
+    }
+
     @GetMapping
     public InstrumentUniverseResponse enumerate(@RequestParam(name = "status", defaultValue = "ACTIVE") String status,
             @RequestParam(name = "assetType", defaultValue = "EQUITY") AssetType assetType,

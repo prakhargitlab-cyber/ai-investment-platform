@@ -80,6 +80,50 @@ public class InstrumentMasterService {
 
     public record GlobalInstrument(InstrumentMasterEntity master, List<InstrumentProviderMappingEntity> providerMappings) {}
 
+    /** Platform keys are independent of provider symbols; catalog evidence is versioned. */
+    public static final String BENCHMARK_CATALOG_VERSION = "NSE_BENCHMARK_CATALOG_V1";
+    public static final Map<String, String> BENCHMARKS = Map.of(
+            "INDIA_BROAD_PRICE", "NIFTY 500", "INDIA_TECHNOLOGY_PRICE", "NIFTY IT",
+            "INDIA_FINANCIALS_PRICE", "NIFTY FINANCIAL SERVICES", "INDIA_HEALTHCARE_PRICE", "NIFTY HEALTHCARE INDEX");
+
+    public static UUID benchmarkId(String key) {
+        if (!BENCHMARKS.containsKey(key)) throw new IllegalArgumentException("UNKNOWN_BENCHMARK_KEY");
+        return UUID.nameUUIDFromBytes(("aip:benchmark:" + key).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    @Transactional
+    public GlobalInstrument registerBenchmark(String key) {
+        UUID id = benchmarkId(key);
+        String symbol = BENCHMARKS.get(key);
+        lockIdentity("BENCHMARK:" + key);
+        var bySymbol = mappings.findByProviderAndExchangeIgnoreCaseAndProviderSymbolIgnoreCase("NSE", "NSE", symbol);
+        if (bySymbol.isPresent() && !id.equals(bySymbol.get().getInstrumentId()))
+            throw new IllegalStateException("BENCHMARK_IDENTITY_CONFLICT");
+        var existing = masters.findById(id);
+        var currentNse = mappings.findByInstrumentId(id).stream().filter(m -> "NSE".equals(m.getProvider())).toList();
+        if (currentNse.size() > 1 || currentNse.stream().anyMatch(m -> !symbol.equals(m.getProviderSymbol())))
+            throw new IllegalStateException("BENCHMARK_IDENTITY_CONFLICT");
+        if (existing.isPresent() && (existing.get().getAssetType() != com.aiinvestment.shared.domain.AssetType.INDEX
+                || !"ACTIVE".equals(existing.get().getStatus()) || !"INR".equals(existing.get().getCurrency())
+                || !"NSE".equals(existing.get().getPrimaryExchange()) || !"IN".equals(existing.get().getCountry())
+                || !symbol.equals(existing.get().getPrimarySymbol())))
+            throw new IllegalStateException("BENCHMARK_IDENTITY_CONFLICT");
+        InstrumentMasterEntity master = existing.orElseGet(() -> masters.saveAndFlush(new InstrumentMasterEntity(id, null,
+                symbol, com.aiinvestment.shared.domain.AssetType.INDEX, "INR", "IN", "NSE", symbol, "ACTIVE", Instant.now())));
+        persistMapping(id, "NSE", symbol, null, "NSE", "INR", "VERIFIED", BENCHMARK_CATALOG_VERSION, new BigDecimal("0.99"));
+        return new GlobalInstrument(master, mappings.findByInstrumentId(id));
+    }
+
+    @Transactional(readOnly=true)
+    public List<GlobalInstrument> registeredBenchmarks() {
+        var ids = BENCHMARKS.keySet().stream().sorted().map(InstrumentMasterService::benchmarkId).toList();
+        var rows = masters.findAllById(ids);
+        var byId = mappings.findByInstrumentIdIn(ids).stream()
+                .collect(java.util.stream.Collectors.groupingBy(InstrumentProviderMappingEntity::getInstrumentId));
+        return rows.stream().sorted(Comparator.comparing(row -> row.getInstrumentId().toString()))
+                .map(row -> new GlobalInstrument(row, byId.getOrDefault(row.getInstrumentId(), List.of()))).toList();
+    }
+
     @Transactional(readOnly=true)
     public Page<InstrumentMasterEntity> enumerate(String status, com.aiinvestment.shared.domain.AssetType assetType, Pageable pageable) {
         if (status == null || assetType == null) throw new IllegalArgumentException("STATUS_AND_ASSET_TYPE_REQUIRED");

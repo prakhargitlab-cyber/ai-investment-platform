@@ -79,6 +79,37 @@ class IndiaMarketDataPopulationJobs:
                 correlation_id=correlation_id, offset=offset, instrument_ids=instrument_ids,
                 start=start, end=end, force=force)
 
+    async def populate_benchmark_history(self, instrument_ids: set[UUID], *, start: date, end: date,
+                                         identity_headers: dict[str, str | None], correlation_id=None):
+        """Explicit bounded index acquisition; registration is a separate master operation."""
+        from app.nse_index_history import NseIndexHistoryProvider, ENDPOINT
+        from app.nse_historical_daily import NseHistoricalResult, persist_daily_result
+        if len(instrument_ids) > self.settings.market_data_population_batch_size:
+            raise ValueError('BENCHMARK_BATCH_LIMIT')
+        results = []
+        async with self._daily_bar_lock:
+            provider = NseIndexHistoryProvider(self.orchestrator, self.settings)
+            try:
+                for key in sorted(instrument_ids, key=str):
+                    now = self._clock()
+                    failures = [t for t in (self._daily_bar_failures.get(key), self._daily_bar_throttled_at) if t]
+                    failed_at = max(failures) if failures else None
+                    if failed_at and now - failed_at < timedelta(hours=self.settings.market_data_population_retry_cooldown_hours):
+                        results.append(NseHistoricalResult(key, start, end, source_url=ENDPOINT, failure_reason='RETRY_COOLDOWN'))
+                        continue
+                    result = await provider.fetch(key, start=start, end=end,
+                        identity_headers=identity_headers, correlation_id=correlation_id)
+                    result = await persist_daily_result(self.repository, result)
+                    results.append(result)
+                    if result.failure_reason:
+                        self._daily_bar_failures[key] = self._clock()
+                        if '429' in result.failure_reason:
+                            self._daily_bar_throttled_at = self._clock()
+            finally:
+                await provider.aclose()
+                await self._sleep(self.settings.market_data_population_request_interval_seconds)
+        return results
+
     async def populate_daily_bars(
         self, global_instrument_id: UUID, *, start: date, end: date,
         identity_headers: dict[str, str | None], correlation_id: str | None = None,

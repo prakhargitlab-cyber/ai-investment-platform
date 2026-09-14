@@ -1013,6 +1013,8 @@ class PortfolioResearchOrchestrator:
                 safe_error_code="COMPANY_NOT_RESOLVED",
                 safe_error_message="Holding identity did not match a registered research company.",
             )
+        if not instrument.get("provider"):
+            _refresh_profile_from_global_instrument(profile, instrument)
         allow_demo = not _is_real_broker_instrument(instrument)
         summary = self.repository.summary(profile.instrument_id, allow_demo=allow_demo)
         summary_counts.update(

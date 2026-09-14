@@ -84,7 +84,7 @@ export type ResearchReadinessRequirement = {
   applicabilityReason?: string | null;
   businessClassification?: string | null;
   classificationSource?: string | null;
-  acquisitionObservation?: { outcome: string; provider: string; observed_at: string; failure_reason?: string | null; history?: { outcome: string; provider: string; observed_at: string }[] } | null;
+  acquisitionObservation?: { outcome?: string | null; provider?: string | null; observed_at?: string | null; failure_reason?: string | null; history?: { outcome: string; provider: string; observed_at: string }[]; news_readiness?: string | null; coverage?: number | null; run_id?: string | null; } | null;
   sourceProvider?: string | null;
   sourceTier?: string | null;
   sourceUrl?: string | null;

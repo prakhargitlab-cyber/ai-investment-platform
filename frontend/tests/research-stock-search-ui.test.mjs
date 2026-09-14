@@ -155,3 +155,16 @@ test("research option colors have theme-safe dark-mode overrides", () => {
   assert.equal((styles.match(/--research-option-text: #f1f5f9;/g) ?? []).length, 2);
   assert.equal((styles.match(/--research-option-muted: #94a3b8;/g) ?? []).length, 2);
 });
+
+  test("readiness acquisition observation is null-safe for the news-run shape (no replaceAll on undefined outcome/provider)", () => {
+    assert.doesNotMatch(workspace, /requirement\.acquisitionObservation \? <p>Last acquisition/);
+    assert.match(workspace, /requirement\.acquisitionObservation && requirement\.acquisitionObservation\.outcome && requirement\.acquisitionObservation\.provider \? <p>Last acquisition/);
+  });
+
+  test("readiness acquisition observation type models the news-run shape with optional outcome/provider", () => {
+    assert.match(api, /outcome\?: string \| null/);
+    assert.match(api, /provider\?: string \| null/);
+    assert.match(api, /news_readiness\?: string \| null/);
+    assert.match(api, /coverage\?: number \| null/);
+    assert.match(api, /run_id\?: string \| null/);
+  });

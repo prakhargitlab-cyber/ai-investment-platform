@@ -29,6 +29,8 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { OpportunityRadar } from "./opportunity-radar";
+import { Backtesting } from "./backtesting";
 import { frontendConfig } from "../config";
 import {
   type AuthenticatedUser,
@@ -77,7 +79,7 @@ import {
 } from "../lib/market-intelligence";
 import { Badge, Button, Card, EmptyState, ErrorState, Field, MetricCard, Skeleton } from "./ui";
 
-type View = "dashboard" | "portfolio" | "research" | "brokers" | "settings";
+type View = "dashboard" | "portfolio" | "research" | "backtesting" | "brokers" | "settings";
 type Theme = "system" | "light" | "dark";
 type SortKey = "company" | "ticker" | "marketValue" | "profitLoss" | "allocation";
 type ResearchSectionId = "overview" | "growth" | "orders" | "capex" | "customers" | "guidance" | "news" | "sources";
@@ -94,6 +96,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Gauge }> = [
   { id: "dashboard", label: "Dashboard", icon: Gauge },
   { id: "portfolio", label: "Portfolio", icon: BriefcaseBusiness },
   { id: "research", label: "Research", icon: Search },
+  { id: "backtesting", label: "Backtesting", icon: LineChart },
   { id: "brokers", label: "Brokers", icon: WalletCards },
   { id: "settings", label: "Settings", icon: Settings }
 ];
@@ -1510,6 +1513,8 @@ export function InvestmentWorkspace() {
           ) : null}
 
           {view !== "research" && watchlistActionError ? <p role="alert">{watchlistActionError}</p> : null}
+          {view === "backtesting" ? <Backtesting /> : null}
+          {view === "dashboard" ? <OpportunityRadar heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
           {loading ? <LoadingView /> : null}
 
           {!loading && !error ? (

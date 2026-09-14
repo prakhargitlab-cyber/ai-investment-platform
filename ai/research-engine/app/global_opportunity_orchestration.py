@@ -25,6 +25,7 @@ from app.models import ResearchBaseModel
 from app.research_readiness_runtime import RepositoryResearchReadinessAdapter, ResearchReadinessRuntime, jurisdiction_for_profile
 from app.sector_relative_strength import SectorContext
 from app.stock_rule_engine import StockRuleEngineService
+from app.news_intelligence import EventImpactFeature, latest_known_features
 
 
 class OpportunityEntry(ResearchBaseModel):
@@ -51,6 +52,9 @@ class OpportunityEntry(ResearchBaseModel):
     technical_feature_version: str
     sector_feature_version: str
     opportunity_ranker_version: str
+    evidence_state: dict = Field(default_factory=dict)
+    rank_eligible: bool = True
+    suppression_reasons: list[str] = Field(default_factory=list)
 
 
 class CandidateDiagnostic(ResearchBaseModel):
@@ -73,6 +77,7 @@ class OpportunityRanking(ResearchBaseModel):
     rank_eligible_count: int
     top_n: list[OpportunityEntry]
     diagnostics: list[CandidateDiagnostic]
+    evaluated_entries: list[OpportunityEntry] = Field(default_factory=list)
 
 
 class _PersistedUniverse:
@@ -96,7 +101,8 @@ class GlobalOpportunityOrchestrator:
 
     async def run(self, canonical_instruments: Iterable[dict], *, as_of: datetime,
                   sector_contexts: Mapping[UUID, SectorContext] | None = None,
-                  shortlist_limit: int = 25, top_n: int = 10) -> OpportunityRanking:
+                  shortlist_limit: int = 25, top_n: int = 10,
+                  review_ids: Iterable[UUID] = ()) -> OpportunityRanking:
         if (type(shortlist_limit) is not int or not 1 <= shortlist_limit <= 100
                 or type(top_n) is not int or not 0 <= top_n <= 100):
             raise ValueError('INVALID_OPPORTUNITY_LIMIT')
@@ -116,10 +122,18 @@ class GlobalOpportunityOrchestrator:
         shortlist = sorted((c for c in stage_b if c.global_instrument_id in phase1), key=lambda c: (
             desc(c.stage_b_score), -c.confidence, desc(phase1[c.global_instrument_id].pre_score),
             -phase1[c.global_instrument_id].confidence, str(c.global_instrument_id)))[:shortlist_limit]
+        # Prior public recommendations have a separate bounded review budget. They never
+        # affect scores or the scanner shortlist. Rotate oldest projections in the caller.
+        review_ids = list(review_ids)[:25]
+        stage_by_id = {c.global_instrument_id: c for c in stage_b}
+        selected = {c.global_instrument_id for c in shortlist}
+        reviews = [stage_by_id[key] for key in review_ids if key in stage_by_id and key not in selected]
+        evaluation_candidates = shortlist + reviews
+        initial_by_id = {c.global_instrument_id: c for c in scan.candidates}
         metadata = {str(row.get('globalInstrumentId')):row for row in rows}
-        diagnostics, rules, successful = [], {}, []
+        diagnostics, rules, successful, temporal_evidence = [], {}, [], {}
         evaluated = 0
-        for candidate in shortlist:
+        for candidate in evaluation_candidates:
             key = candidate.global_instrument_id
             step = 'PUBLIC_EVIDENCE_UNAVAILABLE'
             cache_hit = None
@@ -141,22 +155,27 @@ class GlobalOpportunityOrchestrator:
                 cache_hit = result.cache_hit
                 step = 'RANKER_INPUT_UNAVAILABLE'
                 ranked = self.ranker.score(candidate, result)
+                loader = getattr(self.repository, 'news_records_for', None)
+                features = loader(key, EventImpactFeature, as_of=as_of) if callable(loader) else []
+                temporal_evidence[key] = [f.model_dump(mode='json') for f in latest_known_features(features, as_of)]
                 diagnostics.append(CandidateDiagnostic(global_instrument_id=key,
                     status='RANK_ELIGIBLE' if ranked.rank_eligible else 'SUPPRESSED', cache_hit=cache_hit,
                     rank_eligible=ranked.rank_eligible, suppression_reasons=ranked.eligibility_reasons))
-                if ranked.rank_eligible:
-                    rules[key] = result
-                    successful.append(candidate)
+                rules[key] = result
+                successful.append(candidate)
             except Exception:
                 # Never return exception messages, headers, raw evidence or recommendations.
                 diagnostics.append(CandidateDiagnostic(global_instrument_id=key, status='FAILED',
                     failure_reason=step, cache_hit=cache_hit))
-        ranked = self.ranker.rank(successful, rules)
+        ranked = [r for r in self.ranker.rank(successful, rules) if r.rank_eligible]
+        eligible_ids = {r.global_instrument_id for r in ranked}
+        suppressed = [self.ranker.score(c, rules[c.global_instrument_id]) for c in successful
+                      if c.global_instrument_id not in eligible_ids]
         by_id = {c.global_instrument_id:c for c in successful}
         entries = []
-        for position, result in enumerate(ranked[:top_n], 1):
+        for position, result in enumerate([*ranked, *suppressed], 1):
             key = result.global_instrument_id
-            initial, enriched, rule = phase1[key], by_id[key], rules[key]
+            initial, enriched, rule = initial_by_id[key], by_id[key], rules[key]
             entries.append(OpportunityEntry(rank=position, global_instrument_id=key,
                 symbol=initial.symbol, company_name=initial.company_name,
                 sector=enriched.sector_relative_strength_snapshot.sector, market=initial.market,
@@ -169,8 +188,14 @@ class GlobalOpportunityOrchestrator:
                 top_negative_reasons=result.top_negative_reasons, rule_engine_version=rule.rule_engine_version,
                 technical_feature_version=enriched.technical_feature_snapshot.feature_version,
                 sector_feature_version=enriched.sector_relative_strength_snapshot.feature_version,
-                opportunity_ranker_version=result.ranker_version))
+                opportunity_ranker_version=result.ranker_version,
+                rank_eligible=result.rank_eligible, suppression_reasons=result.eligibility_reasons,
+                evidence_state={'technical': enriched.technical_feature_snapshot.model_dump(mode='json'),
+                    'sector': enriched.sector_relative_strength_snapshot.model_dump(mode='json'),
+                    'rule': rule.model_dump(mode='json'), 'missing_inputs': initial.missing_inputs,
+                    'stale_inputs': initial.stale_inputs, 'news_features': temporal_evidence.get(key, [])}))
         return OpportunityRanking(generated_at=self.clock(), as_of=as_of,
             universe_count=scan.total_canonical_active_equities, phase1_eligible_count=len(phase1),
             stage_b_count=len(stage_b), shortlist_count=len(shortlist), deep_evaluated_count=evaluated,
-            rank_eligible_count=len(ranked), top_n=entries, diagnostics=diagnostics)
+            rank_eligible_count=len(ranked), top_n=[e for e in entries if e.rank_eligible][:top_n],
+            diagnostics=diagnostics, evaluated_entries=entries)

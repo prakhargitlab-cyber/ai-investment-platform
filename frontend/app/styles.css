@@ -2213,3 +2213,11 @@ tbody tr[class*="ownership-"] td {
 .research-saved-lists { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 16px 20px; }
 .research-saved-lists h3 { margin: 0; }
 .research-saved-lists .research-context-select { margin-left: auto; }
+/* Persisted global recommendations */
+.opportunity-radar { padding: 24px; margin-bottom: 24px; border: 1px solid var(--border, #657080); border-radius: 16px; }
+.opportunity-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.opportunity-card { padding: 18px; border: 1px solid var(--border, #657080); border-radius: 12px; }
+.opportunity-card dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.opportunity-card dd { margin: 0; }
+.opportunity-card p, .opportunity-card li { overflow-wrap: anywhere; }
+.opportunity-radar table { width: 100%; text-align: left; border-spacing: 12px; }

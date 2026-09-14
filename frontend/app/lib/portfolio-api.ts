@@ -825,7 +825,7 @@ function currentAuthenticatedApiToken(): string | null {
   return typeof window === "undefined" ? null : window.localStorage.getItem("aip.accessToken");
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = currentAuthenticatedApiToken();
   const response = await fetch(`${frontendConfig.apiBaseUrl}${path}`, {
     ...init,

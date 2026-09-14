@@ -79,6 +79,69 @@ app = FastAPI(title="Research Engine", version="0.3.0")
 logger = logging.getLogger(__name__)
 
 
+@app.get('/api/v1/research/opportunities/current')
+async def opportunity_radar():
+    with repository._persistence_worker_lock:
+        return repository.persistence.opportunity_current()
+
+
+@app.get('/api/v1/research/opportunities/history/{instrument_id}')
+async def opportunity_history(instrument_id: UUID):
+    with repository._persistence_worker_lock:
+        return repository.persistence.recommendation_history(instrument_id)
+
+
+class OpportunityCycleRequest(BaseModel):
+    top_n: int = Field(default=4, ge=2, le=4)
+    shortlist_limit: int = Field(default=25, ge=1, le=100)
+    candidate_ids: list[UUID] | None = Field(default=None, max_length=100)
+
+
+@app.post('/api/v1/research/opportunities/cycles')
+async def opportunity_cycle(body: OpportunityCycleRequest, request: Request):
+    from app.global_opportunity_cycle import run_global_opportunity_cycle
+    if not hasattr(repository.persistence, 'publish_opportunity_cycle'):
+        raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
+    # One in-process cycle at a time; no awaits between history read and atomic publish.
+    import asyncio
+    if not hasattr(app.state, 'opportunity_cycle_lock'):
+        app.state.opportunity_cycle_lock = asyncio.Lock()
+    async with app.state.opportunity_cycle_lock:
+        return await run_global_opportunity_cycle(repository, portfolio_orchestrator,
+            top_n=body.top_n, shortlist_limit=body.shortlist_limit, candidate_ids=body.candidate_ids,
+            identity_headers={k: v for k, v in request.headers.items()
+                              if k.lower() in {'authorization', 'x-user-id', 'x-correlation-id'}})
+
+
+class BacktestRequest(BaseModel):
+    start: str
+    end: str
+    market: str = 'NSE'
+    horizon: str = 'SHORT_TERM'
+    benchmark_id: UUID | None = None
+
+
+@app.get('/api/v1/research/backtesting/runs')
+async def backtest_runs():
+    with repository._persistence_worker_lock:
+        return repository.persistence.backtests()
+
+
+@app.post('/api/v1/research/backtesting/runs')
+async def create_backtest(body: BacktestRequest):
+    from app.recommendation_backtesting import run_backtest
+    if not hasattr(repository.persistence, 'save_backtest'):
+        raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
+    if body.market != 'NSE':
+        raise HTTPException(422, 'UNSUPPORTED_MARKET')
+    try:
+        with repository._persistence_worker_lock:
+            return run_backtest(repository.persistence, start=body.start, end=body.end,
+                                horizon=body.horizon, benchmark_id=body.benchmark_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.middleware("http")
 async def correlation_id_middleware(request: Request, call_next):
     candidate = request.headers.get("X-Request-ID") or request.headers.get("X-Correlation-Id")

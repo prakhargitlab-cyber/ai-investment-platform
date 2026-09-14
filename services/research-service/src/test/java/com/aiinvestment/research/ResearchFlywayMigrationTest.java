@@ -94,7 +94,9 @@ class ResearchFlywayMigrationTest {
                 """,
                 String.class
         );
-        assertThat(version).isEqualTo("11");
+        assertThat(version).isEqualTo("13");
+        assertThat(tables).contains("global_opportunity_snapshot", "stock_recommendation_history",
+                "recommendation_current_state", "global_opportunity_top_selection", "recommendation_backtest_run");
 
         Integer nseSessions = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM research.market_trading_schedules WHERE market_code = 'NSE'", Integer.class
@@ -161,7 +163,7 @@ class ResearchFlywayMigrationTest {
             """);
         Flyway upgrade = Flyway.configure().dataSource(url, username, password)
                 .schemas("research").defaultSchema("research").table("flyway_schema_history_research").load();
-        assertThat(upgrade.migrate().migrationsExecuted).isEqualTo(1);
+        assertThat(upgrade.migrate().migrationsExecuted).isEqualTo(3);
         assertThat(upgrade.migrate().migrationsExecuted).isZero();
         assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_daily_market_bars", Integer.class)).isZero();
         assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_market_price_observations", Integer.class)).isEqualTo(1);

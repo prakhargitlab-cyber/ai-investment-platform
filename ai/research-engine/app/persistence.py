@@ -121,6 +121,13 @@ class ResearchPersistence(Protocol):
 
 
 class DisabledResearchPersistence:
+    def opportunity_current(self):
+        return dict(generated_at=None, best_buy_today=None, top_short_term=[], top_long_term=[], previous_recommendations=[])
+
+    def recommendation_history(self, instrument_id=None): return []
+    def recommendation_states(self): return []
+    def backtests(self): return []
+
     def __init__(self) -> None:
         self._stock_rule_engine_results: dict[tuple[str, str, str], dict[str, Any]] = {}
     def load_documents(self) -> list[ResearchDocument]:
@@ -183,9 +190,10 @@ class DisabledResearchPersistence:
 
 
 from app.news_persistence import NewsPersistenceMixin, sqlite_schema as news_sqlite_schema
+from app.opportunity_persistence import OpportunityPersistenceMixin, SCHEMA as OPPORTUNITY_SCHEMA
 
 
-class SqliteResearchPersistence(NewsPersistenceMixin):
+class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixin):
     def __init__(self, database_path: str | Path = ":memory:") -> None:
         self.database_path = str(database_path)
         self._connection = sqlite3.connect(self.database_path)
@@ -197,6 +205,8 @@ class SqliteResearchPersistence(NewsPersistenceMixin):
         self._connection.executescript(_sqlite_schema())
         self._connection.commit()
         news_sqlite_schema(self._connection)
+        self._connection.executescript(OPPORTUNITY_SCHEMA)
+        self._connection.commit()
 
     def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None:
         self.upsert_daily_market_bars([bar])

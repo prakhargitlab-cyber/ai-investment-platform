@@ -182,7 +182,10 @@ class DisabledResearchPersistence:
         self._stock_rule_engine_results.setdefault(key, dict(result))
 
 
-class SqliteResearchPersistence:
+from app.news_persistence import NewsPersistenceMixin, sqlite_schema as news_sqlite_schema
+
+
+class SqliteResearchPersistence(NewsPersistenceMixin):
     def __init__(self, database_path: str | Path = ":memory:") -> None:
         self.database_path = str(database_path)
         self._connection = sqlite3.connect(self.database_path)
@@ -193,6 +196,7 @@ class SqliteResearchPersistence:
     def migrate(self) -> None:
         self._connection.executescript(_sqlite_schema())
         self._connection.commit()
+        news_sqlite_schema(self._connection)
 
     def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None:
         self.upsert_daily_market_bars([bar])

@@ -313,7 +313,7 @@ class ResearchRequirementRegistry:
                 ResearchRequirement(
                     "CURRENT_NEWS",
                     RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS,
-                    True,
+                    False,
                     "CURRENT_NEWS",
                     inputs=(input_("RELEVANT_CURRENT_EVENT_EVIDENCE", mandatory),),
                 ),
@@ -753,6 +753,7 @@ class ProviderAuthorityRegistry:
                     "CURRENT_NEWS",
                     "GLOBAL",
                     (
+                        ProviderAuthority("SEARCH_COVERAGE", ResearchSourceTier.APPROVED_SECONDARY),
                         ProviderAuthority("REGULATORY_FILING", ResearchSourceTier.REGULATORY),
                         ProviderAuthority("OFFICIAL_COMPANY", ResearchSourceTier.OFFICIAL),
                         ProviderAuthority("REPUTABLE_NEWS", ResearchSourceTier.APPROVED_SECONDARY),
@@ -1094,6 +1095,11 @@ class ResearchReadinessService:
                 classification_source=applicability.source,
                 not_applicable_input_reasons=applicability.excluded_inputs,
                 acquisition_observation=snapshot.acquisition_observations.get(requirement.requirement_id))
+        news_state = snapshot.acquisition_observations.get(requirement.requirement_id, {}).get('news_readiness')
+        if requirement.requirement_id == 'CURRENT_NEWS' and news_state in {'PARTIAL_SEARCH','FAILED_SEARCH','STALE_SEARCH'}:
+            state = {'PARTIAL_SEARCH':ResearchRequirementStatus.PARTIAL,'FAILED_SEARCH':ResearchRequirementStatus.FAILED,
+                'STALE_SEARCH':ResearchRequirementStatus.READY_STALE}[news_state]
+            return with_applicability(self._result(requirement,policy,state,missing_reason=news_state))
         if applicability.state == "NOT_APPLICABLE":
             return with_applicability(self._result(requirement, policy, ResearchRequirementStatus.NOT_APPLICABLE))
         if applicability.excluded_inputs:
@@ -1159,6 +1165,21 @@ class ResearchReadinessService:
         else:
             status = ResearchRequirementStatus.READY_STALE
             missing_reason = "FRESHNESS_POLICY_EXPIRED"
+
+        # Report the actual mandatory freshness blocker, not a newer supporting
+        # input (e.g. June finance cost beside March debt/equity for TMCV).
+        if status == ResearchRequirementStatus.READY_STALE:
+            blockers = []
+            for input_id in mandatory_inputs:
+                candidates = [e for e in eligible if e.complete and input_id in
+                    (e.covered_input_ids or tuple(i.input_id for i in requirement.inputs))]
+                if candidates:
+                    chosen = min(candidates,key=lambda e:(authority.rank(e),
+                        -(e.as_of or e.published_at or e.retrieved_at).timestamp(),-e.retrieved_at.timestamp(),e.evidence_id))
+                    if not policy.is_fresh(chosen,now): blockers.append((input_id,chosen))
+            if blockers:
+                selected = min((e for _,e in blockers),key=lambda e:(policy.evidence_time(e),e.evidence_id))
+                missing_reason += ':' + ','.join(sorted(i for i,_ in blockers))
 
         return with_applicability(self._result(
             requirement,

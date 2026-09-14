@@ -120,6 +120,7 @@ class RepositoryResearchReadinessAdapter:
     def __init__(self, repository) -> None:
         self.repository = repository
         self._canonical_metadata: dict[UUID, dict[str, Any]] = {}
+        self._evaluation_times: dict[UUID, datetime] = {}
         self._refreshing: dict[UUID, frozenset[str]] = {}
         self._failures: dict[UUID, dict[str, str]] = {}
         self._sessions: dict[UUID, tuple] = {}
@@ -178,6 +179,13 @@ class RepositoryResearchReadinessAdapter:
         self._append_financial_evidence(evidence, facts)
         self._append_structured_evidence(evidence, structured)
         self._append_market_observations(evidence, observations)
+        from app.valuation_evidence import materialize_valuation
+        valuation_now = self._evaluation_times.get(global_instrument_id, datetime.now(timezone.utc))
+        for name, value in materialize_valuation(structured, observations, now=valuation_now).items():
+            evidence['VALUATION_INPUTS'].append(ResearchEvidence(evidence_id='derived-valuation:'+name+':'+str(value.as_of_date),
+                requirement_id='VALUATION_INPUTS',source='LICENSED_STRUCTURED',source_tier=ResearchSourceTier.LICENSED_STRUCTURED,
+                retrieved_at=value.retrieved_at,as_of=value.as_of_date,value_fingerprint=str(value.value),
+                source_url=value.source_url,covered_input_ids=('PE' if name=='trailingPE' else 'PB',)))
         self._append_documents(evidence, documents)
         self._append_events(evidence, events)
         self._append_shareholding(evidence, shareholding)
@@ -205,7 +213,8 @@ class RepositoryResearchReadinessAdapter:
                         # Only a real close observation is reusable during a closed session.
                         if session and abs((session - item.as_of).total_seconds()) <= 15 * 60:
                             valid_until = next_session_open(market, schedules, exceptions, session)
-                            if valid_until:
+                            if valid_until and ('LATEST_USABLE_PRICE' in item.covered_input_ids or
+                                    item.evidence_id.startswith('derived-valuation:')):
                                 item = replace(item, valid_until=valid_until)
                     values.append(item)
                 evidence[requirement_id] = values
@@ -217,6 +226,22 @@ class RepositoryResearchReadinessAdapter:
                 key = observation["requirement_id"]
                 history = acquisition.get(key, {}).get("history", [])
                 acquisition[key] = {**observation, "history": [*history, observation]}
+        news_loader = getattr(self.repository, 'news_records_for', None)
+        if callable(news_loader):
+            from app.news_intelligence import SearchRun, search_state
+            evaluated_at = self._evaluation_times.get(global_instrument_id, datetime.now(timezone.utc))
+            runs = news_loader(global_instrument_id, SearchRun, as_of=evaluated_at)
+            if runs:
+                run = runs[-1]
+                state = search_state(run, evaluated_at)
+                acquisition['CURRENT_NEWS'] = {'news_readiness':state, 'coverage':run.coverage,
+                    'run_id':str(run.run_id), 'observed_at':run.completed_at.isoformat(), 'history':[]}
+                if state in {'READY_WITH_EVENTS','READY_NO_EVENTS'}:
+                    evidence['CURRENT_NEWS'] = [ResearchEvidence(evidence_id='search-run:'+str(run.run_id),
+                        requirement_id='CURRENT_NEWS',source='SEARCH_COVERAGE',source_tier=ResearchSourceTier.APPROVED_SECONDARY,
+                        retrieved_at=run.completed_at,as_of=run.completed_at,event_date=run.completed_at,
+                        valid_until=run.completed_at+timedelta(days=1),confidence=run.coverage,
+                        covered_input_ids=('RELEVANT_CURRENT_EVENT_EVIDENCE',))]
         news_checks = [row for row in acquisition.get("CURRENT_NEWS", {}).get("history", [])
             if row.get("outcome") in {"SUCCESS", "SUCCESS_EMPTY"}]
         if news_checks:
@@ -310,6 +335,8 @@ class RepositoryResearchReadinessAdapter:
                             confidence=value.confidence,
                             source_url=value.source_url or record.source_url,
                             covered_input_ids=tuple(sorted(covered_inputs)),
+                            valid_until=((value.as_of_date or value.published_at or value.retrieved_at)+timedelta(days=120)
+                                if requirement_id=='VALUATION_INPUTS' and fact_name in {'trailingEps','forwardEps','bookValue'} else None),
                         )
                     )
 
@@ -693,9 +720,14 @@ class ExistingResearchCapabilityExecutor:
             executed.append("GLOBAL_NEWS_SEARCH")
             if progress is not None:
                 progress.executed("GLOBAL_NEWS_SEARCH")
-            repository_categories.update(
-                {"CATALYSTS", "RISKS", "REGULATORY", "MANAGEMENT", "GUIDANCE"}
-            )
+            news_worker=getattr(self.repository,'refresh_news_intelligence',None)
+            if callable(news_worker):
+                try:
+                    await news_worker(global_instrument_id)
+                except Exception:
+                    failures['CURRENT_NEWS']='NEWS_INTELLIGENCE_UNAVAILABLE'
+            else:
+                repository_categories.update({'CATALYSTS','RISKS','REGULATORY','MANAGEMENT','GUIDANCE'})
         if "GOVERNANCE_HISTORY" in requirement_ids:
             executed.append("GOVERNANCE_EVIDENCE")
             if progress is not None:
@@ -859,6 +891,8 @@ class ResearchReadinessRuntime:
         jurisdiction: str,
         now: datetime | None = None,
     ) -> ResearchReadinessResult:
+        if isinstance(self.data_source, RepositoryResearchReadinessAdapter):
+            self.data_source._evaluation_times[global_instrument_id] = now or datetime.now(timezone.utc)
         if callable(getattr(self.repository, "market_session_data", None)):
             profile = self.repository.profile(global_instrument_id)
             self.data_source._sessions[global_instrument_id] = await self.repository.market_session_data({value for value in (profile.mic, profile.exchange) if value})

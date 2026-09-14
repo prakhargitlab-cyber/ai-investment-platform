@@ -39,7 +39,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from statistics import median, pstdev
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.news_intelligence import EventImpactFeature, SearchRun
 from uuid import UUID
 
 from pydantic import Field
@@ -218,6 +221,8 @@ class StockRuleEngineInput:
     shareholding: tuple[ShareholdingSnapshot, ...]
     canonical_metadata: Mapping[str, Any]
     evaluated_at: datetime
+    news_features: tuple[EventImpactFeature, ...] = ()
+    news_search_run: SearchRun | None = None
 
 
 class StockRuleEngineEligibilityPolicy:
@@ -246,7 +251,7 @@ class StockRuleEngineEligibilityPolicy:
         mandatory_blocking = sorted(
             item.requirement_id
             for item in readiness.requirements
-            if item.mandatory and item.status not in self.FULL_STATUSES and item.status != ResearchRequirementStatus.NOT_APPLICABLE
+            if item.mandatory and item.requirement_id != 'CURRENT_NEWS' and item.status not in self.FULL_STATUSES and item.status != ResearchRequirementStatus.NOT_APPLICABLE
         )
         critical = [by_id.get(key) for key in self.CRITICAL_REQUIREMENTS]
         critical_blocking = sorted(
@@ -312,6 +317,10 @@ class StockRuleEngineInputAdapter:
             self.repository.market_price_observations_for_instruments({instrument_id}),
         )
         evaluated_at = _aware(now or datetime.now(timezone.utc))
+        from app.news_intelligence import EventImpactFeature, SearchRun
+        news_loader = getattr(self.repository, 'news_records_for', None)
+        features = news_loader(instrument_id, EventImpactFeature, as_of=evaluated_at) if callable(news_loader) else []
+        runs = news_loader(instrument_id, SearchRun, as_of=evaluated_at) if callable(news_loader) else []
         return StockRuleEngineInput(
             profile=profile,
             readiness=readiness,
@@ -324,6 +333,7 @@ class StockRuleEngineInputAdapter:
             shareholding=tuple(self.repository.shareholding_for(instrument_id, limit=8)),
             canonical_metadata=self.readiness_adapter.canonical_metadata_for(instrument_id),
             evaluated_at=evaluated_at,
+            news_features=tuple(features), news_search_run=runs[-1] if runs else None,
         )
 
 
@@ -371,7 +381,10 @@ class StockRuleEngineV1:
             "version": STOCK_RULE_ENGINE_VERSION,
             # Fingerprint schema for the V1 payload. This preserves exact-cache
             # safety when explainability fields evolve before a new score rule.
-            "fingerprintContract": "STOCK_RULE_ENGINE_V1_INPUT_1",
+            "fingerprintContract": "STOCK_RULE_ENGINE_V1_INPUT_2_NEWS",
+            "newsFeatures": [f.model_dump(mode='json') for f in sorted(value.news_features,key=lambda f:str(f.feature_id))],
+            "newsSearch": value.news_search_run.model_dump(mode='json') if value.news_search_run else None,
+            "newsEvaluationDate": value.evaluated_at.isoformat() if value.news_features or value.news_search_run else None,
             "analysisMode": "PARTIAL_ALLOWED" if allow_partial else "FULL_REQUIRED",
             # Aging current-news eligibility changes at UTC day boundaries.
             "evaluationDate": value.evaluated_at.date().isoformat(),
@@ -593,6 +606,10 @@ class StockRuleEngineV1:
     def _valuation(self, value: StockRuleEngineInput) -> AreaScoreResult:
         metrics: list[tuple[RuleMetricResult, int]] = []
         structured = _structured_data(value)
+        from app.valuation_evidence import materialize_valuation
+        for name, fact in materialize_valuation(value.structured_snapshots,value.market_prices,now=value.evaluated_at).items():
+            structured[_metric_key(name)] = _Datum(Decimal(str(fact.value)),fact.source_name,fact.source_url,
+                fact.as_of_date,'derived:'+name,'RATIO',0)
         pe = _pick(structured, "trailingpe", "pe", "pricetoearnings")
         forward_pe = _pick(structured, "forwardpe")
         pb = _pick(structured, "pricetobook", "pb")
@@ -821,6 +838,20 @@ class StockRuleEngineV1:
         return self._finish(value, RuleEngineArea.PRICE_TECHNICAL, metrics, [])
 
     def _news(self, value: StockRuleEngineInput) -> AreaScoreResult:
+        from app.news_intelligence import aggregate_impact, search_state
+        normalized = aggregate_impact(value.news_features, value.evaluated_at)
+        state = search_state(value.news_search_run, value.evaluated_at)
+        if normalized is not None or state == 'READY_NO_EVENTS':
+            impact = normalized if normalized is not None else 0
+            refs = sorted(str(f.feature_id) for f in value.news_features) if normalized is not None else ['search-run:'+str(value.news_search_run.run_id)]
+            metric = RuleMetricResult(metric='COMPANY_NEWS_IMPACT',value=impact,unit='IMPACT_MINUS100_PLUS100',score=50+impact/2,
+                rule='COMPANY_EXPOSURE_IMPACT_V2',source='PERSISTED_NEWS_INTELLIGENCE',evidence_references=refs)
+            result=self._finish(value,RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS,[(metric,1)],[])
+            if normalized is not None and state not in {'READY_WITH_EVENTS','READY_NO_EVENTS'}:
+                # Stale discovery reduces coverage/confidence, but does not
+                # expire a still-relevant, independently persisted event.
+                result=result.model_copy(update={'status':AreaScoreStatus.PARTIAL})
+            return result
         events: list[ResearchEvent] = []
         seen: set[tuple[str, str, str]] = set()
         for event in value.events:
@@ -1065,6 +1096,11 @@ class StockRuleEngineV1:
 
     def _risk_overrides(self, value: StockRuleEngineInput) -> list[RiskOverrideResult]:
         overrides: list[RiskOverrideResult] = []
+        from app.news_intelligence import impact_at, latest_known_features
+        for feature in latest_known_features(value.news_features,value.evaluated_at):
+            if feature.severe_validated and impact_at(feature,value.evaluated_at) is not None:
+                overrides.append(RiskOverrideResult(code='VALIDATED_'+feature.event_type,severity=RiskOverrideSeverity.CRITICAL,
+                    evidence_ids=[str(feature.feature_id)]))
         authoritative = [event for event in value.events if _authoritative_unresolved_event(event)]
         for event in authoritative:
             text = f"{event.title} {event.summary}".casefold()

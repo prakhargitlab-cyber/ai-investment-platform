@@ -1,0 +1,17 @@
+{"version":"EXPOSURE_ONTOLOGY_V1","entries":{
+"COPPER":{"aliases":["copper"],"type":"RAW_MATERIAL"},
+"ALUMINIUM":{"aliases":["aluminium","aluminum"],"type":"RAW_MATERIAL"},
+"GOLD":{"aliases":["gold"],"type":"COMMODITY"},
+"SILVER":{"aliases":["silver"],"type":"COMMODITY"},
+"CRUDE_OIL":{"aliases":["crude oil","aviation turbine fuel","jet fuel"],"type":"ENERGY"},
+"NATURAL_GAS":{"aliases":["natural gas"],"type":"ENERGY"},
+"COAL":{"aliases":["coal"],"type":"ENERGY"},
+"PETCOKE":{"aliases":["petcoke","petroleum coke"],"type":"ENERGY"},
+"RUBBER":{"aliases":["natural rubber","rubber"],"type":"RAW_MATERIAL"},
+"PVC":{"aliases":["pvc","polyvinyl chloride"],"type":"RAW_MATERIAL"},
+"TITANIUM_DIOXIDE":{"aliases":["titanium dioxide"],"type":"RAW_MATERIAL"},
+"USD_INR":{"aliases":["usd/inr","usd inr","dollar rupee"],"type":"CURRENCY"},
+"INTEREST_RATE":{"aliases":["interest rates","interest rate"],"type":"INTEREST_RATE"},
+"HOUSING_DEMAND":{"aliases":["housing demand"],"type":"DEMAND_DRIVER"},
+"INFRASTRUCTURE_CAPEX":{"aliases":["infrastructure capex","infrastructure spending"],"type":"DEMAND_DRIVER"}
+}}

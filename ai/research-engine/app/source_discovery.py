@@ -41,6 +41,7 @@ class SearchDateWindow:
     months: int = 12
     year: int | None = None
     query_limit: int | None = None
+    explicit_queries: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,7 @@ class SearxngSearchDiscoveryProvider:
     async def discover(self, company: CompanyResearchProfile | EtfResearchProfile, category: str, date_window: SearchDateWindow) -> list[CandidateSearchResult]:
         results: list[CandidateSearchResult] = []
         failures: list[str] = []
+        self.last_query_degraded = False
         for query_id, query in enumerate(_bounded_search_queries(company, category, date_window), start=1):
             try:
                 response = await _safe_search_get(
@@ -284,6 +286,7 @@ class SearxngSearchDiscoveryProvider:
                 if engine
             })
             unresponsive_count = len(payload.get("unresponsive_engines", []))
+            self.last_query_degraded = self.last_query_degraded or bool(unresponsive_count)
             # An empty result set from engines that did not answer is not
             # evidence that the company had no matching public information.
             # Let the aggregate service treat this as retryable provider
@@ -988,7 +991,7 @@ def generate_etf_search_queries(profile: EtfResearchProfile, category: str, date
 
 
 def _bounded_search_queries(profile: CompanyResearchProfile, category: str, date_window: SearchDateWindow) -> list[str]:
-    queries = generate_search_queries(profile, category, date_window)
+    queries = list(date_window.explicit_queries[:10]) if date_window.explicit_queries is not None else generate_search_queries(profile, category, date_window)
     if date_window.query_limit is None:
         return queries
     return queries[: max(date_window.query_limit, 0)]

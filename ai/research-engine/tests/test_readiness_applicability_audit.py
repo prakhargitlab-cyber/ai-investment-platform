@@ -28,9 +28,10 @@ def test_business_classification_only_controls_applicability(industry, expected)
 
 
 def test_not_applicable_is_excluded_from_both_denominators_without_fake_coverage():
-    snapshot = complete_snapshot(omit={"CURRENT_NEWS", "ORDER_BOOK_CAPEX_GUIDANCE"})
+    # News is optional; use a mandatory input to exercise both denominators.
+    snapshot = complete_snapshot(omit={"GROWTH_FACTS", "ORDER_BOOK_CAPEX_GUIDANCE"})
     decisions = {key: RequirementApplicability("NOT_APPLICABLE", "DOMAIN_TEST")
-                 for key in ("CURRENT_NEWS", "ORDER_BOOK_CAPEX_GUIDANCE")}
+                 for key in ("GROWTH_FACTS", "ORDER_BOOK_CAPEX_GUIDANCE")}
     _, baseline, _ = assess(snapshot)
     _, result, plan = assess(replace(snapshot, applicability_by_requirement=decisions))
     assert baseline.overall_completeness_pct < 100

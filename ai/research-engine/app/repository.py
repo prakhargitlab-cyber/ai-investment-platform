@@ -193,8 +193,23 @@ class ResearchRepository:
         # connection.  Worker operations are serialized per repository so two
         # refreshes do not interleave transactions on that connection.
         self._persistence_worker_lock = threading.RLock()
+        self._news_worker_lock = asyncio.Lock()
         self._seed_demo_data()
         self._load_persisted_research()
+
+    def news_records_for(self, instrument_id, model, *, as_of):
+        loader = getattr(self._persistence, 'load_news_records', None)
+        return loader(model, instrument_id, as_of=as_of) if callable(loader) else []
+
+    async def append_news_record(self, record):
+        return await self._run_blocking_persistence(self._persistence.append_news_record, record)
+
+    async def refresh_news_intelligence(self, instrument_id, *, industry=None):
+        from app.news_acquisition import acquire_news
+        async with self._news_worker_lock:
+            return await acquire_news(self,self.profile(instrument_id),providers=[self._search_discovery.provider],industry=industry,
+                max_queries=min(20,max(1,self.settings.research_search_max_queries_per_category)),
+                max_documents=min(20,max(1,self.settings.research_search_max_documents_per_refresh)))
 
     def list_profiles(self) -> list[CompanyResearchProfile]:
         return self.profiles

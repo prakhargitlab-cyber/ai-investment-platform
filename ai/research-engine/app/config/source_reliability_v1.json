@@ -1,0 +1,12 @@
+{"version":"SOURCE_RELIABILITY_V1","domains":{},"classifications":{
+"REGULATORY":{"tier":"REGULATORY","confidence":0.98},
+"EXCHANGE":{"tier":"EXCHANGE","confidence":0.95},
+"OFFICIAL_COMPANY":{"tier":"COMPANY","confidence":0.92},
+"COMPANY_FILING":{"tier":"COMPANY","confidence":0.95},
+"COMPANY":{"tier":"COMPANY","confidence":0.92},
+"OFFICIAL":{"tier":"OFFICIAL","confidence":0.95},
+"REPUTABLE_NEWS":{"tier":"REPUTABLE_NEWS","confidence":0.75},
+"INVESTMENT_RESEARCH":{"tier":"INVESTMENT_RESEARCH","confidence":0.65},
+"STRUCTURED_MARKET_PROVIDER":{"tier":"STRUCTURED_PROVIDER","confidence":0.78},
+"OTHER":{"tier":"OTHER","confidence":0.4}
+}}

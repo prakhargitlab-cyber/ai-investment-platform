@@ -409,7 +409,7 @@ def test_critical_missing_blocks_full_analysis_and_strong_buy():
 
 
 def test_partial_analysis_requires_explicit_flag_and_is_capped_at_hold():
-    readiness = _readiness({"CURRENT_NEWS": ResearchRequirementStatus.MISSING}, critical_pct=90, overall_pct=82)
+    readiness = _readiness({"GROWTH_FACTS": ResearchRequirementStatus.MISSING}, critical_pct=90, overall_pct=82)
     denied = StockRuleEngineV1().evaluate(_inputs(readiness=readiness), allow_partial=False)
     allowed = StockRuleEngineV1().evaluate(_inputs(readiness=readiness), allow_partial=True)
     assert denied.decision_signal == DecisionSignal.INSUFFICIENT_DATA

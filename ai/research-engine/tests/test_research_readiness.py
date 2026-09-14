@@ -233,7 +233,7 @@ def test_current_news_older_than_thirty_days_is_excluded_but_not_deleted() -> No
         requirement, (boundary_news,), policy, NOW
     ) == (boundary_news,)
     assert snapshot.evidence_for("CURRENT_NEWS") == (old_news,)
-    assert target_ids(plan) == {"CURRENT_NEWS"}
+    assert target_ids(plan) == set()  # News is optional; explicit news refresh remains supported.
 
 
 def test_old_unresolved_governance_evidence_remains_queryable_and_ready() -> None:

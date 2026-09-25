@@ -325,3 +325,196 @@ def test_global_master_404_is_unresolved_and_transient_failure_is_not_cached() -
     except PortfolioServiceUnavailableError:
         pass
     assert all(profile.instrument_id != global_id for profile in repo.list_profiles())
+
+
+# --- DI-6B: COMPANY_NOT_RESOLVED:<REASON> propagation — HTTP level ---------------
+
+
+class _RoutingGlobalInstrumentClient:
+    """Returns different responses based on the request URL (for multi-instrument tests)."""
+
+    def __init__(self, routes: dict[str, httpx.Response | Exception]) -> None:
+        self.routes = routes
+        self.calls: list[dict] = []
+
+    async def get(self, url: str, headers: dict | None = None) -> httpx.Response:
+        self.calls.append({"method": "GET", "url": url, "headers": headers or {}})
+        response = self.routes.get(url)
+        if response is None:
+            raise httpx.HTTPError(f"Unmocked URL: {url}")
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def post(self, url: str, headers: dict | None = None) -> httpx.Response:
+        self.calls.append({"method": "POST", "url": url, "headers": headers or {}})
+        response = self.routes.get(url)
+        if response is None:
+            raise httpx.HTTPError(f"Unmocked URL: {url}")
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+_READINESS_HEADERS = {
+    "X-AIP-User-Id": "user",
+    "X-AIP-User-Issuer": "issuer",
+    "X-AIP-User-Subject": "sub",
+}
+
+
+def test_di6b_A_readiness_404_preserves_gate1_reason(monkeypatch) -> None:
+    """Readiness endpoint surfaces COMPANY_NOT_RESOLVED:REASON when registration rejects."""
+    global_id = uuid4()
+    url = f"http://portfolio-service/api/v1/instruments/{global_id}"
+    payload = _global_master_payload(global_id)
+    payload["canonicalName"] = "ACME"
+    payload["primarySymbol"] = "ACME"  # triggers COMPANY_NAME_EQUALS_TICKER
+    client = _GlobalInstrumentClient(
+        httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+    )
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"), client=client
+    )
+    monkeypatch.setattr(main, "portfolio_orchestrator", orchestrator)
+    monkeypatch.setattr(main, "repository", repo)
+
+    response = TestClient(app).get(
+        f"/api/v1/research/readiness/{global_id}", headers=_READINESS_HEADERS
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "COMPANY_NOT_RESOLVED:COMPANY_NAME_EQUALS_TICKER"
+    assert client.calls == [{"method": "GET", "url": url, "headers": dict(_READINESS_HEADERS)}]
+
+
+def test_di6b_B_readiness_succeeds_with_valid_payload(monkeypatch) -> None:
+    """Readiness endpoint returns 200 when profile resolves successfully (unchanged success path)."""
+    global_id = uuid4()
+    url = f"http://portfolio-service/api/v1/instruments/{global_id}"
+    payload = _global_master_payload(global_id)
+    client = _GlobalInstrumentClient(
+        httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+    )
+    # Use the default main.repository so research_readiness_runtime can find
+    # the profile registered by the orchestrator.
+    orchestrator = PortfolioResearchOrchestrator(
+        main.repository,
+        Settings(portfolio_service_base_url="http://portfolio-service"),
+        client=client,
+    )
+    monkeypatch.setattr(main, "portfolio_orchestrator", orchestrator)
+
+    response = TestClient(app).get(
+        f"/api/v1/research/readiness/{global_id}", headers=_READINESS_HEADERS
+    )
+
+    assert response.status_code == 200
+
+
+def test_di6b_C_readiness_portfolio_404_is_bare_not_resolved(monkeypatch) -> None:
+    """GlobalInstrumentNotFoundError remains bare COMPANY_NOT_RESOLVED (no reason fabricated)."""
+    global_id = uuid4()
+    url = f"http://portfolio-service/api/v1/instruments/{global_id}"
+    client = _GlobalInstrumentClient(
+        httpx.Response(404, request=httpx.Request("GET", url))
+    )
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"), client=client
+    )
+    monkeypatch.setattr(main, "portfolio_orchestrator", orchestrator)
+    monkeypatch.setattr(main, "repository", repo)
+
+    response = TestClient(app).get(
+        f"api/v1/research/readiness/{global_id}", headers=_READINESS_HEADERS
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "COMPANY_NOT_RESOLVED"
+
+
+def test_di6b_D_company_restore_404_preserves_gate1_reason(monkeypatch) -> None:
+    """Company endpoint surfaces COMPANY_NOT_RESOLVED:REASON when restore rejects."""
+    global_id = uuid4()
+    url = f"http://portfolio-service/api/v1/instruments/{global_id}"
+    payload = _global_master_payload(global_id)
+    del payload["primarySymbol"]  # remove primary ticker
+    payload["providerMappings"] = []  # remove all legitimate ticker sources (NSE/YAHOO fallbacks)
+    client = _GlobalInstrumentClient(
+        httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+    )
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"), client=client
+    )
+    monkeypatch.setattr(main, "portfolio_orchestrator", orchestrator)
+    monkeypatch.setattr(main, "repository", repo)
+
+    response = TestClient(app).get(f"/api/v1/research/companies/{global_id}")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "COMPANY_NOT_RESOLVED:MISSING_TICKER"
+
+
+def test_di6b_E_company_restore_succeeds_with_valid_payload(monkeypatch) -> None:
+    """Company endpoint returns 200 when restore succeeds (unchanged success path)."""
+    global_id = uuid4()
+    url = f"http://portfolio-service/api/v1/instruments/{global_id}"
+    payload = _global_master_payload(global_id)
+    client = _GlobalInstrumentClient(
+        httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+    )
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"), client=client
+    )
+    monkeypatch.setattr(main, "portfolio_orchestrator", orchestrator)
+    monkeypatch.setattr(main, "repository", repo)
+
+    response = TestClient(app).get(f"/api/v1/research/companies/{global_id}")
+
+    assert response.status_code == 200
+    assert response.json()["instrumentId"] == str(global_id)
+
+
+def test_di6b_G_no_reason_cross_contaminates_between_readiness_calls(monkeypatch) -> None:
+    """Two sequential readiness calls for different instruments get independent reasons (Test G, HTTP)."""
+    global_id_1 = uuid4()
+    global_id_2 = uuid4()
+    url_1 = f"http://portfolio-service/api/v1/instruments/{global_id_1}"
+    url_2 = f"http://portfolio-service/api/v1/instruments/{global_id_2}"
+
+    payload_1 = _global_master_payload(global_id_1)
+    payload_1["canonicalName"] = "ACME"
+    payload_1["primarySymbol"] = "ACME"  # COMPANY_NAME_EQUALS_TICKER
+
+    payload_2 = _global_master_payload(global_id_2)
+    del payload_2["primarySymbol"]  # remove primary ticker
+    payload_2["providerMappings"] = []  # remove all legitimate ticker sources (NSE/YAHOO fallbacks)
+
+    client = _RoutingGlobalInstrumentClient({
+        url_1: httpx.Response(200, json=payload_1, request=httpx.Request("GET", url_1)),
+        url_2: httpx.Response(200, json=payload_2, request=httpx.Request("GET", url_2)),
+    })
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"), client=client
+    )
+    monkeypatch.setattr(main, "portfolio_orchestrator", orchestrator)
+    monkeypatch.setattr(main, "repository", repo)
+
+    # First call: COMPANY_NAME_EQUALS_TICKER
+    response_1 = TestClient(app).get(
+        f"/api/v1/research/readiness/{global_id_1}", headers=_READINESS_HEADERS
+    )
+    assert response_1.status_code == 404
+    assert response_1.json()["detail"] == "COMPANY_NOT_RESOLVED:COMPANY_NAME_EQUALS_TICKER"
+
+    # Second call: MISSING_TICKER (different instrument, no cross-contamination)
+    response_2 = TestClient(app).get(
+        f"/api/v1/research/readiness/{global_id_2}", headers=_READINESS_HEADERS
+    )
+    assert response_2.status_code == 404
+    assert response_2.json()["detail"] == "COMPANY_NOT_RESOLVED:MISSING_TICKER"

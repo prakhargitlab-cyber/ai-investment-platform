@@ -13,13 +13,15 @@ from test_research_readiness_runtime import _profile, _fact
 
 
 @pytest.mark.parametrize("industry,expected", [
-    ("Banks - Regional", "NOT_APPLICABLE"),
-    ("Financial Data & Stock Exchanges", "NOT_APPLICABLE"),
+    ("Banks - Regional", "PARTIALLY_APPLICABLE"),
+    ("Financial Data & Stock Exchanges", "PARTIALLY_APPLICABLE"),
+    ("Credit Services", "PARTIALLY_APPLICABLE"),
+    ("Housing Finance Company", "PARTIALLY_APPLICABLE"),
     ("Electrical Equipment & Parts", "APPLICABLE"),
     ("Engineering & Construction", "APPLICABLE"),
     ("Aerospace & Defense", "APPLICABLE"),
     ("Utilities - Regulated Electric", "APPLICABLE"),
-    ("Software - Application", "PARTIALLY_APPLICABLE"),
+    ("Software - Application", "APPLICABLE"),
     (None, "UNKNOWN"),
 ])
 def test_business_classification_only_controls_applicability(industry, expected):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 from urllib.parse import urlparse
 
@@ -30,6 +31,8 @@ class RegisteredResearchSource:
     # announcements API was queried with this profile's verified NSE symbol.
     # It is deliberately not derived from a URL, publisher, or source name.
     official_nse_profile_symbol: str | None = None
+    official_published_at: datetime | None = None
+    official_title: str | None = None
 
     @property
     def host(self) -> str:

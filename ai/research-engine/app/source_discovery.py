@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -332,15 +335,72 @@ class OfficialFilingDiscovery:
     """Exchange-first public filing discovery; search remains a fallback."""
     NSE_ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/corporate-announcements"
 
-    def __init__(self, client: httpx.AsyncClient | None = None, announcements_url: str | None = None) -> None:
+    def __init__(self, client: httpx.AsyncClient | None = None, announcements_url: str | None = None,
+                 governance_categories=()) -> None:
         self.announcements_url = announcements_url or self.NSE_ANNOUNCEMENTS_URL
+        # NSE structured `category` values that denote governance disclosures.
+        # Deliberately configuration-only and EMPTY by default: no real NSE
+        # governance category values are captured in this repository, so none
+        # are invented here (see settings.research_nse_governance_categories).
+        self.governance_categories = frozenset(str(v).strip().casefold() for v in governance_categories if str(v).strip())
+        # Slice 6: one deep investigation asks for several requirement groups
+        # (results, governance, business) and baseline asks again; they all
+        # read the SAME per-symbol announcements list. Share it for a short TTL
+        # (bounded LRU; successful responses only) and single-flight concurrent
+        # callers. Per-category selection below still runs on every call.
+        self.rows_ttl_seconds = 300.0
+        self.rows_cache_max_symbols = 32
+        self._rows_cache: "OrderedDict[str, tuple[float, list]]" = OrderedDict()
+        self._rows_flights: dict[str, asyncio.Future] = {}
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0), headers={
             "User-Agent": "Mozilla/5.0 (compatible; AIInvestmentResearch/1.0)",
             "Accept": "application/json", "Referer": "https://www.nseindia.com/",
         })
 
+    def _structured_governance(self, row: dict) -> bool:
+        """Authoritative NSE structured metadata first (preferred over titles)."""
+        if not self.governance_categories:
+            return False
+        values = (row.get("category"), row.get("Category"), row.get("subCategory"), row.get("sub_category"))
+        return any(str(value or "").strip().casefold() in self.governance_categories for value in values)
+
+    async def _announcement_rows(self, symbol: str) -> list:
+        now = time.monotonic()
+        cached = self._rows_cache.get(symbol)
+        if cached is not None and now - cached[0] < self.rows_ttl_seconds:
+            self._rows_cache.move_to_end(symbol)
+            logger.info("official_discovery_rows provider=NSE symbol=%r source=CACHE", symbol)
+            return cached[1]
+        flight = self._rows_flights.get(symbol)
+        if flight is not None:
+            return await asyncio.shield(flight)
+        flight = asyncio.get_running_loop().create_future()
+        self._rows_flights[symbol] = flight
+        try:
+            response = await self.client.get(self.announcements_url, params={"index": "equities", "symbol": symbol})
+            response.raise_for_status()
+            rows = response.json()
+            if not isinstance(rows, list):
+                raise SearchProviderError("NSE_OFFICIAL_INVALID_RESPONSE")
+        except BaseException as exc:
+            flight.set_exception(exc)
+            flight.exception()  # retrieved: joined callers re-raise it themselves
+            raise
+        else:
+            flight.set_result(rows)
+            if self.rows_ttl_seconds > 0:
+                self._rows_cache[symbol] = (time.monotonic(), rows)
+                self._rows_cache.move_to_end(symbol)
+                while len(self._rows_cache) > self.rows_cache_max_symbols:
+                    self._rows_cache.popitem(last=False)
+            return rows
+        finally:
+            self._rows_flights.pop(symbol, None)
+
     async def discover(self, profile: CompanyResearchProfile, categories: set[str], seen_urls: set[str]) -> list[DiscoveryResult]:
-        requested = {category for category in categories if category in {"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN"}}
+        from app.deep_investigation import acquisition_budget
+        budget = acquisition_budget(profile.instrument_id)
+        requested = categories & {"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN", "CAPEX", "NEW_FACILITIES", "ORDERS_BACKLOG", "CONTRACTS", "GUIDANCE", "RISKS", "REGULATORY", "MANAGEMENT"}
         if not _is_indian_nse_profile(profile) or not categories:
             logger.info("official_discovery_result provider=NSE globalInstrumentId=%s status=SKIPPED exchange=%s country=%s reason=INELIGIBLE_PROFILE_OR_CATEGORY", profile.instrument_id, profile.exchange, profile.country)
             return []
@@ -363,15 +423,19 @@ class OfficialFilingDiscovery:
             symbol,
         )
         try:
-            response = await self.client.get(self.announcements_url, params={"index": "equities", "symbol": symbol})
-            response.raise_for_status()
-            rows = response.json()
-            if not isinstance(rows, list):
-                raise SearchProviderError("NSE_OFFICIAL_INVALID_RESPONSE")
+            rows = await self._announcement_rows(symbol)
             candidates: list[tuple[int, datetime, DiscoveryResult]] = []
             candidate_urls = set(seen_urls)
             for row in rows:
                 if not isinstance(row, dict):
+                    continue
+                row_isin = str(row.get("isin") or row.get("ISIN") or "").strip().upper()
+                canonical_isin = (profile.isin or "").strip().upper()
+                row_symbol = str(row.get("symbol") or "").strip().upper()
+                if row_isin and canonical_isin:
+                    if row_isin != canonical_isin:
+                        continue
+                elif row_symbol and row_symbol != symbol.strip().upper():
                     continue
                 title = " ".join(str(row.get(key) or "") for key in ("desc", "attchmntText"))
                 url = str(row.get("attchmntFile") or "")
@@ -380,16 +444,54 @@ class OfficialFilingDiscovery:
                     attachment_text=row.get("attchmntText"),
                     attachment_file=row.get("attchmntFile"),
                 )
-                category = "FINANCIAL_RESULTS" if _is_financial_result_announcement(title) and "FINANCIAL_RESULTS" in requested else (
-                    "SHAREHOLDING_PATTERN" if _is_shareholding_announcement(title) and "SHAREHOLDING_PATTERN" in requested else None
-                )
+                # Classification hierarchy:
+                # 1. NSE authoritative structured `category` field (primary)
+                # 2. Semantic title-based classification (fallback when NSE
+                #    metadata is absent — e.g. legacy responses / test mocks)
+                category = None
+                if "FINANCIAL_RESULTS" in requested and (
+                    _nse_category_is_financial_results(row)
+                    or _is_financial_result_announcement(title)
+                ):
+                    category = "FINANCIAL_RESULTS"
+                elif "SHAREHOLDING_PATTERN" in requested and _is_shareholding_announcement(title):
+                    category = "SHAREHOLDING_PATTERN"
+                if (budget is not None and category == "FINANCIAL_RESULTS" and subtype in {
+                        DocumentSubtype.INVESTOR_PRESENTATION, DocumentSubtype.INVESTOR_RELEASE,
+                        DocumentSubtype.CONFERENCE_CALL_MATERIAL}):
+                    continue
+                if category is None:
+                    from app.extraction import meaningful_business_statement, governance_disclosure
+                    concepts = {
+                        "CAPEX": ["capex", "capital expenditure"],
+                        "NEW_FACILITIES": ["new facility", "new plant", "capacity expansion"],
+                        "ORDERS_BACKLOG": ["order book", "backlog", "order intake"],
+                        "CONTRACTS": ["order", "contract"],
+                    }
+                    category = next((key for key, terms in concepts.items() if key in requested
+                        and meaningful_business_statement(title, terms)), None)
+                    if category is None and "GUIDANCE" in requested and any(term in title.casefold()
+                            for term in ("guidance raised", "guidance maintained", "guidance cut", "guidance for the")):
+                        category = "GUIDANCE"
+                    if category is None and (self._structured_governance(row) or governance_disclosure(title)):
+                        category = next((key for key in ("REGULATORY", "MANAGEMENT", "RISKS") if key in requested), None)
                 # Preserve required filing selection and add only attachments
                 # whose *pre-download NSE metadata* carries a high-confidence
                 # subtype.  Generic announcements remain excluded.
-                if category is None and subtype is not None:
+                if category is None and subtype is not None and budget is None:
+                    if not requested & {"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN"}:
+                        if subtype == DocumentSubtype.ORDER_CONTRACT_DISCLOSURE and not requested & {"ORDERS_BACKLOG", "CONTRACTS"}:
+                            continue
+                        if subtype == DocumentSubtype.CAPEX_CAPACITY_DISCLOSURE and not requested & {"CAPEX", "NEW_FACILITIES"}:
+                            continue
                     category = subtype.value
                 if not url or category is None:
                     continue
+                if url.strip() in _NSE_NO_ATTACHMENT_PLACEHOLDERS:
+                    logger.info("official_candidate_rejected provider=NSE globalInstrumentId=%s reason=NO_ATTACHMENT host=",
+                                profile.instrument_id)
+                    continue
+                url = _resolve_nse_archive_path(url)
                 try:
                     canonical = canonicalize_url(url)
                     validate_public_http_url(canonical)
@@ -405,6 +507,8 @@ class OfficialFilingDiscovery:
                     continue
                 candidate_urls.add(canonical)
                 published = _nse_datetime(row.get("an_dt"))
+                if budget is not None and not budget.accepts_date(published):
+                    continue
                 source = RegisteredResearchSource(
                     source_id=f"nse:{category.lower()}:{profile.instrument_id}:{content_hash_key(canonical)}",
                     instrument_id=profile.instrument_id, url=canonical, source_type=SourceType.EXCHANGE_ANNOUNCEMENT,
@@ -413,6 +517,8 @@ class OfficialFilingDiscovery:
                     company_id=profile.company_id, allowed=True, discovery_method="NSE_OFFICIAL_API",
                     priority=_nse_discovery_priority(subtype, category), categories=(category,),
                     document_subtype=subtype, official_nse_profile_symbol=symbol,
+                    official_published_at=published if published.year > 1 else None,
+                    official_title=title.strip() or None,
                 )
                 candidates.append((_nse_discovery_priority(subtype, category), published, DiscoveryResult(category=category, source=source)))
             accepted = [item for _, _, item in sorted(candidates, key=lambda value: (value[0], -value[1].timestamp()))]
@@ -488,9 +594,61 @@ def _is_indian_nse_profile(profile: CompanyResearchProfile) -> bool:
     return profile.country.upper() in {"IN", "IND", "INDIA"} and profile.exchange.upper() in {"NSE", "XNSE"}
 
 
+# ---- Generic financial-result classification signals -----------------------
+# No company-specific or title-specific strings appear in this block. Each
+# indicator captures a structural pattern that holds across the entire NSE
+# corporate-announcements universe.
+
+# Periodic-cadence indicators.  A financial-results announcement is tied to a
+# reporting cadence (quarterly, half-yearly, annual); these terms are generic
+# across all NSE companies.
+_FINANCIAL_PERIOD_INDICATORS = frozenset({
+    "quarterly", "quarter", "annual", "half year", "half-year", "semiannual",
+    "semi-annual", "nine months", "nine-month", "q1", "q2", "q3", "q4",
+    "h1", "h2", "year ended",
+})
+
+# Financial-results content indicators.  These are broad financial-domain
+# terms; alone they are too coarse (e.g. "results" appears in board-meeting
+# outcomes), so they are only activated when at least one period-cadence
+# indicator is simultaneously present in the same title.
+_FINANCIAL_RESULT_CONTENT_INDICATORS = frozenset({
+    "financial results", "financial result", "financials", "financial statement",
+    "statement of financial", "earnings", "profit and loss", "profit or loss",
+    "income statement", "balance sheet", "cash flow", "statement of cash",
+    "statement of profit", "statement of income", "statement of changes",
+    "unaudited", "audited", "results for the period",
+    "profit", "revenue", "net profit", "statement of comprehensive",
+    "results", "result",
+})
+
+
 def _is_financial_result_announcement(value: str) -> bool:
+    """Classify a pre-download announcement title as a financial-results filing.
+
+    Hierarchy (no company-specific strings):
+    1. Exact phrase fast-path — preserves existing behavior for known wording.
+    2. Semantic co-occurrence — a periodic-cadence indicator (quarterly,
+       half-year, annual, Q1-Q4, H1/H2, year ended) co-occurring with a
+       financial-results content indicator (results, financial, earnings,
+       profit, statement, revenue, balance sheet, cash flow, etc.).
+
+    The co-occurrence rule catches generic titles such as `Quarterly Results`
+    or `Annual Financial Statements` without enumerating any company-specific
+    or title-specific literal.  `results` alone is not sufficient — the
+    cadence indicator provides the specificity that prevents false positives
+    from non-financial announcements like `Results of Board Meeting`.
+    """
     lowered = value.lower()
-    return any(term in lowered for term in ("financial results", "financial result", "unaudited financial", "audited financial", "results for the period ended"))
+    # 1. Exact phrase fast-path
+    if any(term in lowered for term in ("financial results", "financial result", "unaudited financial", "audited financial", "results for the period ended")):
+        return True
+    # 2. Semantic co-occurrence: period cadence + financial content
+    has_period = any(term in lowered for term in _FINANCIAL_PERIOD_INDICATORS)
+    if has_period:
+        if any(term in lowered for term in _FINANCIAL_RESULT_CONTENT_INDICATORS):
+            return True
+    return False
 
 
 def _is_shareholding_announcement(value: str) -> bool:
@@ -498,6 +656,34 @@ def _is_shareholding_announcement(value: str) -> bool:
     # explicit quarterly filing name is a SHAREHOLDING_PATTERN artifact.
     normalized = re.sub(r"\s+", " ", value.casefold()).strip()
     return bool(re.search(r"\bshare(?:holding|\s+holder)\s+pattern\b", normalized))
+
+
+# NSE's authoritative structured category field for corporate announcements.
+# These are controlled NSE taxonomy values, not free-text titles.
+_NSE_CATEGORY_FINANCIAL_RESULTS = frozenset({
+    "financial results",
+    "audited financial results",
+    "unaudited financial results",
+    "statement of financial results",
+    "quarterly results",
+    "annual results",
+    "half yearly results",
+    "half-yearly results",
+})
+
+
+def _nse_category_is_financial_results(row: dict) -> bool:
+    """Use NSE's authoritative structured `category` field when available.
+
+    NSE's corporate-announcements API returns a `category` field (e.g.
+    "Financial Results") that is the single most authoritative generic signal
+    for result-bearing announcements — it is NSE's own taxonomy, not fuzzy
+    title matching.  When the field is absent (legacy responses, test mocks)
+    this degrades to False and the caller falls back to title-based
+    classification.
+    """
+    nse_category = str(row.get("category") or row.get("Category") or "").strip().lower()
+    return bool(nse_category) and nse_category in _NSE_CATEGORY_FINANCIAL_RESULTS
 
 
 def classify_nse_document_subtype(
@@ -674,6 +860,23 @@ def content_hash_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())[-32:]
 
 
+_NSE_NO_ATTACHMENT_PLACEHOLDERS = frozenset({"-", "NA", "N/A", "null", "None"})
+_NSE_ARCHIVE_ORIGIN = "https://nsearchives.nseindia.com"
+_NSE_ARCHIVE_PREFIXES = ("/corporate/", "corporate/", "/content/", "content/")
+
+
+def _resolve_nse_archive_path(url: str) -> str:
+    """NSE may return an archive attachment as a path relative to its
+    archive host. Resolve ONLY the known NSE archive layouts against the fixed
+    NSE archive origin (no caller-controlled host, so SSRF validation is
+    unchanged); every other relative/non-HTTP value is left for validation to
+    reject as before."""
+    value = url.strip()
+    if value.lower().startswith(_NSE_ARCHIVE_PREFIXES):
+        return _NSE_ARCHIVE_ORIGIN + "/" + value.lstrip("/")
+    return value
+
+
 def _safe_attachment_host(url: str) -> str:
     try:
         return (urlparse(url).hostname or "").lower()
@@ -700,6 +903,8 @@ class SearchDiscoveryService:
         self.rejected_candidates: list[RejectedSearchCandidate] = []
 
     async def discover(self, profile: CompanyResearchProfile | EtfResearchProfile, missing_categories: set[str], already_seen_urls: set[str]) -> list[DiscoveryResult]:
+        from app.deep_investigation import acquisition_budget
+        budget = acquisition_budget(profile.instrument_id)
         stats = SearchDiscoveryStats()
         rejected: list[RejectedSearchCandidate] = []
         accepted: list[DiscoveryResult] = []
@@ -707,12 +912,33 @@ class SearchDiscoveryService:
         window = SearchDateWindow(year=datetime.now(timezone.utc).year, query_limit=self.max_queries_per_category)
         per_category_limit = max(1, self.max_documents_per_refresh // max(len(missing_categories), 1))
         provider_errors: list[str] = []
-        for category in sorted(missing_categories):
+        sorted_categories = sorted(missing_categories)
+        for index, category in enumerate(sorted_categories):
+            if budget is not None:
+                if budget.stopped or await budget.sufficient():
+                    budget.stopped = True
+                    break
+                # Distribute the remaining query budget fairly across the
+                # categories still pending so that a budget smaller than
+                # max_queries_per_category does not starve every category after
+                # the first.  (DI-20H: query budget was consumed entirely by
+                # the first category, leaving sibling categories with zero
+                # queries -- e.g. only 1 of 3 governance sub-categories searched.)
+                remaining_categories = len(sorted_categories) - index
+                remaining_queries = budget.max_queries - budget.queries_reserved
+                per_category_cap = max(1, remaining_queries // remaining_categories) if remaining_categories > 0 and remaining_queries > 0 else 0
+                queries = budget.reserve_queries(min(self.max_queries_per_category, per_category_cap))
+                if not queries:
+                    break
+                window = SearchDateWindow(year=budget.as_of.year, query_limit=queries,
+                    months=max(1, (budget.lookback.days + 29) // 30) if budget.lookback else 12)
             accepted_for_category = 0
             stats.categories_attempted += 1
             try:
                 candidates = await self.provider.discover(profile, category, window)
             except SearchProviderError as exc:
+                if budget is not None:
+                    budget.failures.append("SOURCE_UNAVAILABLE:" + str(exc)[:160])
                 stats.provider_failure_count += 1
                 if not provider_errors:
                     stats.reject(str(exc))
@@ -784,7 +1010,7 @@ def _candidate_rank(profile: CompanyResearchProfile | EtfResearchProfile, candid
     relevant = any(term in haystack for term in filing_terms if candidate.category == "FINANCIAL_RESULTS") or any(
         term in haystack for term in ownership_terms if candidate.category in {"Ownership", "INSTITUTIONAL_ACTIVITY"}
     )
-    return (3 if exchange else 2 if official else 0, int(relevant), int(is_pdf), candidate.discovered_at)
+    return (3 if exchange else 2 if official else 0, int(relevant), int(not is_pdf), candidate.discovered_at)
 
 
 def _candidate_to_source(service: SearchDiscoveryService, profile: CompanyResearchProfile | EtfResearchProfile, candidate: CandidateSearchResult) -> RegisteredResearchSource:

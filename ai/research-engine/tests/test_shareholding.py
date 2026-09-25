@@ -7,10 +7,11 @@ import pytest
 import httpx
 
 from app.models import (
-    CompanyResearchProfile, DocumentStatus, DocumentType, ReliabilityLevel, ResearchDocument,
+    CompanyResearchProfile, DocumentStatus, DocumentType, ProvenancedValue, ReliabilityLevel, ResearchDocument,
     ShareholdingCategory, ShareholdingSnapshot, ShareholdingSnapshotValue, SourceClassification,
     SourceMode, SourceType,
 )
+from app.fact_precedence import FactSourceTier, FinancialFact, FinancialFactKey
 from app.persistence import SqliteResearchPersistence
 from app.repository import ResearchRepository, _fair_official_filing_order
 from app.research_fetching import FetchError, FetchResult, HttpResearchFetcher
@@ -956,7 +957,19 @@ async def test_usable_historical_parsed_document_reuses_before_network_and_fresh
         document_type=DocumentType.PDF_REFERENCE, content_hash="c" * 64, status=DocumentStatus.PARSED,
         reliability_level=ReliabilityLevel.LEVEL_A, entity_resolution_confidence=0.99, source_mode=SourceMode.REAL,
         normalized_text="Reliance Industries Limited quarterly financial results revenue 1000 crore PAT 100 crore.")
-    SqliteResearchPersistence(database).upsert_document(parsed)
+    persistence = SqliteResearchPersistence(database)
+    persistence.upsert_document(parsed)
+    # DI-7C Step 4: FINANCIAL_RESULTS qualifying evidence now also requires a
+    # genuinely extracted FinancialFact for this document, not just a
+    # title/text match.  This test is about document reuse/freshness, not
+    # parsing, so the fact is inserted directly alongside the manually
+    # seeded document rather than relying on this loose-prose text to parse.
+    persistence.upsert_financial_fact(FinancialFact(
+        FinancialFactKey(profile.instrument_id, "revenue", "2026-06-30", "QUARTERLY", None),
+        ProvenancedValue(value=Decimal("1000"), unit="INR crore", source_url=source.url,
+                          source_name="NSE", source_type="EXCHANGE_ANNOUNCEMENT", retrieved_at=parsed.retrieved_at, confidence=None),
+        FactSourceTier.OFFICIAL_NSE, "NSE", str(parsed.document_id), SourceMode.REAL,
+    ))
 
     class NoNetworkFetcher:
         calls = 0
@@ -1030,7 +1043,7 @@ async def test_official_fetch_round_robin_prevents_category_starvation_with_boun
     assert len(fetcher.urls) == settings.research_official_document_max_attempts_per_refresh
 
 
-def test_official_filing_scheduler_preserves_newest_first_within_each_category() -> None:
+def test_official_filing_scheduler_preserves_newest_first_and_core_categories_before_non_core() -> None:
     profile = ResearchRepository(settings=Settings()).list_profiles()[0]
     def result(category: str, suffix: str) -> DiscoveryResult:
         source = RegisteredResearchSource(source_id=f"{category}-{suffix}", instrument_id=profile.instrument_id,
@@ -1040,9 +1053,13 @@ def test_official_filing_scheduler_preserves_newest_first_within_each_category()
         return DiscoveryResult(category, source)
     financial_new, financial_old = result("FINANCIAL_RESULTS", "financial-new"), result("FINANCIAL_RESULTS", "financial-old")
     share_new, share_old = result("SHAREHOLDING_PATTERN", "share-new"), result("SHAREHOLDING_PATTERN", "share-old")
-    scheduled = _fair_official_filing_order([financial_new, financial_old, share_new, share_old])
+    news = result("INVESTOR_RELEASE", "news")
+    # Two-phase ordering: Phase 1 = round-robin across CORE categories only
+    # (FINANCIAL_RESULTS, SHAREHOLDING_PATTERN), Phase 2 = non-core categories.
+    # Within FINANCIAL_RESULTS, newest-first is preserved.
+    scheduled = _fair_official_filing_order([financial_new, financial_old, share_new, share_old, news])
     urls = [item.source.url for item in scheduled]
-    assert urls == [financial_new.source.url, share_new.source.url, financial_old.source.url, share_old.source.url]
+    assert urls == [financial_new.source.url, share_new.source.url, financial_old.source.url, share_old.source.url, news.source.url]
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ from the existing durable fact authority/merge rules.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.fact_precedence import FactSourceTier, FinancialFact, FinancialFactKey
+from app.normalization import content_hash
 from app.models import (
     CompanyResearchProfile,
     DocumentStatus,
@@ -41,8 +43,14 @@ from app.models import (
     StructuredMarketSnapshotRecord,
     TimeHorizon,
 )
-from app.research_readiness import ExternalResearchToolAuthorization, ResearchRefreshTarget
-from app.research_readiness_runtime import CapabilityExecutionProgress, CapabilityExecutionResult
+from app.deep_investigation import acquisition_budget
+from app.research_readiness import (
+    ExternalResearchToolAuthorization, ResearchRefreshTarget,
+    REQUIREMENT_STATUSES_NEEDING_ACQUISITION, ResearchReadinessService,
+)
+from app.research_readiness_runtime import (
+    CapabilityExecutionProgress, CapabilityExecutionResult, RepositoryResearchReadinessAdapter,
+)
 
 
 YAHOO_FINANCE_MCP = "YAHOO_FINANCE_MCP"
@@ -242,6 +250,7 @@ class ExternalResearchToolGatewayClient(Protocol):
         requirement_id: str,
         authorization: ExternalResearchToolAuthorization,
         request_id: str,
+        timeout_seconds: float | None = None,
     ) -> YahooMcpNormalizedResult: ...
 
 
@@ -261,6 +270,7 @@ class HttpExternalResearchToolGateway:
         requirement_id: str,
         authorization: ExternalResearchToolAuthorization,
         request_id: str,
+        timeout_seconds: float | None = None,
     ) -> YahooMcpNormalizedResult:
         symbol = profile.provider_instrument_ids.get("YAHOO_FINANCE")
         if not symbol:
@@ -286,6 +296,11 @@ class HttpExternalResearchToolGateway:
                     f"{self.base_url}/internal/v1/external-research/acquire",
                     json=payload,
                     headers=headers,
+                    # Per-request override: caller may cap this specific call to
+                    # whatever of a shared ensure() budget genuinely remains,
+                    # without changing the client's own default timeout (used
+                    # whenever no override is given -- every existing caller).
+                    timeout=timeout_seconds if timeout_seconds is not None else self.timeout_seconds,
                 )
         except httpx.TimeoutException as exc:
             raise ExternalMcpAcquisitionError("DOWNSTREAM_TIMEOUT") from exc
@@ -427,7 +442,7 @@ class YahooMcpResultPersister:
             market_as_of=snapshot.market_as_of,
             retrieved_at=snapshot.retrieved_at,
             persisted_at=now,
-            last_price_at=now if "latestPrice" in facts else None,
+            last_price_at=snapshot.market_as_of if "latestPrice" in facts else None,
             last_valuation_at=(
                 now
                 if any(key in facts for key in ("trailingPE", "forwardPE", "priceToBook"))
@@ -518,7 +533,13 @@ class YahooMcpResultPersister:
             source_mode=SourceMode.REAL,
             freshness="REAL",
             discovery_provider=YAHOO_FINANCE_MCP,
-            source_independence_key=article.url.casefold(),
+            # Deterministic SHA-256 identity (repository's established
+            # convention, e.g. repository.py's source_independence_key=
+            # content_hash(...)) over the case-insensitive canonical source
+            # URL. Must never be the raw URL: source_independence_key is a
+            # fixed-width CHAR(64) column and a raw URL is neither
+            # guaranteed to be 64 characters nor safe to store there.
+            source_independence_key=content_hash(article.url.casefold()),
         )
         event_type = _event_type(article.event_type)
         event = ResearchEvent(
@@ -543,7 +564,14 @@ class YahooMcpResultPersister:
             raw_evidence_reference=article.headline,
             published_at=_aware(article.published_at),
             retrieved_at=_aware(result.retrieved_at),
-            independence_key=f"{YAHOO_FINANCE_MCP}:{article.url.casefold()}",
+            # research_events.independence_key is also a fixed-width CHAR(64)
+            # column (same defect class as source_independence_key above): hash
+            # the same provider-qualified composite identity that was
+            # previously stored raw, via the shared content_hash() helper, so
+            # the key stays deterministic per (provider, case-insensitive URL)
+            # -- preserving the existing provider-distinction semantics -- while
+            # always being exactly 64 lowercase hex characters.
+            independence_key=content_hash(f"{YAHOO_FINANCE_MCP}:{article.url.casefold()}"),
         )
         await self.repository.persist_external_mcp_evidence_async(document, event)
 
@@ -595,6 +623,15 @@ class YahooMcpResultPersister:
         await self.repository.persist_external_mcp_shareholding_async(snapshot)
 
 
+# Small, fixed buffer reserved out of the shared ensure() budget for a
+# target's own post-response work (JSON/pydantic validation + the
+# persistence write) after its network call returns -- not a connection
+# timeout, and deliberately much smaller than the ~10s normal gateway
+# timeout it is subtracted from. Also used as the minimum remaining
+# budget below which starting a request is not worth attempting.
+_RESPONSE_PROCESSING_SAFETY_MARGIN_SECONDS = 0.5
+
+
 class McpFirstResearchCapabilityExecutor:
     """Try configured Yahoo MCP capabilities, then call the unchanged executor."""
 
@@ -623,17 +660,92 @@ class McpFirstResearchCapabilityExecutor:
         correlation_id: str | None,
         identity_headers: Mapping[str, str | None] | None,
         progress: CapabilityExecutionProgress | None = None,
+        deadline: float | None = None,
     ) -> CapabilityExecutionResult:
         completed: set[str] = set()
         executed: list[str] = []
         mcp_failures: dict[str, str] = {}
         profile = self.repository.profile(global_instrument_id)
         request_id = correlation_id or str(global_instrument_id)
+        authority_checked: set[str] = set()
+        upgrade_due = getattr(self.repository, "financial_authority_upgrade_due", None)
+        if (self.enabled and jurisdiction == "INDIA"
+                and any(target.requirement_id == "QUARTERLY_FINANCIALS" for target in targets)
+                and callable(upgrade_due)
+                and await self.repository._run_blocking_persistence(
+                    upgrade_due, profile, datetime.now(timezone.utc),
+                )):
+            # main.py installs this wrapper around the regional executor.
+            # Yahoo success must not consume an outstanding NSE authority
+            # upgrade before the repository ever sees FINANCIAL_RESULTS.
+            capability = "NSE:QUARTERLY_FINANCIALS"
+            executed.append(capability)
+            if progress is not None:
+                progress.executed(capability)
+            try:
+                await self.repository.refresh_targeted_categories(
+                    global_instrument_id, {"FINANCIAL_RESULTS"},
+                    correlation_id=correlation_id, allow_demo=False,
+                    authority_upgrade_categories={"FINANCIAL_RESULTS"},
+                )
+            except Exception:
+                mcp_failures["QUARTERLY_FINANCIALS"] = "NSE_FINANCIAL_UPGRADE_UNAVAILABLE"
+                if progress is not None:
+                    progress.failed("QUARTERLY_FINANCIALS", "NSE_FINANCIAL_UPGRADE_UNAVAILABLE")
+            authority_checked.add("QUARTERLY_FINANCIALS")
+            # Reassess actual persisted evidence, including retained secondary
+            # fallback. Never infer completion from document/transport success.
+            readiness = await self.repository._run_blocking_persistence(
+                ResearchReadinessService(RepositoryResearchReadinessAdapter(self.repository)).assess,
+                global_instrument_id, jurisdiction=jurisdiction,
+            )
+            if readiness.for_requirement("QUARTERLY_FINANCIALS").status not in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
+                completed.add("QUARTERLY_FINANCIALS")
+                if progress is not None:
+                    progress.satisfied("QUARTERLY_FINANCIALS")
+        # This target's own network timeout is capped to whatever of the
+        # shared ensure() budget genuinely remains (bounded above by the
+        # gateway's own normal timeout), minus the small fixed margin above
+        # for this target's own post-response work -- rather than refusing to
+        # even start unless the FULL normal gateway timeout still fits. The
+        # outer asyncio.timeout(ensure_timeout_seconds) wrapped around the
+        # whole plan (ResearchReadinessRuntime._execute_plan_bounded) already
+        # guarantees the shared ensure() budget itself is never exceeded even
+        # without this; capping the per-call timeout exists purely so a
+        # request that provably cannot get a useful answer in the time left is
+        # skipped up front -- cleanly attributed as BUDGET_EXHAUSTED, no socket
+        # opened -- instead of being started and either left for the coarser
+        # outer cancellation to cut off mid-flight, or left running its own
+        # full, uncoordinated timeout regardless of how little shared budget
+        # is actually left.
+        normal_timeout_seconds = getattr(self.gateway, "timeout_seconds", 10.0)
         if self.enabled:
             for target in targets:
+                if target.requirement_id in completed:
+                    continue
+                if target.requirement_id == "ORDER_BOOK_CAPEX_GUIDANCE" and (
+                    target.excluded_input_ids
+                    or (jurisdiction == "INDIA" and profile.provider_instrument_ids.get("NSE"))
+                ):
+                    # The MCP umbrella cannot express concept exclusions. The
+                    # category-aware executor preserves scope, tries official
+                    # NSE disclosures, then uses its approved source fallback.
+                    continue
                 route = self.priority.route(jurisdiction, target.requirement_id)
                 if not route.providers or route.providers[0] != YAHOO_FINANCE_MCP:
                     continue
+                call_timeout_seconds: float | None = None
+                if deadline is not None:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    call_timeout_seconds = min(
+                        normal_timeout_seconds,
+                        remaining - _RESPONSE_PROCESSING_SAFETY_MARGIN_SECONDS,
+                    )
+                    if call_timeout_seconds <= _RESPONSE_PROCESSING_SAFETY_MARGIN_SECONDS:
+                        mcp_failures[target.requirement_id] = "BUDGET_EXHAUSTED"
+                        if progress is not None:
+                            progress.failed(target.requirement_id, "BUDGET_EXHAUSTED")
+                        continue
                 authorization = target.authority_policy.fallback_policy.authorize_external_tool(
                     global_instrument_id=global_instrument_id,
                     requirement_id=target.requirement_id,
@@ -659,6 +771,7 @@ class McpFirstResearchCapabilityExecutor:
                         requirement_id=target.requirement_id,
                         authorization=authorization,
                         request_id=request_id,
+                        timeout_seconds=call_timeout_seconds,
                     )
                     await self.persister.persist(result, profile)
                 except ExternalMcpAcquisitionError as exc:
@@ -678,11 +791,34 @@ class McpFirstResearchCapabilityExecutor:
                 if result.acquisition_outcome == "SUCCESS_EMPTY":
                     # Empty acquisition metadata is not event evidence. Try approved fallbacks.
                     continue
+                if acquisition_budget(global_instrument_id) is not None:
+                    # An active deep-investigation targeted-repair budget means
+                    # the caller specifically asked for this still-missing
+                    # mandatory input. Yahoo's own self-reported "SUCCESS" only
+                    # means *something* was written (e.g. an unrelated
+                    # financial metric, or a news response with zero articles)
+                    # -- it does not mean the targeted gap was actually closed.
+                    # Re-verify against durable readiness before excluding the
+                    # target from the legacy/authoritative fallback, the same
+                    # way the QUARTERLY_FINANCIALS authority-upgrade branch
+                    # above already does. Outside an active repair budget
+                    # (ordinary/routine refresh) this extra round trip is
+                    # skipped and existing behavior is unchanged.
+                    readiness = await self.repository._run_blocking_persistence(
+                        ResearchReadinessService(RepositoryResearchReadinessAdapter(self.repository)).assess,
+                        global_instrument_id, jurisdiction=jurisdiction,
+                    )
+                    if readiness.for_requirement(target.requirement_id).status in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
+                        mcp_failures[target.requirement_id] = "EXTERNAL_RESULT_INCOMPLETE"
+                        if progress is not None:
+                            progress.failed(target.requirement_id, "EXTERNAL_RESULT_INCOMPLETE")
+                        continue
                 completed.add(target.requirement_id)
                 if progress is not None:
                     progress.satisfied(target.requirement_id)
 
-        remaining = tuple(target for target in targets if target.requirement_id not in completed)
+        remaining = tuple(target for target in targets
+                          if target.requirement_id not in completed | authority_checked)
         legacy = (
             await self.legacy_executor.execute_primary(
                 global_instrument_id,
@@ -691,6 +827,7 @@ class McpFirstResearchCapabilityExecutor:
                 correlation_id=correlation_id,
                 identity_headers=identity_headers,
                 progress=progress,
+                deadline=deadline,
             )
             if remaining
             else CapabilityExecutionResult()

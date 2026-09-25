@@ -9,12 +9,14 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Protocol
 from functools import partial
+from uuid import uuid4
 
 import httpx
 from io import BytesIO
 
 from app.settings import Settings
 from app.url_security import validate_public_http_url
+from app.pdf_structure import PdfTextStructure, preserve_pdf_structure
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,9 @@ class FetchResult:
     text: str
     bytes_read: int
     extraction_status: str = "EXTRACTED"
+    pdf_structure: PdfTextStructure | None = None
+    page_count: int | None = None
+    extraction_elapsed_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -138,12 +143,23 @@ class HttpResearchFetcher:
         if getattr(response, "content_type", "") != "application/pdf":
             return self.process_network_response(response, max_bytes=max_bytes)
         queued_at = time.monotonic()
+        extraction_id = uuid4()
         logger.info(
-            "pdf_extraction_queued host=%s path=%s documentBytes=%s configuredConcurrency=%s",
+            "pdf_extraction_queued host=%s path=%s documentBytes=%s configuredConcurrency=%s extractionId=%s",
             _safe_host(response.final_url), _safe_path(response.final_url), len(response.content),
-            self.settings.research_pdf_extraction_concurrency,
+            self.settings.research_pdf_extraction_concurrency, extraction_id,
         )
-        await self._pdf_extraction_semaphore.acquire()
+        timeout = extraction_timeout_seconds
+        if timeout is None:
+            timeout = self.settings.research_official_document_extraction_timeout_seconds
+        try:
+            await asyncio.wait_for(self._pdf_extraction_semaphore.acquire(), timeout=timeout)
+        except TimeoutError as exc:
+            # A stuck, non-cancellable worker must not make admission unbounded.
+            # This is queue expiry, not network failure or a started extraction.
+            logger.warning("pdf_extraction_queue_timeout host=%s path=%s timeoutSeconds=%s extractionId=%s",
+                           _safe_host(response.final_url), _safe_path(response.final_url), timeout, extraction_id)
+            raise PdfExtractionTimeoutError("PDF_EXTRACTION_QUEUE_TIMEOUT") from exc
         loop = asyncio.get_running_loop()
         task = asyncio.ensure_future(loop.run_in_executor(
             self._pdf_extraction_executor,
@@ -151,15 +167,25 @@ class HttpResearchFetcher:
         ))
         self._active_pdf_extractions.add(task)
         started_at = time.monotonic()
+        abandoned = False
+        discard_reported = False
+
+        def report_discard(completed):
+            nonlocal discard_reported
+            if abandoned and completed.done() and not discard_reported:
+                discard_reported = True
+                logger.info("pdf_extraction_discarded host=%s path=%s ownership=DISCARDED extractionId=%s",
+                            _safe_host(response.final_url), _safe_path(response.final_url), extraction_id)
         logger.info(
-            "pdf_extraction_started host=%s path=%s documentBytes=%s queueWaitMs=%s activeExtractions=%s configuredConcurrency=%s",
+            "pdf_extraction_started host=%s path=%s documentBytes=%s queueWaitMs=%s activeExtractions=%s configuredConcurrency=%s extractionId=%s",
             _safe_host(response.final_url), _safe_path(response.final_url), len(response.content),
-            _elapsed_ms(queued_at), len(self._active_pdf_extractions), self.settings.research_pdf_extraction_concurrency,
+            _elapsed_ms(queued_at), len(self._active_pdf_extractions), self.settings.research_pdf_extraction_concurrency, extraction_id,
         )
 
         def release_when_done(completed: asyncio.Future[FetchResult]) -> None:
             self._active_pdf_extractions.discard(completed)
             self._pdf_extraction_semaphore.release()
+            report_discard(completed)
             logger.info(
                 "pdf_extraction_worker_released host=%s path=%s extractionElapsedMs=%s activeExtractions=%s configuredConcurrency=%s",
                 _safe_host(response.final_url), _safe_path(response.final_url), _elapsed_ms(started_at),
@@ -174,9 +200,6 @@ class HttpResearchFetcher:
                     pass
 
         task.add_done_callback(release_when_done)
-        timeout = extraction_timeout_seconds
-        if timeout is None:
-            timeout = self.settings.research_official_document_extraction_timeout_seconds
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
             logger.info(
@@ -184,17 +207,34 @@ class HttpResearchFetcher:
                 _safe_host(response.final_url), _safe_path(response.final_url), _elapsed_ms(started_at),
                 len(self._active_pdf_extractions),
             )
+            # Only the async owner can publish accepted completion. A worker
+            # thread cannot know whether its caller already abandoned the result.
+            logger.info("fetch_extraction_complete host=%s path=%s pageCount=%s extractionElapsedMs=%s extractionStatus=%s ownership=ACCEPTED extractionId=%s",
+                        _safe_host(response.final_url), _safe_path(response.final_url), result.page_count,
+                        result.extraction_elapsed_ms, result.extraction_status, extraction_id)
             return result
         except TimeoutError as exc:
+            abandoned = True
+            report_discard(task)
             logger.warning(
-                "pdf_extraction_timeout host=%s path=%s timeoutSeconds=%s activeExtractions=%s configuredConcurrency=%s",
+                "pdf_extraction_timeout host=%s path=%s timeoutSeconds=%s activeExtractions=%s configuredConcurrency=%s extractionId=%s",
                 _safe_host(response.final_url),
                 _safe_path(response.final_url),
                 timeout,
                 len(self._active_pdf_extractions),
-                self.settings.research_pdf_extraction_concurrency,
+                self.settings.research_pdf_extraction_concurrency, extraction_id,
             )
             raise PdfExtractionTimeoutError("PDF_EXTRACTION_TIMEOUT") from exc
+        except asyncio.CancelledError:
+            abandoned = True
+            report_discard(task)
+            logger.info("pdf_extraction_abandoned host=%s path=%s reason=CALLER_CANCELLED extractionId=%s",
+                        _safe_host(response.final_url), _safe_path(response.final_url), extraction_id)
+            raise
+        except Exception as exc:
+            logger.warning("pdf_extraction_failed host=%s path=%s exception=%s extractionId=%s",
+                           _safe_host(response.final_url), _safe_path(response.final_url), type(exc).__name__, extraction_id)
+            raise
 
     async def fetch_network(
         self,
@@ -323,10 +363,6 @@ class HttpResearchFetcher:
                 raise FetchError("PDF_TEXT_EXTRACTION_FAILED") from exc
             if not any(page.strip() for page in extracted_pages):
                 extraction_status = "PDF_SCANNED_OCR_REQUIRED"
-            logger.info(
-                "fetch_extraction_complete host=%s path=%s pageCount=%s extractionElapsedMs=%s extractionStatus=%s",
-                _safe_host(response.final_url), _safe_path(response.final_url), len(extracted_pages), _elapsed_ms(started), extraction_status,
-            )
         return FetchResult(
             final_url=response.final_url,
             status_code=response.status_code,
@@ -334,6 +370,9 @@ class HttpResearchFetcher:
             text=text,
             bytes_read=len(content),
             extraction_status=extraction_status,
+            pdf_structure=preserve_pdf_structure(text) if content_type == "application/pdf" else None,
+            page_count=len(extracted_pages) if content_type == "application/pdf" else None,
+            extraction_elapsed_ms=_elapsed_ms(started) if content_type == "application/pdf" else None,
         )
 
 

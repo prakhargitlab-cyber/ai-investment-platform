@@ -470,7 +470,9 @@ def test_sustained_growth_beats_decline_and_qoq_has_limited_weight():
 def test_unsustainable_leverage_scores_worse_but_bank_skips_industrial_debt_rule():
     engine = StockRuleEngineV1()
     sound = engine._balance_sheet(_inputs())
-    stressed = engine._balance_sheet(_inputs(structured=(_structured(debtToEquity=250),)))
+    stressed_facts = [replace(f, value=f.value.model_copy(update={"value": Decimal("15000")}))
+        if f.key.metric in {"total_debt", "debt_or_borrowings"} else f for f in _base_facts()]
+    stressed = engine._balance_sheet(_inputs(facts=stressed_facts, structured=(_structured(debtToEquity=250),)))
     bank = engine._balance_sheet(_inputs(sector="Banks"))
     assert sound.raw_score > stressed.raw_score
     assert not any(item.rule == "INDUSTRIAL_DEBT_TO_EQUITY_V1" for item in bank.metrics)
@@ -554,8 +556,10 @@ def test_authoritative_severe_governance_can_override_but_weak_news_cannot():
     severe = _event(event_type=ResearchEventType.REGULATORY_EVENT, impact=EventImpact.STRONG_NEGATIVE, title="Confirmed accounting fraud", summary="Exchange confirms accounting fraud.")
     weak = severe.model_copy(update={"event_id": uuid4(), "source_classification": SourceClassification.REPUTABLE_NEWS, "reliability": ReliabilityLevel.LEVEL_C, "confidence": 0.55})
     engine = StockRuleEngineV1()
-    severe_result = engine.evaluate(_inputs(events=(severe,)), allow_partial=False)
-    weak_result = engine.evaluate(_inputs(events=(weak,)), allow_partial=False)
+    # The fixture's material catalyst stays present so every applicable area is
+    # scorable (full-research contract); only the governance evidence differs.
+    severe_result = engine.evaluate(_inputs(events=(severe, _event())), allow_partial=False)
+    weak_result = engine.evaluate(_inputs(events=(weak, _event())), allow_partial=False)
     assert any(item.code == "CONFIRMED_FRAUD_OR_ACCOUNTING_CRISIS" for item in severe_result.risk_overrides)
     assert severe_result.decision_signal == DecisionSignal.EXIT_REVIEW
     assert not weak_result.risk_overrides
@@ -694,7 +698,7 @@ class _ApiOrchestrator:
             "updatedAt": NOW.isoformat(),
         }
 
-    def register_global_profile_metadata(self, instrument_id, metadata):
+    def register_global_profile_metadata(self, instrument_id, metadata, *, reason_out=None):
         return instrument_id == self.profile.instrument_id
 
 

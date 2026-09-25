@@ -5,12 +5,16 @@ import re
 import logging
 import threading
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 from uuid import UUID
 
 from app.deduplication import DocumentDeduplicator
+from app.document_cache import BoundedDocumentCache, DocumentRef, _ref as _document_ref
+from app.event_store import BoundedEventStore
+from app.failure_taxonomy import TECHNICAL_RETRYABLE, classify_reason as classify_failure_reason
 from app.entity_resolution import EntityResolver
 from app.events import company_updated, document_event, research_event_extracted
 from app.extraction import RuleBasedEventExtractor
@@ -56,8 +60,9 @@ from app.source_discovery import (
     SearxngSearchDiscoveryProvider,
 )
 from app.source_registry import RegisteredResearchSource, registered_sources_for
-from app.structured_research import financial_result_history_from_facts, financial_statement_history_from_facts, latest_quarterly_result_from_facts, latest_quarterly_result, parsed_nse_balance_sheet_periods, parsed_nse_cash_flow_periods, parsed_nse_income_statement_periods
-from app.fact_precedence import FinancialFact, FinancialFactKey, FactSourceTier
+from app.structured_research import _BALANCE_SHEET_HEADING, _CASH_FLOW_HEADING, financial_result_history_from_facts, financial_statement_history_from_facts, latest_quarterly_result_from_facts, latest_quarterly_result, parsed_nse_balance_sheet_periods, parsed_nse_cash_flow_periods, parsed_nse_income_statement_periods
+from app.fact_precedence import FinancialFact, FinancialFactKey, FactSourceTier, newer_official_disclosure
+from app.financial_authority import authoritative_financial_upgrade_required
 
 logger = logging.getLogger(__name__)
 _TRUSTED_NSE_PROFILE_IDENTITY = object()
@@ -92,6 +97,16 @@ _QUARTERLY_WINDOW = _CategoryRefreshStrategy("QUARTERLY_WINDOW", timedelta(days=
 _ANNUAL_WINDOW = _CategoryRefreshStrategy("ANNUAL_WINDOW", timedelta(days=14))
 
 _CATEGORY_STRATEGIES: dict[str, _CategoryRefreshStrategy] = {
+    # Each category has exactly one strategy (no duplicate-key shadowing).
+    #
+    # Announcement / catalyst categories carry time-sensitive, frequent
+    # corporate disclosures; their no-change lightweight check cadence is one
+    # day, matching the canonical announcement block (CONTRACTS,
+    # ACQUISITIONS, GUIDANCE, MANAGEMENT, REGULATORY, CATALYSTS). A prior
+    # second dict block re-declared CAPEX, NEW_FACILITIES, CLIENTS and
+    # ORDERS_BACKLOG as _PERIODIC_SLOW (7d), which shadowed this daily cadence
+    # and is removed here. (No audit/test asserts the prior 7-day shadow for
+    # these categories.)
     "SHAREHOLDING_PATTERN": _QUARTERLY_WINDOW,
     "FINANCIAL_RESULTS": _QUARTERLY_WINDOW,
     "ANNUAL_REPORT": _ANNUAL_WINDOW,
@@ -108,10 +123,7 @@ _CATEGORY_STRATEGIES: dict[str, _CategoryRefreshStrategy] = {
     "MANAGEMENT": _DAILY_LIGHTWEIGHT,
     "REGULATORY": _DAILY_LIGHTWEIGHT,
     "CATALYSTS": _DAILY_LIGHTWEIGHT,
-    "ORDERS_BACKLOG": _DAILY_LIGHTWEIGHT,
-    "CAPEX": _PERIODIC_SLOW,
-    "NEW_FACILITIES": _PERIODIC_SLOW,
-    "CLIENTS": _PERIODIC_SLOW,
+    # Financial-cycle / structural categories checked on a longer cadence.
     "PRODUCTS": _PERIODIC_SLOW,
     "GROWTH": _PERIODIC_SLOW,
 }
@@ -139,6 +151,145 @@ _REFRESH_CATEGORY_ALIASES = {
 }
 
 
+_PLATFORM_EVENT_HISTORY = 1024
+
+
+def _authority_rank(fact: FinancialFact) -> int:
+    """Deterministic tie-break rank: higher OFFICIAL tier wins."""
+    try:
+        return int(fact.source_tier.value)
+    except (AttributeError, ValueError):
+        return 0
+
+
+def _pick_better(existing: FinancialFact | None, candidate: FinancialFact | None) -> FinancialFact | None:
+    if existing is None:
+        return candidate
+    if candidate is None:
+        return existing
+    if _authority_rank(candidate) > _authority_rank(existing):
+        return candidate
+    if _authority_rank(candidate) < _authority_rank(existing):
+        return existing
+    if candidate.key.period_type == "ANNUAL" and existing.key.period_type != "ANNUAL":
+        return candidate
+    return existing
+
+
+def _to_decimal(value):
+    from decimal import Decimal, InvalidOperation
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _period_datetime(period_end, fallback):
+    candidate = None
+    if period_end:
+        try:
+            candidate = datetime.fromisoformat(str(period_end).replace("Z", "+00:00"))
+        except ValueError:
+            candidate = None
+    if candidate is None:
+        candidate = fallback
+    if candidate is None:
+        return None
+    # Research domain convention (see persistence._parse_dt): datetimes are
+    # UTC-aware.  Production PostgreSQL / DATE-only period_end values hydrate
+    # as naive (e.g. "2026-03-31"); attach UTC at this durable read boundary
+    # -- never strip tz from an already-aware timestamp.  This guarantees
+    # derived ROE/ROCE facts carry a tz-aware as_of_date so Stage-2
+    # (ResearchEvidence._require_aware) does not raise
+    # "as_of must be timezone-aware".
+    if candidate.tzinfo is None or candidate.utcoffset() is None:
+        return candidate.replace(tzinfo=timezone.utc)
+    return candidate.astimezone(timezone.utc)
+
+
+def _ratio_fact(instrument_id: UUID, metric: str, numerator: FinancialFact, denominator, basis_desc: str, now) -> FinancialFact | None:
+    """Build a derived PERCENT ratio fact (ROE/ROCE); never persisted directly."""
+    from decimal import Decimal, InvalidOperation
+    num = _to_decimal(numerator.value.value)
+    if num is None or denominator <= 0:
+        return None
+    try:
+        value = num / denominator * Decimal("100")
+    except (InvalidOperation, ZeroDivisionError, TypeError):
+        return None
+    period_end = numerator.key.period_end
+    as_of = _period_datetime(period_end, numerator.value.as_of_date or now)
+    return FinancialFact(
+        FinancialFactKey(instrument_id, metric, period_end, numerator.key.period_type, numerator.key.reporting_basis),
+        ProvenancedValue(
+            value=value, unit="PERCENT", as_of_date=as_of,
+            period=f"derived:{metric}",
+            source_url=numerator.value.source_url,
+            source_name=numerator.value.source_name or "NSE",
+            source_type="DERIVED",
+            published_at=None,
+            retrieved_at=now,
+            confidence=Decimal("0.9"),
+            calculation_basis=f"{metric.upper()}={basis_desc}",
+        ),
+        FactSourceTier.OFFICIAL_NSE, "NSE",
+        f"{numerator.source_identity}:derived:{metric}", SourceMode.REAL,
+    )
+
+
+def _derive_ratio_facts(instrument_id: UUID, facts) -> list[FinancialFact]:
+    """Read-only, matching-period derivation of official ratio facts.
+
+    ROE  = PAT / Equity                          * 100
+    ROCE = EBIT / (TotalAssets - CurrentLiabilities) * 100
+
+    Emitted only when numerator and denominator facts share the same
+    period_end and reporting_basis (matching-period) and the denominator is
+    strictly positive.  Derived facts are NEVER persisted: they are appended at
+    the durable read boundary (``financial_facts_for`` /
+    ``financial_facts_for_instruments``) so readiness and rule-engine scoring
+    observe an OFFICIAL_NSE (authority 4) ratio that outranks a Yahoo summary
+    ratio (authority 2).  ROCE suppression for financial issuers lives one layer
+    up, in the rule engine (``stock_rule_engine._is_financial``); financial
+    applicability is reconciled between ``research_applicability`` and the rule
+    engine, so neither special-cases IRFC.
+    """
+    from app.models import SourceMode
+    if not facts:
+        return []
+    groups: dict[tuple, dict[str, FinancialFact]] = {}
+    for fact in facts:
+        if fact.source_mode != SourceMode.REAL or not fact.key.period_end:
+            continue
+        bucket = groups.setdefault((fact.key.period_end, fact.key.reporting_basis), {})
+        bucket[fact.key.metric] = _pick_better(bucket.get(fact.key.metric), fact)
+
+    now = datetime.now(timezone.utc)
+    derived: list[FinancialFact] = []
+    for (period_end, basis), bucket in groups.items():
+        pat = bucket.get("pat")
+        equity = bucket.get("total_equity") or bucket.get("equity")
+        if pat is not None and equity is not None:
+            eq = _to_decimal(equity.value.value)
+            if eq is not None:
+                roe = _ratio_fact(instrument_id, "roe", pat, eq, "PAT/Equity", now)
+                if roe is not None:
+                    derived.append(roe)
+
+        ebit = bucket.get("ebit") or bucket.get("operating_profit") or bucket.get("operating_income")
+        assets = bucket.get("total_assets")
+        liab = bucket.get("current_liabilities")
+        if ebit is not None and assets is not None and liab is not None:
+            cap_employed = _to_decimal(assets.value.value)
+            cur_liab = _to_decimal(liab.value.value)
+            if cap_employed is not None and cur_liab is not None:
+                roce = _ratio_fact(instrument_id, "roce", ebit, cap_employed - cur_liab,
+                                   "EBIT/(TotalAssets-CurrentLiabilities)", now)
+                if roce is not None:
+                    derived.append(roce)
+    return derived
+
+
 class ResearchRepository:
     def __init__(
         self,
@@ -153,10 +304,23 @@ class ResearchRepository:
         self.settings = settings or Settings()
         self.profiles = _demo_profiles()
         self.etf_profiles: list[EtfResearchProfile] = []
-        self.documents: dict[UUID, ResearchDocument] = {}
-        self.events: dict[UUID, ResearchEvent] = {}
+        # Full bodies are bounded (count + bytes); compact refs are kept for
+        # enumeration. Durable research_documents is the source of truth --
+        # see app/document_cache.py for the retention contract.
+        self.documents = BoundedDocumentCache(
+            max_documents=self.settings.research_document_cache_max_documents,
+            max_bytes=self.settings.research_document_cache_max_bytes,
+        )
+        # Bounded per-instrument event retention; durable research_events is the
+        # source of truth (see app/event_store.py).
+        self.events = BoundedEventStore(
+            lambda instrument_id: self._persistence.load_events({instrument_id}),
+            _event_key, durable=self._documents_are_durable,
+            max_instruments=self.settings.research_event_cache_max_instruments)
         self.shareholding_snapshots: dict[UUID, ShareholdingSnapshot] = {}
-        self.platform_events: list[PlatformEvent] = []
+        # Never read by production code; bounded so it cannot grow with the
+        # number of documents/events processed over the process lifetime.
+        self.platform_events: deque[PlatformEvent] = deque(maxlen=_PLATFORM_EVENT_HISTORY)
         self.last_refresh: dict[UUID, datetime] = {}
         self.last_live_error: dict[UUID, str] = {}
         self._category_refresh: dict[tuple[UUID, str], datetime] = {}
@@ -164,8 +328,8 @@ class ResearchRepository:
         # freshness. Keep its check cadence separate from durable evidence so
         # normal refreshes do not rediscover the same missing category.
         self._category_successful_no_change_checks: dict[tuple[UUID, str], datetime] = {}
+        self._financial_authority_attempts: dict[UUID, datetime] = {}
         self._deduplicator = DocumentDeduplicator()
-        self._event_keys: set[tuple[UUID, ResearchEventType, str, str | None, str | None]] = set()
         self._resolver = EntityResolver(self.profiles)
         self._extractor = RuleBasedEventExtractor()
         self._scorer = CatalystScorer()
@@ -180,7 +344,8 @@ class ResearchRepository:
             allowed_domains=self.settings.research_search_allowed_domains,
         )
         self._official_filing_discovery = official_filing_discovery or OfficialFilingDiscovery(
-            announcements_url=self.settings.nse_announcements_url
+            announcements_url=self.settings.nse_announcements_url,
+            governance_categories=self.settings.research_nse_governance_categories,
         )
         self._official_shareholding_discovery = official_shareholding_discovery or OfficialNseShareholdingDiscovery(
             shareholdings_url=self.settings.nse_shareholdings_url
@@ -222,7 +387,9 @@ class ResearchRepository:
         return self.etf_profiles
 
     def financial_facts_for(self, instrument_id: UUID):
-        return self._persistence.load_financial_facts({instrument_id})
+        persisted = list(self._persistence.load_financial_facts({instrument_id}))
+        persisted.extend(_derive_ratio_facts(instrument_id, persisted))
+        return persisted
 
     async def financial_facts_for_instruments(self, instrument_ids: set[UUID]) -> dict[UUID, list[FinancialFact]]:
         started = time.perf_counter()
@@ -231,6 +398,8 @@ class ResearchRepository:
         for fact in facts:
             if fact.key.instrument_id in grouped:
                 grouped[fact.key.instrument_id].append(fact)
+        for instrument_id, instrument_facts in grouped.items():
+            instrument_facts.extend(_derive_ratio_facts(instrument_id, instrument_facts))
         logger.info(
             "portfolio_summary_stage stage=FINANCIAL_FACTS durationMs=%s requestedInstrumentCount=%s returnedFactCount=%s",
             round((time.perf_counter() - started) * 1000),
@@ -397,15 +566,79 @@ class ResearchRepository:
         return self.summary(instrument_id, allow_demo=True)
 
     def documents_for(self, instrument_id: UUID, source_mode: SourceMode | None = None) -> list[ResearchDocument]:
-        return sorted(
-            [
-                doc
-                for doc in self.documents.values()
-                if doc.instrument_id == instrument_id and (source_mode is None or doc.source_mode == source_mode)
-            ],
-            key=lambda doc: doc.published_at or doc.retrieved_at,
-            reverse=True,
-        )
+        refs = self.documents.refs_for_instrument(instrument_id, source_mode)
+        resident: dict[UUID, ResearchDocument] = {}
+        missing: list[UUID] = []
+        for ref in refs:
+            document = self.documents.get(ref.document_id)
+            if document is None:
+                missing.append(ref.document_id)
+            else:
+                resident[ref.document_id] = document
+        if missing:
+            # Evicted bodies: durable storage is the source of truth. One
+            # batched read, then re-cache as durable (evictable) entries.
+            for document in self._load_documents_by_ids(missing):
+                self.documents.reloads += 1
+                resident[document.document_id] = document
+                self.documents.put(document, durable=True)
+        docs = [resident[ref.document_id] for ref in refs if ref.document_id in resident]
+        if source_mode is not None:
+            docs = [doc for doc in docs if doc.source_mode == source_mode]
+        return sorted(docs, key=lambda doc: doc.published_at or doc.retrieved_at, reverse=True)
+
+    @property
+    def _event_keys(self) -> set:
+        """Read-only view of resident dedup keys (compatibility)."""
+        return self.events.resident_keys()
+
+    def document_count_for(self, instrument_id: UUID, source_mode: SourceMode | None = None) -> int:
+        """Compact count from the identity index -- never loads bodies."""
+        return len(self.documents.refs_for_instrument(instrument_id, source_mode))
+
+    def document_urls_for(self, instrument_id: UUID, source_mode: SourceMode | None = None) -> set[str]:
+        """Canonical URLs already known for an instrument -- never loads bodies."""
+        return {ref.canonical_url for ref in self.documents.refs_for_instrument(instrument_id, source_mode)}
+
+    def _load_documents_by_ids(self, document_ids: list[UUID]) -> list[ResearchDocument]:
+        loader = getattr(self._persistence, "load_documents_by_ids", None)
+        if loader is not None:
+            return list(loader(list(document_ids)))
+        single = getattr(self._persistence, "load_document", None)
+        if single is None:
+            return []
+        return [document for document in (single(document_id) for document_id in document_ids) if document is not None]
+
+    def remember_persisted_document(self, document: ResearchDocument) -> None:
+        """Cache a document its caller has already persisted; the body is
+        evictable only when persistence is actually durable."""
+        self.documents.put(document, durable=document.source_mode == SourceMode.REAL and self._documents_are_durable())
+
+    def _documents_are_durable(self) -> bool:
+        return bool(getattr(self._persistence, "durable_documents", True))
+
+    def _forget_unpersisted_document(self, document: ResearchDocument) -> None:
+        """Undo in-memory registration of a document whose persistence
+        failed or was cancelled: body, compact ref and dedup identity."""
+        self.documents.pop(document.document_id, None)
+        self._deduplicator.forget(document.canonical_url, document.content_hash, document.document_id)
+
+    def _adopt_existing_durable_document(self, document: ResearchDocument) -> ResearchDocument:
+        """Durable storage already holds this URL/hash (UNIQUE) under another
+        id that this process did not know -- e.g. a row committed by a
+        persistence thread whose caller was cancelled, or written by another
+        replica. Adopt the durable row instead of keeping an orphan id."""
+        durable_id = document.duplicate_of_document_id
+        self._forget_unpersisted_document(document)
+        document.status = DocumentStatus.DUPLICATE
+        for durable in self._load_documents_by_ids([durable_id] if durable_id else []):
+            self.documents.register_ref(_document_ref(durable))
+            self._deduplicator.add_identity(durable.document_id, durable.canonical_url, durable.content_hash)
+        return document
+
+    def _mark_document_durable(self, document: ResearchDocument) -> None:
+        if document.source_mode == SourceMode.REAL and self._documents_are_durable():
+            self.documents.mark_durable(document.document_id)
 
     def register_etf_profile(self, profile: EtfResearchProfile) -> EtfResearchProfile:
         for existing in self.etf_profiles:
@@ -432,7 +665,7 @@ class ResearchRepository:
         reliability: ReliabilityLevel | None = None,
         source_mode: SourceMode | None = None,
     ) -> list[ResearchEvent]:
-        values = [event for event in self.events.values() if event.instrument_id == instrument_id]
+        values = self.events.for_instrument(instrument_id)
         if event_type:
             values = [event for event in values if event.event_type == event_type]
         if impact:
@@ -497,6 +730,11 @@ class ResearchRepository:
     def acquisition_observations_for(self, instrument_id):
         loader = getattr(self._persistence, "load_acquisition_observations", None)
         return loader(instrument_id) if loader else []
+
+    def _latest_acquisition_observation(self, instrument_id, requirement_id, provider):
+        rows = [row for row in self.acquisition_observations_for(instrument_id)
+                if row.get("requirement_id") == requirement_id and row.get("provider") == provider]
+        return rows[-1] if rows else None
 
     async def persist_external_mcp_evidence_async(
         self, document: ResearchDocument, event: ResearchEvent
@@ -611,6 +849,7 @@ class ResearchRepository:
         _trusted_profile_identity: object | None = None,
         document_subtype: DocumentSubtype | None = None,
         _metadata_only_nse_financial_result: bool = False,
+        _official_title: str | None = None,
     ) -> ResearchDocument:
         document = self._prepare_ingested_document(
             original_url=original_url, source_type=source_type, source_name=source_name, publisher=publisher,
@@ -621,6 +860,9 @@ class ResearchRepository:
             trusted_profile_identity=_trusted_profile_identity,
             document_subtype=document_subtype,
         )
+        if _trusted_profile_identity is _TRUSTED_NSE_PROFILE_IDENTITY and _official_title:
+            document.title = _official_title
+            document.published_at = published_at
         return self._apply_prepared_ingested_document(
             document,
             document_status=document_status,
@@ -645,16 +887,25 @@ class ResearchRepository:
         if document.source_mode == SourceMode.REAL:
             started = time.monotonic()
             try:
-                await self._run_blocking_persistence(
+                stored = await self._run_blocking_persistence(
                     self._persist_ingested_document,
                     document,
                     nse_financial_result=metadata_only_nse_financial_result,
                 )
-            except Exception as exc:
-                self.documents.pop(document.document_id, None)
-                logger.info("document_ingest_stage globalInstrumentId=%s documentId=%s stage=DOCUMENT_PERSIST elapsedMs=%s outcome=FAILED", document.instrument_id, document.document_id, _elapsed_ms(started))
-                raise FetchError("DOCUMENT_PERSIST_FAILED") from exc
+            except BaseException as exc:
+                # Includes cancellation (timeouts): never leave a document that
+                # is not durably stored pinned in memory or registered as a
+                # dedup identity -- a retry must reprocess it, not skip it.
+                self._forget_unpersisted_document(document)
+                logger.info("document_ingest_stage globalInstrumentId=%s documentId=%s stage=DOCUMENT_PERSIST elapsedMs=%s outcome=%s errorType=%s", document.instrument_id, document.document_id, _elapsed_ms(started), "FAILED" if isinstance(exc, Exception) else "CANCELLED", type(exc).__name__)
+                if isinstance(exc, Exception):
+                    raise FetchError("DOCUMENT_PERSIST_FAILED") from exc
+                raise
+            if stored is False:
+                logger.info("document_ingest_stage globalInstrumentId=%s documentId=%s stage=DOCUMENT_PERSIST elapsedMs=%s outcome=ALREADY_DURABLE durableDocumentId=%s", document.instrument_id, document.document_id, _elapsed_ms(started), document.duplicate_of_document_id)
+                return self._adopt_existing_durable_document(document)
             logger.info("document_ingest_stage globalInstrumentId=%s documentId=%s stage=DOCUMENT_PERSIST elapsedMs=%s outcome=SUCCESS", document.instrument_id, document.document_id, _elapsed_ms(started))
+            self._mark_document_durable(document)
         if (document.instrument_id and document.source_mode == SourceMode.REAL and document_status != DocumentStatus.FAILED
                 and document.source_classification in {SourceClassification.EXCHANGE, SourceClassification.REGULATORY, SourceClassification.OFFICIAL_COMPANY}):
             started = time.monotonic()
@@ -697,13 +948,18 @@ class ResearchRepository:
         self.documents[document.document_id] = document
         if document.source_mode == SourceMode.REAL:
             try:
-                self._persist_ingested_document(
+                stored = self._persist_ingested_document(
                     document,
                     nse_financial_result=metadata_only_nse_financial_result,
                 )
-            except Exception as exc:
-                self.documents.pop(document.document_id, None)
-                raise FetchError("DOCUMENT_PERSIST_FAILED") from exc
+            except BaseException as exc:
+                self._forget_unpersisted_document(document)
+                if isinstance(exc, Exception):
+                    raise FetchError("DOCUMENT_PERSIST_FAILED") from exc
+                raise
+            if stored is False:
+                return self._adopt_existing_durable_document(document)
+            self._mark_document_durable(document)
         return self._continue_ingested_document_after_persistence(document, document_status=document_status)
 
     def _continue_ingested_document_after_persistence(self, document: ResearchDocument, *, document_status: DocumentStatus, financial_processed: bool = False, event_candidates: list[ResearchEvent] | None = None) -> ResearchDocument:
@@ -734,21 +990,15 @@ class ResearchRepository:
         return document
 
     def _apply_ingested_event(self, event: ResearchEvent, *, source_mode: SourceMode) -> None:
-        event_key = _event_key(event)
-        if event_key in self._event_keys:
+        if not self.events.add(event, durable=source_mode == SourceMode.REAL and self._documents_are_durable()):
             return
-        self._event_keys.add(event_key)
-        self.events[event.event_id] = event
         if source_mode == SourceMode.REAL:
             self._persist_ingested_event(event)
         self.platform_events.append(research_event_extracted(event))
 
     async def _apply_ingested_event_async(self, event: ResearchEvent, *, source_mode: SourceMode) -> None:
-        event_key = _event_key(event)
-        if event_key in self._event_keys:
+        if not self.events.add(event, durable=source_mode == SourceMode.REAL and self._documents_are_durable()):
             return
-        self._event_keys.add(event_key)
-        self.events[event.event_id] = event
         if source_mode == SourceMode.REAL:
             started = time.monotonic()
             try:
@@ -783,26 +1033,26 @@ class ResearchRepository:
         nse_financial_result: bool = False,
     ) -> None:
         """Durably store a non-duplicate prepared document."""
-        persisted = self._metadata_only_nse_quarterly_document(
+        persisted = self._durable_nse_financial_document(
             document,
             nse_financial_result=nse_financial_result,
         )
-        self._persistence.upsert_document(persisted)
+        stored = self._persistence.upsert_document(persisted)
+        if stored is False and persisted is not document:
+            document.duplicate_of_document_id = persisted.duplicate_of_document_id
+        return stored
 
-    def _metadata_only_nse_quarterly_document(
+    def _durable_nse_financial_document(
         self,
         document: ResearchDocument,
         *,
         nse_financial_result: bool = False,
     ) -> ResearchDocument:
-        """Keep new official NSE quarterly PDF writes free of document content.
+        """Retain bounded normalized parser input, never raw PDF content.
 
-        PDF bytes are already transient in ``HttpResearchFetcher``.  This
-        final persistence guard also omits extracted text when official
-        discovery classified the attachment as a financial result, or when
-        the parser proved that it contains normalized quarterly facts.  The
-        in-memory document remains available to the existing extraction path
-        for the duration of this request.
+        Dropping normalized text makes a persisted document impossible to
+        reconcile after restart or a parser correction. The existing fetch
+        size limit bounds this input; PDF bytes remain transient.
         """
         if (
             document.content_type != "application/pdf"
@@ -819,11 +1069,11 @@ class ResearchRepository:
             return document
         logger.info(
             "official_document_persist provider=NSE globalInstrumentId=%s documentId=%s "
-            "storage=URL_METADATA_AND_NORMALIZED_FACTS",
+            "storage=URL_METADATA_NORMALIZED_TEXT_AND_FACTS",
             document.instrument_id,
             document.document_id,
         )
-        return document.model_copy(update={"raw_text": None, "normalized_text": None})
+        return document.model_copy(update={"raw_text": None, "pdf_structure": None})
 
     def _prepare_ingested_document(self, *, original_url: str, source_type: SourceType, source_name: str,
                                    publisher: str, content_type: str, body: str, reliability: ReliabilityLevel,
@@ -836,6 +1086,9 @@ class ResearchRepository:
         canonical = canonicalize_url(original_url)
         title, extracted = extract_text(body, content_type)
         normalized = normalize_text(extracted or "")
+        # Transient structural sidecar only; the durable flattened-text contract is unchanged.
+        from app.pdf_structure import preserve_pdf_structure
+        pdf_structure = preserve_pdf_structure(body) if content_type == "application/pdf" else None
         if source_mode == SourceMode.REAL and not allow_empty_content:
             if not normalized:
                 raise FetchError("CONTENT_EMPTY")
@@ -872,6 +1125,7 @@ class ResearchRepository:
             document_subtype=document_subtype,
             raw_text=body if len(body) < 20_000 else None,
             normalized_text=normalized,
+            pdf_structure=pdf_structure,
             content_hash=content_hash(normalized or canonical),
             instrument_id=resolution.instrument_id,
             company_id=resolution.company_id,
@@ -887,14 +1141,15 @@ class ResearchRepository:
         return document
 
     def _persist_official_financial_facts(self, document: ResearchDocument) -> tuple[bool, int]:
-        """Persist explicit NSE quarterly/annual income-statement facts."""
+        """Persist only source-qualified, validated semantic NSE projections."""
         if not document.instrument_id:
             return False, 0
         facts = self._official_financial_fact_candidates(document)
         if not facts:
             return False, 0
-        existing = {fact.key: fact for fact in self._persistence.load_financial_facts()}
+        existing = {fact.key: fact for fact in self._persistence.load_financial_facts({document.instrument_id})}
         written = 0
+        explicit_revision = self._is_explicit_financial_revision(document)
         for fact in facts:
             prior = existing.get(fact.key)
             same_document_correction = (
@@ -902,46 +1157,62 @@ class ResearchRepository:
                 and prior.source_tier == FactSourceTier.OFFICIAL_NSE
                 and prior.source_identity == str(document.document_id)
             )
-            if self._persistence.upsert_financial_fact(fact, allow_same_tier_correction=same_document_correction):
+            revised = explicit_revision and newer_official_disclosure(prior, fact)
+            if self._persistence.upsert_financial_fact(fact, allow_same_tier_correction=same_document_correction or revised):
                 written += 1
         return True, written
 
     def _reconcile_persisted_official_financial_document(self, document: ResearchDocument) -> tuple[bool, int]:
         """Atomically reconcile a known trusted document without retrieval.
 
-        This is deliberately explicit: normal reads and ordinary completeness
-        repair retain their existing missing-fact selection behavior.
+        Source-owned corrections and explicitly published newer revisions may
+        replace comparable facts. Obsolete-key removal stays source-owned.
         """
-        facts = self._official_financial_fact_candidates(document)
+        from app.financial_projection import project_semantic_financial_facts
+        projection = project_semantic_financial_facts(document)
+        facts = list(projection.facts)
         if not facts:
             return False, 0
+        existing = {fact.key: fact for fact in self._persistence.load_financial_facts({document.instrument_id})}
+        owned = {key for key, fact in existing.items() if fact.source_identity == str(document.document_id)}
+        if owned == {fact.key for fact in facts} and all(
+            _same_persisted_financial_fact(existing[fact.key], fact) for fact in facts
+        ):
+            return True, 0
         return True, self._persistence.reconcile_financial_facts_for_source(
             document.instrument_id,
             str(document.document_id),
             facts,
+            complete_scopes=projection.scopes,
+            **({"allow_official_revision": True} if self._is_explicit_financial_revision(document) else {}),
         )
 
+    def _is_explicit_financial_revision(self, document: ResearchDocument) -> bool:
+        if (not document.instrument_id or document.source_mode != SourceMode.REAL
+                or document.source_type != SourceType.EXCHANGE_ANNOUNCEMENT
+                or document.source_classification != SourceClassification.EXCHANGE
+                or not _is_nse_official_document_url(document.canonical_url)):
+            return False
+        title = (document.title or "").lower()
+        if re.search(r"\b(?:no|not)\s+(?:revised|restated|corrected)\b", title):
+            return False
+        if not re.search(r"\b(?:revised|restated|corrected)\s+(?:(?:annual|quarterly|consolidated|standalone|audited|unaudited)\s+)*(?:financial results|financial statements|results)\b", title):
+            return False
+        try:
+            profile = self.profile(document.instrument_id)
+        except KeyError:
+            return False
+        return (document.company_id == profile.company_id and bool(profile.provider_instrument_ids.get("NSE"))
+            and profile.country.upper() in {"IN", "IND", "INDIA"} and profile.exchange.upper() in {"NSE", "XNSE"})
+
     @staticmethod
-    def _official_financial_fact_candidates(document: ResearchDocument) -> list[FinancialFact]:
-        if not document.instrument_id:
-            return []
-        periods = [
-            *parsed_nse_income_statement_periods([document]),
-            *parsed_nse_balance_sheet_periods([document]),
-            *parsed_nse_cash_flow_periods([document]),
-        ]
-        return [
-            FinancialFact(
-                FinancialFactKey(document.instrument_id, metric, period.period_end, period.period_type, period.reporting_basis),
-                value,
-                FactSourceTier.OFFICIAL_NSE,
-                "NSE",
-                str(document.document_id),
-                SourceMode.REAL,
-            )
-            for period in periods
-            for metric, value in period.metrics
-        ]
+    def _official_financial_fact_candidates(document: ResearchDocument, *, parsed_periods=None) -> list[FinancialFact]:
+        # Legacy parsed_periods is deliberately not a trust/projection bypass.
+        # Retain the keyword for callers performing rolling-window discovery.
+        from app.financial_projection import project_semantic_financial_facts
+        _facts = list(project_semantic_financial_facts(document).facts)
+
+        return _facts
 
     def _validate_document_relevance(
         self,
@@ -992,6 +1263,7 @@ class ResearchRepository:
         *,
         correlation_id: str | None = None,
         allow_demo: bool = True,
+        authority_upgrade_categories: set[str] | None = None,
     ) -> ResearchSummary:
         """Run only planner-selected legacy capabilities under the existing flight.
 
@@ -1017,6 +1289,7 @@ class ResearchRepository:
                 selected,
                 correlation_id=correlation_id,
                 allow_demo=allow_demo,
+                authority_upgrade_categories=authority_upgrade_categories,
             )
         )
         self._instrument_refresh_flights[instrument_id] = task
@@ -1039,6 +1312,7 @@ class ResearchRepository:
         *,
         correlation_id: str | None,
         allow_demo: bool,
+        authority_upgrade_categories: set[str] | None = None,
     ) -> ResearchSummary:
         profile = self.profile(instrument_id)
         run = await self._run_blocking_persistence(
@@ -1048,16 +1322,30 @@ class ResearchRepository:
             correlation_id=correlation_id,
             mode="TARGETED_LIVE" if self.settings.research_live_enabled else "TARGETED_DEMO",
         )
-        documents_before = len(self.documents_for(instrument_id, source_mode=SourceMode.REAL))
+        documents_before = self.document_count_for(instrument_id, source_mode=SourceMode.REAL)
         events_before = len(self.events_for(instrument_id, source_mode=SourceMode.REAL))
         try:
             if self.settings.research_live_enabled:
-                await self._refresh_live(
-                    instrument_id,
-                    set(),
-                    force=True,
+                # Deep investigation runs under a per-requirement acquisition
+                # budget (set by deep_investigation.investigate); when present,
+                # the targeted categories are re-acquired as a bounded repair
+                # that bypasses ONLY the successful-no-change cooldown (see
+                # _instrument_refresh_gate/targeted_repair), never fresh
+                # evidence and never unrelated categories. Without an active
+                # budget this remains the ordinary public/compat path and keeps
+                # force=True. targeted_repair is only forwarded when active so
+                # existing strict _refresh_live test doubles stay compatible.
+                from app.deep_investigation import acquisition_budget
+                _targeted_repair = acquisition_budget(instrument_id) is not None
+                _live_kwargs: dict = dict(
+                    force=not _targeted_repair,
                     requested_categories=categories,
                 )
+                if _targeted_repair:
+                    _live_kwargs["targeted_repair"] = True
+                if authority_upgrade_categories:
+                    _live_kwargs["authority_upgrade_categories"] = authority_upgrade_categories
+                await self._refresh_live(instrument_id, set(), **_live_kwargs)
         except asyncio.CancelledError:
             await self._run_blocking_persistence(
                 self._persistence.complete_refresh_run,
@@ -1094,7 +1382,7 @@ class ResearchRepository:
             )
             raise
         self.last_refresh[instrument_id] = datetime.now(timezone.utc)
-        documents_after = len(self.documents_for(instrument_id, source_mode=SourceMode.REAL))
+        documents_after = self.document_count_for(instrument_id, source_mode=SourceMode.REAL)
         events_after = len(self.events_for(instrument_id, source_mode=SourceMode.REAL))
         await self._run_blocking_persistence(
             self._persistence.complete_refresh_run,
@@ -1149,7 +1437,7 @@ class ResearchRepository:
             correlation_id=correlation_id,
             mode="LIVE" if self.settings.research_live_enabled else "DEMO",
         )
-        documents_before = len(self.documents_for(instrument_id, source_mode=SourceMode.REAL))
+        documents_before = self.document_count_for(instrument_id, source_mode=SourceMode.REAL)
         events_before = len(self.events_for(instrument_id, source_mode=SourceMode.REAL))
         if self.settings.research_live_enabled:
             try:
@@ -1169,7 +1457,7 @@ class ResearchRepository:
                 )
                 raise
         self.last_refresh[instrument_id] = datetime.now(timezone.utc)
-        documents_after = len(self.documents_for(instrument_id, source_mode=SourceMode.REAL))
+        documents_after = self.document_count_for(instrument_id, source_mode=SourceMode.REAL)
         events_after = len(self.events_for(instrument_id, source_mode=SourceMode.REAL))
         await self._run_blocking_persistence(self._persistence.complete_refresh_run,
             run,
@@ -1191,11 +1479,11 @@ class ResearchRepository:
             correlation_id=correlation_id,
             mode="LIVE" if self.settings.research_live_enabled else "DEMO",
         )
-        documents_before = len(self.documents_for(instrument_id, source_mode=SourceMode.REAL))
+        documents_before = self.document_count_for(instrument_id, source_mode=SourceMode.REAL)
         if self.settings.research_live_enabled and self.settings.research_search_enabled:
             await self._refresh_etf_search_discovery(profile)
         self.last_refresh[instrument_id] = datetime.now(timezone.utc)
-        documents_after = len(self.documents_for(instrument_id, source_mode=SourceMode.REAL))
+        documents_after = self.document_count_for(instrument_id, source_mode=SourceMode.REAL)
         status = "COMPLETED" if documents_after > documents_before else "FAILED"
         await self._run_blocking_persistence(self._persistence.complete_refresh_run,
             run,
@@ -1216,18 +1504,26 @@ class ResearchRepository:
         pre_resolved_categories: set[str],
         *,
         force: bool = False,
+        targeted_repair: bool = False,
         requested_categories: set[str] | None = None,
+        authority_upgrade_categories: set[str] | None = None,
     ) -> None:
-        sources = registered_sources_for(instrument_id)
+        from app.deep_investigation import acquisition_budget
+        budget = acquisition_budget(instrument_id)
+        sources = registered_sources_for(instrument_id) if budget is None else ()
         profile = self.profile(instrument_id)
         now = datetime.now(timezone.utc)
-        gate = self._instrument_refresh_gate(profile, pre_resolved_categories, now, force=force)
+        gate = self._instrument_refresh_gate(
+            profile, pre_resolved_categories, now, force=force, targeted_repair=targeted_repair,
+            requested_categories=requested_categories,
+        )
         due_categories = set(gate.missing_categories)
         if requested_categories is not None:
             requested_categories = {
                 _canonical_refresh_category(value) for value in requested_categories
             }
             due_categories.intersection_update(requested_categories)
+        due_categories.difference_update(authority_upgrade_categories or set())
         logger.info(
             "research_refresh_gate globalInstrumentId=%s outcome=DUE_CATEGORIES dueCategories=%s",
             instrument_id,
@@ -1235,13 +1531,17 @@ class ResearchRepository:
         )
         if requested_categories is None or "FINANCIAL_RESULTS" in requested_categories:
             await self._reconcile_incomplete_persisted_official_financial_facts(profile)
+        authority_upgrade = (
+            (requested_categories is None or "FINANCIAL_RESULTS" in requested_categories)
+            and await self._run_blocking_persistence(self.financial_authority_upgrade_due, profile, now)
+        )
         shareholding_selected = (
             requested_categories is None or "SHAREHOLDING_PATTERN" in requested_categories
         )
         has_shareholding_reconciliation = shareholding_selected and (
             gate.shareholding_backfill_needed or gate.shareholding_category_enrichment_needed
         )
-        if not due_categories and not has_shareholding_reconciliation:
+        if not due_categories and not has_shareholding_reconciliation and not authority_upgrade:
             logger.info("research_refresh_gate globalInstrumentId=%s category=ALL outcome=REUSE_FRESH", instrument_id)
             return
         if not sources:
@@ -1255,6 +1555,8 @@ class ResearchRepository:
             ):
                 continue
             try:
+                if budget is not None and not await budget.allow_document():
+                    break
                 await self._fetch_registered_source(profile, source)
                 self.last_live_error.pop(instrument_id, None)
             except RestrictedFetchError:
@@ -1266,7 +1568,9 @@ class ResearchRepository:
             pre_resolved_categories,
             now=now,
             force=force,
+            targeted_repair=targeted_repair,
             requested_categories=requested_categories,
+            authority_upgrade_categories=authority_upgrade_categories,
         )
 
     def _instrument_refresh_gate(
@@ -1276,16 +1580,54 @@ class ResearchRepository:
         now: datetime,
         *,
         force: bool = False,
+        targeted_repair: bool = False,
+        requested_categories: set[str] | None = None,
     ) -> _InstrumentRefreshGate:
         structured_categories = {
             "FINANCIAL_RESULTS", "Ownership", "INSTITUTIONAL_ACTIVITY", "SHAREHOLDING_PATTERN", "VALUATION",
             "ORDERS_BACKLOG", "CONTRACTS", "CAPEX", "NEW_FACILITIES", "ACQUISITIONS",
             "CLIENTS", "GUIDANCE", "ANALYST_OPINION", "ANALYST_TARGETS", "Regulatory",
         }
-        missing = self._missing_categories(profile, pre_resolved_categories, now, structured_categories, force=force)
+        # The narrow set of categories deep-investigation targeted repair
+        # explicitly asked for (e.g. {"FINANCIAL_RESULTS"} for a
+        # BUSINESS_QUALITY_FACTS repair). Readiness (requirement-level) has
+        # already determined the specific mandatory input backed by this
+        # category is still missing/partial/failed before this repair budget
+        # was ever opened -- so, for exactly these explicitly-requested
+        # categories, a category-level "qualifying evidence exists"/TTL
+        # freshness stamp must not by itself suppress a real acquisition
+        # attempt (the stamp is blind to which specific fact was extracted).
+        # Never applied to a category the caller did not request.
+        repair_target_categories: frozenset[str] = frozenset()
+        if targeted_repair and requested_categories:
+            repair_target_categories = frozenset(
+                _canonical_refresh_category(category) for category in requested_categories
+            )
+        missing = self._missing_categories(
+            profile, pre_resolved_categories, now, structured_categories, force=force,
+            repair_target_categories=repair_target_categories,
+        )
         eligible_missing: set[str] = set()
         for category in missing:
-            eligible, next_eligible = (True, None) if force else self._category_is_eligible_to_check(profile.instrument_id, category, now)
+            if force:
+                eligible, next_eligible = True, None
+            else:
+                # targeted_repair is the narrow override used only by deep
+                # investigation/repair of an applicable mandatory requirement
+                # that is still MISSING/PARTIAL/FAILED. It bypasses the
+                # successful-no-change lightweight cooldown (a prior check that
+                # found nothing) so a real acquisition attempt can run for the
+                # targeted requirement. For genuinely fresh evidence
+                # (evidence_at is set), the TTL cooldown is bypassed ONLY for
+                # the specific category(ies) explicitly requested by this
+                # repair (repair_target_categories) -- never for a category
+                # that was not requested. force remains the broad
+                # global/backfill escape.
+                eligible, next_eligible = self._category_is_eligible_to_check(
+                    profile.instrument_id, category, now,
+                    bypass_no_change_cooldown=targeted_repair,
+                    bypass_evidence_cooldown=category in repair_target_categories,
+                )
             if eligible:
                 eligible_missing.add(category)
             else:
@@ -1335,17 +1677,34 @@ class ResearchRepository:
         *,
         now: datetime | None = None,
         force: bool = False,
+        targeted_repair: bool = False,
         requested_categories: set[str] | None = None,
+        authority_upgrade_categories: set[str] | None = None,
     ) -> None:
+        from app.deep_investigation import acquisition_budget
+        budget = acquisition_budget(profile.instrument_id)
+        if budget is not None and await budget.sufficient():
+            budget.stopped = True
+            return
         now = now or datetime.now(timezone.utc)
-        gate = self._instrument_refresh_gate(profile, pre_resolved_categories, now, force=force)
+        gate = self._instrument_refresh_gate(
+            profile, pre_resolved_categories, now, force=force, targeted_repair=targeted_repair,
+            requested_categories=requested_categories,
+        )
         missing = set(gate.missing_categories)
         if requested_categories is not None:
             requested_categories = {
                 _canonical_refresh_category(value) for value in requested_categories
             }
             missing.intersection_update(requested_categories)
+        missing.difference_update(authority_upgrade_categories or set())
+        if missing & {"CAPEX", "NEW_FACILITIES", "ORDERS_BACKLOG", "CONTRACTS", "GUIDANCE"}:
+            missing.difference_update(await self._run_blocking_persistence(self._inapplicable_business_categories, profile))
         due_categories = set(missing)
+        authority_upgrade = (
+            (requested_categories is None or "FINANCIAL_RESULTS" in requested_categories)
+            and await self._run_blocking_persistence(self.financial_authority_upgrade_due, profile, now)
+        )
         shareholding_selected = (
             requested_categories is None or "SHAREHOLDING_PATTERN" in requested_categories
         )
@@ -1373,13 +1732,15 @@ class ResearchRepository:
                 profile.instrument_id,
                 valid_shareholding_periods,
             )
-        if not missing and not shareholding_backfill_needed and not shareholding_category_enrichment_needed:
+        if not missing and not shareholding_backfill_needed and not shareholding_category_enrichment_needed and not authority_upgrade:
             logger.info("official_discovery_gate globalInstrumentId=%s eligible=false reason=NO_MISSING_CATEGORIES", profile.instrument_id)
             return
-        seen_urls = {doc.canonical_url for doc in self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)}
+        seen_urls = self.document_urls_for(profile.instrument_id, source_mode=SourceMode.REAL)
         # Resolve authoritative filings before broad research searches can
         # exhaust public-search engines. This is global-instrument research.
-        official_due_categories = {"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN"} & due_categories
+        official_due_categories = {"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN", "CAPEX", "NEW_FACILITIES", "ORDERS_BACKLOG", "CONTRACTS", "GUIDANCE", "RISKS", "REGULATORY", "MANAGEMENT"} & due_categories
+        if authority_upgrade:
+            official_due_categories.add("FINANCIAL_RESULTS")
         eligible_official = (
             profile.country.upper() in {"IN", "IND", "INDIA"}
             and profile.exchange.upper() in {"NSE", "XNSE"}
@@ -1387,19 +1748,80 @@ class ResearchRepository:
         )
         logger.info("official_discovery_gate globalInstrumentId=%s eligible=%s reason=%s", profile.instrument_id, eligible_official, "NSE_OFFICIAL_CATEGORY" if eligible_official else "PROFILE_OR_CATEGORY_INELIGIBLE")
         if eligible_official:
+            financial_attempt = (
+                "FINANCIAL_RESULTS" in official_due_categories
+                and bool(profile.provider_instrument_ids.get("NSE"))
+            )
+            discovery_failed = False
+            if financial_attempt:
+                # Bound unsuccessful and empty authority upgrades too. This
+                # does not mark evidence fresh or change fallback readiness.
+                self._financial_authority_attempts[profile.instrument_id] = now
             try:
                 # Let official discovery return known URLs too: the official fetch
                 # loop can then explicitly reuse a durable global document, while
                 # failed/scanned historical attempts remain eligible for retry.
                 official_filings = await self._official_filing_discovery.discover(profile, official_due_categories, set())
+                if budget is not None:
+                    # DI-20H.4 accounting: the default is an empty dict, so the
+                    # previous `is None` guard never populated it and every
+                    # no-failure shortfall was misreported as DISCOVERY_NO_*.
+                    budget.discovery_attempted = True
+                    for _result in official_filings:
+                        _cat = _result.category or "UNKNOWN"
+                        budget.discovery_outcome[_cat] = budget.discovery_outcome.get(_cat, 0) + 1
             except Exception as exc:
+                discovery_failed = True
+                if budget is not None:
+                    budget.failures.append(f"SOURCE_UNAVAILABLE:NSE:{type(exc).__name__}")
                 official_filings = []
                 self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:{type(exc).__name__}"
                 # OfficialFilingDiscovery emits the terminal provider diagnostic.
                 # Keep this boundary diagnostic for injected/legacy implementations.
                 logger.warning("official_discovery_handled provider=NSE globalInstrumentId=%s status=FAILED reason=%s", profile.instrument_id, type(exc).__name__)
-            if await self._fetch_official_filings(profile, official_filings, seen_urls):
+            fetched = await self._fetch_official_filings(profile, official_filings, seen_urls)
+            if fetched and not discovery_failed:
                 successful_check_categories.update({"FINANCIAL_RESULTS"} & official_due_categories)
+            if financial_attempt and callable(getattr(self._persistence, "upsert_acquisition_observation", None)):
+                facts = await self._run_blocking_persistence(
+                    self._persistence.load_financial_facts, {profile.instrument_id},
+                )
+                official_count = sum(fact.source_tier == FactSourceTier.OFFICIAL_NSE
+                                     and fact.source_mode == SourceMode.REAL for fact in facts)
+                failed = discovery_failed or not fetched
+                await self.record_acquisition_observation(
+                    profile.instrument_id, "QUARTERLY_FINANCIALS", "NSE",
+                    "FAILED" if failed else "SUCCESS" if official_filings and official_count else "SUCCESS_EMPTY",
+                    datetime.now(timezone.utc), evidence_count=official_count,
+                    failure_reason=self.last_live_error.get(profile.instrument_id) if failed else None,
+                )
+            if profile.provider_instrument_ids.get("NSE") and callable(getattr(self._persistence, "upsert_acquisition_observation", None)):
+                from app.research_applicability import event_concept, CONCEPT_CATEGORIES
+                from app.extraction import governance_disclosure
+                business = set().union(*CONCEPT_CATEGORIES.values())
+                for requirement_id, categories in (
+                    ("ORDER_BOOK_CAPEX_GUIDANCE", business),
+                    ("GOVERNANCE_HISTORY", {"RISKS", "REGULATORY", "MANAGEMENT"}),
+                ):
+                    selected_categories = official_due_categories & categories
+                    if not selected_categories:
+                        continue
+                    selected_concepts = {key for key, values in CONCEPT_CATEGORIES.items() if values & selected_categories}
+                    count = sum(event.source_classification == SourceClassification.EXCHANGE and (
+                        event_concept(str(event.event_type)) in selected_concepts if requirement_id == "ORDER_BOOK_CAPEX_GUIDANCE"
+                        else governance_disclosure(event.title + " " + event.summary))
+                        for event in self.events_for(profile.instrument_id, source_mode=SourceMode.REAL))
+                    if requirement_id == "GOVERNANCE_HISTORY":
+                        count += sum(document.source_classification == SourceClassification.EXCHANGE
+                            and document.status in {DocumentStatus.PARSED, DocumentStatus.PROCESSED}
+                            and bool(document.normalized_text)
+                            and governance_disclosure((document.title or "") + " " + document.normalized_text)
+                            for document in self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL))
+                    failed = discovery_failed or not fetched
+                    await self.record_acquisition_observation(profile.instrument_id, requirement_id, "NSE",
+                        "FAILED" if failed else "SUCCESS" if count else "SUCCESS_EMPTY",
+                        datetime.now(timezone.utc), evidence_count=count,
+                        failure_reason=self.last_live_error.get(profile.instrument_id) if failed else None)
         if (
             "SHAREHOLDING_PATTERN" in due_categories
             or shareholding_backfill_needed
@@ -1426,6 +1848,8 @@ class ResearchRepository:
                         discovered_snapshots[0].source_identity_key if discovered_snapshots else "NONE",
                     )
                 for snapshot in snapshots_to_process:
+                    if budget is not None and not await budget.allow_document():
+                        break
                     enriched_snapshot = await self._enrich_nse_shareholding_snapshot(snapshot)
                     persisted += int(await self._persist_shareholding_snapshot_async(enriched_snapshot))
                 if shareholding_backfill_needed or shareholding_category_enrichment_needed:
@@ -1441,7 +1865,26 @@ class ResearchRepository:
                 self.last_live_error[profile.instrument_id] = str(exc)
             except (FetchError, ValueError) as exc:
                 self.last_live_error[profile.instrument_id] = f"NSE_SHAREHOLDING_UNAVAILABLE:{type(exc).__name__}"
+        # An authoritative NSE acquisition failure recorded above (official
+        # filing discovery or the NSE shareholding feed) must survive every
+        # non-authoritative acquisition attempt that follows in this same
+        # refresh -- both the profile-known-source loop immediately below
+        # and the broader search fallback further down -- whether that
+        # later attempt succeeds for an unrelated category or merely fails
+        # with a less specific reason.  Search success (or an unrelated
+        # failure) must never mask an authoritative NSE failure.
+        current_live_error = self.last_live_error.get(profile.instrument_id)
+        protect_authoritative_error = (
+            current_live_error
+            if current_live_error is not None
+            and current_live_error.startswith(("OFFICIAL_FILING_", "NSE_SHAREHOLDING_"))
+            else None
+        )
         if due_categories:
+            if budget is not None:
+                # Financial and ownership requirements use their authoritative
+                # routes above. Generic search must not substitute presentations.
+                due_categories.difference_update({"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN"})
             discovery_categories = _search_discovery_categories(due_categories)
             discovered = (
                 _profile_source_discovery(profile, discovery_categories, seen_urls)
@@ -1456,12 +1899,16 @@ class ResearchRepository:
                     continue
                 fetched_source_ids.add(source.source_id)
                 try:
+                    if budget is not None and not await budget.allow_document():
+                        break
                     self._validate_registered_source(profile, source)
                     await self._fetch_registered_source(profile, source)
                 except (FetchError, RestrictedFetchError, ValueError) as exc:
-                    self.last_live_error[profile.instrument_id] = f"TARGETED_SOURCE_UNAVAILABLE:{source.source_id}:{exc}"
+                    if protect_authoritative_error is None:
+                        self.last_live_error[profile.instrument_id] = f"TARGETED_SOURCE_UNAVAILABLE:{source.source_id}:{exc}"
                 except Exception:
-                    self.last_live_error[profile.instrument_id] = f"TARGETED_SOURCE_UNAVAILABLE:{source.source_id}:HTTP_FETCH_FAILED"
+                    if protect_authoritative_error is None:
+                        self.last_live_error[profile.instrument_id] = f"TARGETED_SOURCE_UNAVAILABLE:{source.source_id}:HTTP_FETCH_FAILED"
         if self.settings.research_search_enabled:
             self._mark_qualifying_categories_fresh(
                 profile.instrument_id,
@@ -1481,11 +1928,10 @@ class ResearchRepository:
             }
             if search_categories:
                 logger.info("search_fallback_start globalInstrumentId=%s missingCategories=%s", profile.instrument_id, sorted(search_categories))
-                refreshed_seen_urls = {
-                    doc.canonical_url for doc in self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)
-                }
+                refreshed_seen_urls = self.document_urls_for(profile.instrument_id, source_mode=SourceMode.REAL)
                 if await self._refresh_search_discovery(
-                    profile, _search_discovery_categories(search_categories), refreshed_seen_urls
+                    profile, _search_discovery_categories(search_categories), refreshed_seen_urls,
+                    protect_error=protect_authoritative_error,
                 ):
                     successful_check_categories.update(search_categories)
         self._mark_qualifying_categories_fresh(
@@ -1495,6 +1941,32 @@ class ResearchRepository:
         )
         self._mark_successful_categories_checked(profile.instrument_id, successful_check_categories, now)
 
+    def financial_authority_upgrade_due(
+        self, profile: CompanyResearchProfile, now: datetime, readiness=None,
+    ) -> bool:
+        # The last NSE authority attempt is durable (research_acquisition_
+        # observations), so the cooldown survives restarts instead of being
+        # repeated by every new process. A successful/empty check keeps the
+        # lightweight interval; a TECHNICAL failure only backs off briefly so a
+        # later deep/repair attempt can retry instead of being locked out for
+        # the whole window. An attempt still in flight (in-memory only) keeps
+        # the conservative interval.
+        attempted = self._financial_authority_attempts.get(profile.instrument_id)
+        observation = self._latest_acquisition_observation(profile.instrument_id, "QUARTERLY_FINANCIALS", "NSE")
+        observed_at = _aware_observation_time(observation)
+        interval = _QUARTERLY_WINDOW.lightweight_check_interval
+        last = attempted
+        if observed_at is not None and (attempted is None or observed_at >= attempted - timedelta(seconds=1)):
+            last = observed_at
+            if observation.get("outcome") == "FAILED" and classify_failure_reason(
+                    observation.get("failure_reason") or "NSE_AUTHORITY_ATTEMPT_FAILED") == TECHNICAL_RETRYABLE:
+                interval = timedelta(seconds=self.settings.research_authority_retry_backoff_seconds)
+        if last is not None and now < last + interval:
+            return False
+        return authoritative_financial_upgrade_required(
+            profile, self._persistence.load_financial_facts({profile.instrument_id}), readiness,
+        )
+
     async def _incomplete_persisted_official_financial_documents(self, profile: CompanyResearchProfile) -> list[ResearchDocument]:
         if (profile.country.upper() not in {"IN", "IND", "INDIA"} or profile.exchange.upper() not in {"NSE", "XNSE"}
                 or not profile.provider_instrument_ids.get("NSE")):
@@ -1503,6 +1975,8 @@ class ResearchRepository:
         documents = [document for document in self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)
                      if document.company_id == profile.company_id and document.source_classification == SourceClassification.EXCHANGE
                      and document.source_type == SourceType.EXCHANGE_ANNOUNCEMENT and bool(document.normalized_text)
+                     and _is_usable_durable_document(document)
+                     and not _official_filing_content_type_unsupported(document.canonical_url)
                      and _is_nse_official_document_url(document.canonical_url)]
         if not documents:
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=SKIPPED reason=NO_QUALIFYING_PERSISTED_DOCUMENT", profile.instrument_id)
@@ -1513,19 +1987,48 @@ class ResearchRepository:
             # held for this instrument, then use their explicit periods to
             # define the rolling window.  No calendar-derived target periods
             # are invented here.
+            #
+            # DI-7C Steps 3/5/6: income-statement completeness keeps its
+            # existing fixed {"revenue", "pat"} bar (unchanged).  Balance-sheet
+            # (AS_AT) and cash-flow periods have no universal required-field
+            # list -- NSE does not always publish every field -- so their
+            # "expected" metrics are whatever this same document's own parse
+            # actually found for that period.  A document that never mentions
+            # a balance sheet at all contributes nothing here and is never
+            # required to have one (Step 3's "do not require fields NSE
+            # legitimately does not publish").
             parsed_by_document = [
-                (document, parsed_nse_income_statement_periods([document]))
+                (
+                    document,
+                    parsed_nse_income_statement_periods([document]),
+                    parsed_nse_balance_sheet_periods([document]),
+                    parsed_nse_cash_flow_periods([document]),
+                )
                 for document in documents
             ]
-            parsed_by_document = [item for item in parsed_by_document if item[1]]
+            parsed_by_document = [
+                item for item in parsed_by_document if item[1] or item[2] or item[3]
+            ]
             if not parsed_by_document:
                 return None
 
             available_periods: dict[tuple[str, str | None], set[str]] = {}
             periods_by_document: dict[UUID, set[tuple[str, str | None, str]]] = {}
-            for document, periods in parsed_by_document:
+            # Balance-sheet/cash-flow metrics a period is expected to have,
+            # derived from this document's own parse rather than a hard-coded
+            # universal set (Step 3).  AS_AT keys never collide with
+            # QUARTERLY/ANNUAL income-statement keys (different period_type),
+            # but an ANNUAL cash-flow period shares its key with that same
+            # period's ANNUAL income-statement entry, so cash-flow metrics
+            # found there are unioned onto the existing revenue/pat bar
+            # (Step 6: cash flow is only ever expected where the existing
+            # parser's own ANNUAL-only semantics already say it applies).
+            expected_statement_metrics_by_key: dict[tuple[str, str | None, str], set[str]] = {}
+
+            for document, income_periods, balance_periods, cash_periods in parsed_by_document:
                 document_periods: set[tuple[str, str | None, str]] = set()
-                for period in periods:
+                document_text = document.normalized_text or ""
+                for period in income_periods:
                     if period.period_type not in {"QUARTERLY", "ANNUAL"}:
                         continue
                     # A parsed result column is evidence of an explicitly
@@ -1536,6 +2039,31 @@ class ResearchRepository:
                     group = (period.period_type, period.reporting_basis)
                     available_periods.setdefault(group, set()).add(period.period_end)
                     document_periods.add((period.period_type, period.reporting_basis, period.period_end))
+                for period in (*balance_periods, *cash_periods):
+                    metrics = dict(period.metrics)
+                    if not metrics:
+                        continue
+                    group = (period.period_type, period.reporting_basis)
+                    available_periods.setdefault(group, set()).add(period.period_end)
+                    key = (period.period_type, period.reporting_basis, period.period_end)
+                    document_periods.add(key)
+                    expected_statement_metrics_by_key.setdefault(key, set()).update(metrics.keys())
+                annual_income_periods = [
+                    period for period in income_periods
+                    if period.period_type == "ANNUAL" and dict(period.metrics)
+                ]
+                if annual_income_periods and not balance_periods and _BALANCE_SHEET_HEADING.search(document_text):
+                    for period in annual_income_periods:
+                        key = ("AS_AT", period.reporting_basis, period.period_end)
+                        available_periods.setdefault(("AS_AT", period.reporting_basis), set()).add(period.period_end)
+                        document_periods.add(key)
+                        expected_statement_metrics_by_key.setdefault(key, set()).add(_BALANCE_SHEET_EXTRACTION_PENDING_SENTINEL)
+                if annual_income_periods and not cash_periods and _CASH_FLOW_HEADING.search(document_text):
+                    for period in annual_income_periods:
+                        key = ("ANNUAL", period.reporting_basis, period.period_end)
+                        available_periods.setdefault(("ANNUAL", period.reporting_basis), set()).add(period.period_end)
+                        document_periods.add(key)
+                        expected_statement_metrics_by_key.setdefault(key, set()).add(_CASH_FLOW_EXTRACTION_PENDING_SENTINEL)
                 if document_periods:
                     periods_by_document[document.document_id] = document_periods
 
@@ -1547,12 +2075,12 @@ class ResearchRepository:
             if not target_periods:
                 return None
 
-            facts = self._persistence.load_financial_facts()
+            facts = self._persistence.load_financial_facts({profile.instrument_id})
             present_by_period: dict[tuple[str, str | None, str], set[str]] = {}
             for fact in facts:
                 if (
                     fact.key.instrument_id != profile.instrument_id
-                    or fact.key.period_type not in {"QUARTERLY", "ANNUAL"}
+                    or fact.key.period_type not in {"QUARTERLY", "ANNUAL", "AS_AT"}
                     or fact.source_tier != FactSourceTier.OFFICIAL_NSE
                     or fact.source_mode != SourceMode.REAL
                     or not fact.key.period_end
@@ -1561,15 +2089,46 @@ class ResearchRepository:
                 key = (fact.key.period_type, fact.key.reporting_basis, fact.key.period_end)
                 present_by_period.setdefault(key, set()).add(fact.key.metric)
 
-            incomplete = {
-                key for key in target_periods
-                if not {"revenue", "pat"} <= present_by_period.get(key, set())
-            }
-            if not incomplete:
+            def _is_incomplete(key: tuple[str, str | None, str]) -> bool:
+                period_type = key[0]
+                present = present_by_period.get(key, set())
+                if period_type == "AS_AT":
+                    expected = expected_statement_metrics_by_key.get(key, set())
+                    return not expected or not (expected <= present)
+                required = {"revenue", "pat"} | expected_statement_metrics_by_key.get(key, set())
+                return not (required <= present)
+
+            incomplete = {key for key in target_periods if _is_incomplete(key)}
+            existing = {fact.key: fact for fact in facts}
+            obsolete_documents = set()
+            for document, income, balance, cash in parsed_by_document:
+                from app.financial_projection import project_semantic_financial_facts
+                projection = project_semantic_financial_facts(document)
+                candidates = projection.facts
+                explicit_revision = self._is_explicit_financial_revision(document)
+                candidate_keys = {candidate.key for candidate in candidates}
+                rolling_dates = {key[2] for key in target_periods & periods_by_document.get(document.document_id, set())}
+                if any(fact.source_tier == FactSourceTier.OFFICIAL_NSE
+                       and fact.source_identity == str(document.document_id)
+                       and fact.key.period_end in rolling_dates and fact.key not in candidate_keys
+                       and any(scope.contains(fact.key) for scope in projection.scopes)
+                       for fact in facts):
+                    obsolete_documents.add(document.document_id)
+                for candidate in candidates:
+                    prior = existing.get(candidate.key)
+                    period = (candidate.key.period_type, candidate.key.reporting_basis, candidate.key.period_end)
+                    if (period in target_periods and prior is not None
+                            and prior.source_tier == FactSourceTier.OFFICIAL_NSE
+                            and (prior.source_identity == str(document.document_id)
+                                 or (explicit_revision and newer_official_disclosure(prior, candidate)))
+                            and (prior.value.value != candidate.value.value or prior.value.unit != candidate.value.unit)):
+                        incomplete.add(period)
+            if not incomplete and not obsolete_documents:
                 return [], target_periods, incomplete
             selected = [
-                document for document, _periods in parsed_by_document
+                document for document, *_parsed in parsed_by_document
                 if periods_by_document.get(document.document_id, set()) & incomplete
+                or document.document_id in obsolete_documents
             ]
             return selected, target_periods, incomplete
 
@@ -1601,7 +2160,7 @@ class ResearchRepository:
         documents = await self._incomplete_persisted_official_financial_documents(profile)
         for document in documents:
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=START documentId=%s", profile.instrument_id, document.document_id)
-            parsed, written = await self._run_blocking_persistence(self._persist_official_financial_facts, document)
+            parsed, written = await self._run_blocking_persistence(self._reconcile_persisted_official_financial_document, document)
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=COMPLETE documentId=%s parserResult=%s factsWritten=%s", profile.instrument_id, document.document_id, "PARSED" if parsed else "NO_RESULT", written)
         return bool(documents)
 
@@ -1656,12 +2215,28 @@ class ResearchRepository:
         seen_urls: set[str],
     ) -> bool:
         """Fetch a small, newest-first official filing set within an interactive budget."""
+        from app.deep_investigation import acquisition_budget
+        budget = acquisition_budget(profile.instrument_id)
         attempted = 0
         completed_without_failure = True
         host_transport_failures: dict[str, int] = {}
         scheduled_filings = _fair_official_filing_order(filings)
+
         for filing_index, result in enumerate(scheduled_filings):
             source = result.source
+
+            if budget is not None:
+                if budget.stopped or await budget.sufficient():
+                    budget.stopped = True
+                    break
+                if not budget.accepts_date(source.official_published_at):
+                    continue
+            host = (urlparse(source.url).hostname or "").lower()
+            # Check reuse and content-type support BEFORE consuming a budget
+            # document slot. Both paths require no network fetch and must never
+            # exhaust the per-candidate document budget (DI-20H Fix 2: reusable
+            # documents and unsupported archives were consuming allow_document()
+            # slots, starving genuinely-needed fetches).
             reusable = self._reusable_official_document(profile.instrument_id, source.url)
             if reusable is not None:
                 if source.document_subtype and reusable.document_subtype is None:
@@ -1672,15 +2247,47 @@ class ResearchRepository:
                         nse_financial_result="FINANCIAL_RESULTS" in source.categories,
                     )
                 seen_urls.add(reusable.canonical_url)
-                await self._run_blocking_persistence(self._reconcile_reused_official_financial_facts, profile, source, reusable)
+                # Isolate a reconciliation failure so a single problematic
+                # reusable document cannot crash the entire official-filing
+                # fetch loop and prevent subsequent valid filings from being
+                # processed (DI-20H Fix 3).
+                try:
+                    await self._run_blocking_persistence(self._reconcile_reused_official_financial_facts, profile, source, reusable)
+                except Exception as exc:
+                    logger.warning(
+                        "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SKIPPED reason=RECONCILE_FAILED documentId=%s error=%s",
+                        profile.instrument_id, host, _safe_url_path(source.url),
+                        reusable.document_id, type(exc).__name__,
+                    )
+                    if budget is not None:
+                        budget.failures.append("RECONCILE_FAILED")
+                    continue
                 logger.info(
                     "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=REUSED reason=ALREADY_PERSISTED documentId=%s",
                     profile.instrument_id,
-                    (urlparse(source.url).hostname or "").lower(),
+                    host,
                     _safe_url_path(source.url),
                     reusable.document_id,
                 )
                 continue
+            if _official_filing_content_type_unsupported(source.url):
+                # An unsupported archive/office attachment can never be parsed by
+                # the official-document fetch path (HttpResearchFetcher.process_network_response
+                # rejects it with FetchError "Unsupported content type", research_fetching.py:304).
+                # Skipping it here -- before `attempted += 1` and before any network
+                # fetch -- keeps a provably-unusable file from exhausting the
+                # per-refresh attempt budget (DI-11C Fix 1). Extensionless/ambiguous
+                # URLs are never skipped here.
+                logger.info(
+                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SKIPPED reason=UNSUPPORTED_CONTENT_TYPE",
+                    profile.instrument_id,
+                    host,
+                    _safe_url_path(source.url),
+                )
+                continue
+            if budget is not None:
+                if not await budget.allow_document():
+                    break
             if attempted >= self.settings.research_official_document_max_attempts_per_refresh:
                 logger.info(
                     "official_document_fetch provider=NSE globalInstrumentId=%s outcome=SKIPPED reason=ATTEMPT_BUDGET",
@@ -1689,7 +2296,6 @@ class ResearchRepository:
                 # Continue so a later durable reusable filing can still be
                 # recorded without consuming network budget.
                 continue
-            host = (urlparse(source.url).hostname or "").lower()
             if host_transport_failures.get(host, 0) >= self.settings.research_official_document_max_transport_failures_per_host:
                 logger.info(
                     "official_document_fetch provider=NSE globalInstrumentId=%s host=%s outcome=SKIPPED reason=HOST_TRANSPORT_FAILURE_BUDGET",
@@ -1712,6 +2318,7 @@ class ResearchRepository:
             started = time.monotonic()
             try:
                 document, joined_in_flight = await self._single_flight_official_filing(profile, source)
+
                 if document.status != DocumentStatus.DUPLICATE:
                     seen_urls.add(document.canonical_url)
                 if document.status != DocumentStatus.DUPLICATE and not _is_usable_durable_document(document):
@@ -1740,6 +2347,8 @@ class ResearchRepository:
                 )
             except TimeoutError:
                 completed_without_failure = False
+                if budget is not None:
+                    budget.failures.append("NETWORK_TIMEOUT")
                 exc = TransportFetchError("NETWORK_TIMEOUT")
                 host_transport_failures[host] = host_transport_failures.get(host, 0) + 1
                 self.last_live_error[profile.instrument_id] = "OFFICIAL_FILING_FETCH_FAILED:NETWORK_TIMEOUT"
@@ -1749,6 +2358,8 @@ class ResearchRepository:
                 )
             except TransportFetchError as exc:
                 completed_without_failure = False
+                if budget is not None:
+                    budget.failures.append(_fetch_rejection_reason(exc))
                 host_transport_failures[host] = host_transport_failures.get(host, 0) + 1
                 self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{type(exc).__name__}"
                 logger.warning(
@@ -1757,6 +2368,8 @@ class ResearchRepository:
                 )
             except (FetchError, RestrictedFetchError, ValueError) as exc:
                 completed_without_failure = False
+                if budget is not None:
+                    budget.failures.append(_fetch_rejection_reason(exc) if isinstance(exc, FetchError) else "PARSER_FAILED")
                 if _is_transport_fetch_failure(exc):
                     host_transport_failures[host] = host_transport_failures.get(host, 0) + 1
                 self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{type(exc).__name__}"
@@ -1782,7 +2395,7 @@ class ResearchRepository:
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s documentId=%s outcome=SKIPPED reason=%s",
                         profile.instrument_id, document.document_id, reason)
             return
-        parsed, written = self._persist_official_financial_facts(document)
+        parsed, written = self._reconcile_persisted_official_financial_document(document)
         outcome, reason = ("PROCESSED", "FACTS_UPSERTED" if written else "NO_CHANGES") if parsed else ("SKIPPED", "PARSE_NO_RESULT")
         logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s documentId=%s outcome=%s reason=%s",
                     profile.instrument_id, document.document_id, outcome, reason)
@@ -1857,11 +2470,25 @@ class ResearchRepository:
             else:
                 network_result = None
             if network_result is not None:
-                fetch_result = await self._fetcher.process_network_response_async(
-                    network_result,
-                    max_bytes=self.settings.research_official_document_max_bytes,
-                    extraction_timeout_seconds=self.settings.research_official_document_extraction_timeout_seconds,
-                )
+                try:
+                    fetch_result = await self._fetcher.process_network_response_async(
+                        network_result,
+                        max_bytes=self.settings.research_official_document_max_bytes,
+                        extraction_timeout_seconds=self.settings.research_official_document_extraction_timeout_seconds,
+                    )
+                finally:
+                    # Release the large raw PDF bytes regardless of whether
+                    # extraction succeeded or timed out (DI-20H Fix 4). The
+                    # worker thread holds its own reference to response.content
+                    # and releases it when done; this drops the caller's
+                    # reference promptly so it cannot be retained across the
+                    # persist tail of a cycle.
+                    del network_result
+                # process_network_response_async already extracted the text we
+                # need to ingest; the raw downloaded document bytes are no
+                # longer required. Drop them now (before the blocking persist
+                # below) so large NSE PDFs cannot be retained across the persist
+                # tail of a cycle that may itself await I/O.
                 logger.info("fetch_persist_start provider=NSE globalInstrumentId=%s host=%s path=%s", profile.instrument_id, host, _safe_url_path(source.url))
                 document = await self._ingest_registered_fetch_result_async(profile, source, fetch_result, expected_profile=profile)
                 logger.info("fetch_persist_complete provider=NSE globalInstrumentId=%s host=%s path=%s", profile.instrument_id, host, _safe_url_path(source.url))
@@ -1872,6 +2499,21 @@ class ResearchRepository:
             # retry flight that was installed for the same key.
             if self._official_filing_flights.get(key) is asyncio.current_task():
                 self._official_filing_flights.pop(key, None)
+
+    def _inapplicable_business_categories(self, profile: CompanyResearchProfile) -> set[str]:
+        """Apply the same positive rules to refresh callers outside readiness."""
+        from app.research_applicability import classify_requirements, CONCEPT_CATEGORIES
+        records = self.structured_market_snapshots_for({profile.instrument_id}).get(profile.instrument_id, [])
+        for record in sorted(records, key=lambda row: (row.provider != "NSE", -row.retrieved_at.timestamp())):
+            if record.instrument_id != profile.instrument_id:
+                continue
+            industry = record.snapshot.facts.get("industry")
+            if not industry or not industry.value:
+                continue
+            decision = classify_requirements(None, str(industry.value), industry.source_url)["ORDER_BOOK_CAPEX_GUIDANCE"]
+            return set().union(*(CONCEPT_CATEGORIES[concept] for concept, state in decision.concepts.items()
+                if state.state == "NOT_APPLICABLE"))
+        return set()
 
     def _reusable_official_document(self, instrument_id: UUID, url: str) -> ResearchDocument | None:
         canonical = canonicalize_url(url)
@@ -1892,6 +2534,7 @@ class ResearchRepository:
         structured_categories: set[str],
         *,
         force: bool = False,
+        repair_target_categories: frozenset[str] = frozenset(),
     ) -> set[str]:
         coverage = self._scorer.score(
             profile.instrument_id,
@@ -1908,7 +2551,8 @@ class ResearchRepository:
             return missing
         return {
             category for category in missing
-            if not self._category_is_fresh(profile.instrument_id, category, now)
+            if category in repair_target_categories
+            or not self._category_is_fresh(profile.instrument_id, category, now)
             or self._quarterly_window_open(profile.instrument_id, category, now)
         }
 
@@ -1923,17 +2567,46 @@ class ResearchRepository:
         instrument_id: UUID,
         category: str,
         now: datetime,
+        *,
+        bypass_no_change_cooldown: bool = False,
+        bypass_evidence_cooldown: bool = False,
     ) -> tuple[bool, datetime | None]:
         """Keep provider polling separate from evidence freshness.
 
         `_category_refresh` records the last successful provider check in this
         process. Evidence time remains on the durable document/snapshot and is
         never changed when an official listing is unchanged.
+
+        ``bypass_no_change_cooldown`` is the deep-investigation repair escape:
+        when an applicable mandatory requirement is still MISSING/PARTIAL/FAILED,
+        a prior *successful-no-change* lightweight check must not keep the
+        targeted requirement stuck behind a category cooldown. It bypasses ONLY
+        the no-evidence no-change cooldown below; by itself it does not touch
+        the evidence_at-is-set (genuinely fresh evidence) branch.
+
+        ``bypass_evidence_cooldown`` is the narrower, requirement-aware repair
+        escape: category-level "qualifying evidence exists" freshness (e.g. a
+        FINANCIAL_RESULTS document with at least one extracted fact) is blind
+        to which *specific* fact was extracted. Readiness (requirement-level)
+        has already determined, before this repair budget was opened, that the
+        specific mandatory input backed by this category is still missing --
+        so that stale-but-present evidence must not suppress a real
+        acquisition attempt. The caller passes this only for the exact
+        category(ies) the current repair explicitly requested; it is never
+        applied to a category that was not requested, so genuinely fresh and
+        already-complete evidence for any other category remains untouched
+        and is not refetched.
         """
         category = _canonical_refresh_category(category)
         strategy = _CATEGORY_STRATEGIES.get(category, _PERIODIC_SLOW)
         evidence_at, period_end = self._category_evidence_timing(instrument_id, category)
         if evidence_at is None:
+            if bypass_no_change_cooldown:
+                # Deep-investigation repair: the targeted requirement's backing
+                # category had a no-change check with no qualifying evidence; a
+                # bounded re-acquisition is permitted. Fresh evidence (below)
+                # is never bypassed.
+                return True, None
             checked_at = self._category_successful_no_change_checks.get((instrument_id, category))
             if checked_at is None:
                 # Failed provider attempts never write this state and remain
@@ -1941,6 +2614,8 @@ class ResearchRepository:
                 return True, None
             next_eligible = checked_at + strategy.lightweight_check_interval
             return now >= next_eligible, next_eligible
+        if bypass_evidence_cooldown:
+            return True, None
         checked_at = self._category_refresh.get((instrument_id, category))
         if strategy is _QUARTERLY_WINDOW and period_end is not None:
             next_window = _next_quarter_window(period_end)
@@ -1969,12 +2644,7 @@ class ResearchRepository:
                 return snapshots[0].retrieved_at, snapshots[0].period_end
             return None, None
         if category == "FINANCIAL_RESULTS":
-            documents = [
-                document for document in self.documents_for(instrument_id, source_mode=SourceMode.REAL)
-                if _is_usable_durable_document(document)
-                and any(term in f"{document.title or ''} {document.normalized_text or ''}".lower()
-                        for term in ("financial result", "quarterly result", "earnings", "annual report"))
-            ]
+            documents = self._financial_result_documents_with_extracted_facts(instrument_id)
             if documents:
                 latest = documents[0]
                 return latest.retrieved_at, _explicit_quarter_end(latest.normalized_text or latest.raw_text or "")
@@ -2015,6 +2685,34 @@ class ResearchRepository:
     def _category_has_qualifying_evidence(self, instrument_id: UUID, category: str) -> bool:
         return self._qualifying_category_evidence(instrument_id, category) is not None
 
+    def _financial_result_documents_with_extracted_facts(self, instrument_id: UUID) -> list[ResearchDocument]:
+        """Durable FINANCIAL_RESULTS-looking documents that actually yielded facts.
+
+        DI-7C Step 4: DOCUMENT_FETCHED is not equivalent to
+        FINANCIAL_FACTS_EXTRACTED.  A document whose title/text looks like a
+        result announcement but whose parse produced zero persisted
+        FinancialFact rows must not count as qualifying evidence -- doing so
+        would incorrectly open the multi-day quarterly freshness window and
+        block retry even though nothing was actually extracted.
+        """
+        documents = [
+            document for document in self.documents_for(instrument_id, source_mode=SourceMode.REAL)
+            if _is_usable_durable_document(document) and any(
+                term in f"{document.title or ''} {document.normalized_text or ''}".lower()
+                for term in _FINANCIAL_RESULT_EVIDENCE_TERMS
+            )
+        ]
+        if not documents:
+            return []
+        extracted_document_ids = {
+            fact.source_identity
+            for fact in self._persistence.load_financial_facts({instrument_id})
+            if fact.key.instrument_id == instrument_id
+            and fact.source_tier == FactSourceTier.OFFICIAL_NSE
+            and fact.source_mode == SourceMode.REAL
+        }
+        return [document for document in documents if str(document.document_id) in extracted_document_ids]
+
     def _qualifying_category_evidence(self, instrument_id: UUID, category: str) -> dict[str, object] | None:
         category = _canonical_refresh_category(category)
         if category == "SHAREHOLDING_PATTERN":
@@ -2036,16 +2734,14 @@ class ResearchRepository:
                 return {"reason": "REAL_EVENT_EVIDENCE"}
         if category != "FINANCIAL_RESULTS":
             return None
-        result_terms = ("financial result", "quarterly result", "earnings", "annual report")
-        for document in self.documents_for(instrument_id, source_mode=SourceMode.REAL):
-            if _is_usable_durable_document(document) and any(
-                term in f"{document.title or ''} {document.normalized_text or ''}".lower() for term in result_terms
-            ):
-                return {
-                    "reason": "DURABLE_FINANCIAL_RESULT_DOCUMENT",
-                    "document_id": document.document_id,
-                    "evidence_at": document.retrieved_at.isoformat(),
-                }
+        documents = self._financial_result_documents_with_extracted_facts(instrument_id)
+        if documents:
+            document = documents[0]
+            return {
+                "reason": "DURABLE_FINANCIAL_RESULT_DOCUMENT",
+                "document_id": document.document_id,
+                "evidence_at": document.retrieved_at.isoformat(),
+            }
         return None
 
     def _category_is_fresh(self, instrument_id: UUID, category: str, now: datetime) -> bool:
@@ -2069,13 +2765,43 @@ class ResearchRepository:
             ttl = self.settings.research_search_refresh_cooldown_seconds
         return (now - refreshed_at).total_seconds() < ttl
 
-    async def _refresh_search_discovery(self, profile: CompanyResearchProfile, missing: set[str], seen_urls: set[str]) -> bool:
+    async def _refresh_search_discovery(
+        self, profile: CompanyResearchProfile, missing: set[str], seen_urls: set[str],
+        *, protect_error: str | None = None,
+    ) -> bool:
+        from app.deep_investigation import acquisition_budget
+        budget = acquisition_budget(profile.instrument_id)
+        # When protect_error is set, an authoritative NSE acquisition failure
+        # was already recorded earlier in this same refresh for a different
+        # category. This search-fallback attempt still runs normally (its
+        # stats, logging, and return value are unaffected) but it must not
+        # touch last_live_error: neither a fallback success nor a fallback
+        # failure may overwrite or erase that authoritative failure.
+        def _set_live_error(value: str) -> None:
+            if protect_error is None:
+                self.last_live_error[profile.instrument_id] = value
+
+        def _clear_live_error() -> None:
+            if protect_error is None:
+                self.last_live_error.pop(profile.instrument_id, None)
+
+        if budget is not None and await budget.sufficient():
+            # Authoritative evidence persisted earlier in this refresh (e.g. an
+            # NSE governance filing) already satisfies the requirement: spend
+            # no search queries on a fallback that can add nothing.
+            logger.info("search_fallback_skipped globalInstrumentId=%s requirement=%s reason=REQUIREMENT_SATISFIED",
+                        profile.instrument_id, budget.requirement_id)
+            budget.stopped = True
+            return True
+
         try:
             discovered = await self._search_discovery.discover(profile, missing, seen_urls)
         except SearchProviderError as exc:
+            if budget is not None:
+                budget.failures.append("SOURCE_UNAVAILABLE:" + str(exc)[:160])
             reason = str(exc)
             self._search_discovery.last_stats.reject(reason)
-            self.last_live_error[profile.instrument_id] = f"SEARCH_PROVIDER_UNAVAILABLE:{reason}"
+            _set_live_error(f"SEARCH_PROVIDER_UNAVAILABLE:{reason}")
             logger.warning("research_discovery_terminal company=%s provider=%s status=SEARCH_PROVIDER_UNAVAILABLE reason=%s",
                 profile.company_name, self._search_discovery.provider.provider_name, reason)
             return False
@@ -2085,7 +2811,7 @@ class ResearchRepository:
                 terminal = "SEARCH_RETURNED_ZERO_RESULTS"
             else:
                 terminal = "RESULTS_REJECTED"
-            self.last_live_error[profile.instrument_id] = terminal
+            _set_live_error(terminal)
             logger.warning("research_discovery_terminal company=%s provider=%s status=%s candidates=%s accepted=%s rejected_reasons=%s",
                 profile.company_name, self._search_discovery.provider.provider_name, terminal,
                 stats.candidate_count, stats.accepted_count, stats.rejected_reasons)
@@ -2095,9 +2821,11 @@ class ResearchRepository:
             # the no-change schedule.
             return stats.provider_failure_count == 0
         fetched_documents = 0
-        extracted_before = len(self.events)
+        extracted_before = self.events.applied
         fetch_failures: dict[str, int] = {}
         for result in discovered:
+            if budget is not None and not await budget.allow_document():
+                break
             if fetched_documents >= self.settings.research_search_max_documents_per_refresh:
                 break
             source = result.source
@@ -2112,26 +2840,26 @@ class ResearchRepository:
             except RestrictedFetchError as exc:
                 self._search_discovery.last_stats.reject("ROBOTS_OR_ACCESS_BLOCKED")
                 fetch_failures["ROBOTS_OR_ACCESS_BLOCKED"] = fetch_failures.get("ROBOTS_OR_ACCESS_BLOCKED", 0) + 1
-                self.last_live_error[profile.instrument_id] = f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}"
+                _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}")
             except FetchError as exc:
                 failure = _fetch_rejection_reason(exc)
                 self._search_discovery.last_stats.reject(failure)
                 fetch_failures[failure] = fetch_failures.get(failure, 0) + 1
-                self.last_live_error[profile.instrument_id] = f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}"
+                _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}")
             except ValueError as exc:
                 self._search_discovery.last_stats.reject("PARSER_FAILED")
                 fetch_failures["PARSER_FAILED"] = fetch_failures.get("PARSER_FAILED", 0) + 1
-                self.last_live_error[profile.instrument_id] = f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}"
+                _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}")
             except Exception as exc:
                 self._search_discovery.last_stats.reject("HTTP_FETCH_FAILED")
                 fetch_failures["HTTP_FETCH_FAILED"] = fetch_failures.get("HTTP_FETCH_FAILED", 0) + 1
-                self.last_live_error[profile.instrument_id] = f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:HTTP_FETCH_FAILED"
+                _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:HTTP_FETCH_FAILED")
         if fetched_documents > 0:
-            self.last_live_error.pop(profile.instrument_id, None)
+            _clear_live_error()
         elif discovered:
-            self.last_live_error[profile.instrument_id] = "DOCUMENT_FETCH_FAILED"
+            _set_live_error("DOCUMENT_FETCH_FAILED")
         self._search_discovery.last_stats.documents_fetched = fetched_documents
-        self._search_discovery.last_stats.events_extracted = len(self.events) - extracted_before
+        self._search_discovery.last_stats.events_extracted = self.events.applied - extracted_before
         logger.info("research_fetch_complete company=%s provider=%s accepted_results=%s document_fetch_count=%s extraction_count=%s terminal_status=%s failure_reasons=%s",
             profile.company_name, self._search_discovery.provider.provider_name, len(discovered), fetched_documents,
             self._search_discovery.last_stats.events_extracted,
@@ -2140,7 +2868,7 @@ class ResearchRepository:
 
     async def _refresh_etf_search_discovery(self, profile: EtfResearchProfile) -> None:
         categories = {"ETF_PROFILE", "ETF_PERFORMANCE", "INDEX_OUTLOOK", "ETF_RISK"}
-        seen_urls = {doc.canonical_url for doc in self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)}
+        seen_urls = self.document_urls_for(profile.instrument_id, source_mode=SourceMode.REAL)
         try:
             discovered = await self._search_discovery.discover(profile, categories, seen_urls)
         except SearchProviderError as exc:
@@ -2204,7 +2932,7 @@ class ResearchRepository:
                 self._prepare_ingested_document,
                 original_url=result.final_url, source_type=source.source_type, source_classification=source.source_classification,
                 source_name=source.source_name, publisher=source.publisher, content_type=result.content_type, body=result.text,
-                reliability=source.reliability_level, published_at=None, source_mode=SourceMode.REAL,
+                reliability=source.reliability_level, published_at=source.official_published_at if trusted_identity else None, source_mode=SourceMode.REAL,
                 discovered_at=None,
                 discovery_provider=(source.discovery_method if source.discovery_method == "SEARCH_DISCOVERY" or trusted_identity else None),
                 expected_profile=expected_profile, document_status=document_status,
@@ -2215,6 +2943,9 @@ class ResearchRepository:
             logger.info("document_ingest_stage globalInstrumentId=%s stage=PREPARE elapsedMs=%s outcome=FAILED", profile.instrument_id, _elapsed_ms(started))
             raise
         logger.info("document_ingest_stage globalInstrumentId=%s documentId=%s stage=PREPARE elapsedMs=%s outcome=SUCCESS", profile.instrument_id, document.document_id, _elapsed_ms(started))
+        if trusted_identity and source.official_title:
+            document.title = source.official_title
+            document.published_at = source.official_published_at
         return await self._apply_prepared_ingested_document_async(
             document,
             document_status=document_status,
@@ -2254,6 +2985,8 @@ class ResearchRepository:
             ),
             document_subtype=source.document_subtype,
             _metadata_only_nse_financial_result="FINANCIAL_RESULTS" in source.categories,
+            **({"published_at": source.official_published_at, "_official_title": source.official_title}
+               if self._has_trusted_nse_profile_identity(profile, source, expected_profile) else {}),
         )
 
     @staticmethod
@@ -2344,7 +3077,14 @@ class ResearchRepository:
             document.duplicate_of_document_id = duplicate.document_id
             return document
         self.documents[document.document_id] = document
-        self._persistence.upsert_document(document)
+        try:
+            stored = self._persistence.upsert_document(document)
+        except BaseException:
+            self._forget_unpersisted_document(document)
+            raise
+        if stored is False:
+            return self._adopt_existing_durable_document(document)
+        self._mark_document_durable(document)
         self._update_etf_facts(profile, document)
         self.last_refresh[profile.instrument_id] = datetime.now(timezone.utc)
         return document
@@ -2423,20 +3163,24 @@ class ResearchRepository:
             )
 
     def _load_persisted_research(self) -> None:
-        for document in self._persistence.load_documents():
-            if document.document_id in self.documents:
+        # Rehydrate identity/index/dedup state cheaply: identity columns
+        # only, never full document bodies. Full ResearchDocument objects
+        # are loaded lazily and kept in a bounded cache (self.documents /
+        # documents_for()), so process memory at startup no longer scales
+        # with the total historical document count.
+        for identity in self._persistence.load_document_identities():
+            document_id, instrument_id, canonical_url, content_hash = identity[:4]
+            if document_id is None:
                 continue
-            self.documents[document.document_id] = document
-            self._deduplicator.add(document)
-        for event in self._persistence.load_events():
-            if event.event_id in self.events:
-                continue
-            self.events[event.event_id] = event
-            self._event_keys.add(_event_key(event))
-            self.last_refresh[event.instrument_id] = max(
-                self.last_refresh.get(event.instrument_id, event.detected_at),
-                event.detected_at,
-            )
+            source_mode, sort_key = (identity[4], identity[5]) if len(identity) >= 6 else (SourceMode.REAL, None)
+            self.documents.register_ref(DocumentRef(document_id, instrument_id, source_mode, canonical_url, content_hash, sort_key))
+            self._deduplicator.add_identity(document_id, canonical_url, content_hash)
+        # Events are loaded per instrument on first use; startup only needs the
+        # latest detection time per instrument (compact aggregate).
+        latest = getattr(self._persistence, "load_event_refresh_times", None)
+        for instrument_id, detected_at in (latest() if callable(latest) else []):
+            if instrument_id is not None and detected_at is not None:
+                self.last_refresh[instrument_id] = max(self.last_refresh.get(instrument_id, detected_at), detected_at)
         for snapshot in self._persistence.load_shareholding_snapshots():
             self.shareholding_snapshots.setdefault(snapshot.id, snapshot)
 
@@ -2610,9 +3354,20 @@ def _profile_source_discovery(
     return results
 
 
+def _aware_observation_time(observation) -> datetime | None:
+    if not observation or not observation.get("observed_at"):
+        return None
+    value = observation["observed_at"]
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 def _fetch_rejection_reason(exc: FetchError) -> str:
     message = str(exc)
     if message in {
+        "NETWORK_TIMEOUT",
+        "PDF_EXTRACTION_TIMEOUT",
+        "PDF_EXTRACTION_QUEUE_TIMEOUT",
         "CONTENT_EMPTY",
         "CONTENT_TOO_SHORT",
         "COMPANY_RELEVANCE_FAILED",
@@ -2696,6 +3451,18 @@ def _explicit_quarter_end(text: str) -> datetime | None:
     return None
 
 
+def _same_persisted_financial_fact(prior: FinancialFact, incoming: FinancialFact) -> bool:
+    # as_of_date/period are parser projection fields, not persisted columns.
+    excluded = {"as_of_date", "period", "calculation_basis"}
+    return (
+        prior.key == incoming.key and prior.source_tier == incoming.source_tier
+        and prior.source_provider == incoming.source_provider
+        and prior.source_identity == incoming.source_identity
+        and prior.source_mode == incoming.source_mode
+        and prior.value.model_dump(exclude=excluded) == incoming.value.model_dump(exclude=excluded)
+    )
+
+
 def _eligible_for_nse_shareholding_reconciliation(profile: CompanyResearchProfile) -> bool:
     return (
         profile.country.upper() in {"IN", "IND", "INDIA"}
@@ -2727,8 +3494,121 @@ def _checked_categories(categories: set[str], shareholding_check_succeeded: bool
     return categories - {"SHAREHOLDING_PATTERN"}
 
 
+# Core authoritative financial-statement categories that must never be
+# starved out of the bounded per-refresh attempt budget by a batch of
+# opportunistic NSE announcement categories (DI-7C Step 10).  Only
+# FINANCIAL_RESULTS is actually routed through this function today --
+# SHAREHOLDING_PATTERN uses a separate official XBRL discovery path -- but
+# both are listed for robustness if that ever changes.
+_CORE_FINANCIAL_FILING_CATEGORIES = frozenset({"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN"})
+
+
+# The official-document fetch path (HttpResearchFetcher.process_network_response,
+# research_fetching.py:295) can only ingest these content types. Every other
+# content type is rejected at runtime with FetchError("Unsupported content type")
+# (research_fetching.py:304). This set is the single source of truth for whether
+# a candidate is *processable* by the official fetch path.
+_OFFICIAL_DOCUMENT_PROCESSABLE_CONTENT_TYPES = frozenset({
+    "text/html",
+    "text/plain",
+    "application/xml",
+    "text/xml",
+    "application/rss+xml",
+    "application/pdf",
+})
+
+
+# Binary/archive/office extensions NSE occasionally attaches. Each maps to the
+# content type the fetcher would actually receive; all of them are, by
+# construction, absent from _OFFICIAL_DOCUMENT_PROCESSABLE_CONTENT_TYPES, so a
+# file with one of these extensions can provably never be parsed by the official
+# fetch path. Skipping such a candidate BEFORE a network fetch and BEFORE
+# `attempted += 1` prevents a useless file from exhausting the per-refresh
+# attempt budget (DI-11C Fix 1).
+_OFFICIAL_UNSUPPORTED_CONTENT_TYPES_BY_EXTENSION: dict[str, str] = {
+    ".zip": "application/zip",
+    ".zipx": "application/zip",
+    ".7z": "application/x-7z-compressed",
+    ".rar": "application/vnd.rar",
+    ".tar": "application/x-tar",
+    ".gz": "application/gzip",
+    ".tgz": "application/gzip",
+    ".bz2": "application/x-bzip2",
+    ".xz": "application/x-xz",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".exe": "application/x-msdownload",
+    ".dll": "application/x-msdownload",
+    ".bin": "application/octet-stream",
+    ".iso": "application/octet-stream",
+    ".img": "application/octet-stream",
+    ".eml": "message/rfc822",
+    ".msg": "application/vnd.ms-outlook",
+}
+
+
+def _official_filing_url_extension(url: str) -> str:
+    """Lowercased file extension of an announcement attachment URL.
+
+    Returns "" for extensionless/ambiguous URLs (e.g. ``...?id=5`` or a path
+    with no dot in its final segment) so callers retain the existing run-time
+    content-type handling instead of falsely pre-skipping such a candidate.
+    """
+    path = urlparse(url).path
+    name = path.rsplit("/", 1)[-1]
+    dot = name.rfind(".")
+    if dot <= 0:  # no extension, or a leading-dot filename like ".gitignore"
+        return ""
+    return name[dot:].lower()
+
+
+def _official_filing_content_type_unsupported(url: str) -> bool:
+    """True iff the URL's file extension provably resolves to a content type the
+    official-document fetch path cannot process.
+
+    Only decisive, processable-unsupported extensions are matched. Unknown and
+    extensionless/ambiguous URLs return False so existing discovery/fetch
+    behavior is preserved (DI-11C Fix 1).
+    """
+    extension = _official_filing_url_extension(url)
+    if not extension:
+        return False
+    content_type = _OFFICIAL_UNSUPPORTED_CONTENT_TYPES_BY_EXTENSION.get(extension)
+    if content_type is None:
+        # Unknown extension: cannot prove it is unsupported. Defer to run-time
+        # content-type handling rather than risk a false pre-skip.
+        return False
+    return content_type not in _OFFICIAL_DOCUMENT_PROCESSABLE_CONTENT_TYPES
+
+
+def _derivative_newspaper_publication(source) -> bool:
+    text = f"{getattr(source, 'official_title', None) or ''} {source.url}".casefold()
+    return "newspaper" in text or "clipping" in text
+
+
 def _fair_official_filing_order(filings: list[DiscoveryResult]) -> list[DiscoveryResult]:
-    """Interleave categories while preserving discovery order within each one."""
+    """Two-phase ordering: prioritize core financial categories over non-core.
+
+    Phase 1: round-robin across CORE categories only (FINANCIAL_RESULTS,
+    SHAREHOLDING_PATTERN).  Phase 2: round-robin across remaining non-core
+    categories.  This guarantees that a bounded document budget of ``N`` useful
+    acquisition attempts always exhausts core financial-result candidates before
+    any opportunistic non-core announcement (newspaper, board meeting, investor
+    presentation) consumes a slot.
+
+    Within FINANCIAL_RESULTS, results are sorted newest-first with unsupported
+    content-type URLs deferred (the fetch loop skips them before consuming a
+    budget slot, but defusing them from first place keeps the most recently
+    published parseable result prioritized).
+    """
     buckets: dict[str, list[DiscoveryResult]] = {}
     category_order: list[str] = []
     for filing in filings:
@@ -2736,20 +3616,54 @@ def _fair_official_filing_order(filings: list[DiscoveryResult]) -> list[Discover
             buckets[filing.category] = []
             category_order.append(filing.category)
         buckets[filing.category].append(filing)
-    ordered: list[DiscoveryResult] = []
-    offsets = {category: 0 for category in category_order}
-    while True:
-        emitted = False
-        for category in category_order:
-            index = offsets[category]
-            bucket = buckets[category]
-            if index >= len(bucket):
-                continue
-            ordered.append(bucket[index])
-            offsets[category] = index + 1
-            emitted = True
-        if not emitted:
-            return ordered
+    if "FINANCIAL_RESULTS" in buckets:
+        def financial_priority(filing: DiscoveryResult):
+            published = filing.source.official_published_at
+            dated = published.astimezone(timezone.utc) if published and published.tzinfo else published
+            age_key = (dated - datetime.min.replace(tzinfo=dated.tzinfo)).total_seconds() if dated else 0
+            # A newspaper publication/clipping of results is a derivative
+            # (usually an image scan filed after the results): it must not
+            # consume the bounded document budget before primary result
+            # filings of any recent quarter. It stays eligible afterwards.
+            return (_official_filing_content_type_unsupported(filing.source.url),
+                    _derivative_newspaper_publication(filing.source), -age_key, filing.source.url)
+        buckets["FINANCIAL_RESULTS"].sort(key=financial_priority)
+    core_categories = [c for c in category_order if c in _CORE_FINANCIAL_FILING_CATEGORIES]
+    non_core_categories = [c for c in category_order if c not in _CORE_FINANCIAL_FILING_CATEGORIES]
+
+    def _round_robin(categories: list[str]) -> list[DiscoveryResult]:
+        ordered: list[DiscoveryResult] = []
+        offsets = {category: 0 for category in categories}
+        while True:
+            emitted = False
+            for category in categories:
+                index = offsets[category]
+                bucket = buckets[category]
+                if index >= len(bucket):
+                    continue
+                ordered.append(bucket[index])
+                offsets[category] = index + 1
+                emitted = True
+            if not emitted:
+                return ordered
+
+    return _round_robin(core_categories) + _round_robin(non_core_categories)
+
+
+# Shared with _financial_result_documents_with_extracted_facts and
+# _category_evidence_timing so both use one definition of "looks like a
+# financial result announcement" (DI-7C Step 4/9).
+_FINANCIAL_RESULT_EVIDENCE_TERMS = ("financial result", "quarterly result", "earnings", "annual report")
+
+# Internal-only completeness sentinels (DI-7C Step 4/5/6): a document whose
+# text carries a recognized balance-sheet/cash-flow heading but whose parse
+# nonetheless yielded zero periods for that statement is a genuine
+# extraction gap, not "nothing was expected".  These sentinel metric names
+# are namespaced so they can never collide with a real parsed metric key and
+# are never satisfied by any persisted fact, so such a period stays
+# incomplete (and thus retryable) until extraction actually succeeds.
+_BALANCE_SHEET_EXTRACTION_PENDING_SENTINEL = "__nse_balance_sheet_extraction_pending__"
+_CASH_FLOW_EXTRACTION_PENDING_SENTINEL = "__nse_cash_flow_extraction_pending__"
 
 
 def _is_usable_durable_document(document: ResearchDocument) -> bool:

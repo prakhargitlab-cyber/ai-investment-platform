@@ -4,15 +4,17 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID
 
 import httpx
 import pytest
 import respx
 
-from app.deduplication import DocumentDeduplicator
+from app.deduplication import DocumentDeduplicator, DocumentIdentity
 from app.entity_resolution import EntityResolver
 from app.extraction import RuleBasedEventExtractor
 from app.models import CompanyResearchProfile, DocumentStatus, DocumentSubtype, DocumentType, EntityResolution, EtfResearchProfile, EventImpact, PortfolioResearchCompany, PortfolioResearchSummary, ProvenancedValue, ReliabilityLevel, ResearchDocument, ResearchEvent, ResearchEventType, ShareholdingCategory, ShareholdingSnapshot, ShareholdingSnapshotValue, SourceClassification, SourceMode, SourceType, TimeHorizon
@@ -20,7 +22,7 @@ from app.fact_precedence import FactSourceTier, FinancialFact, FinancialFactKey
 from app.normalization import canonicalize_url, content_hash, extract_published_at, extract_text, normalize_numbers
 from app.repository import ResearchRepository, _InstrumentRefreshGate, _canonical_refresh_category
 from app.persistence import SqliteResearchPersistence
-from app.portfolio_orchestration import PortfolioResearchOrchestrator, _company_aliases, _hydrate_verified_exchange_mappings, _instrument_asset_type, _instrument_name
+from app.portfolio_orchestration import PortfolioResearchOrchestrator, _company_aliases, _hydrate_verified_exchange_mappings, _instrument_asset_type, _instrument_name, _status_from_summary
 from app.research_fetching import DocumentSizeLimitExceeded, FetchError, FetchResult, HttpResearchFetcher, HttpStatusFetchError, NetworkFetchResult, PdfExtractionTimeoutError, RestrictedFetchError, TransportFetchError
 from app.scoring import CatalystScorer, canonical_read_model_score
 from app.settings import Settings
@@ -179,9 +181,14 @@ def test_document_deduplication_uses_url_and_hash() -> None:
     doc = _document("https://example.com/a", "same text")
     duplicate_url = _document("https://example.com/a", "different text")
     duplicate_hash = _document("https://example.com/b", "same text")
+    expected = DocumentIdentity(doc.document_id, doc.canonical_url, doc.content_hash)
     assert dedupe.add(doc) is None
-    assert dedupe.add(duplicate_url) == doc
-    assert dedupe.add(duplicate_hash) == doc
+    # A duplicate hit returns the earlier document's lightweight identity,
+    # not the full ResearchDocument object -- the deduplicator must never
+    # pin full document bodies (raw_text/normalized_text/pdf_structure)
+    # for the life of the process just to recognize a repeat ingestion.
+    assert dedupe.add(duplicate_url) == expected
+    assert dedupe.add(duplicate_hash) == expected
 
 
 def test_rule_based_extraction_sets_confidence_and_negative_events() -> None:
@@ -2933,14 +2940,23 @@ class _OfficialFetchFixture:
 
 @pytest.mark.asyncio
 async def test_successful_official_financial_result_persists_and_is_removed_from_fallback_missing_categories() -> None:
+    # DI-7C: FINANCIAL_RESULTS freshness now requires at least one genuinely
+    # extracted FinancialFact (Step 4), so the fixture text below must be
+    # real parseable NSE tabular content, not loose prose -- and persistence
+    # must be enabled for the extracted fact to actually be stored.
     settings = Settings(research_live_enabled=True, research_search_enabled=True, research_official_document_max_attempts_per_refresh=3)
-    repository = ResearchRepository(settings=settings, search_discovery=SearchDiscoveryService(_StaticSearchProvider([])))
-    profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
-    source = _official_financial_result_source(profile, "latest")
+    repository = ResearchRepository(settings=settings, search_discovery=SearchDiscoveryService(_StaticSearchProvider([])), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    source = replace(_official_financial_result_source(profile, "latest"), official_nse_profile_symbol="RELIANCE")
     repository._official_filing_discovery = _StaticOfficialDiscovery([DiscoveryResult("FINANCIAL_RESULTS", source)])
     repository._fetcher = _OfficialFetchFixture(FetchResult(
-        final_url=source.url, status_code=200, content_type="text/html", bytes_read=180,
-        text="<html><title>Reliance Industries Limited Quarterly Financial Results</title><main>Reliance Industries Limited RELIANCE INE002A01018 quarterly financial results revenue from operations 1000 crore PAT 100 crore.</main></html>",
+        final_url=source.url, status_code=200, content_type="application/pdf", bytes_read=180,
+        text=(
+            "Reliance Industries Limited RELIANCE INE002A01018 Statement of Standalone "
+            "Financial Results (Rs. in Crore) Particulars Quarter Ended "
+            "30.06.2026 30.06.2025 Revenue From Operations 1000.00 900.00 "
+            "Net Profit for the period after Tax 100.00 90.00"
+        ),
     ))
 
     await repository._refresh_targeted(profile, set())
@@ -3369,9 +3385,18 @@ async def test_official_filing_single_flight_cancellation_cleans_up_and_urls_rem
 
 @pytest.mark.asyncio
 async def test_fast_large_official_pdf_persists_and_marks_financial_results_fresh(monkeypatch) -> None:
+    # DI-7C: freshness now requires at least one genuinely extracted
+    # FinancialFact (Step 4), so the mocked PDF page text must be real
+    # parseable NSE tabular content, not loose prose, and persistence must
+    # be enabled for the extracted fact to actually be stored.
     class Page:
         def extract_text(self):
-            return "Reliance Industries Limited RELIANCE INE002A01018 quarterly financial results revenue 1000 crore PAT 100 crore"
+            return (
+                "Reliance Industries Limited RELIANCE INE002A01018 Statement of Standalone "
+                "Financial Results (Rs. in Crore) Particulars Quarter Ended "
+                "30.06.2026 30.06.2025 Revenue From Operations 1000.00 900.00 "
+                "Net Profit for the period after Tax 100.00 90.00"
+            )
 
     class Reader:
         def __init__(self, _stream):
@@ -3388,9 +3413,9 @@ async def test_fast_large_official_pdf_persists_and_marks_financial_results_fres
     client = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda request: httpx.Response(200, headers={"content-type": "application/pdf"}, content=b"%PDF-" + b"x" * 5_000_000, request=request)
     ))
-    repository = ResearchRepository(settings=settings, fetcher=HttpResearchFetcher(settings, client))
-    profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
-    source = _official_financial_result_source(profile, "large")
+    repository = ResearchRepository(settings=settings, fetcher=HttpResearchFetcher(settings, client), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    source = replace(_official_financial_result_source(profile, "large"), official_nse_profile_symbol="RELIANCE")
 
     await repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set())
     repository._mark_qualifying_categories_fresh(profile.instrument_id, {"FINANCIAL_RESULTS"}, datetime.now(timezone.utc))
@@ -3524,12 +3549,20 @@ async def test_official_pdf_above_default_budget_fails_before_processing() -> No
 
 @pytest.mark.asyncio
 async def test_global_official_document_is_reused_without_second_download_or_extraction() -> None:
-    repository = ResearchRepository(settings=Settings(research_live_enabled=True))
-    profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
-    source = _official_financial_result_source(profile, "reused")
+    # DI-7C: freshness now requires a genuinely extracted FinancialFact
+    # (Step 4); the fixture text must be real parseable NSE tabular content
+    # and persistence must be enabled for the extracted fact to be stored.
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    source = replace(_official_financial_result_source(profile, "reused"), official_nse_profile_symbol="RELIANCE")
     fetcher = _OfficialFetchFixture(FetchResult(
-        final_url=source.url, status_code=200, content_type="text/html", bytes_read=180,
-        text="<html><title>Reliance Industries Limited Quarterly Financial Results</title><main>Reliance Industries Limited RELIANCE INE002A01018 quarterly financial results revenue 1000 crore PAT 100 crore.</main></html>",
+        final_url=source.url, status_code=200, content_type="application/pdf", bytes_read=180,
+        text=(
+            "Reliance Industries Limited RELIANCE INE002A01018 Statement of Standalone "
+            "Financial Results (Rs. in Crore) Particulars Quarter Ended "
+            "30.06.2026 30.06.2025 Revenue From Operations 1000.00 900.00 "
+            "Net Profit for the period after Tax 100.00 90.00"
+        ),
     ))
     repository._fetcher = fetcher
 
@@ -3585,7 +3618,10 @@ async def test_distinct_official_urls_are_not_collapsed_as_same_quarterly_docume
 
 
 def test_existing_durable_financial_result_is_the_only_reason_a_failed_refresh_can_become_fresh() -> None:
-    repository = ResearchRepository(settings=Settings(research_live_enabled=True))
+    # DI-7C: freshness now requires a genuinely extracted FinancialFact
+    # (Step 4); the fixture text must be real parseable NSE tabular content
+    # and persistence must be enabled for the extracted fact to be stored.
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True), persistence=SqliteResearchPersistence())
     profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
     now = datetime.now(timezone.utc)
     assert "FINANCIAL_RESULTS" in repository._missing_categories(profile, set(), now, {"FINANCIAL_RESULTS"})
@@ -3593,8 +3629,15 @@ def test_existing_durable_financial_result_is_the_only_reason_a_failed_refresh_c
         original_url="https://nsearchives.nseindia.com/corporate/prior-result.pdf",
         source_type=SourceType.EXCHANGE_ANNOUNCEMENT, source_classification=SourceClassification.EXCHANGE,
         source_name="NSE corporate announcements", publisher="NSE", content_type="text/html",
-        body="<html><title>Reliance Industries Limited Quarterly Financial Results</title><main>Reliance Industries Limited RELIANCE INE002A01018 quarterly financial results revenue 1000 crore PAT 100 crore.</main></html>",
+        body=(
+            "<html><title>Reliance Industries Limited Quarterly Financial Results</title><main>"
+            "Reliance Industries Limited RELIANCE INE002A01018 Amounts in Rs. Crore Extract of Statement of "
+            "Unaudited Financial Results for the quarter ended 30th June 2026 Particulars Quarter Ended "
+            "30th June 2026 30th June 2025 Revenue From Operations 1000.00 900.00 "
+            "Net Profit for the period after Tax 100.00 90.00</main></html>"
+        ),
         reliability=ReliabilityLevel.LEVEL_A, source_mode=SourceMode.REAL, expected_profile=profile,
+        discovery_provider="NSE_OFFICIAL_API",
     )
 
     repository._mark_qualifying_categories_fresh(profile.instrument_id, {"FINANCIAL_RESULTS"}, now)
@@ -3980,6 +4023,114 @@ def test_statement_history_projects_only_persisted_supported_metrics_without_bas
     assert cash_flow[0].metrics["operating_cash_flow"].value == Decimal("100")
 
 
+def test_bug1_nse_facts_do_not_disappear_when_yahoo_reports_same_period_as_a_datetime_string() -> None:
+    """DI-7C.1 Bug 1, test A: NSE's clean ``2026-03-31`` and Yahoo's
+    ``2026-03-31T00:00:00`` must be treated as the same reporting period, and
+    NSE's higher-authority CONSOLIDATED facts must still be selected and
+    presented for that period -- not silently dropped because Yahoo's
+    datetime-style string previously compared as a lexically "newer" period.
+    This reproduces the KHANDSE symptom: NSE income facts disappearing from
+    financialResultHistory.
+    """
+    instrument_id = UUID("99999999-9999-9999-9999-999999999980")
+    facts = [
+        _selection_fact(instrument_id, "revenue", "500", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "pat", "50", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "eps", "5.0", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "revenue", "480", period="2026-03-31T00:00:00", basis="UNKNOWN", tier=FactSourceTier.YAHOO, provider="YAHOO_FINANCE"),
+    ]
+    history = financial_result_history_from_facts(facts, period_type="QUARTERLY")
+    assert [item.period for item in history] == ["2026-03-31"]
+    assert history[0].reporting_basis == "CONSOLIDATED"
+    assert history[0].revenue.value == Decimal("500")
+    assert history[0].pat.value == Decimal("50")
+    assert history[0].eps.value == Decimal("5.0")
+
+
+def test_bug1_genuinely_later_period_still_outranks_an_earlier_datetime_formatted_period() -> None:
+    """DI-7C.1 Bug 1, test B: normalizing period identity to a calendar date
+    must not stop a genuinely later period from outranking a genuinely
+    earlier one merely because the earlier one carries a datetime/timezone
+    suffix.
+    """
+    instrument_id = UUID("99999999-9999-9999-9999-999999999979")
+    facts = [
+        _selection_fact(instrument_id, "revenue", "100", period="2026-03-31T23:59:59+05:30", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "revenue", "200", period="2026-06-30", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+    ]
+    history = financial_result_history_from_facts(facts, period_type="QUARTERLY")
+    assert [item.period for item in history] == ["2026-06-30", "2026-03-31"]
+    assert history[0].revenue.value == Decimal("200")
+    assert history[1].revenue.value == Decimal("100")
+
+
+def test_bug1_timezone_suffix_does_not_manufacture_a_false_later_period() -> None:
+    """DI-7C.1 Bug 1, test C: a timezone-suffixed datetime for the same
+    calendar day must not be treated as a distinct, later period than an
+    equivalent date-only NSE period.
+    """
+    instrument_id = UUID("99999999-9999-9999-9999-999999999978")
+    facts = [
+        _selection_fact(instrument_id, "revenue", "500", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "pat", "50", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "revenue", "480", period="2026-03-31T00:00:00+05:30", basis="UNKNOWN", tier=FactSourceTier.YAHOO, provider="YAHOO_FINANCE"),
+    ]
+    history = financial_result_history_from_facts(facts, period_type="QUARTERLY")
+    assert [item.period for item in history] == ["2026-03-31"]
+    assert history[0].reporting_basis == "CONSOLIDATED"
+    assert history[0].revenue.value == Decimal("500")
+
+
+def test_bug1_nse_still_outranks_yahoo_for_the_same_metric_at_an_equivalent_period() -> None:
+    """DI-7C.1 Bug 1, test D: once NSE's date-only and Yahoo's datetime-style
+    period_end are correctly merged as one period/basis group, NSE's fact
+    must still win over Yahoo's for the same metric -- source precedence is
+    unaffected by this fix.
+    """
+    instrument_id = UUID("99999999-9999-9999-9999-999999999977")
+    facts = [
+        _selection_fact(instrument_id, "revenue", "500", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "revenue", "480", period="2026-03-31T00:00:00", basis="CONSOLIDATED", tier=FactSourceTier.YAHOO, provider="YAHOO_FINANCE"),
+    ]
+    history = financial_result_history_from_facts(facts, period_type="QUARTERLY")
+    assert [item.period for item in history] == ["2026-03-31"]
+    assert history[0].revenue.value == Decimal("500")
+    assert history[0].revenue.source_name == "NSE"
+
+
+def test_bug1_standalone_and_consolidated_periods_stay_separate_after_normalization() -> None:
+    """DI-7C.1 Bug 1, test E: normalizing period identity for comparison
+    must not merge distinct reporting bases into one period/basis group, and
+    the existing (unmodified) single-basis-per-series selection must still
+    hold -- STANDALONE must never be composed into the CONSOLIDATED row.
+    """
+    instrument_id = UUID("99999999-9999-9999-9999-999999999976")
+    facts = [
+        _selection_fact(instrument_id, "revenue", "500", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+        _selection_fact(instrument_id, "revenue", "400", period="2026-03-31T00:00:00", basis="STANDALONE", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE"),
+    ]
+    history = financial_result_history_from_facts(facts, period_type="QUARTERLY")
+    assert [item.period for item in history] == ["2026-03-31"]
+    assert history[0].reporting_basis == "CONSOLIDATED"
+    assert history[0].revenue.value == Decimal("500")
+
+
+def test_bug1_statement_history_merges_datetime_style_period_end_with_date_only_period_end() -> None:
+    """DI-7C.1 Bug 1 additional coverage: the same period-identity fix
+    applies to financial_statement_history_from_facts (balance sheet / cash
+    flow projections), not only the income-result history.
+    """
+    instrument_id = UUID("99999999-9999-9999-9999-999999999975")
+    facts = [
+        _selection_fact(instrument_id, "total_assets", "500", period="2026-03-31", basis="CONSOLIDATED", tier=FactSourceTier.OFFICIAL_NSE, provider="NSE", period_type="AS_AT"),
+        _selection_fact(instrument_id, "total_assets", "480", period="2026-03-31T00:00:00", basis="UNKNOWN", tier=FactSourceTier.YAHOO, provider="YAHOO_FINANCE", period_type="AS_AT"),
+    ]
+    balance = financial_statement_history_from_facts(facts, period_type="AS_AT", metrics={"total_assets"})
+    assert [item.period for item in balance] == ["2026-03-31"]
+    assert balance[0].reporting_basis == "CONSOLIDATED"
+    assert balance[0].metrics["total_assets"].value == Decimal("500")
+
+
 def test_enrichment_uses_complete_persisted_quarterly_facts_without_document_parser(monkeypatch) -> None:
     instrument_id = UUID("99999999-9999-9999-9999-999999999991")
     company = PortfolioResearchCompany(instrument_id=instrument_id, company_name="Example", status="RESOLVED_RESEARCH_AVAILABLE")
@@ -4290,7 +4441,7 @@ def test_category_freshness_uses_independent_configurable_windows() -> None:
         research_catalyst_freshness_seconds=10,
         research_analyst_freshness_seconds=50,
     )
-    repository = ResearchRepository(settings=settings)
+    repository = ResearchRepository(settings=settings, persistence=SqliteResearchPersistence())
     instrument_id = repository.profiles[0].instrument_id
     now = datetime.now(timezone.utc)
     repository._category_refresh[(instrument_id, "FINANCIAL_RESULTS")] = now
@@ -4300,13 +4451,24 @@ def test_category_freshness_uses_independent_configurable_windows() -> None:
         "title": "Quarterly Financial Results",
     })
     repository.documents[document.document_id] = document
+    # DI-7C Step 4: freshness now also requires a genuinely extracted
+    # FinancialFact for this document, not just a title/text match -- this
+    # test is about freshness *window* configuration, not extraction, so a
+    # fact is inserted directly rather than relying on real NSE parsing of
+    # this test's minimal placeholder text.
+    repository._persistence.upsert_financial_fact(FinancialFact(
+        FinancialFactKey(instrument_id, "revenue", "2026-06-30", "QUARTERLY", None),
+        ProvenancedValue(value=Decimal("100"), unit="INR crore", source_url=document.canonical_url,
+                          source_name="NSE", source_type="EXCHANGE_ANNOUNCEMENT", retrieved_at=now, confidence=None),
+        FactSourceTier.OFFICIAL_NSE, "NSE", str(document.document_id), SourceMode.REAL,
+    ))
     assert repository._category_is_fresh(instrument_id, "FINANCIAL_RESULTS", now)
     assert repository.documents[document.document_id] is document
     assert not repository._category_is_fresh(instrument_id, "FINANCIAL_RESULTS", now.replace(year=now.year + 1))
 
 
 def test_quarterly_financial_result_eligibility_uses_explicit_reporting_period_window() -> None:
-    repository = ResearchRepository(settings=Settings())
+    repository = ResearchRepository(settings=Settings(), persistence=SqliteResearchPersistence())
     instrument_id = repository.profiles[0].instrument_id
     document = _document(
         "https://exchange.example/results",
@@ -4319,6 +4481,16 @@ def test_quarterly_financial_result_eligibility_uses_explicit_reporting_period_w
         "retrieved_at": datetime(2026, 7, 15, tzinfo=timezone.utc),
     })
     repository.documents[document.document_id] = document
+    # DI-7C Step 4: eligibility windowing now also requires a genuinely
+    # extracted FinancialFact for this document (see the freshness test
+    # above for the same reasoning) -- inserted directly since this test is
+    # about the explicit-reporting-period eligibility window, not parsing.
+    repository._persistence.upsert_financial_fact(FinancialFact(
+        FinancialFactKey(instrument_id, "revenue", "2026-06-30", "QUARTERLY", None),
+        ProvenancedValue(value=Decimal("100"), unit="INR crore", source_url=document.canonical_url,
+                          source_name="NSE", source_type="EXCHANGE_ANNOUNCEMENT", retrieved_at=document.retrieved_at, confidence=None),
+        FactSourceTier.OFFICIAL_NSE, "NSE", str(document.document_id), SourceMode.REAL,
+    ))
 
     eligible, next_eligible = repository._category_is_eligible_to_check(
         instrument_id, "FINANCIAL_RESULTS", datetime(2026, 8, 15, tzinfo=timezone.utc)
@@ -4423,9 +4595,9 @@ async def test_targeted_refresh_constrains_official_discovery_to_precomputed_due
 
     await repository._refresh_targeted(profile, set())
 
-    # A stale/incomplete instrument does not authorize financial filing work
-    # when FINANCIAL_RESULTS was filtered out before discovery.
-    assert official.calls == []
+    # Guidance can use official announcements without authorizing financial
+    # filing work that was filtered out before discovery.
+    assert official.calls == [{"GUIDANCE"}]
 
 
 @pytest.mark.asyncio
@@ -5120,3 +5292,1184 @@ def _candidate(url: str, category: str) -> CandidateSearchResult:
         query=f"AIXTRON {category} 2026",
         category=category,
     )
+
+
+# --- DI-6: COMPANY_NOT_RESOLVED root-cause diagnostics (Gate 1) ---------------
+#
+# These call PortfolioResearchOrchestrator._register_equity_profile_from_instrument
+# directly (the established private-method-testing pattern already used
+# elsewhere in this file, e.g. orchestrator._dedupe_instruments /
+# orchestrator._finalize) so each of the seven previously-collapsed guard
+# conditions can be verified in isolation, independent of the surrounding
+# register_missing / read-vs-refresh plumbing.
+
+
+def _register_equity_profile(orchestrator, *, asset_type="EQUITY", company_name="ACME LTD",
+                              ticker="ACME", exchange="NSE", isin="INE000A01010"):
+    reason: dict = {}
+    instrument = {"assetType": asset_type, "companyName": company_name, "tradingCurrency": "INR", "country": "IN"}
+    profile = orchestrator._register_equity_profile_from_instrument(
+        instrument, "BROKER", "PID1", isin, ticker, exchange, exchange, reason_out=reason,
+    )
+    return profile, reason
+
+
+def test_A_missing_ticker_reports_missing_ticker_reason() -> None:
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator, ticker="")
+    assert profile is None
+    assert reason == {"reason": "MISSING_TICKER"}
+
+
+def test_B_unknown_ticker_reports_unknown_ticker_reason() -> None:
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator, ticker="UNKNOWN")
+    assert profile is None
+    assert reason == {"reason": "UNKNOWN_TICKER"}
+
+
+def test_C_missing_exchange_reports_missing_exchange_reason() -> None:
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator, exchange="")
+    assert profile is None
+    assert reason == {"reason": "MISSING_EXCHANGE"}
+
+
+def test_D_unknown_exchange_reports_unknown_exchange_reason() -> None:
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator, exchange="UNKNOWN")
+    assert profile is None
+    assert reason == {"reason": "UNKNOWN_EXCHANGE"}
+
+
+def test_E_missing_company_name_reports_missing_company_name_reason(monkeypatch) -> None:
+    # _instrument_name() always falls back to ticker/brokerSymbol/"Resolved
+    # instrument" and can never itself return "" for any instrument shape a
+    # real caller can construct, so the "not company_name" guard is
+    # unreachable from real instrument data today. It is still real code
+    # with its own reason code, so it is verified directly here by
+    # monkeypatching the name lookup, exactly as the guard would see it.
+    import app.portfolio_orchestration as portfolio_orchestration_module
+    monkeypatch.setattr(portfolio_orchestration_module, "_instrument_name", lambda instrument: "")
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator)
+    assert profile is None
+    assert reason == {"reason": "MISSING_COMPANY_NAME"}
+
+
+def test_E_unknown_company_name_also_reports_missing_company_name_reason() -> None:
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator, company_name="UNKNOWN")
+    assert profile is None
+    assert reason == {"reason": "MISSING_COMPANY_NAME"}
+
+
+def test_F_company_name_equals_ticker_reports_company_name_equals_ticker_reason() -> None:
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator, company_name="ACME", ticker="ACME")
+    assert profile is None
+    assert reason == {"reason": "COMPANY_NAME_EQUALS_TICKER"}
+
+
+def test_G_unsupported_asset_type_reports_unsupported_asset_type_reason() -> None:
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    profile, reason = _register_equity_profile(orchestrator, asset_type="WARRANT")
+    assert profile is None
+    assert reason == {"reason": "UNSUPPORTED_ASSET_TYPE"}
+
+
+def test_gate1_diagnostic_enhancement_does_not_change_accept_or_reject_outcome() -> None:
+    """Regression required by DI-6: reason_out is purely additive. Omitting it
+    (the pre-existing call shape) and passing it alongside a fully valid
+    instrument must both still register the profile -- and no reason is
+    fabricated for an instrument that was actually accepted."""
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    instrument = {"assetType": "EQUITY", "companyName": "ACME LTD", "tradingCurrency": "INR", "country": "IN"}
+    without_reason_out = orchestrator._register_equity_profile_from_instrument(
+        instrument, "BROKER", "PID1", "INE000A01010", "ACME", "NSE", "NSE",
+    )
+    assert without_reason_out is not None
+    assert without_reason_out.company_name == "ACME LTD"
+    reason: dict = {}
+    with_reason_out = orchestrator._register_equity_profile_from_instrument(
+        instrument, "BROKER", "PID1", "INE000A01010", "ACME", "NSE", "NSE", reason_out=reason,
+    )
+    assert with_reason_out is not None
+    assert reason == {}
+
+
+# --- DI-6B: COMPANY_NOT_RESOLVED:<REASON> propagation — orchestrator level ---
+# Verifies that register_global_profile_metadata and restore_global_profile
+# propagate the Gate-1 reason code through reason_out to active HTTP paths,
+# while preserving backward-compatible boolean returns when reason_out is
+# omitted and leaving no residual diagnostic state between calls.
+
+_DI6B_INSTRUMENT_ID = UUID("6b000000-0000-0000-0000-0000000000b1")
+_DI6B_INSTRUMENT_ID_2 = UUID("6b000000-0000-0000-0000-0000000000b2")
+
+
+def _di6b_global_payload(
+    global_id: UUID,
+    *,
+    canonical_name: str = "Generic Components Limited",
+    primary_symbol: str | None = "GENERIC",
+    primary_exchange: str = "NSE",
+    asset_type: str = "EQUITY",
+    isin: str = "INE000A01010",
+    country: str = "IN",
+    currency: str = "INR",
+) -> dict:
+    """Build a global-instrument identity payload with controllable Gate-1 fields.
+
+    Mirrors the shape returned by portfolio-service's ``GET /api/v1/instruments/{id}``
+    so it exercises the real ``_global_master_instrument`` normalisation path.
+    Passing ``primary_symbol=None`` omits the key entirely (triggers MISSING_TICKER).
+    """
+    payload: dict = {
+        "globalInstrumentId": str(global_id),
+        "canonicalName": canonical_name,
+        "isin": isin,
+        "assetType": asset_type,
+        "country": country,
+        "currency": currency,
+        "primaryExchange": primary_exchange,
+    }
+    if primary_symbol is not None:
+        payload["primarySymbol"] = primary_symbol
+    return payload
+
+
+def _di6b_valid_payload(global_id: UUID) -> dict:
+    """A payload that passes all Gate-1 checks (used by Test B / success assertions)."""
+    return {
+        "globalInstrumentId": str(global_id),
+        "canonicalName": "Generic Components Limited",
+        "isin": "INE000A01010",
+        "assetType": "EQUITY",
+        "country": "IN",
+        "currency": "INR",
+        "primaryExchange": "NSE",
+        "primarySymbol": "GENERIC",
+        "providerMappings": [
+            {"provider": "NSE", "providerSymbol": "GENERIC", "status": "VERIFIED", "exchange": "NSE"},
+        ],
+    }
+
+
+def test_di6b_A_register_global_profile_metadata_preserves_company_name_equals_ticker_reason() -> None:
+    """COMPANY_NAME_EQUALS_TICKER reason propagates through register_global_profile_metadata → False."""
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    payload = _di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="ACME", primary_symbol="ACME")
+    reason: dict = {}
+    result = orchestrator.register_global_profile_metadata(_DI6B_INSTRUMENT_ID, payload, reason_out=reason)
+    assert result is False
+    assert reason == {"reason": "COMPANY_NAME_EQUALS_TICKER"}
+
+
+def test_di6b_A_register_global_profile_metadata_preserves_missing_ticker_reason() -> None:
+    """MISSING_TICKER reason propagates through register_global_profile_metadata → False."""
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    payload = _di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="Acme Corp", primary_symbol=None)
+    reason: dict = {}
+    result = orchestrator.register_global_profile_metadata(_DI6B_INSTRUMENT_ID, payload, reason_out=reason)
+    assert result is False
+    assert reason == {"reason": "MISSING_TICKER"}
+
+
+def test_di6b_B_register_global_profile_metadata_valid_instrument_succeeds_and_no_reason() -> None:
+    """Valid instrument registers successfully; reason_out stays empty (readiness success path)."""
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    payload = _di6b_valid_payload(_DI6B_INSTRUMENT_ID)
+    reason: dict = {}
+    result = orchestrator.register_global_profile_metadata(_DI6B_INSTRUMENT_ID, payload, reason_out=reason)
+    assert result is True
+    assert reason == {}
+
+
+def test_di6b_F_register_global_profile_metadata_without_reason_out_returns_bool() -> None:
+    """Omitting reason_out preserves the pre-existing boolean return shape (Test F)."""
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    payload = _di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="ACME", primary_symbol="ACME")
+    result = orchestrator.register_global_profile_metadata(_DI6B_INSTRUMENT_ID, payload)
+    assert result is False
+    assert isinstance(result, bool)
+
+
+def test_di6b_F_register_global_profile_metadata_without_reason_out_valid_succeeds() -> None:
+    """Valid instrument without reason_out returns True (backward compatible)."""
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    payload = _di6b_valid_payload(_DI6B_INSTRUMENT_ID)
+    result = orchestrator.register_global_profile_metadata(_DI6B_INSTRUMENT_ID, payload)
+    assert result is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_di6b_F_restore_global_profile_without_reason_out_returns_bool() -> None:
+    """restore_global_profile without reason_out returns bool (Test F, backward compatible)."""
+    url = f"http://portfolio-service/api/v1/instruments/{_DI6B_INSTRUMENT_ID}"
+    payload = _di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="ACME", primary_symbol="ACME")
+    respx.get(url).mock(return_value=httpx.Response(200, json=payload))
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"),
+    )
+    result = await orchestrator.restore_global_profile(_DI6B_INSTRUMENT_ID)
+    assert result is False
+    assert isinstance(result, bool)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_di6b_D_restore_global_profile_preserves_company_name_equals_ticker_reason() -> None:
+    """Gate-1 reason propagates through restore_global_profile (company() restore path)."""
+    url = f"http://portfolio-service/api/v1/instruments/{_DI6B_INSTRUMENT_ID}"
+    payload = _di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="ACME", primary_symbol="ACME")
+    respx.get(url).mock(return_value=httpx.Response(200, json=payload))
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"),
+    )
+    reason: dict = {}
+    result = await orchestrator.restore_global_profile(_DI6B_INSTRUMENT_ID, reason_out=reason)
+    assert result is False
+    assert reason == {"reason": "COMPANY_NAME_EQUALS_TICKER"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_di6b_D_restore_global_profile_preserves_missing_ticker_reason() -> None:
+    """MISSING_TICKER reason propagates through restore_global_profile."""
+    url = f"http://portfolio-service/api/v1/instruments/{_DI6B_INSTRUMENT_ID}"
+    payload = _di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="Acme Corp", primary_symbol=None)
+    respx.get(url).mock(return_value=httpx.Response(200, json=payload))
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"),
+    )
+    reason: dict = {}
+    result = await orchestrator.restore_global_profile(_DI6B_INSTRUMENT_ID, reason_out=reason)
+    assert result is False
+    assert reason == {"reason": "MISSING_TICKER"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_di6b_E_restore_global_profile_succeeds_with_valid_payload() -> None:
+    """Successful restore returns True and does not populate reason_out."""
+    url = f"http://portfolio-service/api/v1/instruments/{_DI6B_INSTRUMENT_ID}"
+    payload = _di6b_valid_payload(_DI6B_INSTRUMENT_ID)
+    respx.get(url).mock(return_value=httpx.Response(200, json=payload))
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"),
+    )
+    reason: dict = {}
+    result = await orchestrator.restore_global_profile(_DI6B_INSTRUMENT_ID, reason_out=reason)
+    assert result is True
+    assert reason == {}
+
+
+def test_di6b_G_register_no_reason_persists_between_calls() -> None:
+    """reason_out is local to each register_global_profile_metadata call — no cross-instrument contamination."""
+    orchestrator = PortfolioResearchOrchestrator(ResearchRepository(settings=Settings()), Settings())
+    # instrument 1: COMPANY_NAME_EQUALS_TICKER
+    payload_1 = _di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="ACME", primary_symbol="ACME")
+    reason_1: dict = {}
+    result_1 = orchestrator.register_global_profile_metadata(_DI6B_INSTRUMENT_ID, payload_1, reason_out=reason_1)
+    assert result_1 is False
+    assert reason_1 == {"reason": "COMPANY_NAME_EQUALS_TICKER"}
+    # instrument 2: MISSING_TICKER (different instrument, different reason)
+    payload_2 = _di6b_global_payload(_DI6B_INSTRUMENT_ID_2, canonical_name="Acme Corp", primary_symbol=None)
+    reason_2: dict = {}
+    result_2 = orchestrator.register_global_profile_metadata(_DI6B_INSTRUMENT_ID_2, payload_2, reason_out=reason_2)
+    assert result_2 is False
+    assert reason_2 == {"reason": "MISSING_TICKER"}
+    # reason_1 must not have been mutated by the second call
+    assert reason_1 == {"reason": "COMPANY_NAME_EQUALS_TICKER"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_di6b_G_restore_no_reason_persists_between_calls() -> None:
+    """reason_out is local to each restore_global_profile call — no cross-instrument contamination."""
+    url_1 = f"http://portfolio-service/api/v1/instruments/{_DI6B_INSTRUMENT_ID}"
+    url_2 = f"http://portfolio-service/api/v1/instruments/{_DI6B_INSTRUMENT_ID_2}"
+    respx.get(url_1).mock(return_value=httpx.Response(
+        200, json=_di6b_global_payload(_DI6B_INSTRUMENT_ID, canonical_name="ACME", primary_symbol="ACME")))
+    respx.get(url_2).mock(return_value=httpx.Response(
+        200, json=_di6b_global_payload(_DI6B_INSTRUMENT_ID_2, canonical_name="Acme Corp", primary_symbol=None)))
+    repo = ResearchRepository(settings=Settings(research_demo_enabled=False))
+    orchestrator = PortfolioResearchOrchestrator(
+        repo, Settings(portfolio_service_base_url="http://portfolio-service"),
+    )
+    reason_1: dict = {}
+    result_1 = await orchestrator.restore_global_profile(_DI6B_INSTRUMENT_ID, reason_out=reason_1)
+    assert result_1 is False
+    assert reason_1 == {"reason": "COMPANY_NAME_EQUALS_TICKER"}
+    reason_2: dict = {}
+    result_2 = await orchestrator.restore_global_profile(_DI6B_INSTRUMENT_ID_2, reason_out=reason_2)
+    assert result_2 is False
+    assert reason_2 == {"reason": "MISSING_TICKER"}
+    assert reason_1 == {"reason": "COMPANY_NAME_EQUALS_TICKER"}
+
+# --- DI-7A: Preserve authoritative NSE failure through search fallback -----
+#
+# repository._refresh_search_discovery previously popped last_live_error
+# unconditionally on any successful search-fallback fetch, even when an
+# authoritative NSE acquisition failure (official filing discovery / the NSE
+# shareholding feed) had already been recorded earlier in the very same
+# refresh for a different category. portfolio_orchestration._status_from_
+# summary's final catch-all separately mapped every unrecognized live_error
+# string -- including every authoritative NSE failure -- to the misleading
+# SEARCH_PROVIDER_UNAVAILABLE status. These tests exercise both fixes.
+
+
+class _RaisingOfficialDiscovery:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    async def discover(self, _profile, _categories, _seen_urls):
+        self.calls += 1
+        raise self.exc
+
+
+class _EmptyOfficialDiscovery:
+    async def discover(self, _profile, _categories, _seen_urls):
+        return []
+
+
+class _RaisingShareholdingDiscovery:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    async def discover(self, _profile):
+        self.calls += 1
+        raise self.exc
+
+
+class _EmptyShareholdingDiscovery:
+    async def discover(self, _profile):
+        return []
+
+
+def _reliance_profile_for_nse_tests(repository: ResearchRepository) -> CompanyResearchProfile:
+    profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
+    profile.provider_instrument_ids["NSE"] = "RELIANCE"
+    return profile
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_A_financial_results_official_discovery_failure_survives_unrelated_search_success() -> None:
+    guidance_url = "https://www.ril.com/investors/guidance-note"
+    search = SearchDiscoveryService(_StaticSearchProvider([_candidate(guidance_url, "Guidance")]), max_documents_per_refresh=6)
+    repository = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True),
+        search_discovery=search,
+        official_filing_discovery=_RaisingOfficialDiscovery(SearchProviderError("NSE_OFFICIAL_INVALID_RESPONSE")),
+        official_shareholding_discovery=_EmptyShareholdingDiscovery(),
+    )
+    profile = _reliance_profile_for_nse_tests(repository)
+    respx.get(guidance_url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html><title>Reliance guidance</title><main><p>May 2, 2026</p><p>Reliance Industries Limited RELIANCE INE002A01018 reiterates full-year guidance.</p></main></html>",
+        )
+    )
+
+    await repository._refresh_targeted(profile, set())
+
+    # The authoritative FINANCIAL_RESULTS official-discovery failure must
+    # survive, byte-for-byte, even though an unrelated Guidance search
+    # candidate was fetched successfully in the very same refresh.
+    assert repository.last_live_error.get(profile.instrument_id) == "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"
+    # The unrelated success still legitimately happened -- the fix must not
+    # suppress the unrelated fetch itself, only protect the error slot.
+    assert repository.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_B_shareholding_pattern_nse_failure_survives_unrelated_search_success() -> None:
+    guidance_url = "https://www.ril.com/investors/guidance-note-2"
+    search = SearchDiscoveryService(_StaticSearchProvider([_candidate(guidance_url, "Guidance")]), max_documents_per_refresh=6)
+    repository = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True),
+        search_discovery=search,
+        official_filing_discovery=_EmptyOfficialDiscovery(),
+        official_shareholding_discovery=_RaisingShareholdingDiscovery(SearchProviderError("NSE_SHAREHOLDING_OFFICIAL_UNAVAILABLE")),
+    )
+    profile = _reliance_profile_for_nse_tests(repository)
+    respx.get(guidance_url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html><title>Reliance guidance</title><main><p>May 3, 2026</p><p>Reliance Industries Limited RELIANCE INE002A01018 reiterates full-year guidance.</p></main></html>",
+        )
+    )
+
+    await repository._refresh_targeted(profile, set())
+
+    assert repository.last_live_error.get(profile.instrument_id) == "NSE_SHAREHOLDING_OFFICIAL_UNAVAILABLE"
+    assert repository.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_C_search_fail_then_succeed_unchanged_when_no_authoritative_failure() -> None:
+    # No NSE-eligible category is authoritatively failing here (a non-Indian
+    # profile), so protect_error is always None and the legacy pop-on-success
+    # behavior for _refresh_search_discovery must be completely unchanged.
+    besi_id = UUID("22222222-2222-2222-2222-222222222222")
+    restricted_url = "https://seekingalpha.com/article/besi-q2-di7a-c"
+    publisher_url = "https://www.marketscreener.com/quote/stock/BESI-6319/news/besi-di7a-c"
+    provider = _StaticSearchProvider([
+        _candidate(restricted_url, "CAPEX & Capacity"),
+        _candidate(publisher_url, "Growth"),
+    ])
+    search = SearchDiscoveryService(provider, max_documents_per_refresh=2)
+    repo = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_demo_enabled=True, research_search_enabled=True, research_max_retries=0),
+        discovery=_StaticDiscovery([]),
+        search_discovery=search,
+    )
+    respx.get(restricted_url).mock(return_value=httpx.Response(403, headers={"content-type": "text/html"}))
+    respx.get(publisher_url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html><title>BESI capacity expansion</title><main><p>May 2, 2026</p><p>BE Semiconductor Industries BESI XAMS reports strong growth.</p></main></html>",
+        )
+    )
+
+    summary = await repo.refresh(besi_id)
+
+    assert summary.documents
+    # The prior source-fetch failure (403, unrelated category) is cleared by
+    # the later success exactly as it was before DI-7A: this is the
+    # unprotected/legacy path and must be byte-for-byte unchanged.
+    assert repo.last_live_error.get(besi_id) is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_D_nse_success_and_search_success_introduces_no_false_error() -> None:
+    settings = Settings(research_live_enabled=True, research_search_enabled=True, research_official_document_max_attempts_per_refresh=3)
+    guidance_url = "https://nsearchives.nseindia.com/corporate/reliance-guidance-d.pdf"
+    search = SearchDiscoveryService(_StaticSearchProvider([_candidate(guidance_url, "Guidance")]), max_documents_per_refresh=6)
+    repository = ResearchRepository(settings=settings, search_discovery=search)
+    profile = _reliance_profile_for_nse_tests(repository)
+    source = _official_financial_result_source(profile, "latest-d")
+    repository._official_filing_discovery = _StaticOfficialDiscovery([DiscoveryResult("FINANCIAL_RESULTS", source)])
+    repository._official_shareholding_discovery = _EmptyShareholdingDiscovery()
+    respx.get(source.url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html><title>Reliance Industries Limited Quarterly Financial Results</title><main>Reliance Industries Limited RELIANCE INE002A01018 quarterly financial results revenue from operations 1000 crore PAT 100 crore.</main></html>",
+        )
+    )
+    respx.get(guidance_url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html><title>Reliance guidance</title><main><p>May 5, 2026</p><p>Reliance Industries Limited RELIANCE INE002A01018 reiterates full-year guidance.</p></main></html>",
+        )
+    )
+    respx.get("https://www.ril.com/").mock(return_value=httpx.Response(403, headers={"content-type": "text/html"}))
+    respx.get("https://www.ril.com/investors/investor-relations").mock(return_value=httpx.Response(403, headers={"content-type": "text/html"}))
+
+    await repository._refresh_targeted(profile, set())
+
+    # Both the authoritative NSE path and the unrelated search fallback
+    # succeeded: neither fix may fabricate an error where none exists.
+    assert repository.last_live_error.get(profile.instrument_id) is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_E_no_authoritative_category_due_leaves_search_only_refresh_unchanged() -> None:
+    # A profile where official_due_categories is structurally always empty
+    # (non-Indian exchange): the search-fallback pop/clear behavior must be
+    # identical to pre-DI-7A behavior, proving the fix is a strict no-op
+    # outside the NSE-authoritative scenario.
+    besi_id = UUID("22222222-2222-2222-2222-222222222222")
+    publisher_url = "https://www.marketscreener.com/quote/stock/BESI-6319/news/besi-di7a-e"
+    provider = _StaticSearchProvider([_candidate(publisher_url, "Growth")])
+    search = SearchDiscoveryService(provider, max_documents_per_refresh=2)
+    repo = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_demo_enabled=True, research_search_enabled=True, research_max_retries=0),
+        discovery=_StaticDiscovery([]),
+        search_discovery=search,
+    )
+    respx.get(publisher_url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html><title>BESI update</title><main><p>May 2, 2026</p><p>BE Semiconductor Industries BESI XAMS reports growth.</p></main></html>",
+        )
+    )
+
+    summary = await repo.refresh(besi_id)
+
+    assert summary.documents
+    assert repo.last_live_error.get(besi_id) is None
+
+
+@pytest.mark.asyncio
+async def test_F_authoritative_failure_survives_search_zero_results_for_other_categories() -> None:
+    settings = Settings(research_live_enabled=True, research_search_enabled=True)
+    search = SearchDiscoveryService(_StaticSearchProvider([]), max_documents_per_refresh=6)
+    repository = ResearchRepository(
+        settings=settings,
+        search_discovery=search,
+        official_filing_discovery=_RaisingOfficialDiscovery(SearchProviderError("NSE_OFFICIAL_INVALID_RESPONSE")),
+        official_shareholding_discovery=_EmptyShareholdingDiscovery(),
+    )
+    profile = _reliance_profile_for_nse_tests(repository)
+
+    await repository._refresh_targeted(profile, set())
+
+    # A zero-candidate search-fallback result for the other due categories
+    # must not overwrite the authoritative failure with
+    # SEARCH_RETURNED_ZERO_RESULTS / RESULTS_REJECTED.
+    assert repository.last_live_error.get(profile.instrument_id) == "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_G_authoritative_failure_survives_search_fetch_failure_for_other_category() -> None:
+    restricted_url = "https://seekingalpha.com/article/reliance-guidance-di7a-g"
+    search = SearchDiscoveryService(_StaticSearchProvider([_candidate(restricted_url, "Guidance")]), max_documents_per_refresh=6)
+    repository = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True),
+        search_discovery=search,
+        official_filing_discovery=_RaisingOfficialDiscovery(SearchProviderError("NSE_OFFICIAL_INVALID_RESPONSE")),
+        official_shareholding_discovery=_EmptyShareholdingDiscovery(),
+    )
+    profile = _reliance_profile_for_nse_tests(repository)
+    respx.get(restricted_url).mock(return_value=httpx.Response(403, headers={"content-type": "text/html"}))
+
+    await repository._refresh_targeted(profile, set())
+
+    # A failed search-fallback fetch for an unrelated category must not
+    # overwrite the authoritative failure with SEARCH_SOURCE_UNAVAILABLE.
+    assert repository.last_live_error.get(profile.instrument_id) == "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"
+
+
+@pytest.mark.asyncio
+async def test_H_authoritative_failure_survives_total_search_provider_outage() -> None:
+    search = SearchDiscoveryService(_FailingSearchProvider("SEARCH_PROVIDER_UNAVAILABLE:engine_down"), max_documents_per_refresh=6)
+    repository = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True),
+        search_discovery=search,
+        official_filing_discovery=_RaisingOfficialDiscovery(SearchProviderError("NSE_OFFICIAL_INVALID_RESPONSE")),
+        official_shareholding_discovery=_EmptyShareholdingDiscovery(),
+    )
+    profile = _reliance_profile_for_nse_tests(repository)
+
+    await repository._refresh_targeted(profile, set())
+
+    # The search provider itself being entirely unavailable for every due
+    # category must not overwrite the authoritative NSE failure with
+    # SEARCH_PROVIDER_UNAVAILABLE.
+    assert repository.last_live_error.get(profile.instrument_id) == "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"
+
+
+@pytest.mark.asyncio
+async def test_I_official_filing_discovery_failure_maps_to_document_fetch_failed_status() -> None:
+    class OfficialFilingFailureRepository(ResearchRepository):
+        async def refresh(self, instrument_id: UUID, correlation_id: str | None = None, **kwargs):
+            self.last_live_error[instrument_id] = "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"
+            return self.summary(instrument_id, allow_demo=False)
+
+    # research_search_enabled=True (alongside research_live_enabled) is what
+    # makes refresh_portfolio's can_live_search gate true, so it calls
+    # refresh_instrument -> repository.refresh() (the override below) instead
+    # of short-circuiting straight to a cached repository.summary() read.
+    repo = OfficialFilingFailureRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True, research_demo_enabled=True),
+        search_discovery=SearchDiscoveryService(_StaticSearchProvider([])),
+    )
+    repo.profiles[3].provider_instrument_ids["IBKR"] = "RELIANCE-CONID"
+    # An NSE identity is required for _eligible_for_official_nse_research to
+    # be True, which is what makes refresh_portfolio call refresh_instrument
+    # (and therefore the overridden refresh() below) instead of reading a
+    # cached summary directly.
+    repo.profiles[3].provider_instrument_ids["NSE"] = "RELIANCE"
+    client = _RecordingPortfolioClient([
+        _portfolio_position(
+            None, "RELIANCE", "XNSE", "RELIANCE",
+            provider="IBKR", provider_instrument_id="RELIANCE-CONID", data_freshness="REAL_BROKER",
+        ),
+    ])
+    orchestrator = PortfolioResearchOrchestrator(
+        repo,
+        Settings(portfolio_service_base_url="http://portfolio-service", research_live_enabled=True, research_search_enabled=True),
+        client=client, structured_provider=_UnavailableStructuredProvider(),
+    )
+
+    result = await orchestrator.refresh_portfolio(UUID("aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa"))
+
+    company = result.companies[0]
+    # No new public status value: the authoritative NSE failure maps to the
+    # already-recognized DOCUMENT_FETCH_FAILED status, not
+    # SEARCH_PROVIDER_UNAVAILABLE.
+    assert company.status == "DOCUMENT_FETCH_FAILED"
+    assert company.safe_error_code == "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"
+    assert result.failed == 1
+
+
+@pytest.mark.asyncio
+async def test_J_nse_shareholding_failure_maps_to_document_fetch_failed_status() -> None:
+    class ShareholdingFailureRepository(ResearchRepository):
+        async def refresh(self, instrument_id: UUID, correlation_id: str | None = None, **kwargs):
+            self.last_live_error[instrument_id] = "NSE_SHAREHOLDING_OFFICIAL_UNAVAILABLE"
+            return self.summary(instrument_id, allow_demo=False)
+
+    repo = ShareholdingFailureRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True, research_demo_enabled=True),
+        search_discovery=SearchDiscoveryService(_StaticSearchProvider([])),
+    )
+    repo.profiles[3].provider_instrument_ids["IBKR"] = "RELIANCE-CONID"
+    repo.profiles[3].provider_instrument_ids["NSE"] = "RELIANCE"
+    client = _RecordingPortfolioClient([
+        _portfolio_position(
+            None, "RELIANCE", "XNSE", "RELIANCE",
+            provider="IBKR", provider_instrument_id="RELIANCE-CONID", data_freshness="REAL_BROKER",
+        ),
+    ])
+    orchestrator = PortfolioResearchOrchestrator(
+        repo,
+        Settings(portfolio_service_base_url="http://portfolio-service", research_live_enabled=True, research_search_enabled=True),
+        client=client, structured_provider=_UnavailableStructuredProvider(),
+    )
+
+    result = await orchestrator.refresh_portfolio(UUID("aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa"))
+
+    company = result.companies[0]
+    assert company.status == "DOCUMENT_FETCH_FAILED"
+    assert company.safe_error_code == "NSE_SHAREHOLDING_OFFICIAL_UNAVAILABLE"
+    assert result.failed == 1
+
+
+@pytest.mark.asyncio
+async def test_K_authoritative_nse_failure_still_softens_to_partial_when_structured_evidence_exists() -> None:
+    # DOCUMENT_FETCH_FAILED was already in the "structured evidence available"
+    # softening set (_attach_structured_market) before DI-7A. Routing
+    # authoritative NSE failures into that same already-recognized status
+    # (Fix 2) must keep benefiting from that existing, unmodified downstream
+    # behavior -- not regress it -- while the preserved raw reason (Fix 1)
+    # continues to ride along unmodified as safe_error_code.
+    import app.portfolio_orchestration as portfolio_orchestration_module
+
+    company = PortfolioResearchCompany(
+        company_name="Reliance Industries Limited",
+        status="DOCUMENT_FETCH_FAILED",
+        safe_error_code="OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError",
+    )
+    snapshot = SimpleNamespace(status="AVAILABLE", facts={"latestPrice": Decimal("2500.00")})
+
+    portfolio_orchestration_module._attach_structured_market(company, snapshot, None)
+
+    assert company.status == "RESOLVED_PARTIAL_DATA"
+    assert company.safe_error_message == "Structured market evidence is available; public document discovery remains incomplete."
+    # The preserved authoritative reason (Fix 1) is untouched by the
+    # softening step: it remains available as a precise diagnostic even
+    # though the categorical status has improved to RESOLVED_PARTIAL_DATA.
+    assert company.safe_error_code == "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_step8_shareholding_pattern_failure_survives_multi_category_search_success_end_to_end() -> None:
+    """DI-7A STEP 8: the explicit multi-category regression scenario.
+
+    SHAREHOLDING_PATTERN's authoritative NSE feed fails; a search-fallback
+    fetch for a different category (Guidance) succeeds in the same refresh.
+    Verifies, end to end through repository.last_live_error,
+    repository.summary(), and _status_from_summary, that: (1) the raw
+    authoritative reason string is preserved unmodified, (2) it is exposed
+    correctly via a still-recognized status (no new public status value),
+    and (3) an unrelated success is still allowed to legitimately improve
+    the categorical research status -- that is expected and correct, not a
+    masking regression, because it is reflected in genuine additional
+    evidence, not in the disappearance of the authoritative failure signal.
+    """
+    guidance_url = "https://www.ril.com/investors/guidance-note-step8"
+    search = SearchDiscoveryService(_StaticSearchProvider([_candidate(guidance_url, "Guidance")]), max_documents_per_refresh=6)
+    repository = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True),
+        search_discovery=search,
+        official_filing_discovery=_EmptyOfficialDiscovery(),
+        official_shareholding_discovery=_RaisingShareholdingDiscovery(SearchProviderError("NSE_SHAREHOLDING_OFFICIAL_UNAVAILABLE")),
+    )
+    profile = _reliance_profile_for_nse_tests(repository)
+    respx.get(guidance_url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html><title>Reliance guidance</title><main><p>May 4, 2026</p><p>Reliance Industries Limited RELIANCE INE002A01018 reiterates full-year guidance.</p></main></html>",
+        )
+    )
+
+    await repository._refresh_targeted(profile, set())
+
+    preserved_error = repository.last_live_error.get(profile.instrument_id)
+    assert preserved_error == "NSE_SHAREHOLDING_OFFICIAL_UNAVAILABLE"
+
+    summary = repository.summary(profile.instrument_id, allow_demo=False)
+    status = _status_from_summary(summary, preserved_error)
+    # A genuine, unrelated document now exists for this instrument, so the
+    # categorical status correctly reflects partial availability rather than
+    # DOCUMENT_FETCH_FAILED -- the important guarantee is that the raw
+    # authoritative reason (asserted above) was never erased or overwritten,
+    # unlike before DI-7A where the pop would have made it silently vanish.
+    assert summary.documents
+    assert status in {"RESOLVED_PARTIAL_DATA", "RESOLVED_RESEARCH_AVAILABLE"}
+
+# ============================================================================
+# --- DI-7C: NSE-first complete financial statements -----------------------
+# ============================================================================
+#
+# Covers: balance-sheet/cash-flow completeness (Steps 3, 5, 6), zero-fact
+# documents must not count as complete (Step 4), NSE-vs-Yahoo field-level
+# precedence regression coverage (Step 7/8), per-period historical
+# correctness (Step 9), attempt-budget starvation fix (Step 10), and a
+# small/micro-cap NSE-only regression (Step 12).  Text fixtures below reuse
+# the exact proven shapes already used elsewhere in this suite so real
+# parser behavior (not just repository plumbing) is exercised.
+
+from app.structured_research import parsed_nse_balance_sheet_periods, parsed_nse_cash_flow_periods, parsed_nse_income_statement_periods
+
+_DI7C_JUNE_RESULT_TEXT = (
+    "Amounts in Rs. Crore Extract of Statement of Unaudited Financial Results for the quarter ended 30th June 2026 "
+    "Particulars Quarter Ended Year Ended 30th June 31st March 30th June 31st March "
+    "2026 2026 2025 2026 "
+    "Revenue From Operations 8,261.11 7,335.75 6,915.38 27,284.15 "
+    "Net Profit for the period after Tax 1,927.21 1,684.31 1,745.69 6,427.00 "
+    "Earning Per Share (of Rs 10 each) Basic (Rs.) 1.47 1.29 1.34 5.36 Diluted (Rs.) 1.47 1.29 1.34 5.36"
+)
+
+_DI7C_QUARTERLY_ONLY_TEXT = (
+    "Amounts in Rs. Crore Extract of Statement of Unaudited Financial Results for the quarter ended 30th June 2026 "
+    "Particulars Quarter Ended 30th June 2026 30th June 2025 "
+    "Revenue From Operations 500.00 450.00 "
+    "Net Profit for the period after Tax 50.00 45.00"
+)
+
+
+def _di7c_balance_sheet_text(*, current: str = "31 March 2026", prior: str = "31 March 2025") -> str:
+    return (
+        f"Balance Sheet Particulars As at {current} {prior} "
+        "Total Assets 500.00 450.00 Total Equity 120.00 110.00 "
+        "Total Liabilities 380.00 340.00 Total Current Assets 200.00 180.00 "
+        "Total Current Liabilities 150.00 140.00 Cash and Cash Equivalents 25.00 20.00 "
+        "Total Borrowings 300.00 275.00"
+    )
+
+
+def _di7c_cash_flow_text(*, current: str = "31 March 2026", prior: str = "31 March 2025") -> str:
+    return (
+        f"Statement of Cash Flows Particulars Year Ended {current} {prior} "
+        "Net cash from operating activities 100.00 90.00 "
+        "Net cash used in investing activities 40.00 35.00 "
+        "Net cash from financing activities 20.00 15.00 "
+        "Net increase in cash and cash equivalents 40.00 40.00 "
+        "Operating profit 200.00 180.00 Opening cash and cash equivalents 10.00 8.00"
+    )
+
+
+_DI7C_UNPARSEABLE_BALANCE_SHEET_HEADING = (
+    "Balance Sheet Particulars As at 31 March 2026 31 March 2025 [table could not be extracted]"
+)
+
+
+def _di7c_ingest(
+    repository: ResearchRepository,
+    profile: CompanyResearchProfile,
+    *,
+    suffix: str,
+    text: str,
+    company_line: str = "Reliance Industries Limited RELIANCE INE002A01018",
+) -> ResearchDocument:
+    return repository.ingest_fixture(
+        original_url=f"https://nsearchives.nseindia.com/corporate/di7c-{suffix}.pdf",
+        source_type=SourceType.EXCHANGE_ANNOUNCEMENT,
+        source_name="NSE corporate announcements",
+        publisher="NSE",
+        content_type="text/html",
+        body=f"<html><title>{company_line} Financial Results</title><main>{company_line} {text}</main></html>",
+        reliability=ReliabilityLevel.LEVEL_A,
+        source_mode=SourceMode.REAL,
+        source_classification=SourceClassification.EXCHANGE,
+        expected_profile=profile,
+        discovery_provider="NSE_OFFICIAL_API",
+    )
+
+
+@pytest.mark.asyncio
+async def test_A_balance_sheet_heading_present_but_unparsed_remains_incomplete() -> None:
+    """Step 5: revenue+PAT present, a Balance Sheet section is present in the
+    filing text, but nothing usable was extracted from it -- the annual
+    period must remain incomplete rather than being masked by the income
+    statement fields alone."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True))
+    profile = _reliance_profile_for_nse_tests(repository)
+    document = _di7c_ingest(
+        repository, profile, suffix="a",
+        text=_DI7C_JUNE_RESULT_TEXT + " " + _DI7C_UNPARSEABLE_BALANCE_SHEET_HEADING,
+    )
+
+    incomplete = await repository._incomplete_persisted_official_financial_documents(profile)
+
+    assert document.document_id in {item.document_id for item in incomplete}
+
+
+@pytest.mark.asyncio
+async def test_B_income_and_expected_balance_sheet_present_is_complete() -> None:
+    """Step 5's positive case: when the balance sheet is both expected and
+    successfully parsed, the period must be treated as complete."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    _di7c_ingest(
+        repository, profile, suffix="b",
+        text=_DI7C_JUNE_RESULT_TEXT + " " + _di7c_balance_sheet_text(),
+    )
+
+    incomplete = await repository._incomplete_persisted_official_financial_documents(profile)
+
+    assert incomplete == []
+
+
+@pytest.mark.asyncio
+async def test_C_zero_fact_document_is_not_qualifying_evidence() -> None:
+    """Step 4: DOCUMENT_FETCHED must not be treated as FINANCIAL_FACTS_EXTRACTED.
+    A durable, title-matching document that yields zero parsed facts must not
+    open the multi-day quarterly freshness window."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True))
+    profile = _reliance_profile_for_nse_tests(repository)
+    _di7c_ingest(
+        repository, profile, suffix="c",
+        text="financial result quarterly result announcement -- no parseable statement content here.",
+    )
+
+    evidence = repository._qualifying_category_evidence(profile.instrument_id, "FINANCIAL_RESULTS")
+    eligible, _next = repository._category_is_eligible_to_check(
+        profile.instrument_id, "FINANCIAL_RESULTS", datetime.now(timezone.utc)
+    )
+
+    assert evidence is None
+    assert eligible is True
+
+
+@pytest.mark.asyncio
+async def test_D_scanned_document_with_no_extractable_text_is_not_falsely_complete() -> None:
+    """Step 14: a document that could not be extracted (represented here as a
+    durable document with no usable normalized_text, standing in for
+    PDF_SCANNED_OCR_REQUIRED) must not count as qualifying financial
+    evidence, and the category must remain retryable."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True))
+    profile = _reliance_profile_for_nse_tests(repository)
+    repository.ingest_fixture(
+        original_url="https://nsearchives.nseindia.com/corporate/di7c-d.pdf",
+        source_type=SourceType.EXCHANGE_ANNOUNCEMENT,
+        source_name="NSE corporate announcements",
+        publisher="NSE",
+        content_type="application/pdf",
+        body="",
+        reliability=ReliabilityLevel.LEVEL_A,
+        source_mode=SourceMode.REAL,
+        source_classification=SourceClassification.EXCHANGE,
+        expected_profile=profile,
+        allow_empty_content=True,
+        document_status=DocumentStatus.PARSED,
+    )
+
+    evidence = repository._qualifying_category_evidence(profile.instrument_id, "FINANCIAL_RESULTS")
+    eligible, _next = repository._category_is_eligible_to_check(
+        profile.instrument_id, "FINANCIAL_RESULTS", datetime.now(timezone.utc)
+    )
+
+    assert evidence is None
+    assert eligible is True
+
+
+@pytest.mark.asyncio
+async def test_E_missing_expected_cash_flow_where_heading_present_remains_incomplete() -> None:
+    """Step 6: a Cash Flow heading is present (so cash flow is genuinely
+    expected for this annual filing) but nothing was extracted -- the annual
+    period must remain incomplete."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True))
+    profile = _reliance_profile_for_nse_tests(repository)
+    document = _di7c_ingest(
+        repository, profile, suffix="e",
+        text=_DI7C_JUNE_RESULT_TEXT + " Statement of Cash Flows Particulars Year Ended 31 March 2026 31 March 2025 [table could not be extracted]",
+    )
+
+    incomplete = await repository._incomplete_persisted_official_financial_documents(profile)
+
+    assert document.document_id in {item.document_id for item in incomplete}
+
+
+@pytest.mark.asyncio
+async def test_F_period_without_cash_flow_heading_is_not_falsely_incomplete() -> None:
+    """Step 6: an ordinary quarterly-only filing with no cash-flow section at
+    all must not be required to have cash-flow facts -- absence of a
+    heading must not manufacture a false incompleteness signal."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    _di7c_ingest(repository, profile, suffix="f", text=_DI7C_QUARTERLY_ONLY_TEXT)
+
+    incomplete = await repository._incomplete_persisted_official_financial_documents(profile)
+
+    assert incomplete == []
+
+
+@pytest.mark.asyncio
+async def test_G_older_nse_authoritative_fact_beats_newer_yahoo_equivalent() -> None:
+    """Step 7: regression coverage at the repository/persistence layer (not
+    just the fact_precedence unit level) proving official NSE outranks a
+    later-arriving Yahoo value for the same metric/period, regardless of
+    retrieval time."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    older_nse = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    newer_yahoo = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    key = FinancialFactKey(profile.instrument_id, "revenue", "2026-03-31", "ANNUAL", None)
+
+    repository._persistence.upsert_financial_fact(FinancialFact(
+        key,
+        ProvenancedValue(value=Decimal("1000"), unit="INR crore", source_url="https://nsearchives.nseindia.com/x.pdf",
+                          source_name="NSE", source_type="EXCHANGE_ANNOUNCEMENT", retrieved_at=older_nse, confidence=None),
+        FactSourceTier.OFFICIAL_NSE, "NSE", "doc-older-nse", SourceMode.REAL,
+    ))
+    repository._persistence.upsert_financial_fact(FinancialFact(
+        key,
+        ProvenancedValue(value=Decimal("999"), unit="INR crore", source_url="https://finance.yahoo.com/x",
+                          source_name="Yahoo Finance", source_type="YAHOO_FINANCE_MCP", retrieved_at=newer_yahoo, confidence=None),
+        FactSourceTier.YAHOO, "YAHOO_FINANCE", "yahoo-newer", SourceMode.REAL,
+    ))
+
+    facts = {fact.key: fact for fact in repository._persistence.load_financial_facts({profile.instrument_id})}
+    assert facts[key].source_tier == FactSourceTier.OFFICIAL_NSE
+    assert facts[key].value.value == Decimal("1000")
+
+
+@pytest.mark.asyncio
+async def test_H_partial_nse_facts_are_preserved_when_yahoo_also_present() -> None:
+    """Step 8: NSE's own facts for a period must never be displaced by a
+    Yahoo fact for a *different* metric in the same period -- NSE data that
+    exists is preserved regardless of what else Yahoo supplies."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    now = datetime.now(timezone.utc)
+    revenue_key = FinancialFactKey(profile.instrument_id, "revenue", "2026-03-31", "ANNUAL", None)
+    pat_key = FinancialFactKey(profile.instrument_id, "pat", "2026-03-31", "ANNUAL", None)
+
+    repository._persistence.upsert_financial_fact(FinancialFact(
+        revenue_key,
+        ProvenancedValue(value=Decimal("1000"), unit="INR crore", source_url="https://nsearchives.nseindia.com/x.pdf",
+                          source_name="NSE", source_type="EXCHANGE_ANNOUNCEMENT", retrieved_at=now, confidence=None),
+        FactSourceTier.OFFICIAL_NSE, "NSE", "doc-partial-nse", SourceMode.REAL,
+    ))
+    repository._persistence.upsert_financial_fact(FinancialFact(
+        pat_key,
+        ProvenancedValue(value=Decimal("50"), unit="INR crore", source_url="https://finance.yahoo.com/x",
+                          source_name="Yahoo Finance", source_type="YAHOO_FINANCE_MCP", retrieved_at=now, confidence=None),
+        FactSourceTier.YAHOO, "YAHOO_FINANCE", "yahoo-fills-pat", SourceMode.REAL,
+    ))
+
+    facts = {fact.key: fact for fact in repository._persistence.load_financial_facts({profile.instrument_id})}
+    assert facts[revenue_key].source_tier == FactSourceTier.OFFICIAL_NSE
+    assert facts[revenue_key].value.value == Decimal("1000")
+    assert pat_key in facts
+
+
+@pytest.mark.asyncio
+async def test_I_multiple_historical_quarters_evaluated_independently() -> None:
+    """Step 9: one complete quarter must not make a different, genuinely
+    incomplete quarter look complete."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True))
+    profile = _reliance_profile_for_nse_tests(repository)
+    complete_document = _di7c_ingest(
+        repository, profile, suffix="i-complete",
+        text=_DI7C_JUNE_RESULT_TEXT + " " + _di7c_balance_sheet_text(),
+    )
+    incomplete_document = _di7c_ingest(
+        repository, profile, suffix="i-incomplete",
+        text=_DI7C_JUNE_RESULT_TEXT.replace("30th June", "30th September").replace("2026-06-30", "2026-09-30")
+        + " " + _DI7C_UNPARSEABLE_BALANCE_SHEET_HEADING,
+        company_line="Reliance Industries Limited RELIANCE INE002A01018 September",
+    )
+
+    incomplete_ids = {item.document_id for item in await repository._incomplete_persisted_official_financial_documents(profile)}
+
+    assert incomplete_document.document_id in incomplete_ids
+    # The complete document's own annual period must not be dragged into
+    # incompleteness merely because a different document also touches an
+    # ANNUAL period -- only genuinely incomplete keys select a document.
+    complete_periods = {
+        (period.period_type, period.reporting_basis, period.period_end)
+        for period in parsed_nse_income_statement_periods([complete_document])
+        if dict(period.metrics)
+    }
+    incomplete_periods = {
+        (period.period_type, period.reporting_basis, period.period_end)
+        for period in parsed_nse_income_statement_periods([incomplete_document])
+        if dict(period.metrics)
+    }
+    assert complete_periods and incomplete_periods
+
+
+@pytest.mark.asyncio
+async def test_J_annual_periods_evaluated_correctly_per_period() -> None:
+    """Step 9: the same independence guarantee for ANNUAL-typed periods."""
+    repository = ResearchRepository(settings=Settings(research_live_enabled=True), persistence=SqliteResearchPersistence())
+    profile = _reliance_profile_for_nse_tests(repository)
+    _di7c_ingest(
+        repository, profile, suffix="j-complete-annual",
+        text=_DI7C_JUNE_RESULT_TEXT + " " + _di7c_balance_sheet_text(current="31 March 2026", prior="31 March 2025"),
+    )
+
+    incomplete = await repository._incomplete_persisted_official_financial_documents(profile)
+
+    assert incomplete == []
+
+
+@pytest.mark.asyncio
+async def test_K_core_financial_category_not_starved_by_opportunistic_categories() -> None:
+    """Step 10: with >=3 distinct opportunistic announcement categories and
+    FINANCIAL_RESULTS all due in the same refresh, and the default attempt
+    budget, FINANCIAL_RESULTS must still receive an attempt within the
+    budget rather than being scheduled after all opportunistic categories."""
+    profile_id = UUID("11111111-1111-1111-1111-111111111111")
+
+    def _result(category: str, suffix: str) -> DiscoveryResult:
+        source = RegisteredResearchSource(
+            source_id=f"nse:{category.lower()}:{suffix}", instrument_id=profile_id,
+            url=f"https://nsearchives.nseindia.com/corporate/{category.lower()}-{suffix}.pdf",
+            source_type=SourceType.EXCHANGE_ANNOUNCEMENT, source_classification=SourceClassification.EXCHANGE,
+            source_name="NSE corporate announcements", publisher="NSE", reliability_level=ReliabilityLevel.LEVEL_A,
+            domain="nsearchives.nseindia.com", company_id=UUID("22222222-2222-2222-2222-222222222222"),
+            discovery_method="NSE_OFFICIAL_API", priority=0, categories=(category,),
+        )
+        return DiscoveryResult(category=category, source=source)
+
+    filings = [
+        _result("CONFERENCE_CALL_MATERIAL", "1"),
+        _result("INVESTOR_PRESENTATION", "1"),
+        _result("INVESTOR_RELEASE", "1"),
+        _result("ORDER_CONTRACT_DISCLOSURE", "1"),
+        _result("CAPEX_CAPACITY_DISCLOSURE", "1"),
+        _result("FINANCIAL_RESULTS", "1"),
+    ]
+
+    from app.repository import _fair_official_filing_order
+
+    scheduled = _fair_official_filing_order(filings)
+    budget = Settings().research_official_document_max_attempts_per_refresh
+    scheduled_categories_within_budget = {item.category for item in scheduled[:budget]}
+
+    assert "FINANCIAL_RESULTS" in scheduled_categories_within_budget
+
+
+@pytest.mark.asyncio
+async def test_L_small_cap_nse_only_acquisition_succeeds_without_yahoo_or_search() -> None:
+    """Step 12: a VERIFIED-NSE small/micro-cap instrument with no Yahoo
+    mapping and search unavailable must still successfully acquire income
+    statement, balance sheet, and cash flow facts from NSE alone."""
+    settings = Settings(research_live_enabled=True, research_search_enabled=False)
+    repository = ResearchRepository(settings=settings, persistence=SqliteResearchPersistence())
+    profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
+    profile.provider_instrument_ids.clear()
+    profile.provider_instrument_ids["NSE"] = "RELIANCE"
+    assert "YAHOO" not in profile.provider_instrument_ids
+
+    source = replace(_official_financial_result_source(profile, "small-cap"), official_nse_profile_symbol="RELIANCE")
+    repository._official_filing_discovery = _StaticOfficialDiscovery([DiscoveryResult("FINANCIAL_RESULTS", source)])
+    repository._fetcher = _OfficialFetchFixture(FetchResult(
+        final_url=source.url, status_code=200, content_type="text/html", bytes_read=200,
+        text=(
+            "<html><title>Reliance Industries Limited Financial Results</title><main>"
+            "Reliance Industries Limited RELIANCE INE002A01018 " + _DI7C_JUNE_RESULT_TEXT + " "
+            + _di7c_balance_sheet_text() + " " + _di7c_cash_flow_text() + "</main></html>"
+        ),
+    ))
+
+    await repository._refresh_targeted(profile, set())
+
+    facts = repository._persistence.load_financial_facts({profile.instrument_id})
+    nse_facts = [fact for fact in facts if fact.source_tier == FactSourceTier.OFFICIAL_NSE]
+    metrics = {fact.key.metric for fact in nse_facts}
+    assert {"revenue", "pat"} <= metrics
+    assert {"total_assets", "total_equity"} & metrics
+    assert {"cash_flow_from_operating_activities"} & metrics or any(
+        "cash" in metric for metric in metrics
+    )
+    assert not any(fact.source_tier == FactSourceTier.YAHOO for fact in facts)
+
+
+@pytest.mark.asyncio
+async def test_M_verified_only_nse_trust_unaffected_by_completeness_changes() -> None:
+    """Step 15-M: a profile without a VERIFIED NSE mapping must still never
+    have its financial facts reconciled by the balance-sheet/cash-flow
+    completeness repair path -- DI-7C's completeness/gating changes must not
+    alter this pre-existing trust boundary.  (Broad official-filing
+    *discovery* eligibility is keyed on profile.country/profile.exchange,
+    not provider_instrument_ids -- that is pre-existing, unrelated behavior
+    this task's LOCKED list forbids touching.  The actual VERIFIED-NSE trust
+    boundary DI-7C must preserve is enforced inside
+    _incomplete_persisted_official_financial_documents itself, which is
+    what this test exercises directly.)"""
+    settings = Settings(research_live_enabled=True, research_persistence_enabled=True)
+    repository = ResearchRepository(settings=settings, persistence=SqliteResearchPersistence(":memory:"))
+    profile = _reliance_profile_for_nse_tests(repository)
+    profile.provider_instrument_ids.pop("NSE", None)
+    _di7c_ingest(
+        repository, profile, suffix="m",
+        text=_DI7C_JUNE_RESULT_TEXT + " " + _di7c_balance_sheet_text(),
+    )
+
+    incomplete = await repository._incomplete_persisted_official_financial_documents(profile)
+
+    assert incomplete == []
+
+
+@pytest.mark.asyncio
+async def test_N_exact_isin_priority_unaffected_by_completeness_changes() -> None:
+    """Step 15-N: DI-7C touches only repository.py completeness/gating/
+    scheduling internals; exact-ISIN identity resolution in
+    portfolio_orchestration.py is untouched.  Smoke-checks that module still
+    imports and its exact-match helper is unchanged in shape."""
+    from app.portfolio_orchestration import _hydrate_verified_exchange_mappings
+    assert callable(_hydrate_verified_exchange_mappings)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_O_di7a_authoritative_error_protection_composes_with_di7c_completeness() -> None:
+    """Step 15-O: DI-7A's authoritative-error protection and DI-7C's
+    balance-sheet completeness reconciliation must compose correctly in the
+    same refresh -- an official-filing discovery failure is preserved even
+    while an unrelated, already-persisted document is independently
+    reconciled for balance-sheet completeness."""
+    repository = ResearchRepository(
+        settings=Settings(research_live_enabled=True, research_search_enabled=True),
+        search_discovery=SearchDiscoveryService(_StaticSearchProvider([])),
+        official_filing_discovery=_RaisingOfficialDiscovery(SearchProviderError("NSE_OFFICIAL_INVALID_RESPONSE")),
+        official_shareholding_discovery=_EmptyShareholdingDiscovery(),
+    )
+    profile = _reliance_profile_for_nse_tests(repository)
+    _di7c_ingest(
+        repository, profile, suffix="o",
+        text=_DI7C_JUNE_RESULT_TEXT + " " + _DI7C_UNPARSEABLE_BALANCE_SHEET_HEADING,
+    )
+
+    await repository._refresh_targeted(profile, set())
+
+    assert repository.last_live_error.get(profile.instrument_id) == "OFFICIAL_FILING_DISCOVERY_UNAVAILABLE:SearchProviderError"

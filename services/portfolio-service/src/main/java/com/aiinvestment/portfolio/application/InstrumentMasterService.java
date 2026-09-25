@@ -138,6 +138,25 @@ public class InstrumentMasterService {
 
     @Transactional
     public InstrumentMasterEntity canonicalizeOfficialNse(String isin, String symbol, String companyName, String source) {
+        return canonicalizeOfficialSecurity(isin, symbol, companyName, source, com.aiinvestment.shared.domain.AssetType.EQUITY);
+    }
+
+    /**
+     * NSE's own SERIES field for a row already, authoritatively, tells us it is an investment
+     * vehicle (REIT/InvIT), not an operating company's equity. Canonicalize it under a non-equity
+     * asset type from the moment it is first seen, rather than defaulting it to EQUITY on the hope
+     * that a later provider-reported quoteType corrects it (it may never run, or may never succeed).
+     * Only applies to a brand-new instrument_master row (see canonicalizeOfficialSecurity): an
+     * already-existing row's asset type is never silently rewritten by this call.
+     */
+    @Transactional
+    public InstrumentMasterEntity canonicalizeOfficialInvestmentVehicle(String isin, String symbol, String companyName) {
+        return canonicalizeOfficialSecurity(isin, symbol, companyName, "NSE_OFFICIAL_INVESTMENT_VEHICLE_BOOTSTRAP",
+                com.aiinvestment.shared.domain.AssetType.OTHER);
+    }
+
+    private InstrumentMasterEntity canonicalizeOfficialSecurity(String isin, String symbol, String companyName, String source,
+            com.aiinvestment.shared.domain.AssetType assetType) {
         String normalized = InstrumentMasterEntity.normalizeIsin(isin);
         if (normalized == null || symbol == null || symbol.isBlank()) throw new IllegalArgumentException("OFFICIAL_NSE_IDENTITY_REQUIRED");
         lockIdentity("ISIN:" + normalized);
@@ -147,7 +166,7 @@ public class InstrumentMasterService {
         if (existing.isPresent() && existing.get().getIsin() != null && !normalized.equals(existing.get().getIsin()))
             throw new IllegalStateException("NSE_IDENTITY_MISMATCH");
         InstrumentMasterEntity master = existing.orElseGet(() -> masters.saveAndFlush(new InstrumentMasterEntity(UUID.randomUUID(), normalized,
-                firstText(companyName, symbol), com.aiinvestment.shared.domain.AssetType.EQUITY, "INR", "IN", "NSE", symbol, "ACTIVE", Instant.now())));
+                firstText(companyName, symbol), assetType, "INR", "IN", "NSE", symbol, "ACTIVE", Instant.now())));
         master.applyVerifiedPrimaryListing("NSE", symbol, companyName);
         var verified = reusableMapping(master.getInstrumentId(), "NSE");
         if (verified.isPresent() && !same(verified.get().getProviderSymbol(), symbol))

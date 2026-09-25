@@ -1,6 +1,8 @@
 from uuid import UUID, uuid4
 import logging
 import time
+from contextlib import asynccontextmanager
+import asyncio
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, status
@@ -21,10 +23,11 @@ from app.sector_leaderboard import build_sector_leaderboard
 from app.sector_performance import belongs_to_region, performance_window, rank_performers
 from app.market_universe import IndiaMarketUniverseProvider, MarketUniverseUnavailable
 from app.market_data_population import IndiaMarketDataPopulationJobs
-from app.market_data_ensure import IndiaMarketDataEnsureService
+from app.market_data_ensure import IndiaMarketDataEnsureService, _internal_service_identity
 from app.market_universe_sectors import canonical_sector_counts
 from app.watchlists import AddWatchlistInstrumentRequest, EnsureDefaultWatchlistRequest, watchlist_research_projection
-from app.scheduler import default_schedule_rules
+from app.scheduler import default_schedule_rules, nse_opportunity_schedule
+from app.global_opportunity_scheduler import GlobalOpportunityScheduler
 from app.settings import Settings, configure_application_logging, reset_request_id, set_request_id
 from app.sources import default_source_providers
 from app.research_readiness_runtime import (
@@ -75,14 +78,76 @@ research_readiness_runtime = ResearchReadinessRuntime(
     ensure_timeout_seconds=settings.research_readiness_ensure_timeout_seconds,
 )
 stock_rule_engine_service = StockRuleEngineService(repository, research_readiness_adapter)
-app = FastAPI(title="Research Engine", version="0.3.0")
+@asynccontextmanager
+async def research_lifespan(application):
+    if hasattr(repository.persistence, 'record_opportunity_job'):
+        # The worker (queue processor) always starts: manually-POSTed and
+        # controlled/candidate cycles must still run even when the
+        # automatic scheduler is disabled. Only the scheduler -- which
+        # decides *when* to submit production cycles on its own -- is
+        # gated by the narrow research_opportunity_scheduler_enabled flag.
+        _opportunity_worker().start()
+        if settings.research_opportunity_scheduler_enabled:
+            _opportunity_scheduler().start()
+    try:
+        yield
+    finally:
+        worker = getattr(application.state, 'opportunity_worker', None)
+        if worker is not None:
+            await worker.close()
+            del application.state.opportunity_worker
+        scheduler = getattr(application.state, 'opportunity_scheduler', None)
+        if scheduler is not None:
+            await scheduler.close()
+            del application.state.opportunity_scheduler
+        # Readiness uses shielded single-flight tasks: explicitly drain them on shutdown.
+        flights = [flight.task for flight in research_readiness_runtime._flights.values()]
+        for task in flights:
+            task.cancel()
+        await asyncio.gather(*flights, return_exceptions=True)
+
+
+app = FastAPI(title="Research Engine", version="0.3.0", lifespan=research_lifespan)
 logger = logging.getLogger(__name__)
+
+
+def _opportunity_worker():
+    from app.opportunity_worker import OpportunityCycleWorker
+    if not hasattr(app.state, 'opportunity_worker'):
+        async def runner(**parameters):
+            from app.global_opportunity_cycle import run_global_opportunity_cycle
+            return await run_global_opportunity_cycle(repository, portfolio_orchestrator,
+                **parameters, readiness_runtime=research_readiness_runtime,
+                identity_headers=_internal_service_identity(portfolio_orchestrator.settings))
+        app.state.opportunity_worker = OpportunityCycleWorker(repository, runner)
+    return app.state.opportunity_worker
+
+
+def _opportunity_scheduler():
+    from app.opportunity_worker import OpportunityCycleWorker
+    if not hasattr(app.state, 'opportunity_scheduler'):
+        worker = _opportunity_worker()
+        app.state.opportunity_scheduler = GlobalOpportunityScheduler(
+            worker=worker,
+            persistence=repository.persistence,
+        )
+    return app.state.opportunity_scheduler
+
+
+@app.get('/api/v1/research/opportunities/cycles/{cycle_id}/status')
+async def opportunity_cycle_status(cycle_id: UUID):
+    with repository._persistence_worker_lock:
+        values = repository.persistence.opportunity_jobs() if hasattr(repository.persistence, 'opportunity_jobs') else []
+    value = next((v for v in values if v['cycle_id'] == str(cycle_id)), None)
+    if value is None:
+        raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
+    return value
 
 
 @app.get('/api/v1/research/opportunities/current')
 async def opportunity_radar():
     with repository._persistence_worker_lock:
-        return repository.persistence.opportunity_current()
+        return repository.persistence.global_opportunity_radar()
 
 
 @app.get('/api/v1/research/opportunities/history/{instrument_id}')
@@ -92,6 +157,10 @@ async def opportunity_history(instrument_id: UUID):
 
 
 class OpportunityCycleRequest(BaseModel):
+    # top_n is legacy display metadata (the UI initial page size). It is validated
+    # only against its previous compatible range and is NEVER used to truncate the
+    # qualifying persisted recommendation set: production passes top_n=None to the
+    # orchestrator (unbounded ranking) and publication iterates ranking.evaluated_entries.
     top_n: int = Field(default=4, ge=2, le=4)
     shortlist_limit: int = Field(default=25, ge=1, le=100)
     candidate_ids: list[UUID] | None = Field(default=None, max_length=100)
@@ -102,15 +171,21 @@ async def opportunity_cycle(body: OpportunityCycleRequest, request: Request):
     from app.global_opportunity_cycle import run_global_opportunity_cycle
     if not hasattr(repository.persistence, 'publish_opportunity_cycle'):
         raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
-    # One in-process cycle at a time; no awaits between history read and atomic publish.
-    import asyncio
-    if not hasattr(app.state, 'opportunity_cycle_lock'):
-        app.state.opportunity_cycle_lock = asyncio.Lock()
-    async with app.state.opportunity_cycle_lock:
-        return await run_global_opportunity_cycle(repository, portfolio_orchestrator,
-            top_n=body.top_n, shortlist_limit=body.shortlist_limit, candidate_ids=body.candidate_ids,
-            identity_headers={k: v for k, v in request.headers.items()
-                              if k.lower() in {'authorization', 'x-user-id', 'x-correlation-id'}})
+    worker = _opportunity_worker()
+    if body.candidate_ids is None:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content=worker.submit(
+            {'top_n': body.top_n, 'shortlist_limit': body.shortlist_limit}))
+    # Diagnostics use the same process lock and never update production state.
+    async with worker.run_lock:
+        try:
+            return await run_global_opportunity_cycle(repository, portfolio_orchestrator,
+                top_n=body.top_n, shortlist_limit=body.shortlist_limit, candidate_ids=body.candidate_ids,
+                readiness_runtime=research_readiness_runtime,
+                identity_headers=_internal_service_identity(portfolio_orchestrator.settings))
+        except PortfolioServiceUnavailableError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                                detail='PORTFOLIO_SERVICE_UNAVAILABLE') from exc
 
 
 class BacktestRequest(BaseModel):
@@ -185,7 +260,7 @@ def sources():
 
 @app.get("/api/v1/research/schedule")
 def schedule():
-    return default_schedule_rules()
+    return {"source_rules": default_schedule_rules(), "opportunity_schedule": nse_opportunity_schedule()}
 
 
 @app.get("/api/v1/research/companies")
@@ -746,9 +821,12 @@ async def company(instrument_id: UUID, x_correlation_id: str | None = Header(def
     try:
         return repository.profile(instrument_id)
     except StopIteration as exc:
-        if await _resolve_restored_instrument_profile(instrument_id, x_correlation_id, _identity_headers(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject, x_aip_user_email, x_aip_user_display_name, x_aip_user_roles)):
+        profile_reason: dict = {}
+        if await _resolve_restored_instrument_profile(instrument_id, x_correlation_id, _identity_headers(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject, x_aip_user_email, x_aip_user_display_name, x_aip_user_roles), reason_out=profile_reason):
             return repository.profile(instrument_id)
-        raise HTTPException(status_code=404, detail="COMPANY_NOT_RESOLVED") from exc
+        not_resolved_reason = profile_reason.get("reason")
+        not_resolved_detail = f"COMPANY_NOT_RESOLVED:{not_resolved_reason}" if not_resolved_reason else "COMPANY_NOT_RESOLVED"
+        raise HTTPException(status_code=404, detail=not_resolved_detail) from exc
 
 
 @app.get("/api/v1/research/companies/{instrument_id}/events")
@@ -984,9 +1062,12 @@ async def _require_profile_or_restored_instrument(instrument_id: UUID, correlati
     try:
         repository.profile(instrument_id)
     except StopIteration as exc:
-        if await _resolve_restored_instrument_profile(instrument_id, correlation_id, identity_headers):
+        profile_reason: dict = {}
+        if await _resolve_restored_instrument_profile(instrument_id, correlation_id, identity_headers, reason_out=profile_reason):
             return
-        raise HTTPException(status_code=404, detail="COMPANY_NOT_RESOLVED") from exc
+        not_resolved_reason = profile_reason.get("reason")
+        not_resolved_detail = f"COMPANY_NOT_RESOLVED:{not_resolved_reason}" if not_resolved_reason else "COMPANY_NOT_RESOLVED"
+        raise HTTPException(status_code=404, detail=not_resolved_detail) from exc
 
 
 async def _readiness_profile(
@@ -1001,10 +1082,13 @@ async def _readiness_profile(
             correlation_id=correlation_id,
             identity_headers=identity_headers,
         )
+        profile_reason: dict = {}
         if not portfolio_orchestrator.register_global_profile_metadata(
-            global_instrument_id, metadata
+            global_instrument_id, metadata, reason_out=profile_reason
         ):
-            raise HTTPException(status_code=404, detail="COMPANY_NOT_RESOLVED")
+            not_resolved_reason = profile_reason.get("reason")
+            not_resolved_detail = f"COMPANY_NOT_RESOLVED:{not_resolved_reason}" if not_resolved_reason else "COMPANY_NOT_RESOLVED"
+            raise HTTPException(status_code=404, detail=not_resolved_detail)
         profile = repository.profile(global_instrument_id)
     except (GlobalInstrumentNotFoundError, StopIteration) as exc:
         raise HTTPException(status_code=404, detail="COMPANY_NOT_RESOLVED") from exc
@@ -1019,10 +1103,10 @@ async def _readiness_profile(
     return profile
 
 
-async def _resolve_restored_instrument_profile(instrument_id: UUID, correlation_id: str | None = None, identity_headers: dict[str, str | None] | None = None) -> bool:
+async def _resolve_restored_instrument_profile(instrument_id: UUID, correlation_id: str | None = None, identity_headers: dict[str, str | None] | None = None, *, reason_out: dict | None = None) -> bool:
     try:
         return await portfolio_orchestrator.restore_global_profile(
-            instrument_id, correlation_id=correlation_id, identity_headers=identity_headers
+            instrument_id, correlation_id=correlation_id, identity_headers=identity_headers, reason_out=reason_out
         )
     except GlobalInstrumentNotFoundError:
         return False

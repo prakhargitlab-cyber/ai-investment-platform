@@ -83,7 +83,7 @@ class YahooFinanceProvider:
     async def resolve_instrument(self, instrument: dict[str, Any], identity: str | None = None) -> StructuredInstrumentResolution:
         identity = identity or strongest_company_identity(instrument)
         if not identity:
-            raise StructuredProviderError("COMPANY_NOT_RESOLVED")
+            raise StructuredProviderError("COMPANY_NOT_RESOLVED:MISSING_IDENTITY")
         trusted_nse_candidate = _trusted_nse_candidate(instrument)
         if trusted_nse_candidate:
             return await self._resolve_verified_nse_candidate(instrument, identity, trusted_nse_candidate)
@@ -129,9 +129,19 @@ class YahooFinanceProvider:
                 _candidate_validation_reason(instrument, candidate, score,
                                              self.settings.structured_resolution_min_confidence),
             )
-        if not scored or scored[0][0] < self.settings.structured_resolution_min_confidence:
+        if not scored:
+            # NO_CANDIDATES fires ONLY when Yahoo returned zero quotes for every
+            # resolution query. Rejected candidates are logged above (yahoo_candidate
+            # REJECT_*), never collapsed into NO_CANDIDATES, so this reason stays
+            # semantically accurate for a genuine empty live Yahoo result -- and the
+            # queries/errors below make the cache-vs-live inconsistency
+            # (cached ACCEPTABLE snapshot vs live empty result) diagnosable.
+            logger.info("yahoo_resolution_rejected reason=NO_CANDIDATES queries=%r provider_errors=%r",
+                        queries, provider_errors)
+            raise StructuredProviderError("COMPANY_NOT_RESOLVED:NO_CANDIDATES")
+        if scored[0][0] < self.settings.structured_resolution_min_confidence:
             logger.info("yahoo_resolution_rejected reason=LOW_CONFIDENCE")
-            raise StructuredProviderError("COMPANY_NOT_RESOLVED")
+            raise StructuredProviderError("COMPANY_NOT_RESOLVED:LOW_CONFIDENCE")
         if len(scored) > 1 and scored[0][0] - scored[1][0] < self.settings.structured_resolution_ambiguity_margin:
             logger.info("yahoo_resolution_rejected reason=AMBIGUOUS top_score=%.4f runner_up_score=%.4f",
                         scored[0][0], scored[1][0])
@@ -164,7 +174,7 @@ class YahooFinanceProvider:
         if len(matches) != 1:
             logger.info("yahoo_mapping_resolution globalInstrumentId=%s candidateSource=VERIFIED_NSE candidate=%s outcome=REJECTED reason=EXACT_SYMBOL_NOT_FOUND",
                         instrument.get("instrumentId"), candidate_symbol)
-            raise StructuredProviderError("COMPANY_NOT_RESOLVED")
+            raise StructuredProviderError("COMPANY_NOT_RESOLVED:EXACT_SYMBOL_NOT_FOUND")
         candidate = matches[0]
         reason = _trusted_nse_candidate_reason(instrument, identity, candidate, candidate_symbol)
         if reason is not None:
@@ -421,8 +431,18 @@ def _trusted_nse_candidate_reason(instrument: dict[str, Any], identity: str, can
         return "CURRENCY_MISMATCH"
     expected_isin = str(instrument.get("isin") or "").upper()
     candidate_isin = str(candidate.get("isin") or "").upper()
-    if expected_isin and candidate_isin and expected_isin != candidate_isin:
-        return "ISIN_MISMATCH"
+    if expected_isin and candidate_isin:
+        # An exact official ISIN match is the strongest identity signal this
+        # gate has -- two different companies cannot share an ISIN -- so it
+        # is authoritative on its own and is never subsequently overridden by
+        # a low company-name-similarity score. This mirrors the Java
+        # NseMappingReconciliationService's EXACT_ISIN priority. A mismatched
+        # ISIN is still rejected outright; when an exact comparison cannot be
+        # made at all (either side missing an ISIN), today's name-similarity
+        # check is unchanged.
+        if expected_isin != candidate_isin:
+            return "ISIN_MISMATCH"
+        return None
     candidate_name = str(candidate.get("longname") or candidate.get("shortname") or "")
     if not candidate_name or _name_similarity(identity, candidate_name) < 0.55:
         return "COMPANY_NAME_MISMATCH"
@@ -695,7 +715,7 @@ def _normalize_statement_facts(income: Any, balance: Any, cashflow: Any, period_
 def _is_financial_identity(info: dict[str, Any]) -> bool:
     """Banks and financials do not receive industrial EBIT/ROCE semantics."""
     identity = " ".join(str(info.get(key) or "") for key in ("sector", "industry", "longName", "shortName")).lower()
-    return bool(re.search(r"\b(bank|financial|insurance|credit|lending|asset management)\b", identity))
+    return bool(re.search(r"\b(bank|financial|insurance|credit|lending|asset management|nbfc|leasing|mortgage|microfinance|housing finance|finance company)\b", identity))
 
 
 def _statement_value(frame: Any, period: Any, labels: tuple[str, ...]) -> Decimal | None:

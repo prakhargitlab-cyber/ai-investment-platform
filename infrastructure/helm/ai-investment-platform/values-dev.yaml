@@ -1,4 +1,4 @@
-global:
+﻿global:
   environment: LOCAL
   springProfile: LOCAL
   imageRegistry: localhost:5001
@@ -57,6 +57,9 @@ research:
     databaseSchema: research
     passwordSecretName: dev-postgres
     passwordSecretKey: POSTGRES_PASSWORD
+  # Explicit for DEV visibility/audit; matches the chart default.
+  opportunityScheduler:
+    enabled: false
   portfolioServiceBaseUrl: http://portfolio-service
   mcpAcquisition:
     enabled: true
@@ -186,3 +189,4 @@ yahooFinanceMcp:
 marketData:
   demoMode: true
   quoteCacheMode: redis
+

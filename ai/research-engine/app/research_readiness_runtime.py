@@ -17,8 +17,9 @@ from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
-from app.research_applicability import classify_requirements
-from app.market_sessions import latest_completed_session, next_session_open
+from app.research_applicability import classify_requirements, CONCEPT_INPUTS, CONCEPT_CATEGORIES
+from app.market_sessions import price_session_valid_until
+from app.normalization import content_hash
 
 from app.fact_precedence import FactSourceTier, FinancialFact
 from app.historical_market_data import has_year_historical_coverage
@@ -38,6 +39,7 @@ from app.models import (
 from app.research_readiness import (
     DurableResearchSnapshot,
     ProviderAuthorityRegistry,
+    REQUIREMENT_STATUSES_NEEDING_ACQUISITION,
     ResearchEvidence,
     ResearchReadinessResult,
     ResearchReadinessService,
@@ -59,6 +61,26 @@ _FINANCIAL_REQUIREMENTS = frozenset(
         "GROWTH_FACTS",
         "BALANCE_SHEET_FACTS",
         "QUARTERLY_FINANCIALS",
+    }
+)
+# STAGE-1 (cheap baseline) data contract: every eligible NSE equity must have
+# only low-cost, structured read-only facts acquired before any pre-ranking or
+# deep-enrichment decision. These gate exclusively on structured market-data
+# reads (ensured cheaply via ensure_structured_market + historical price series),
+# NOT on per-instrument financial-document discovery, NSE result reconciliation,
+# governance/RISKS/REGULATORY/MANAGEMENT search, or PDF fetching -- those
+# expensive steps are deferred to STAGE-2 deep enrichment (shortlist only,
+# ensure(requirement_ids=None) for <= shortlist_limit candidates). Financial
+# facts themselves are READ by the scanner from persistence (persisted by the
+# NSE/GHCL refresh); any candidate whose financials are not yet persisted simply
+# does not enter the deep pool and is deep-acquired by the Stage-2 shortlist
+# instead of the full 2578-universe baseline pass.
+BASELINE_REQUIREMENT_IDS = frozenset(
+    {
+        "LATEST_PRICE",
+        "HISTORICAL_PRICE_SERIES",
+        "VALUATION_INPUTS",
+        "SECTOR_MACRO",
     }
 )
 _KNOWN_REQUIREMENTS = frozenset(
@@ -189,7 +211,7 @@ class RepositoryResearchReadinessAdapter:
         self._append_documents(evidence, documents)
         self._append_events(evidence, events)
         self._append_shareholding(evidence, shareholding)
-        self._append_canonical_sector(evidence, global_instrument_id, profile)
+        self._append_canonical_sector(evidence, global_instrument_id, profile, structured)
 
         metadata = self.canonical_metadata_for(global_instrument_id)
         sector = metadata.get("canonicalSector") or metadata.get("sector")
@@ -201,21 +223,25 @@ class RepositoryResearchReadinessAdapter:
             sector = sector or (sector_fact.value if sector_fact else None)
             if not industry and industry_fact and industry_fact.value:
                 industry, classification_source = str(industry_fact.value), industry_fact.source_url
-        applicability = classify_requirements(str(sector) if sector else None, str(industry) if industry else None, classification_source)
+        applicability = classify_requirements(str(sector) if sector else None, str(industry) if industry else None, classification_source, asset_type=metadata.get("assetType"))
         schedules, exceptions = self._sessions.get(global_instrument_id, ([], []))
         if schedules:
             market = profile.mic or profile.exchange
-            for requirement_id in ("LATEST_PRICE", "VALUATION_INPUTS"):
+            for requirement_id in ("LATEST_PRICE", "VALUATION_INPUTS", "HISTORICAL_PRICE_SERIES"):
+                if requirement_id not in evidence:
+                    continue
                 values = []
                 for item in evidence[requirement_id]:
                     if item.as_of:
-                        session = latest_completed_session(market, schedules, exceptions, item.as_of + timedelta(minutes=15))
-                        # Only a real close observation is reusable during a closed session.
-                        if session and abs((session - item.as_of).total_seconds()) <= 15 * 60:
-                            valid_until = next_session_open(market, schedules, exceptions, session)
-                            if valid_until and ('LATEST_USABLE_PRICE' in item.covered_input_ids or
-                                    item.evidence_id.startswith('derived-valuation:')):
-                                item = replace(item, valid_until=valid_until)
+                        # A genuine session close stays usable through the next
+                        # expected trading session open (weekends/holidays extend
+                        # validity rather than aging it). None -> wall-clock TTL
+                        # fallback (fail-closed / conservative).
+                        valid_until = price_session_valid_until(market, schedules, exceptions, item.as_of)
+                        if valid_until and ('LATEST_USABLE_PRICE' in item.covered_input_ids
+                                            or item.evidence_id.startswith('derived-valuation:')
+                                            or requirement_id == "HISTORICAL_PRICE_SERIES"):
+                            item = replace(item, valid_until=valid_until)
                     values.append(item)
                 evidence[requirement_id] = values
 
@@ -225,7 +251,9 @@ class RepositoryResearchReadinessAdapter:
             for observation in observations_loader(global_instrument_id):
                 key = observation["requirement_id"]
                 history = acquisition.get(key, {}).get("history", [])
-                acquisition[key] = {**observation, "history": [*history, observation]}
+                # Executor completion describes orchestration, not provider evidence.
+                selected = acquisition.get(key, {}) if observation.get("provider") == "READINESS_EXECUTOR" and observation.get("outcome") == "COMPLETED" and history else observation
+                acquisition[key] = {**selected, "history": [*history, observation]}
         news_loader = getattr(self.repository, 'news_records_for', None)
         if callable(news_loader):
             from app.news_intelligence import SearchRun, search_state
@@ -249,6 +277,22 @@ class RepositoryResearchReadinessAdapter:
             if checked_at:
                 evidence["CURRENT_NEWS"] = [replace(item, valid_until=checked_at + timedelta(days=1))
                     for item in evidence["CURRENT_NEWS"]]
+        catalyst_checked_at = _completed_authoritative_check(
+            acquisition.get("ORDER_BOOK_CAPEX_GUIDANCE", {}).get("history", []))
+        if catalyst_checked_at is not None:
+            # Explicit zero-result coverage (same principle as a completed news
+            # search): the latest authoritative NSE announcement check for the
+            # catalyst categories completed. It covers the concept inputs as
+            # "checked" -- it is not an event and carries no score. Concepts
+            # excluded as NOT_APPLICABLE are removed by applicability as usual.
+            # A never-run or FAILED latest check adds nothing (incomplete/retry).
+            evidence["ORDER_BOOK_CAPEX_GUIDANCE"].append(ResearchEvidence(
+                evidence_id="catalyst-check:NSE:" + catalyst_checked_at.isoformat(),
+                requirement_id="ORDER_BOOK_CAPEX_GUIDANCE", source="NSE",
+                source_tier=ResearchSourceTier.OFFICIAL, retrieved_at=catalyst_checked_at,
+                as_of=catalyst_checked_at, published_at=catalyst_checked_at, event_date=catalyst_checked_at,
+                covered_input_ids=("MATERIAL_CATALYST_EVIDENCE", "ORDER_BOOK_OR_MAJOR_CONTRACT",
+                                   "CAPACITY_OR_CAPEX_OR_COMMISSIONING", "MANAGEMENT_GUIDANCE")))
         persisted_failures = {key: value["failure_reason"] for key, value in acquisition.items()
             if value.get("outcome") == "FAILED" and value.get("failure_reason")}
         supported = set(evidence)
@@ -262,6 +306,7 @@ class RepositoryResearchReadinessAdapter:
             failure_reasons={**persisted_failures, **self._failures.get(global_instrument_id, {})},
             acquisition_observations=acquisition,
             applicability_by_requirement=applicability,
+            document_diagnostics=tuple(_document_diagnostic(document, facts, events, shareholding) for document in documents),
         )
 
     @staticmethod
@@ -269,23 +314,26 @@ class RepositoryResearchReadinessAdapter:
         evidence: dict[str, list[ResearchEvidence]], facts: Sequence[FinancialFact]
     ) -> None:
         real = [fact for fact in facts if fact.source_mode == SourceMode.REAL]
-        periods_by_series: dict[tuple[str, str], dict[str, set[str]]] = {}
-        quarterly_metrics: dict[str, dict[str, set[str]]] = {}
+        from app.normalization import normalize_financial_amount
+        def unit_for(fact):
+            return normalize_financial_amount(Decimal(0), fact.value.unit)[1]
+        periods_by_series: dict[tuple, dict[str, set[str]]] = {}
+        quarterly_metrics: dict[tuple, dict[str, set[str]]] = {}
         all_quarterly_periods: set[str] = set()
-        annual_periods: set[str] = set()
+        annual_periods: dict[tuple, set[str]] = {}
         for fact in real:
             metric = _metric(fact.key.metric)
             if not fact.key.period_end:
                 continue
             period = fact.key.period_end[:10]
-            basis = fact.key.reporting_basis or "UNKNOWN"
+            basis = (fact.key.reporting_basis or "UNKNOWN", unit_for(fact))
             periods_by_series.setdefault((fact.key.period_type, basis), {}).setdefault(metric, set()).add(period)
             if fact.key.period_type == "QUARTERLY":
                 all_quarterly_periods.add(period)
                 family = "revenue" if metric in {"revenue", "total_revenue"} else "pat" if metric in {"pat", "net_income", "net_profit"} else metric
                 quarterly_metrics.setdefault(basis, {}).setdefault(family, set()).add(period)
             elif fact.key.period_type == "ANNUAL":
-                annual_periods.add(period)
+                annual_periods.setdefault(basis, set()).add(period)
         latest_quarter = max(all_quarterly_periods, default=None)
 
         for fact in real:
@@ -293,10 +341,10 @@ class RepositoryResearchReadinessAdapter:
             coverage = _financial_fact_coverage(
                 fact,
                 metric,
-                periods_by_series.get((fact.key.period_type, fact.key.reporting_basis or "UNKNOWN"), {}),
-                quarterly_metrics.get(fact.key.reporting_basis or "UNKNOWN", {}).get("revenue", set())
-                    & quarterly_metrics.get(fact.key.reporting_basis or "UNKNOWN", {}).get("pat", set()),
-                annual_periods,
+                periods_by_series.get((fact.key.period_type, (fact.key.reporting_basis or "UNKNOWN", unit_for(fact))), {}),
+                quarterly_metrics.get((fact.key.reporting_basis or "UNKNOWN", unit_for(fact)), {}).get("revenue", set())
+                    & quarterly_metrics.get((fact.key.reporting_basis or "UNKNOWN", unit_for(fact)), {}).get("pat", set()),
+                annual_periods.get((fact.key.reporting_basis or "UNKNOWN", unit_for(fact)), set()),
                 latest_quarter,
             )
             for requirement_id, covered_inputs in coverage.items():
@@ -336,7 +384,8 @@ class RepositoryResearchReadinessAdapter:
                             source_url=value.source_url or record.source_url,
                             covered_input_ids=tuple(sorted(covered_inputs)),
                             valid_until=((value.as_of_date or value.published_at or value.retrieved_at)+timedelta(days=120)
-                                if requirement_id=='VALUATION_INPUTS' and fact_name in {'trailingEps','forwardEps','bookValue'} else None),
+                                if requirement_id in ('VALUATION_INPUTS','BALANCE_SHEET_FACTS')
+                                and fact_name in {'trailingEps','forwardEps','bookValue','totalDebt','debtToEquity','totalCash'} else None),
                         )
                     )
 
@@ -408,27 +457,28 @@ class RepositoryResearchReadinessAdapter:
             if document.status not in {DocumentStatus.PARSED, DocumentStatus.PROCESSED}:
                 continue
             text = f"{document.title or ''} {document.normalized_text or ''}".casefold()
-            latest_fact_period = max((item.as_of for item in evidence["QUARTERLY_FINANCIALS"]
-                if item.as_of and "LATEST_QUARTERLY_RESULT" in item.covered_input_ids), default=None)
-            document_at = document.published_at or document.retrieved_at
-            if (any(term in text for term in ("financial result", "quarterly result", "earnings"))
-                    and (latest_fact_period is None or document_at >= latest_fact_period)):
-                evidence["QUARTERLY_FINANCIALS"].append(
-                    _evidence_from_document(
-                        document,
-                        "QUARTERLY_FINANCIALS",
-                        ("LATEST_QUARTERLY_RESULT",),
-                    )
-                )
-            if any(term in text for term in _GOVERNANCE_TERMS):
+            # DI-12A: a document carries no numerical value, so it must NOT
+            # cover numerical QUARTERLY_FINANCIALS inputs (e.g. the mandatory
+            # LATEST_QUARTERLY_RESULT) on a loose keyword match such as
+            # "financial result"/"quarterly result"/"earnings". Previously this
+            # branch let a keyword-only NSE press-release (its parse producing
+            # zero persisted FinancialFact rows) independently satisfy
+            # LATEST_QUARTERLY_RESULT and become the selected authority (Castrol:
+            # READY_FRESH with sourceProvider=NSE, OFFICIAL_NSE_FACTS=0). The
+            # authoritative numerical coverage for QUARTERLY_FINANCIALS is
+            # derived exclusively from persisted FinancialFact rows in
+            # _append_financial_evidence. Documents retain their legitimate
+            # non-financial contributions below (governance / sector-macro).
+            from app.extraction import governance_disclosure
+            if document.normalized_text and governance_disclosure(text):
                 evidence["GOVERNANCE_HISTORY"].append(
                     _evidence_from_document(
                         document,
                         "GOVERNANCE_HISTORY",
                         ("GOVERNANCE_EVIDENCE",),
                         unresolved=any(
-                            term in text for term in ("litigation", "fraud", "regulatory")
-                        ),
+                            term in text for term in ("pending litigation", "ongoing litigation", "fraud investigation", "regulatory action", "enforcement action")
+                        ) and not any(term in text for term in ("resolved", "case closed", "no wrongdoing", "settled and closed")),
                     )
                 )
             if any(term in text for term in _MACRO_TERMS):
@@ -556,6 +606,7 @@ class RepositoryResearchReadinessAdapter:
         evidence: dict[str, list[ResearchEvidence]],
         instrument_id: UUID,
         profile: CompanyResearchProfile,
+        structured: Sequence[StructuredMarketSnapshotRecord] = (),
     ) -> None:
         metadata = self._canonical_metadata.get(instrument_id, {})
         sector = (
@@ -563,21 +614,54 @@ class RepositoryResearchReadinessAdapter:
             or metadata.get("sector")
             or metadata.get("industrySector")
         )
-        if not sector:
+        if sector:
+            # Canonical registry sector is authoritative. Returning here means
+            # the structured-market fallback below is never even consulted --
+            # authority ordering (canonical > structured fallback > missing) is
+            # enforced procedurally, not just by evidence-tier ranking.
+            retrieved_at = _aware_datetime(
+                metadata.get("updatedAt") or metadata.get("retrievedAt")
+            ) or datetime.now(timezone.utc)
+            evidence["SECTOR_MACRO"].append(
+                ResearchEvidence(
+                    evidence_id=f"canonical-sector:{instrument_id}:{str(sector).strip().casefold()}",
+                    requirement_id="SECTOR_MACRO",
+                    source="EXCHANGE_OR_INDEX_PROVIDER",
+                    source_tier=ResearchSourceTier.TRUSTED_MARKET_DATA,
+                    retrieved_at=retrieved_at,
+                    as_of=retrieved_at,
+                    fact_key="canonical-sector",
+                    value_fingerprint=str(sector).strip(),
+                    covered_input_ids=("CANONICAL_SECTOR",),
+                )
+            )
             return
-        retrieved_at = _aware_datetime(
-            metadata.get("updatedAt") or metadata.get("retrievedAt")
-        ) or datetime.now(timezone.utc)
+        # Canonical registry has no usable sector for this instrument. Fall
+        # back to an already-persisted structured-market 'sector' fact -- the
+        # same durable snapshot _append_structured_evidence already reads, so
+        # this introduces no new network call. The evidence's source/tier
+        # explicitly identify it as structured-market/Yahoo-derived (never
+        # EXCHANGE_OR_INDEX_PROVIDER/TRUSTED_MARKET_DATA, which would
+        # misrepresent it as canonical/NSE provenance), and its timestamp is
+        # the fact's own retrieved/as-of time -- never the canonical
+        # registry's updatedAt, which does not apply to a value the registry
+        # never supplied. Industry is deliberately not used as a stand-in:
+        # no existing domain logic treats industry as an acceptable sector
+        # substitute, and inventing that mapping here would fabricate data.
+        fallback = _structured_sector_fact(structured)
+        if fallback is None:
+            return
+        value, source_name, source_tier, fact_time = fallback
         evidence["SECTOR_MACRO"].append(
             ResearchEvidence(
-                evidence_id=f"canonical-sector:{instrument_id}:{str(sector).strip().casefold()}",
+                evidence_id=f"structured-sector:{instrument_id}:{value.strip().casefold()}",
                 requirement_id="SECTOR_MACRO",
-                source="EXCHANGE_OR_INDEX_PROVIDER",
-                source_tier=ResearchSourceTier.TRUSTED_MARKET_DATA,
-                retrieved_at=retrieved_at,
-                as_of=retrieved_at,
-                fact_key="canonical-sector",
-                value_fingerprint=str(sector).strip(),
+                source=source_name,
+                source_tier=source_tier,
+                retrieved_at=fact_time,
+                as_of=fact_time,
+                fact_key="structured-sector",
+                value_fingerprint=value.strip(),
                 covered_input_ids=("CANONICAL_SECTOR",),
             )
         )
@@ -636,6 +720,7 @@ class ExistingResearchCapabilityExecutor:
         correlation_id: str | None,
         identity_headers: Mapping[str, str | None] | None,
         progress: CapabilityExecutionProgress | None = None,
+        deadline: float | None = None,
     ) -> CapabilityExecutionResult:
         requirement_ids = {target.requirement_id for target in targets}
         unknown = requirement_ids - _KNOWN_REQUIREMENTS
@@ -713,9 +798,11 @@ class ExistingResearchCapabilityExecutor:
             executed.append("ORDER_BOOK_CAPACITY_CATALYSTS")
             if progress is not None:
                 progress.executed("ORDER_BOOK_CAPACITY_CATALYSTS")
-            repository_categories.update(
-                {"ORDERS_BACKLOG", "CONTRACTS", "CAPEX", "NEW_FACILITIES", "GUIDANCE"}
-            )
+            excluded = set().union(*(set(target.excluded_input_ids) for target in targets
+                if target.requirement_id == "ORDER_BOOK_CAPEX_GUIDANCE"))
+            for concept, categories in CONCEPT_CATEGORIES.items():
+                if CONCEPT_INPUTS[concept] not in excluded:
+                    repository_categories.update(categories)
         if "CURRENT_NEWS" in requirement_ids:
             executed.append("GLOBAL_NEWS_SEARCH")
             if progress is not None:
@@ -723,9 +810,15 @@ class ExistingResearchCapabilityExecutor:
             news_worker=getattr(self.repository,'refresh_news_intelligence',None)
             if callable(news_worker):
                 try:
-                    await news_worker(global_instrument_id)
+                    outcome = await news_worker(global_instrument_id)
                 except Exception:
                     failures['CURRENT_NEWS']='NEWS_INTELLIGENCE_UNAVAILABLE'
+                else:
+                    reason = _incomplete_news_search_reason(outcome)
+                    if reason:
+                        # A partial/failed search is a technical gap (retryable),
+                        # never "no news exists".
+                        failures['CURRENT_NEWS'] = reason
             else:
                 repository_categories.update({'CATALYSTS','RISKS','REGULATORY','MANAGEMENT','GUIDANCE'})
         if "GOVERNANCE_HISTORY" in requirement_ids:
@@ -735,11 +828,18 @@ class ExistingResearchCapabilityExecutor:
             repository_categories.update({"RISKS", "REGULATORY", "MANAGEMENT"})
         if repository_categories:
             try:
+                upgrade_options = {}
+                financial_targets = [target for target in targets if target.requirement_id in _FINANCIAL_REQUIREMENTS]
+                if financial_targets and all(target.reason == ResearchRequirementStatus.READY_FRESH for target in financial_targets):
+                    # Fresh targets were added for authority only. Do not turn
+                    # the legacy force-refresh flag into broad financial work.
+                    upgrade_options["authority_upgrade_categories"] = {"FINANCIAL_RESULTS"}
                 await self.repository.refresh_targeted_categories(
                     global_instrument_id,
                     repository_categories,
                     correlation_id=correlation_id,
                     allow_demo=True,
+                    **upgrade_options,
                 )
             except Exception as exc:
                 for requirement_id in requirement_ids & (
@@ -890,6 +990,7 @@ class ResearchReadinessRuntime:
         *,
         jurisdiction: str,
         now: datetime | None = None,
+        evidence_only: bool = False,
     ) -> ResearchReadinessResult:
         if isinstance(self.data_source, RepositoryResearchReadinessAdapter):
             self.data_source._evaluation_times[global_instrument_id] = now or datetime.now(timezone.utc)
@@ -901,6 +1002,7 @@ class ResearchReadinessRuntime:
             global_instrument_id,
             jurisdiction=jurisdiction,
             now=now,
+            evidence_only=evidence_only,
         )
 
     async def ensure(
@@ -911,7 +1013,13 @@ class ResearchReadinessRuntime:
         requirement_ids: Sequence[str] | None,
         correlation_id: str | None = None,
         identity_headers: Mapping[str, str | None] | None = None,
+        wait_for_completion: bool = False,
     ) -> TargetedEnsureResult:
+        """Interactive callers cap plan execution; background owners await it.
+
+        Completion mode is for the persisted cycle worker, not the API route.
+        Neither mode treats transport success or elapsed time as readiness.
+        """
         selected = self._validated_requirement_ids(requirement_ids)
         readiness = await self.read(global_instrument_id, jurisdiction=jurisdiction)
         plan = self.planner.plan(
@@ -920,6 +1028,25 @@ class ResearchReadinessRuntime:
             requirement_ids=selected,
             include_non_mandatory=True,
         )
+        # An explicit ensure may improve authority even while secondary facts
+        # remain fresh. Reads and the generic freshness planner stay unchanged.
+        upgrade_due = getattr(self.repository, "financial_authority_upgrade_due", None)
+        quarterly = next((item for item in readiness.requirements
+                          if item.requirement_id == "QUARTERLY_FINANCIALS"), None)
+        if (jurisdiction == "INDIA" and quarterly is not None
+                and (selected is None or "QUARTERLY_FINANCIALS" in selected)
+                and not any(target.requirement_id == "QUARTERLY_FINANCIALS" for target in plan.targets)
+                and callable(upgrade_due)
+                and await self.repository._run_blocking_persistence(
+                    upgrade_due, self.repository.profile(global_instrument_id), readiness.generated_at, quarterly,
+                )):
+            plan = replace(plan, targets=(*plan.targets, ResearchRefreshTarget(
+                requirement_id=quarterly.requirement_id,
+                rule_engine_area=quarterly.rule_engine_area,
+                reason=quarterly.status,
+                authority_policy=self.authority_registry.policy_for(quarterly.requirement_id, jurisdiction),
+                existing_evidence_ids=quarterly.evidence_ids,
+            )))
         planned_ids = tuple(target.requirement_id for target in plan.targets)
         if not plan.targets:
             return TargetedEnsureResult(readiness, (), ())
@@ -939,6 +1066,8 @@ class ResearchReadinessRuntime:
                 target
                 for target in remaining.targets
                 if target.requirement_id not in attempted
+                or (wait_for_completion and "ACQUISITION_TIMEOUT" in
+                    shared_execution.failures.get(target.requirement_id, ""))
             )
             if not remaining_targets:
                 return TargetedEnsureResult(
@@ -955,6 +1084,7 @@ class ResearchReadinessRuntime:
                 jurisdiction=jurisdiction,
                 correlation_id=correlation_id,
                 identity_headers=identity_headers,
+                wait_for_completion=wait_for_completion,
             )
         )
         flight = _EnsureFlight(task, target_ids)
@@ -965,7 +1095,15 @@ class ResearchReadinessRuntime:
                 self._flights.pop(global_instrument_id, None)
 
         task.add_done_callback(cleanup)
-        execution = await asyncio.shield(task)
+        try:
+            execution = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if wait_for_completion:
+                # The creating background cycle owns its plan's lifetime.
+                # Followers above remain shielded and cannot cancel the owner.
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
         recorder = getattr(self.repository, "record_acquisition_observation", None)
         if callable(recorder):
             for target in plan.targets:
@@ -973,6 +1111,8 @@ class ResearchReadinessRuntime:
                 await recorder(global_instrument_id, target.requirement_id, "READINESS_EXECUTOR",
                     "FAILED" if failure else "COMPLETED", datetime.now(timezone.utc), failure_reason=failure)
         readiness = await self.read(global_instrument_id, jurisdiction=jurisdiction)
+        logger.info("readiness_re_evaluated globalInstrumentId=%s source=DURABLE acquisitionCompleted=true",
+                    global_instrument_id)
         return TargetedEnsureResult(
             readiness,
             planned_ids,
@@ -987,8 +1127,45 @@ class ResearchReadinessRuntime:
         jurisdiction: str,
         correlation_id: str | None,
         identity_headers: Mapping[str, str | None] | None,
+        wait_for_completion: bool = False,
     ) -> _PlanExecutionResult:
         progress = CapabilityExecutionProgress()
+        if wait_for_completion:
+            # A persisted background opportunity job owns completion. The API
+            # latency budget is an observation interval, not its job lifetime.
+            # Existing network/document/provider limits still bound operations;
+            # do not pass the expired interactive deadline into later targets.
+            task = asyncio.create_task(self._execute_plan(
+                plan, jurisdiction=jurisdiction, correlation_id=correlation_id,
+                identity_headers=identity_headers, progress=progress, deadline=None))
+            logger.info("acquisition_started globalInstrumentId=%s owner=BACKGROUND_CYCLE",
+                        plan.global_instrument_id)
+            try:
+                done, _ = await asyncio.wait({task}, timeout=self.ensure_timeout_seconds)
+                if not done:
+                    logger.info("orchestration_wait_expired globalInstrumentId=%s budgetSeconds=%s acquisitionState=RUNNING inFlight=%s",
+                                plan.global_instrument_id, self.ensure_timeout_seconds,
+                                [capability for capability in progress.executed_capabilities
+                                 if capability.rsplit(':', 1)[-1] not in progress.failures
+                                 and capability.rsplit(':', 1)[-1] not in progress.satisfied_requirement_ids])
+                result = await task
+                logger.info("acquisition_completed globalInstrumentId=%s failures=%d",
+                            plan.global_instrument_id, len(result.failures))
+                return result
+            finally:
+                # Runtime shutdown owns cancellation of its registered flight.
+                # Never orphan a child plan when that owner is cancelled.
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        # Deadline for interactive plan execution (initial planning and the
+        # final durable read are outside it), computed once so
+        # every target attempted inside a sequential per-target acquisition
+        # loop (see McpFirstResearchCapabilityExecutor.execute_primary) can
+        # tell how much of the SHARED budget genuinely remains, instead of
+        # each target assuming its own fresh per-call timeout independent of
+        # everything already attempted before it in the same plan.
+        deadline = asyncio.get_event_loop().time() + self.ensure_timeout_seconds
         try:
             async with asyncio.timeout(self.ensure_timeout_seconds):
                 return await self._execute_plan(
@@ -997,6 +1174,7 @@ class ResearchReadinessRuntime:
                     correlation_id=correlation_id,
                     identity_headers=identity_headers,
                     progress=progress,
+                    deadline=deadline,
                 )
         except TimeoutError:
             # The interactive route owns a smaller execution budget than the
@@ -1018,11 +1196,23 @@ class ResearchReadinessRuntime:
                         "ACQUISITION_TIMEOUT",
                     )
             self.data_source.finish_refresh(plan.global_instrument_id, failures)
+            # Best-effort: identify the capability still in flight (attempted
+            # but neither failed nor satisfied yet) when the timeout fired --
+            # this is the operation that actually consumed the remaining
+            # budget, which `requirements=` alone does not reveal (that field
+            # is a post-hoc re-read, not a record of what was executing).
+            in_flight = sorted(
+                capability for capability in progress.executed_capabilities
+                if capability.rsplit(':', 1)[-1] not in progress.failures
+                and capability.rsplit(':', 1)[-1] not in progress.satisfied_requirement_ids
+            )
             logger.warning(
                 "research_readiness_ensure_timeout globalInstrumentId=%s "
-                "budgetSeconds=%s requirements=%s",
+                "budgetSeconds=%s requested=%s inFlight=%s requirements=%s",
                 plan.global_instrument_id,
                 self.ensure_timeout_seconds,
+                sorted(target.requirement_id for target in plan.targets),
+                in_flight,
                 sorted(failures),
             )
             return _PlanExecutionResult(
@@ -1037,6 +1227,7 @@ class ResearchReadinessRuntime:
         correlation_id: str | None,
         identity_headers: Mapping[str, str | None] | None,
         progress: CapabilityExecutionProgress | None = None,
+        deadline: float | None = None,
     ) -> _PlanExecutionResult:
         ids = tuple(target.requirement_id for target in plan.targets)
         self.data_source.mark_refreshing(plan.global_instrument_id, ids)
@@ -1051,6 +1242,7 @@ class ResearchReadinessRuntime:
                 correlation_id=correlation_id,
                 identity_headers=identity_headers,
                 progress=progress,
+                deadline=deadline,
             )
             executed.extend(primary.executed_capabilities)
             if progress is not None:
@@ -1077,12 +1269,7 @@ class ResearchReadinessRuntime:
             if target.requirement_id in completed:
                 continue
             result = after_primary.for_requirement(target.requirement_id)
-            if result.status not in {
-                ResearchRequirementStatus.MISSING,
-                ResearchRequirementStatus.PARTIAL,
-                ResearchRequirementStatus.CONFLICTING,
-                ResearchRequirementStatus.FAILED,
-            }:
+            if result.status not in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
                 continue
             if target.authority_policy.fallback_policy.permits(result.status):
                 unresolved.append(target)
@@ -1117,12 +1304,7 @@ class ResearchReadinessRuntime:
 
     @staticmethod
     def _requires_acquisition(status: ResearchRequirementStatus) -> bool:
-        return status in {
-            ResearchRequirementStatus.MISSING,
-            ResearchRequirementStatus.PARTIAL,
-            ResearchRequirementStatus.CONFLICTING,
-            ResearchRequirementStatus.FAILED,
-        }
+        return status in REQUIREMENT_STATUSES_NEEDING_ACQUISITION
 
     def _validated_requirement_ids(
         self, requirement_ids: Sequence[str] | None
@@ -1153,6 +1335,68 @@ class ResearchReadinessRuntime:
         return tuple(dict.fromkeys(expanded))
 
 
+def _document_diagnostic(document, facts, events, shareholding=()):
+    import re
+    from app.repository import _official_filing_content_type_unsupported
+    qualitative = {"GOVERNANCE_HISTORY": [], "SECTOR_MACRO": []}
+    RepositoryResearchReadinessAdapter._append_documents(qualitative, [document])
+    qualitative_count = sum(len(rows) for rows in qualitative.values())
+    extracted_text = re.sub(r"\[PDF_PAGE \d+\]", "", document.normalized_text or "").strip()
+    fact_count = sum(fact.source_identity == str(document.document_id) for fact in facts)
+    event_count = sum(event.source_document_id == document.document_id for event in events)
+    shareholding_count = sum(snapshot.research_document_id == document.document_id for snapshot in shareholding)
+    if _official_filing_content_type_unsupported(document.canonical_url):
+        state = "UNSUPPORTED_DOCUMENT"
+    elif document.status == DocumentStatus.FAILED:
+        state = "EXTRACTION_FAILED" if extracted_text else "NO_EXTRACTABLE_TEXT"
+    elif fact_count or event_count or shareholding_count or qualitative_count:
+        state = "PROCESSED_WITH_EVIDENCE"
+    elif not extracted_text:
+        state = "NO_EXTRACTABLE_TEXT"
+    elif document.status == DocumentStatus.PROCESSED:
+        state = "PROCESSED_NO_RELEVANT_EVIDENCE"
+    else:
+        state = str(document.status)
+    return {"documentId": str(document.document_id), "sourceUrl": document.canonical_url,
+        "state": state, "normalizedTextAvailable": bool(extracted_text), "financialFactCount": fact_count, "eventCount": event_count, "shareholdingSnapshotCount": shareholding_count, "qualitativeEvidenceCount": qualitative_count}
+
+
+def _evidence_state(item):
+    if item.status == ResearchRequirementStatus.NOT_APPLICABLE:
+        return "NOT_APPLICABLE"
+    reason = item.missing_reason or ""
+    if item.status in {ResearchRequirementStatus.FAILED, ResearchRequirementStatus.MISSING} and "UNAVAILABLE" in reason:
+        return "SOURCE_UNAVAILABLE"
+    return {"READY_FRESH": "READY", "READY_STALE": "STALE"}.get(item.status.value, item.status.value)
+
+
+def _acquisition_diagnostics(item):
+    states = []
+    if item.applicability == "NOT_APPLICABLE":
+        return ["NOT_APPLICABLE"]
+    if item.applicability == "UNKNOWN" or any(d.state == "UNKNOWN" for d in item.concept_applicability.values()):
+        states.append("UNKNOWN_APPLICABILITY")
+    for row in (item.acquisition_observation or {}).get("history", []):
+        if row.get("provider") == "READINESS_EXECUTOR":
+            continue
+        if row.get("provider") == "NSE":
+            states.append("AUTHORITATIVE_ATTEMPTED")
+            if row.get("outcome") in {"FAILED", "SUCCESS_EMPTY"}:
+                states.append("AUTHORITATIVE_UNAVAILABLE")
+        reason = str(row.get("failure_reason") or "")
+        if "TIMEOUT" in reason:
+            states.append("ACQUISITION_TIMEOUT")
+        elif "EXTRACTION" in reason:
+            states.append("EXTRACTION_FAILED")
+        elif "FETCH_FAILED" in reason:
+            states.append("DOCUMENT_FETCH_FAILED")
+        elif row.get("outcome") == "SUCCESS_EMPTY":
+            states.append("NO_USABLE_EVIDENCE")
+    if item.source_tier in {ResearchSourceTier.APPROVED_SECONDARY, ResearchSourceTier.LICENSED_STRUCTURED, ResearchSourceTier.APPROVED_EXTERNAL_TOOL} and item.evidence_ids:
+        states.append("SECONDARY_FALLBACK_USED")
+    return list(dict.fromkeys(states))
+
+
 def readiness_response(
     value: ResearchReadinessResult,
     registry: ResearchRequirementRegistry,
@@ -1170,6 +1414,8 @@ def readiness_response(
                 "importance": item.importance.value,
                 "mandatory": item.mandatory,
                 "status": item.status.value,
+                "evidenceState": _evidence_state(item),
+                "acquisitionDiagnostics": _acquisition_diagnostics(item),
                 "applicability": item.applicability,
                 "applicabilityReason": item.applicability_reason,
                 "businessClassification": item.classification,
@@ -1198,12 +1444,20 @@ def readiness_response(
                 "evidenceIds": list(item.evidence_ids),
                 "coveredInputIds": list(item.covered_input_ids),
                 "missingInputIds": list(item.missing_input_ids),
+                "subrequirements": {
+                    concept: {
+                        "applicability": decision.state,
+                        "reason": decision.reason,
+                        "evidenceState": item.concept_evidence_states.get(concept, "MISSING"),
+                        "covered": CONCEPT_INPUTS[concept] in item.covered_input_ids,
+                    } for concept, decision in item.concept_applicability.items()
+                },
                 "concreteRequirements": [
                     {
                         "inputId": input_.input_id,
                         "importance": input_.importance.value,
                         "covered": input_.input_id in item.covered_input_ids,
-                        "applicability": "NOT_APPLICABLE" if item.applicability == "NOT_APPLICABLE" or input_.input_id in item.not_applicable_input_reasons else "APPLICABLE",
+                        "applicability": "NOT_APPLICABLE" if item.applicability == "NOT_APPLICABLE" or input_.input_id in item.not_applicable_input_reasons else next((decision.state for concept, decision in item.concept_applicability.items() if CONCEPT_INPUTS[concept] == input_.input_id), item.applicability if item.applicability == "UNKNOWN" else "APPLICABLE"),
                         "applicabilityReason": item.not_applicable_input_reasons.get(input_.input_id) or (item.applicability_reason if item.applicability == "NOT_APPLICABLE" else None),
                     }
                     for input_ in contract.inputs
@@ -1224,6 +1478,7 @@ def readiness_response(
         "confidencePct": value.confidence_pct,
         "generatedAt": value.generated_at.isoformat(),
         "requirements": requirements,
+        "documentDiagnostics": list(value.document_diagnostics),
     }
     if ensure is not None:
         response["refreshState"] = {
@@ -1339,6 +1594,10 @@ def _structured_fact_coverage(
         add("VALUATION_INPUTS", "FCF_YIELD")
     if fact_name == "roe":
         add("BUSINESS_QUALITY_FACTS", "ROE")
+    if fact_name == "roce":
+        # Statement-derived structured ROCE is consumed by the quality rules;
+        # readiness must see the same input it scores.
+        add("BUSINESS_QUALITY_FACTS", "ROCE")
     if fact_name in {"profitMargin", "operatingMargin"}:
         add("BUSINESS_QUALITY_FACTS", "MARGINS")
     if fact_name in {"freeCashFlow", "operatingCashFlow"}:
@@ -1393,7 +1652,7 @@ def _evidence_from_financial_fact(
         source_url=fact.value.source_url,
         covered_input_ids=covered_input_ids,
         valid_until=(as_of + timedelta(days=120 if fact.key.period_type == "QUARTERLY" else 400)
-            if requirement_id == "VALUATION_INPUTS" and as_of and fact.key.period_type in {"QUARTERLY", "ANNUAL"} else None),
+            if requirement_id in ("VALUATION_INPUTS", "BALANCE_SHEET_FACTS") and as_of and fact.key.period_type in {"QUARTERLY", "ANNUAL"} else None),
     )
 
 
@@ -1508,7 +1767,15 @@ def _document_source(
 def _event_source(
     event: ResearchEvent, requirement_id: str
 ) -> tuple[str, ResearchSourceTier]:
-    if str(event.independence_key or "").startswith("YAHOO_FINANCE_MCP:"):
+    # independence_key is a fixed-width CHAR(64) SHA-256 hex digest (see
+    # YahooMcpResultPersister._persist_article), not a readable "PROVIDER:..."
+    # string, so provenance is verified by recomputing the same
+    # content_hash(...) over this event's own source_url with the Yahoo MCP
+    # convention's exact prefix/casefold shape, rather than string-matching a
+    # literal prefix that no longer exists in the stored value.
+    if event.independence_key and event.independence_key == content_hash(
+        f"YAHOO_FINANCE_MCP:{(event.source_url or '').casefold()}"
+    ):
         return "APPROVED_EXTERNAL_TOOL", ResearchSourceTier.APPROVED_EXTERNAL_TOOL
     host = (urlparse(event.source_url).hostname or "").casefold()
     if event.source_classification == SourceClassification.EXCHANGE:
@@ -1537,6 +1804,37 @@ def _structured_source_tier(provider: str) -> ResearchSourceTier:
     if normalized == "EODHD":
         return ResearchSourceTier.LICENSED_STRUCTURED
     return ResearchSourceTier.APPROVED_SECONDARY
+
+
+def _structured_sector_fact(
+    structured: Sequence[StructuredMarketSnapshotRecord],
+) -> tuple[str, str, ResearchSourceTier, datetime] | None:
+    """Best available structured-market 'sector' fact, if any: (value,
+    source, source_tier, fact_time). Used only as a fallback when canonical
+    registry metadata has no sector at all -- see _append_canonical_sector.
+    Prefers the same ordering already used for applicability's sector
+    derivation above: OFFICIAL-tier providers first, then most recently
+    retrieved. Only an actual 'sector' fact is used; industry is never
+    substituted in.
+    """
+    for record in sorted(
+        structured,
+        key=lambda record: (
+            int(_structured_source_tier(record.provider) != ResearchSourceTier.OFFICIAL),
+            -record.retrieved_at.timestamp(),
+        ),
+    ):
+        fact = record.snapshot.facts.get("sector")
+        if fact is None or fact.value in (None, ""):
+            continue
+        fact_time = fact.retrieved_at or record.retrieved_at
+        return (
+            str(fact.value),
+            _market_source(record.provider),
+            _structured_source_tier(record.provider),
+            fact_time,
+        )
+    return None
 
 
 def _market_source(provider: str) -> str:
@@ -1605,6 +1903,33 @@ def _fingerprint(value: Any) -> str | None:
 
 def _date_key(value: datetime | None) -> str:
     return value.astimezone(timezone.utc).isoformat() if value is not None else "UNKNOWN"
+
+
+def _completed_authoritative_check(history: Sequence[Mapping[str, Any]]) -> datetime | None:
+    """Time of the latest authoritative (NSE) check when it completed.
+
+    SUCCESS (qualifying events found) and SUCCESS_EMPTY (check completed, no
+    qualifying event) both mean the check ran; FAILED, a missing observation
+    or an executor-only row never count as a completed check.
+    """
+    rows = [row for row in history if row.get("provider") == "NSE"
+            and _aware_datetime(row.get("observed_at")) is not None]
+    if not rows:
+        return None
+    latest = max(rows, key=lambda row: _aware_datetime(row.get("observed_at")))
+    if latest.get("outcome") not in {"SUCCESS", "SUCCESS_EMPTY"}:
+        return None
+    return _aware_datetime(latest.get("observed_at"))
+
+
+def _incomplete_news_search_reason(outcome: Any) -> str | None:
+    run = outcome[0] if isinstance(outcome, tuple) and outcome else outcome
+    state = getattr(run, "outcome", None)
+    if state not in {"SEARCH_PARTIAL", "SEARCH_FAILED"}:
+        return None
+    codes = sorted({provider.failure_code for provider in getattr(run, "providers", ())
+                    if getattr(provider, "failure_code", None)})
+    return "|".join(codes) if codes else "SEARCH_PROVIDER_UNAVAILABLE"
 
 
 def _is_india(profile: CompanyResearchProfile) -> bool:

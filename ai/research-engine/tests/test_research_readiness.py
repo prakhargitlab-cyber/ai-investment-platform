@@ -208,9 +208,10 @@ def test_mandatory_and_optional_distinction_is_retained_by_planner() -> None:
     _, readiness, plan = assess(complete_snapshot(omit={"LATEST_PRICE", "SHAREHOLDING"}))
 
     assert readiness.for_requirement("LATEST_PRICE").mandatory is True
-    assert readiness.for_requirement("SHAREHOLDING").mandatory is False
+    # Full-research contract: stock-level shareholding is mandatory and planned.
+    assert readiness.for_requirement("SHAREHOLDING").mandatory is True
     assert readiness.for_requirement("SHAREHOLDING").status == ResearchRequirementStatus.MISSING
-    assert target_ids(plan) == {"LATEST_PRICE"}
+    assert target_ids(plan) == {"LATEST_PRICE", "SHAREHOLDING"}
 
 
 def test_current_news_older_than_thirty_days_is_excluded_but_not_deleted() -> None:
@@ -233,7 +234,9 @@ def test_current_news_older_than_thirty_days_is_excluded_but_not_deleted() -> No
         requirement, (boundary_news,), policy, NOW
     ) == (boundary_news,)
     assert snapshot.evidence_for("CURRENT_NEWS") == (old_news,)
-    assert target_ids(plan) == set()  # News is optional; explicit news refresh remains supported.
+    # Full-research contract: a mandatory current-news check with no in-window
+    # evidence is planned (never silently satisfied by stale evidence).
+    assert target_ids(plan) == {"CURRENT_NEWS"}
 
 
 def test_old_unresolved_governance_evidence_remains_queryable_and_ready() -> None:

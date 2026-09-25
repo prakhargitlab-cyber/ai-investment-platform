@@ -140,7 +140,7 @@ test("shareholding drawers resolve the current portfolio company by instrumentId
   assert.match(workspace, /researchInstrumentId: research\?\.instrumentId \?\? position\.instrument\.globalInstrumentId/);
   assert.match(workspace, /portfolioResearch\?\.companies\.find\(\(company\) => company\.instrumentId === detail\.researchInstrumentId\)/);
   assert.match(workspace, /researchInstrumentId: company\.instrumentId/);
-  assert.match(workspace, /portfolioResearchSummary\?\.companies\.find\(\(company\) => company\.instrumentId === researchDetail\.researchInstrumentId\)/);
+  assert.match(workspace, /portfolioResearchSummary\?\.companies\.find\(\s*\(company\) => company\.instrumentId === researchDetail\.researchInstrumentId\s*\)/);
   assert.doesNotMatch(workspace, /setResearchDetail\(\{ position: holding, research: company \}\)/);
 });
 

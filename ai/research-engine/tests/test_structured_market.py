@@ -455,3 +455,118 @@ async def test_financial_issuer_reported_statements_are_preserved_without_indust
     assert {row["periodType"] for row in snapshot.statement_facts} == {"ANNUAL", "QUARTERLY"}
     assert all(row["sourceUrl"].endswith("EXCHANGE.NS") for row in snapshot.statement_facts)
     assert "roce" not in snapshot.facts
+
+
+# --- DI-6: COMPANY_NOT_RESOLVED root-cause diagnostics (Gate 2) ---------------
+
+
+@pytest.mark.asyncio
+async def test_H_no_usable_identity_reports_missing_identity_reason():
+    with pytest.raises(StructuredProviderError, match="COMPANY_NOT_RESOLVED:MISSING_IDENTITY"):
+        await provider(lambda request: response({"quotes": []})).resolve_instrument(
+            instrument(canonicalName="", isin="", canonicalSymbol="", brokerSymbol="")
+        )
+
+
+@pytest.mark.asyncio
+async def test_I_zero_candidates_reports_no_candidates_reason():
+    with pytest.raises(StructuredProviderError, match="COMPANY_NOT_RESOLVED:NO_CANDIDATES"):
+        await provider(lambda request: response({"quotes": []})).resolve_instrument(instrument())
+
+
+@pytest.mark.asyncio
+async def test_J_low_confidence_candidate_reports_low_confidence_reason():
+    async_provider = provider(lambda request: response({"quotes": [
+        {"symbol": "ZENTEC.BO", "quoteType": "EQUITY", "longname": "Zen Technologies Limited",
+         "exchange": "BSE", "currency": "INR"}
+    ]}))
+    with pytest.raises(StructuredProviderError, match="COMPANY_NOT_RESOLVED:LOW_CONFIDENCE"):
+        await async_provider.resolve_instrument(instrument(canonicalExchange="NSE"))
+
+
+@pytest.mark.asyncio
+async def test_K_exact_trusted_nse_symbol_not_found_reports_reason():
+    async_provider = provider(lambda request: response({"quotes": []}))
+    held = instrument(canonicalName="Generic Components Limited", isin="INE000A01010", canonicalExchange="NSE",
+                      structuredNseCandidateTicker="OFFICIAL.NS", structuredNseCandidateSource="VERIFIED_NSE")
+    with pytest.raises(StructuredProviderError, match="COMPANY_NOT_RESOLVED:EXACT_SYMBOL_NOT_FOUND"):
+        await async_provider.resolve_instrument(held)
+
+
+def test_L_existing_symbol_mismatch_reason_preserved():
+    # _resolve_verified_nse_candidate() only ever calls
+    # _trusted_nse_candidate_reason() on a quote already exact-matched by
+    # symbol (see its `matches` filter), so SYMBOL_MISMATCH is not reachable
+    # end-to-end through resolve_instrument() -- it is exercised directly
+    # here, exactly as tests/test_trusted_nse_candidate_isin_priority.py
+    # already does for this function.
+    from app.structured_market import _trusted_nse_candidate_reason
+    candidate = {"symbol": "DIFFERENT.NS", "quoteType": "EQUITY", "longname": "Generic Components Limited",
+                 "exchange": "NSE", "currency": "INR", "isin": "INE000A01010"}
+    held = instrument(canonicalName="Generic Components Limited", isin="INE000A01010", canonicalExchange="NSE")
+    assert _trusted_nse_candidate_reason(held, "Generic Components Limited", candidate, "OFFICIAL.NS") == "SYMBOL_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_M_existing_isin_mismatch_reason_preserved():
+    async_provider = provider(lambda request: response({"quotes": [
+        {"symbol": "OFFICIAL.NS", "quoteType": "EQUITY", "longname": "Generic Components Limited",
+         "exchange": "NSE", "currency": "INR", "isin": "INE999Z99999"}
+    ]}))
+    held = instrument(canonicalName="Generic Components Limited", isin="INE000A01010", canonicalExchange="NSE",
+                      structuredNseCandidateTicker="OFFICIAL.NS", structuredNseCandidateSource="VERIFIED_NSE")
+    with pytest.raises(StructuredProviderError, match="COMPANY_NOT_RESOLVED:ISIN_MISMATCH"):
+        await async_provider.resolve_instrument(held)
+
+
+@pytest.mark.asyncio
+async def test_N_existing_company_name_mismatch_reason_preserved():
+    async_provider = provider(lambda request: response({"quotes": [
+        {"symbol": "OFFICIAL.NS", "quoteType": "EQUITY", "longname": "Different Company Limited",
+         "exchange": "NSE", "currency": "INR"}
+    ]}))
+    held = instrument(canonicalName="Generic Components Limited", isin="INE000A01010", canonicalExchange="NSE",
+                      structuredNseCandidateTicker="OFFICIAL.NS", structuredNseCandidateSource="VERIFIED_NSE")
+    with pytest.raises(StructuredProviderError, match="COMPANY_NOT_RESOLVED:COMPANY_NAME_MISMATCH"):
+        await async_provider.resolve_instrument(held)
+
+
+@pytest.mark.asyncio
+async def test_O_exact_isin_match_resolves_despite_company_name_mismatch():
+    """Regression: the pre-existing exact-ISIN-priority behavior in
+    _trusted_nse_candidate_reason must still make resolve_instrument succeed
+    end-to-end when the ISIN matches exactly, even with a very different
+    company name -- DI-6 must not touch this precedence."""
+    async_provider = provider(lambda request: response({"quotes": [
+        {"symbol": "OFFICIAL.NS", "quoteType": "EQUITY", "longname": "Totally Different Trading Name Limited",
+         "exchange": "NSE", "currency": "INR", "isin": "INE000A01010"}
+    ]}))
+    held = instrument(canonicalName="Generic Components Limited", isin="INE000A01010", canonicalExchange="NSE",
+                      structuredNseCandidateTicker="OFFICIAL.NS", structuredNseCandidateSource="VERIFIED_NSE")
+    resolution = await async_provider.resolve_instrument(held)
+    assert resolution.status == "VERIFIED_NSE_CANDIDATE"
+    assert resolution.provider_ticker == "OFFICIAL.NS"
+
+
+@pytest.mark.asyncio
+async def test_P_verified_nse_candidate_provider_failure_remains_unavailable_not_company_not_resolved():
+    """Regression: the HTTP-exception path in _resolve_verified_nse_candidate
+    is out of DI-6's scope and must keep raising the bare, unsuffixed
+    STRUCTURED_PROVIDER_UNAVAILABLE -- never a COMPANY_NOT_RESOLVED reason."""
+    def handler(request):
+        raise httpx.ConnectError("boom", request=request)
+    async_provider = provider(handler)
+    held = instrument(structuredNseCandidateTicker="OFFICIAL.NS", structuredNseCandidateSource="VERIFIED_NSE")
+    with pytest.raises(StructuredProviderError, match="STRUCTURED_PROVIDER_UNAVAILABLE"):
+        await async_provider.resolve_instrument(held)
+
+
+@pytest.mark.asyncio
+async def test_Q_successful_resolution_behavior_is_unchanged_by_diagnostic_enhancement():
+    def handler(request):
+        return response({"quotes": [{"symbol": "ZENTEC.NS", "quoteType": "EQUITY",
+                                     "longname": "Zen Technologies Limited", "exchange": "NSE", "currency": "INR"}]})
+    resolution = await provider(handler).resolve_instrument(instrument())
+    assert resolution.provider_ticker == "ZENTEC.NS"
+    assert resolution.quote_type == "EQUITY"
+    assert resolution.confidence > 0

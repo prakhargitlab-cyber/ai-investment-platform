@@ -50,7 +50,17 @@ public class CanonicalIdentityBootstrap {
                         log.warn("canonical_identity_bootstrap event=CANONICAL_BOOTSTRAP_FAILED reason=AMBIGUOUS_OFFICIAL_IDENTITY symbol={}", row.symbol());
                         continue;
                     }
-                    try { instruments.canonicalizeOfficialNse(row.isin(), row.symbol(), row.companyName(), "NSE_OFFICIAL_ISIN_BOOTSTRAP"); }
+                    try {
+                        if ("IV".equalsIgnoreCase(row.series())) {
+                            // NSE's own series code already says this is an investment vehicle
+                            // (REIT/InvIT), not an operating company; classify it as such from the
+                            // start instead of defaulting to EQUITY and relying on a later,
+                            // provider-reported quoteType to correct it.
+                            instruments.canonicalizeOfficialInvestmentVehicle(row.isin(), row.symbol(), row.companyName());
+                        } else {
+                            instruments.canonicalizeOfficialNse(row.isin(), row.symbol(), row.companyName(), "NSE_OFFICIAL_ISIN_BOOTSTRAP");
+                        }
+                    }
                     catch (RuntimeException rejected) { log.warn("canonical_identity_bootstrap event=CANONICAL_BOOTSTRAP_FAILED reason=IDENTITY_REJECTED symbol={}", row.symbol()); }
                 }
                 store.universeLoaded(now);

@@ -69,7 +69,7 @@ test("drawer projection reads durable provider identity, sector, industry, and m
   const drawer = workspace.slice(drawerStart, drawerEnd);
   assert.match(drawer, /market\?\.resolution\.providerTicker/);
   assert.match(workspace, /research\?\.structuredMarket\?\.facts\[key\]/);
-  assert.match(drawer, /research\?\.valuation\.state/);
+  assert.match(drawer, /research\?\.valuation\?\.state/);
   assert.match(drawer, /structuredFact\(research, "sector"\)/);
   assert.match(drawer, /structuredFact\(research, "industry"\)/);
   assert.match(drawer, /structuredFact\(research, "latestPrice"\)/);

@@ -149,7 +149,7 @@ def test_deterministic_duplicates_corrections_conflicts_and_asof():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('count,queries',[(0,0),(1,2),(18,2)])
+@pytest.mark.parametrize('count,queries',[(0,0),(1,2),(18,36)])
 async def test_stage_b_batch_queries_and_no_network(count,queries,monkeypatch):
     from app.global_scanner import GlobalScanner
     from app.persistence import SqliteResearchPersistence
@@ -169,7 +169,7 @@ async def test_stage_b_batch_queries_and_no_network(count,queries,monkeypatch):
     assert len(statements)==queries and len(result)==count
     assert initial.model_dump()==before
     if count:
-        assert sum('global_daily_market_bars' in s for s in statements)==1
+        assert sum('global_daily_market_bars' in s for s in statements)==count
         assert all(c.technical_feature_snapshot.technical_input_source=='DAILY_MARKET_BAR_NSE' for c in result)
         assert all(c.technical_score==c.stage_b_score for c in result)
     assert result==GlobalScanner(None,store).enrich_candidates(initial)

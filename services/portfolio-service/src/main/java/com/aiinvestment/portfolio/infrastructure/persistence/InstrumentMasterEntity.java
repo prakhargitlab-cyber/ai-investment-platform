@@ -47,8 +47,16 @@ public class InstrumentMasterEntity {
         if (officialName != null && !officialName.isBlank()) this.canonicalName = officialName.trim();
         this.updatedAt = Instant.now();
     }
+    /**
+     * Refines the asset type from a stronger, later piece of evidence (an authoritative NSE-native
+     * source, or a provider-reported quoteType). Deliberately one-directional and sticky: it only
+     * ever moves the type AWAY from the ingestion-time EQUITY default, and once it has moved away
+     * (to ETF, OTHER, or anything else), further calls are no-ops. This guarantees a non-operating
+     * security (ETF/REIT/InvIT) that has been correctly classified can never be flipped back to
+     * EQUITY by a later, weaker or mistaken signal (e.g. a provider quoteType heuristic).
+     */
     public void applyValidatedAssetType(AssetType validatedType) {
-        if (validatedType != null && validatedType != this.assetType) {
+        if (validatedType != null && this.assetType == AssetType.EQUITY && validatedType != this.assetType) {
             this.assetType = validatedType;
             this.updatedAt = Instant.now();
         }

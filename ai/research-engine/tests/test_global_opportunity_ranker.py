@@ -16,7 +16,7 @@ def inputs(n=1, core=80, tech=60, sector=40, confidence=90):
     key = UUID(int=n)
     technical = TechnicalFeatureSnapshot(global_instrument_id=key, as_of=NOW, configuration={},
         observation_count=200, history_readiness='FULL', technical_score=tech, confidence=80,
-        technical_state='UPTREND')
+        technical_state='UPTREND', latest_price=100)
     relative = SectorRelativeStrengthSnapshot(global_instrument_id=key, as_of=NOW, configuration={},
         relative_strength_score=sector, confidence=70,
         sector_state='NEUTRAL' if sector is not None else 'INSUFFICIENT_DATA')

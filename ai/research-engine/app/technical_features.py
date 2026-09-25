@@ -52,12 +52,20 @@ class TechnicalConfig:
     momentum_full_scale_pct: float = 20.0
     extension_penalty: float = 15.0
     volume_breakout_bonus: float = 5.0
+    # A fractal/pivot swing point needs this many strictly-lower (for a high) or
+    # strictly-higher (for a low) bars on BOTH sides to confirm -- 3 is a common
+    # swing-trading convention, tighter than 5 (less lag) and less noisy than 2.
+    # A candidate within the most recent `swing_pivot_window` observations is
+    # never confirmed: it needs that many later bars to exist first, which is
+    # what keeps this deterministic and free of look-ahead.
+    swing_pivot_window: int = 3
 
     def __post_init__(self):
         if (self.max_age_days < 1 or self.level_lookback < 2 or self.year_observations < 2
                 or len(self.return_lookbacks) != 5 or any(n < 1 for n in self.return_lookbacks)
                 or tuple(sorted(set(self.return_lookbacks))) != self.return_lookbacks
-                or len(self.score_weights) != 3 or sum(self.score_weights) <= 0):
+                or len(self.score_weights) != 3 or sum(self.score_weights) <= 0
+                or self.swing_pivot_window < 1):
             raise ValueError("Invalid feature lookbacks or weights")
         for name, value in asdict(self).items():
             numbers = value if isinstance(value, tuple) else (value,)
@@ -202,6 +210,19 @@ class TechnicalFeatureSnapshot(ResearchBaseModel):
     distance_to_resistance_pct: float | None = None
     higher_highs_higher_lows: bool | None = None
     lower_highs_lower_lows: bool | None = None
+    # Real fractal/pivot-confirmed swing structure (see swing_pivot_window),
+    # kept alongside the rolling-window booleans above rather than replacing
+    # them: those compare two adjacent 20-day windows' extrema, this compares
+    # actual confirmed local turning points.
+    latest_swing_high: float | None = None
+    previous_swing_high: float | None = None
+    latest_swing_low: float | None = None
+    previous_swing_low: float | None = None
+    swing_higher_high: bool | None = None
+    swing_lower_high: bool | None = None
+    swing_higher_low: bool | None = None
+    swing_lower_low: bool | None = None
+    market_structure_state: Literal["BULLISH", "BEARISH", "MIXED", "INSUFFICIENT_DATA"] = "INSUFFICIENT_DATA"
     breakout_state: str = "INSUFFICIENT_DATA"
     technical_state: TechnicalState = "INSUFFICIENT_DATA"
     technical_score: float | None = None
@@ -323,6 +344,29 @@ def _clamp(value: float) -> float:
     return min(100.0, max(0.0, value))
 
 
+def _confirmed_swing_points(prices: list[float], window: int) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """Deterministic fractal swing highs/lows: index i is a swing high only when
+    strictly greater than every one of the `window` bars on each side, and a
+    swing low only when strictly lower on each side. A flat plateau (a tie on
+    either side) confirms no pivot there rather than guessing a winner --
+    price has to actually turn, not merely stop rising, to register.
+
+    No look-ahead: a candidate at index i requires `window` bars to already
+    exist after it in `prices`, so nothing in the most recent `window`
+    observations is ever returned as confirmed -- exactly like a real trader
+    would not yet know a high held until price moved away from it.
+    """
+    highs, lows = [], []
+    n = len(prices)
+    for i in range(window, n - window):
+        left, right = prices[i - window:i], prices[i + 1:i + 1 + window]
+        if all(prices[i] > v for v in left) and all(prices[i] > v for v in right):
+            highs.append((i, prices[i]))
+        if all(prices[i] < v for v in left) and all(prices[i] < v for v in right):
+            lows.append((i, prices[i]))
+    return highs, lows
+
+
 class TechnicalFeatureEngine:
     def __init__(self, config: TechnicalConfig | None = None):
         self.config = config or TechnicalConfig()
@@ -414,6 +458,29 @@ class TechnicalFeatureEngine:
                 before, after = prices[-2*cfg.level_lookback:-cfg.level_lookback], prices[-cfg.level_lookback:]
                 result.higher_highs_higher_lows = max(after) > max(before) and min(after) > min(before)
                 result.lower_highs_lower_lows = max(after) < max(before) and min(after) < min(before)
+            if n >= cfg.swing_pivot_window * 2 + 1:
+                swing_highs, swing_lows = _confirmed_swing_points(prices, cfg.swing_pivot_window)
+                if swing_highs:
+                    result.latest_swing_high = swing_highs[-1][1]
+                if len(swing_highs) >= 2:
+                    result.previous_swing_high = swing_highs[-2][1]
+                if swing_lows:
+                    result.latest_swing_low = swing_lows[-1][1]
+                if len(swing_lows) >= 2:
+                    result.previous_swing_low = swing_lows[-2][1]
+                if result.latest_swing_high is not None and result.previous_swing_high is not None:
+                    result.swing_higher_high = result.latest_swing_high > result.previous_swing_high
+                    result.swing_lower_high = result.latest_swing_high < result.previous_swing_high
+                if result.latest_swing_low is not None and result.previous_swing_low is not None:
+                    result.swing_higher_low = result.latest_swing_low > result.previous_swing_low
+                    result.swing_lower_low = result.latest_swing_low < result.previous_swing_low
+                if result.swing_higher_high is not None and result.swing_higher_low is not None:
+                    if result.swing_higher_high and result.swing_higher_low:
+                        result.market_structure_state = "BULLISH"
+                    elif result.swing_lower_high and result.swing_lower_low:
+                        result.market_structure_state = "BEARISH"
+                    else:
+                        result.market_structure_state = "MIXED"
             if use_daily:
                 self._candles(result, rows, history.conflicting_dates)
             else:
@@ -423,7 +490,8 @@ class TechnicalFeatureEngine:
                 self._score(result)
         self._volume_signals(result)
         for name, minimum in [('RSI14', 15), ('MA20', 20), ('MA50', 50), ('MA100', 100), ('MA200', 200),
-                              ('BREAKOUT', cfg.level_lookback + 1)]:
+                              ('BREAKOUT', cfg.level_lookback + 1),
+                              ('SWING_STRUCTURE', cfg.swing_pivot_window * 2 + 1)]:
             result.feature_readiness[name] = 'AVAILABLE' if usable and n >= minimum else 'INSUFFICIENT_HISTORY'
         for name in ('ATR14', 'ADX14'):
             result.feature_readiness.setdefault(name, 'MISSING_OHLC')
@@ -440,6 +508,7 @@ class TechnicalFeatureEngine:
                          "volume_average20", "volume_ratio20", "support_level", "resistance_level",
                          "distance_to_support_pct", "distance_to_resistance_pct", "higher_highs_higher_lows",
                          "lower_highs_lower_lows", "distance_from52_week_high_pct", "distance_from52_week_low_pct",
+                         "latest_swing_high", "previous_swing_high", "latest_swing_low", "previous_swing_low",
                          *(f"distance_to_dma{p}_pct" for p in (20, 50, 100, 200))]
         for name in feature_names:
             alias = TechnicalFeatureSnapshot.model_fields[name].alias or name

@@ -55,7 +55,7 @@ test("clicking a visible stock opens read-only readiness without creating a hold
   assert.match(click, /openResearchReadiness\(stock\.globalInstrumentId, stock\.companyName\)/);
   assert.doesNotMatch(click, /ensureDefaultWatchlist|addWatchlistInstrument|prefetchVisible|ensureReadiness|createPortfolio|createPosition|addPosition|updateHolding/);
   assert.match(workspace, /held: false,[\s\S]*?quantity: 0/);
-  assert.match(workspace, /Qty 0 · Not held/);
+  assert.match(workspace, /Public company research · Not held/);
   const rowStart = workspace.indexOf("function MarketPerformanceRow");
   const rowEnd = workspace.indexOf("function PortfolioCreatePanel", rowStart);
   const row = workspace.slice(rowStart, rowEnd);

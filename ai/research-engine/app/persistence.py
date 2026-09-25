@@ -32,7 +32,7 @@ from app.models import (
     DailyMarketBar,
 )
 from app.settings import Settings
-from app.fact_precedence import FinancialFact, FinancialFactKey, FactSourceTier, merge_fact
+from app.fact_precedence import FinancialFact, FinancialFactKey, FactSourceTier, merge_fact, newer_official_disclosure
 from app.models import ProvenancedValue
 
 
@@ -50,6 +50,15 @@ class ResearchPersistence(Protocol):
     def load_documents(self) -> list[ResearchDocument]:
         ...
 
+    def load_document(self, document_id: UUID) -> ResearchDocument | None:
+        ...
+
+    def load_documents_by_ids(self, document_ids: list[UUID]) -> list[ResearchDocument]:
+        ...
+
+    def load_document_identities(self) -> list[tuple[UUID, UUID | None, str, str, str, datetime | None]]:
+        ...
+
     def load_events(self, instrument_ids: set[UUID] | None = None) -> list[ResearchEvent]:
         ...
 
@@ -61,8 +70,11 @@ class ResearchPersistence(Protocol):
         instrument_id: UUID,
         source_identity: str,
         facts: list[FinancialFact],
+        *,
+        allow_official_revision: bool = False,
+        complete_scopes: tuple = (),
     ) -> int:
-        """Atomically replace facts owned by one persisted source document."""
+        """Atomically upsert source facts and reconcile explicitly complete scopes."""
         ...
 
     def upsert_event(self, event: ResearchEvent) -> bool:
@@ -122,7 +134,7 @@ class ResearchPersistence(Protocol):
 
 class DisabledResearchPersistence:
     def opportunity_current(self):
-        return dict(generated_at=None, best_buy_today=None, top_short_term=[], top_long_term=[], previous_recommendations=[])
+        return dict(generated_at=None, best_buy_today=None, top_short_term=[], top_long_term=[], top_exit=[], previous_recommendations=[])
 
     def recommendation_history(self, instrument_id=None): return []
     def recommendation_states(self): return []
@@ -131,6 +143,19 @@ class DisabledResearchPersistence:
     def __init__(self) -> None:
         self._stock_rule_engine_results: dict[tuple[str, str, str], dict[str, Any]] = {}
     def load_documents(self) -> list[ResearchDocument]:
+        return []
+
+    def load_document(self, document_id: UUID) -> ResearchDocument | None:
+        return None
+
+    # Nothing is stored: the in-memory copy of a document is the only copy,
+    # so the repository must never evict it (see app/document_cache.py).
+    durable_documents = False
+
+    def load_documents_by_ids(self, document_ids: list[UUID]) -> list[ResearchDocument]:
+        return []
+
+    def load_document_identities(self) -> list[tuple[UUID, UUID | None, str, str, str, datetime | None]]:
         return []
 
     def load_events(self, instrument_ids: set[UUID] | None = None) -> list[ResearchEvent]:
@@ -188,12 +213,36 @@ class DisabledResearchPersistence:
         )
         self._stock_rule_engine_results.setdefault(key, dict(result))
 
+    def record_global_market_scan(self, scan):
+        return None
+
+    def global_market_scans(self):
+        return []
+
+    def persist_global_suggestion_lifecycle(self, scan, cards):
+        return None
+
+    def global_current_suggestions(self, *, horizon=None):
+        return []
+
+    def global_opportunity_radar(self):
+        # No persistence backend -- there is no cycle history to draw
+        # previous_recommendations from, so it is always [], matching
+        # opportunity_current()'s own empty-state fallback above.
+        return dict(best_buy_today=None, top_short_term=[], top_long_term=[],
+                    top_exit=[], top_short_term_count=0, top_long_term_count=0,
+                    top_exit_count=0, previous_recommendations=[], generated_at=None,
+                    last_processed_at=None, source_scan_id=None)
+
 
 from app.news_persistence import NewsPersistenceMixin, sqlite_schema as news_sqlite_schema
-from app.opportunity_persistence import OpportunityPersistenceMixin, SCHEMA as OPPORTUNITY_SCHEMA
+from app.opportunity_persistence import OpportunityPersistenceMixin, SCHEMA as OPPORTUNITY_SCHEMA, SUGGESTION_SCHEMA
+from app.cycle_checkpoint import CycleRunPersistenceMixin, SQLITE_SCHEMA as CYCLE_RUN_SCHEMA
+from app.macro_persistence import MacroPersistenceMixin, SQLITE_SCHEMA as MACRO_SCHEMA
+from app.macro_event_persistence import MacroEventPersistenceMixin, SQLITE_SCHEMA as MACRO_EVENT_SCHEMA
 
 
-class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixin):
+class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixin, CycleRunPersistenceMixin, MacroPersistenceMixin, MacroEventPersistenceMixin):
     def __init__(self, database_path: str | Path = ":memory:") -> None:
         self.database_path = str(database_path)
         self._connection = sqlite3.connect(self.database_path)
@@ -206,6 +255,14 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         self._connection.commit()
         news_sqlite_schema(self._connection)
         self._connection.executescript(OPPORTUNITY_SCHEMA)
+        self._connection.commit()
+        self._connection.executescript(SUGGESTION_SCHEMA)
+        self._connection.commit()
+        self._connection.executescript(CYCLE_RUN_SCHEMA)
+        self._connection.commit()
+        self._connection.executescript(MACRO_SCHEMA)
+        self._connection.commit()
+        self._connection.executescript(MACRO_EVENT_SCHEMA)
         self._connection.commit()
 
     def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None:
@@ -262,40 +319,49 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
             raise ValueError("Provider filter must be nonblank")
         ordered = sorted({str(UUID(str(value))) for value in instrument_ids})
         result = []
-        for offset in range(0, len(ordered), 500):
-            batch = ordered[offset:offset + 500]
-            params = list(batch)
-            sql = "SELECT * FROM global_daily_market_bars WHERE global_instrument_id IN (" + ",".join("?" for _ in batch) + ")"
-            if start_date is not None:
-                sql += " AND trading_date >= ?"
-                params.append(start_date.isoformat())
-            if end_date is not None:
-                sql += " AND trading_date <= ?"
-                params.append(end_date.isoformat())
-            if provider is not None:
-                sql += " AND provider = ?"
-                params.append(provider.strip())
-            sql += " ORDER BY global_instrument_id, trading_date, provider"
-            result.extend(_daily_market_bar_from_row(row) for row in self._connection.execute(sql, params).fetchall())
+        with self._connection:
+            for offset in range(0, len(ordered), 500):
+                batch = ordered[offset:offset + 500]
+                params = list(batch)
+                sql = "SELECT * FROM global_daily_market_bars WHERE global_instrument_id IN (" + ",".join("?" for _ in batch) + ")"
+                if start_date is not None:
+                    sql += " AND trading_date >= ?"
+                    params.append(start_date.isoformat())
+                if end_date is not None:
+                    sql += " AND trading_date <= ?"
+                    params.append(end_date.isoformat())
+                if provider is not None:
+                    sql += " AND provider = ?"
+                    params.append(provider.strip())
+                sql += " ORDER BY global_instrument_id, trading_date, provider"
+                result.extend(_daily_market_bar_from_row(row) for row in self._connection.execute(sql, params).fetchall())
         # Sort once more for identical ordering across database collations.
         return sorted(result, key=lambda bar: (str(bar.global_instrument_id), bar.trading_date, bar.provider))
 
     def _filtered_rows(self, table, ids, *, column="instrument_id", order=None):
-        """Internal identifiers only; values are parameterized in bounded batches."""
-        if ids is not None:
-            ordered = sorted({str(value) for value in ids})
-            rows = []
-            for offset in range(0, len(ordered), 500):
-                batch = ordered[offset:offset + 500]
-                sql = f"SELECT * FROM {table} WHERE {column} IN ({','.join('?' for _ in batch)})"
-                if order:
-                    sql += f" ORDER BY {order}"
-                rows.extend(self._connection.execute(sql, batch).fetchall())
-            return rows
-        sql = f"SELECT * FROM {table}"
-        if order:
-            sql += f" ORDER BY {order}"
-        return self._connection.execute(sql).fetchall()
+        """Internal identifiers only; values are parameterized in bounded batches.
+
+        Read-only: wrapped in ``with self._connection`` so the implicit psycopg
+        transaction (autocommit=False) opened by the first SELECT is committed on
+        return -- otherwise the long-lived connection is left ``idle in
+        transaction`` (DI-16B). Reuses the commit/rollback boundary the write
+        methods already use via ``with self._connection``.
+        """
+        with self._connection:
+            if ids is not None:
+                ordered = sorted({str(value) for value in ids})
+                rows = []
+                for offset in range(0, len(ordered), 500):
+                    batch = ordered[offset:offset + 500]
+                    sql = f"SELECT * FROM {table} WHERE {column} IN ({','.join('?' for _ in batch)})"
+                    if order:
+                        sql += f" ORDER BY {order}"
+                    rows.extend(self._connection.execute(sql, batch).fetchall())
+                return rows
+            sql = f"SELECT * FROM {table}"
+            if order:
+                sql += f" ORDER BY {order}"
+            return self._connection.execute(sql).fetchall()
 
     def load_financial_facts(self, instrument_ids: set[UUID] | None = None) -> list[FinancialFact]:
         return [_financial_fact_from_row(row) for row in self._filtered_rows("global_financial_facts", instrument_ids)]
@@ -316,18 +382,35 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         instrument_id: UUID,
         source_identity: str,
         facts: list[FinancialFact],
+        *,
+        allow_official_revision: bool = False,
+        complete_scopes: tuple = (),
     ) -> int:
-        """Make one document's owned fact set equal its validated parser output.
+        """Upsert validated output; delete only inside explicit complete scopes.
 
         The source identity is the durable ``research_documents.document_id``.
         Facts owned by other documents can share a semantic key but are never
-        replaced or deleted merely because this document is reconciled.
+        replaced or deleted merely because this document is reconciled. An
+        explicitly authorized newer official revision may replace comparable
+        keys; obsolete-key deletion remains restricted to this source.
         """
-        if not source_identity or not facts:
-            raise ValueError("A non-empty, source-owned financial fact set is required")
+        if not source_identity:
+            raise ValueError("A source-owned financial fact set is required")
+        if not facts:
+            return 0
         if any(fact.key.instrument_id != instrument_id or fact.source_identity != source_identity for fact in facts):
             raise ValueError("Document reconciliation facts must share instrument and source identity")
         incoming = {fact.key: fact for fact in facts}
+        if len(incoming) != len(facts):
+            raise ValueError("Duplicate financial fact identities must be resolved before persistence")
+        from app.financial_projection import FinancialReconciliationScope
+        if any(not isinstance(scope, FinancialReconciliationScope) for scope in complete_scopes):
+            raise ValueError("Explicit financial reconciliation scopes are required")
+        # A scope cannot authorize deleting stronger evidence or use a wholly
+        # empty family as evidence of completeness.
+        authorized_scopes = tuple(scope for scope in complete_scopes if any(
+            scope.contains(fact.key) and fact.source_tier == FactSourceTier.OFFICIAL_NSE
+            and fact.source_provider == "NSE" and fact.source_mode == SourceMode.REAL for fact in facts))
         written = 0
         with self._connection:
             owned_rows = self._connection.execute(
@@ -348,13 +431,24 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                     allow_same_tier_correction=(
                         existing is not None
                         and existing.source_tier == FactSourceTier.OFFICIAL_NSE
-                        and existing.source_identity == source_identity
+                        and (existing.source_identity == source_identity
+                             or (allow_official_revision and newer_official_disclosure(existing, fact)))
                     ),
                 )
                 if accepted is fact:
+                    transient = {"as_of_date", "period", "calculation_basis"}
+                    if existing is not None and (existing.key, existing.value.model_dump(exclude=transient),
+                            existing.source_identity, existing.source_tier, existing.source_provider, existing.source_mode) == (
+                            fact.key, fact.value.model_dump(exclude=transient), fact.source_identity, fact.source_tier,
+                            fact.source_provider, fact.source_mode):
+                        continue
                     self._write_financial_fact(fact)
                     written += 1
             for key in set(owned) - set(incoming):
+                if (owned[key].source_tier != FactSourceTier.OFFICIAL_NSE or owned[key].source_provider != "NSE"
+                        or owned[key].source_mode != SourceMode.REAL
+                        or not any(scope.contains(key) for scope in authorized_scopes)):
+                    continue
                 self._connection.execute(
                     "DELETE FROM global_financial_facts WHERE instrument_id=? AND metric=? AND period_end=? AND period_type=? AND reporting_basis=? AND source_identity=?",
                     (str(key.instrument_id), key.metric, key.period_end or "", key.period_type, key.reporting_basis or "", source_identity),
@@ -376,7 +470,9 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         if instrument_ids:
             sql += " WHERE instrument_id IN (" + ",".join("?" for _ in instrument_ids) + ")"
             params = [str(value) for value in instrument_ids]
-        return [_structured_snapshot_from_row(row) for row in self._connection.execute(sql, params).fetchall()]
+        with self._connection:
+            rows = self._connection.execute(sql, params).fetchall()
+        return [_structured_snapshot_from_row(row) for row in rows]
 
     def upsert_structured_market_snapshot(self, record: StructuredMarketSnapshotRecord) -> None:
         payload = record.snapshot.model_dump(mode="json")
@@ -413,23 +509,26 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
             sql += " WHERE instrument_id IN (" + ",".join("?" for _ in instrument_ids) + ")"
             params = [str(value) for value in instrument_ids]
         sql += " ORDER BY observed_at"
+        with self._connection:
+            rows = self._connection.execute(sql, params).fetchall()
         return [MarketPriceObservation(instrument_id=_required_uuid(row["instrument_id"], "global_market_price_observations.instrument_id"),
             observed_at=_parse_dt(row["observed_at"]) or datetime.now(timezone.utc), price=Decimal(str(row["price"])), currency=row["currency"],
             provider=row["provider"], source_url=row["source_url"], retrieved_at=_parse_dt(row["retrieved_at"]) or datetime.now(timezone.utc))
-            for row in self._connection.execute(sql, params).fetchall()]
+            for row in rows]
 
     def load_market_price_coverage(self, instrument_ids: set[UUID]) -> dict[UUID, tuple[datetime, datetime, int]]:
         if not instrument_ids:
             return {}
         placeholders = ",".join("?" for _ in instrument_ids)
-        rows = self._connection.execute(
-            f"""SELECT instrument_id, MIN(observed_at) AS first_observed_at,
-                MAX(observed_at) AS latest_observed_at, COUNT(*) AS observation_count
-                FROM global_market_price_observations
-                WHERE instrument_id IN ({placeholders}) AND CAST(price AS NUMERIC) > 0
-                GROUP BY instrument_id""",
-            [str(value) for value in instrument_ids],
-        ).fetchall()
+        with self._connection:
+            rows = self._connection.execute(
+                f"""SELECT instrument_id, MIN(observed_at) AS first_observed_at,
+                    MAX(observed_at) AS latest_observed_at, COUNT(*) AS observation_count
+                    FROM global_market_price_observations
+                    WHERE instrument_id IN ({placeholders}) AND CAST(price AS NUMERIC) > 0
+                    GROUP BY instrument_id""",
+                [str(value) for value in instrument_ids],
+            ).fetchall()
         coverage: dict[UUID, tuple[datetime, datetime, int]] = {}
         for row in rows:
             first = _parse_dt(row["first_observed_at"])
@@ -462,11 +561,12 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         rule_engine_version: str,
         input_fingerprint: str,
     ) -> dict[str, Any] | None:
-        row = self._connection.execute(
-            """SELECT result_json FROM global_stock_rule_engine_results
-               WHERE global_instrument_id=? AND rule_engine_version=? AND input_fingerprint=?""",
-            (str(global_instrument_id), rule_engine_version, input_fingerprint),
-        ).fetchone()
+        with self._connection:
+            row = self._connection.execute(
+                """SELECT result_json FROM global_stock_rule_engine_results
+                   WHERE global_instrument_id=? AND rule_engine_version=? AND input_fingerprint=?""",
+                (str(global_instrument_id), rule_engine_version, input_fingerprint),
+            ).fetchone()
         if row is None:
             return None
         payload = row["result_json"]
@@ -504,21 +604,67 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
 
     def load_market_schedules(self, markets: set[str] | None = None):
         from app.market_sessions import MarketTradingSchedule
-        rows = self._connection.execute("SELECT * FROM market_trading_schedules").fetchall()
+        with self._connection:
+            rows = self._connection.execute("SELECT * FROM market_trading_schedules").fetchall()
         values = [MarketTradingSchedule(row["market_code"], row["mic"], row["country_code"], row["timezone"], int(row["trading_day"]),
             _parse_sql_time(row["regular_open_time"]), _parse_sql_time(row["regular_close_time"]), bool(row["enabled"])) for row in rows]
         return [value for value in values if not markets or value.market_code in markets or value.mic in markets]
 
     def load_market_calendar_exceptions(self, markets: set[str] | None = None):
         from app.market_sessions import MarketCalendarException
-        rows = self._connection.execute("SELECT * FROM market_trading_calendar_exceptions").fetchall()
+        with self._connection:
+            rows = self._connection.execute("SELECT * FROM market_trading_calendar_exceptions").fetchall()
         values = [MarketCalendarException(row["market_code"], date.fromisoformat(row["trading_date"]), row["exception_type"],
                   _parse_sql_time(row["open_time"]) if row["open_time"] else None, _parse_sql_time(row["close_time"]) if row["close_time"] else None, row["reason"]) for row in rows]
         return [value for value in values if not markets or value.market_code in markets]
 
     def load_documents(self) -> list[ResearchDocument]:
-        rows = self._connection.execute("SELECT * FROM research_documents ORDER BY retrieved_at").fetchall()
+        with self._connection:
+            rows = self._connection.execute("SELECT * FROM research_documents ORDER BY retrieved_at").fetchall()
         return [_document_from_row(row) for row in rows]
+
+    def load_document(self, document_id: UUID) -> ResearchDocument | None:
+        """Reload a single document from durable storage by id. Used by
+        ResearchRepository's bounded in-memory document cache to recover a
+        document that was evicted to bound process memory -- durable
+        storage remains the source of truth, so eviction never loses data,
+        it only trades a rare reload for a bounded memory footprint.
+        """
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM research_documents WHERE document_id = ? LIMIT 1", (str(document_id),)
+            ).fetchone()
+        return _document_from_row(row) if row is not None else None
+
+    def load_documents_by_ids(self, document_ids: list[UUID]) -> list[ResearchDocument]:
+        """Batched durable reload of evicted document bodies (bounded
+        parameter batches, one round trip per 500 ids)."""
+        return [_document_from_row(row) for row in self._filtered_rows(
+            "research_documents", set(document_ids), column="document_id")]
+
+    def load_document_identities(self) -> list[tuple[UUID, UUID | None, str, str, str, datetime | None]]:
+        """Cheap startup/dedup-seeding read: compact identity columns only,
+        never the (potentially large) normalized_text body -- rehydration
+        cost is independent of historical document size.
+        """
+        with self._connection:
+            rows = self._connection.execute(
+                "SELECT document_id, instrument_id, canonical_url, content_hash, source_mode, published_at, retrieved_at "
+                "FROM research_documents ORDER BY retrieved_at"
+            ).fetchall()
+        return [(_parse_uuid(row["document_id"]), _parse_uuid(row["instrument_id"]), row["canonical_url"], row["content_hash"],
+                 SourceMode(row["source_mode"]), _parse_dt(row["published_at"]) or _parse_dt(row["retrieved_at"]))
+                for row in rows]
+
+    def load_event_refresh_times(self) -> list[tuple[UUID | None, datetime | None]]:
+        """Compact startup read: latest event detection per instrument."""
+        with self._connection:
+            rows = self._connection.execute(
+                "SELECT instrument_id, MAX(detected_at) AS detected_at FROM research_events GROUP BY instrument_id"
+            ).fetchall()
+        return [(_parse_uuid(row["instrument_id"]),
+                 row["detected_at"] if isinstance(row["detected_at"], datetime) else _parse_dt(row["detected_at"]))
+                for row in rows]
 
     def load_events(self, instrument_ids: set[UUID] | None = None) -> list[ResearchEvent]:
         rows = self._filtered_rows("research_events", instrument_ids, order="detected_at")
@@ -606,7 +752,14 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                 (document.canonical_url, document.content_hash),
             ).fetchone()
             if existing:
-                document.duplicate_of_document_id = UUID(existing["document_id"])
+                # existing["document_id"] is a native uuid.UUID on PostgreSQL
+                # (psycopg3 adapts the `uuid` column type automatically) but a
+                # plain str on the SQLite test store -- UUID(...) unconditionally
+                # only handles the latter and raises AttributeError against the
+                # former. _required_uuid (the file's existing UUID-normalization
+                # helper, used throughout this module) accepts both without an
+                # unnecessary stringify/reparse round trip for the already-UUID case.
+                document.duplicate_of_document_id = _required_uuid(existing["document_id"], "research_documents.document_id")
                 # A later official discovery may know a high-value subtype for
                 # an attachment already stored as generic.  Enrich only the
                 # optional metadata; identity/deduplication remain URL/hash
@@ -634,15 +787,15 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                     _uuid(document.instrument_id),
                     str(document.source_type),
                     str(document.source_classification),
-                    document.source_name,
+                    _bounded(document.source_name, RESEARCH_DOCUMENT_COLUMN_LIMITS["source_name"]),
                     document.original_url,
                     document.canonical_url,
                     document.original_url,
                     str(document.document_type), document.document_subtype,
-                    document.title,
+                    _bounded(document.title, RESEARCH_DOCUMENT_COLUMN_LIMITS["title"]),
                     _dt(document.published_at),
                     _dt(document.retrieved_at),
-                    document.content_type,
+                    _bounded(document.content_type, RESEARCH_DOCUMENT_COLUMN_LIMITS["content_type"]),
                     document.content_hash,
                     str(document.source_mode),
                     document.freshness,
@@ -650,7 +803,7 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                     str(document.status),
                     document.entity_resolution_confidence,
                     _dt(document.discovered_at),
-                    document.discovery_provider,
+                    _bounded(document.discovery_provider, RESEARCH_DOCUMENT_COLUMN_LIMITS["discovery_provider"]),
                     document.source_independence_key,
                     _uuid(document.duplicate_of_document_id),
                     document.normalized_text,
@@ -736,7 +889,8 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         self._connection.commit()
 
     def load_acquisition_observations(self, instrument_id):
-        rows = self._connection.execute("SELECT * FROM research_acquisition_observations WHERE instrument_id=? ORDER BY observed_at", (str(instrument_id),)).fetchall()
+        with self._connection:
+            rows = self._connection.execute("SELECT * FROM research_acquisition_observations WHERE instrument_id=? ORDER BY observed_at", (str(instrument_id),)).fetchall()
         return [dict(row) for row in rows]
 
     def start_refresh_run(
@@ -841,6 +995,20 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                     _dt(datetime.now(timezone.utc)),
                 ),
             )
+
+
+# PostgreSQL (research-service Flyway V1) VARCHAR limits for display metadata
+# of research_documents. SQLite TEXT has no limit, which hid DOCUMENT_PERSIST_FAILED
+# for long official NSE announcement titles (desc + attchmntText) in production.
+# Identity columns (URLs, hashes) are never truncated -- only descriptive text.
+# tests/test_slice5_failure_regressions.py asserts these match the migrations.
+RESEARCH_DOCUMENT_COLUMN_LIMITS = {"title": 500, "source_name": 240, "content_type": 120, "discovery_provider": 120}
+
+
+def _bounded(value: str | None, limit: int) -> str | None:
+    if value is None or len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "\u2026"
 
 
 def persistence_from_settings(settings: Settings) -> ResearchPersistence:

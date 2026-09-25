@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("up", "deploy", "down", "clean", "status", "url", "components")]
     [string]$Command = "up",
 
@@ -74,6 +74,7 @@ $RuntimeDir = Join-Path $ProjectRoot ".tmp"
 $ApplicationUrlFile = Join-Path $RuntimeDir "application-url.txt"
 $ImageTagFile = Join-Path $RuntimeDir "last-image-tag.txt"
 $LegacyPortForwardPidFile = Join-Path $RuntimeDir "frontend-port-forward.pid"
+$OpportunityBootstrapMarkerFile = Join-Path $RuntimeDir "initial-opportunity-cycle-triggered.txt"
 
 $JavaServices = @(
     "api-gateway",
@@ -968,6 +969,181 @@ function Remove-OldApplicationImages {
     }
 }
 
+
+function Invoke-InitialOpportunityCycleAfterCleanDeploy {
+    # A clean removes this marker. Therefore only the first successful full `up`
+    # after a clean explicitly requests an initial production opportunity cycle.
+    # Normal `up` reruns and component deploys do not trigger a cycle; after the
+    # initial cycle, the research-engine scheduler owns subsequent executions.
+    if (Test-Path $OpportunityBootstrapMarkerFile) {
+        Write-Host "Initial opportunity cycle already handled for this LOCAL runtime; scheduler owns future runs." -ForegroundColor DarkGray
+        return
+    }
+
+    # Kubernetes readiness is not sufficient here. portfolio-service can be Ready
+    # while CanonicalIdentityBootstrap is still populating the active NSE equity
+    # universe. Starting the production cycle before that bootstrap is populated
+    # can produce universe_count=0 and an empty Global Opportunity Radar.
+    #
+    # Use the exact canonical-universe API consumed by GlobalScanner and wait for
+    # a production-sized active EQUITY universe before submitting the one-time
+    # initial cycle. This is a data-readiness gate, not an arbitrary sleep.
+    Write-Step "Waiting for canonical NSE equity universe before initial opportunity cycle"
+
+    $universeReadyCode = @'
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+base_url = "http://portfolio-service"
+params = urllib.parse.urlencode({"status": "ACTIVE", "assetType": "EQUITY", "page": 0, "size": 1})
+url = f"{base_url}/api/v1/instruments?{params}"
+minimum_universe = 2500
+poll_seconds = 10
+deadline = time.monotonic() + (20 * 60)
+last_count = None
+last_error = None
+
+while time.monotonic() < deadline:
+    try:
+        # portfolio-service protects /api/v1/instruments with the same
+        # X-AIP-User-* identity contract used by research-engine.  A Kubernetes
+        # Ready pod can therefore still return 401 to an anonymous readiness
+        # probe.  Use a deterministic server-owned UUID identity for this
+        # read-only bootstrap check; do not bypass portfolio authentication.
+        headers = {
+            "X-AIP-User-Id": "00000000-0000-0000-0000-000000000001",
+            "X-AIP-User-Issuer": "platform-bootstrap",
+            "X-AIP-User-Subject": "global-opportunity-bootstrap",
+            "Accept": "application/json",
+        }
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("instruments"), list):
+            raise ValueError("Invalid canonical universe response")
+
+        count = int(payload.get("totalElements", len(payload["instruments"])))
+        if count != last_count:
+            print(f"Canonical active EQUITY universe count: {count}", flush=True)
+            last_count = count
+
+        if count >= minimum_universe:
+            print(f"Canonical NSE equity universe ready: {count} instruments", flush=True)
+            sys.exit(0)
+
+        last_error = f"canonical universe contains only {count} active EQUITY instruments"
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        message = f"HTTP {exc.code}: {body[:500]}"
+        if message != last_error:
+            print(f"Canonical universe not ready yet: {message}", flush=True)
+        last_error = message
+    except Exception as exc:
+        message = str(exc)
+        if message != last_error:
+            print(f"Canonical universe not ready yet: {message}", flush=True)
+        last_error = message
+
+    time.sleep(poll_seconds)
+
+print(
+    f"Timed out waiting for canonical NSE equity universe; last_count={last_count}, last_error={last_error}",
+    file=sys.stderr,
+)
+sys.exit(1)
+'@
+
+    $universeReadyBytes = [System.Text.Encoding]::UTF8.GetBytes($universeReadyCode)
+    $universeReadyBase64 = [Convert]::ToBase64String($universeReadyBytes)
+    $universeReadyLauncher = "import base64;exec(base64.b64decode('$universeReadyBase64'))"
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        kubectl exec deployment/research-engine -n $Namespace -c research-engine -- python -c $universeReadyLauncher
+        $universeReadyExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($universeReadyExitCode -ne 0) {
+        throw "Canonical NSE equity universe did not become ready. Initial opportunity cycle was NOT submitted and the bootstrap marker was NOT written."
+    }
+
+    Write-Step "Triggering initial opportunity cycle for fresh LOCAL runtime"
+
+    # Execute the request from inside the research-engine pod so platform.ps1
+    # does not need to create or maintain a local port-forward.
+    $pythonCode = @'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+url = "http://127.0.0.1:8000/api/v1/research/opportunities/cycles"
+payload = json.dumps({"candidate_ids": None, "shortlist_limit": 25, "top_n": 4}).encode("utf-8")
+request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        print(response.read().decode("utf-8"))
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", errors="replace")
+    # If another valid production cycle became active after the universe readiness
+    # gate, treat HTTP 409 as handled rather than creating a duplicate.
+    if exc.code == 409:
+        print(body)
+        sys.exit(10)
+    print(body, file=sys.stderr)
+    sys.exit(1)
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+'@
+
+    # PowerShell 5 / kubectl can corrupt quotes and newlines when a multiline
+    # Python program is passed directly to `python -c`. Encode the program first
+    # and pass only a shell-safe Base64 token through kubectl.
+    $pythonBytes = [System.Text.Encoding]::UTF8.GetBytes($pythonCode)
+    $pythonBase64 = [Convert]::ToBase64String($pythonBytes)
+    $pythonLauncher = "import base64;exec(base64.b64decode('$pythonBase64'))"
+
+    # Native stderr is surfaced as PowerShell error records on Windows PowerShell
+    # 5 when ErrorActionPreference=Stop. Temporarily allow the native process to
+    # finish so its explicit exit code (0 / 10 / failure) remains authoritative.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $result = kubectl exec deployment/research-engine -n $Namespace -c research-engine -- python -c $pythonLauncher 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    $result | Out-Host
+
+    if ($exitCode -eq 0) {
+        Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
+        Write-Host "Initial opportunity cycle submitted after canonical universe readiness. Future cycles are scheduler-owned." -ForegroundColor Green
+        return
+    }
+
+    if ($exitCode -eq 10) {
+        # Another production cycle became active only after canonical-universe
+        # readiness. Never submit a duplicate.
+        Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
+        Write-Host "An opportunity cycle is already active after canonical universe readiness; no duplicate was submitted. Future cycles are scheduler-owned." -ForegroundColor Yellow
+        return
+    }
+
+    throw "Unable to submit the initial opportunity cycle after canonical universe readiness. The bootstrap marker was not written, so a later full 'up' can retry safely."
+}
+
 function Stop-LegacyFrontendPortForward {
     # Cleanup only. New platform runs never create a direct frontend port-forward
     # because it bypasses the API Gateway and breaks same-origin /api requests.
@@ -1069,6 +1245,7 @@ function Start-Platform {
     Apply-LocalRuntimeNormalization
     Wait-ForDeployments -AllEnabled
     Assert-ImmutableDeploymentImages -Names $selected
+    Invoke-InitialOpportunityCycleAfterCleanDeploy
 
     $url = Resolve-ApplicationUrl
     Save-SuccessfulFullImageTag
@@ -1263,6 +1440,7 @@ function Clean-Platform {
     Remove-Item $ApplicationUrlFile -Force -ErrorAction SilentlyContinue
     Remove-Item $ImageTagFile -Force -ErrorAction SilentlyContinue
     Remove-Item $LegacyPortForwardPidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $OpportunityBootstrapMarkerFile -Force -ErrorAction SilentlyContinue
 
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green

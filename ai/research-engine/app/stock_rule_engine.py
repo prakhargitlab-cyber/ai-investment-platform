@@ -208,6 +208,8 @@ class _Datum:
     evidence_id: str
     unit: str | None = None
     authority: int = 0
+    reporting_basis: str | None = None
+    period_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +227,37 @@ class StockRuleEngineInput:
     news_search_run: SearchRun | None = None
 
 
+#: Evidence-id prefix of an explicit completed authoritative catalyst check
+#: (research_readiness_runtime); it covers inputs without claiming an event.
+CATALYST_CHECK_PREFIX = "catalyst-check:"
+
+
+#: CURRENT_NEWS is optional contextual research under the full-research
+#: contract: its acquisition/readiness state -- MISSING, PARTIAL, FAILED,
+#: READY, READY_FRESH, READY_STALE, SUCCESS_EMPTY (a completed zero-result
+#: check, scored as a READY area), UNSCORABLE, or any other truthful state
+#: -- must never by itself suppress full_analysis_allowed / "FULLY_ANALYZED",
+#: Rule Engine evaluation, or rank_eligible. This is a single, blanket,
+#: state-independent exemption for the CURRENT_NEWS requirement / the
+#: NEWS_GEOPOLITICAL_EVENTS area -- replacing the previous state-by-state
+#: (PARTIAL/FAILED-only "technical failure") carve-out -- and applies only to
+#: CURRENT_NEWS. CURRENT_NEWS acquisition stays enabled and its state stays
+#: truthful: it is still acquired, retried, scored, and remains visible in
+#: missing_inputs / area diagnostics / blocking_requirements and reasons
+#: wherever those are already surfaced; only its ability to gate eligibility
+#: is removed. No other mandatory/applicable requirement (VALUATION_INPUTS,
+#: BUSINESS_QUALITY_FACTS, BALANCE_SHEET_FACTS, QUARTERLY_FINANCIALS,
+#: LATEST_PRICE, SHAREHOLDING, ORDER_BOOK_CAPEX_GUIDANCE, etc.) is affected.
+_CURRENT_NEWS_REQUIREMENT_ID = "CURRENT_NEWS"
+
+
+def _current_news_is_optional_and_non_blocking(requirement_id: str) -> bool:
+    """True exactly for the CURRENT_NEWS requirement id; used to exempt it,
+    unconditionally, from the mandatory/applicable eligibility gates below.
+    """
+    return requirement_id == _CURRENT_NEWS_REQUIREMENT_ID
+
+
 class StockRuleEngineEligibilityPolicy:
     """One deterministic gate shared by the API and UI action contract."""
 
@@ -238,6 +271,9 @@ class StockRuleEngineEligibilityPolicy:
     FULL_STATUSES = frozenset(
         {ResearchRequirementStatus.READY_FRESH, ResearchRequirementStatus.READY_STALE}
     )
+    EXEMPT_STATUSES = frozenset(
+        {ResearchRequirementStatus.NOT_APPLICABLE, ResearchRequirementStatus.UNSUPPORTED}
+    )
     PARTIAL_STATUSES = frozenset(
         {
             ResearchRequirementStatus.READY_FRESH,
@@ -248,10 +284,25 @@ class StockRuleEngineEligibilityPolicy:
 
     def evaluate(self, readiness: ResearchReadinessResult) -> AnalysisEligibility:
         by_id = {item.requirement_id: item for item in readiness.requirements}
+        # Full-research contract: every applicable mandatory requirement --
+        # including CURRENT_NEWS, SHAREHOLDING and ORDER_BOOK_CAPEX_GUIDANCE --
+        # must be READY. Only explicit non-applicability exempts one:
+        # NOT_APPLICABLE (business model / asset type) or UNSUPPORTED (explicit
+        # instrument-level regime, e.g. shareholding outside India), which the
+        # Rule Engine also scores as a non-applicable area. MISSING / REFRESHING
+        # / CONFLICTING always block.
+        #
+        # CURRENT_NEWS is optional contextual research: it is unconditionally
+        # exempted from mandatory_blocking below, in every state (including
+        # MISSING / never-attempted), rather than only when it technically
+        # failed. See _current_news_is_optional_and_non_blocking() above.
         mandatory_blocking = sorted(
             item.requirement_id
             for item in readiness.requirements
-            if item.mandatory and item.requirement_id != 'CURRENT_NEWS' and item.status not in self.FULL_STATUSES and item.status != ResearchRequirementStatus.NOT_APPLICABLE
+            if item.mandatory
+            and item.status not in self.FULL_STATUSES
+            and item.status not in self.EXEMPT_STATUSES
+            and not _current_news_is_optional_and_non_blocking(item.requirement_id)
         )
         critical = [by_id.get(key) for key in self.CRITICAL_REQUIREMENTS]
         critical_blocking = sorted(
@@ -303,6 +354,20 @@ class StockRuleEngineInputAdapter:
         self.repository = repository
         self.readiness_adapter = readiness_adapter
 
+    async def _run_blocking(self, operation, *args, **kwargs):
+        """Run a synchronous persistence read off the event loop via the
+        repository's existing bounded-offload boundary
+        (``_run_blocking_persistence``: ``asyncio.to_thread`` + worker lock) --
+        the same boundary the scanner/orchestrator already use -- so the
+        synchronous reads in ``load`` no longer starve ``/health`` (DI-16
+        restartCount=3 liveness starvation). Mirrors the orchestrator's
+        ``_run_blocking`` boundary: inline fallback for test doubles that don't
+        expose the boundary. Additive; no matching/score/threshold change."""
+        run_blocking = getattr(self.repository, "_run_blocking_persistence", None)
+        if run_blocking is not None:
+            return await run_blocking(operation, *args, **kwargs)
+        return operation(*args, **kwargs)
+
     async def load(
         self,
         profile: CompanyResearchProfile,
@@ -319,18 +384,29 @@ class StockRuleEngineInputAdapter:
         evaluated_at = _aware(now or datetime.now(timezone.utc))
         from app.news_intelligence import EventImpactFeature, SearchRun
         news_loader = getattr(self.repository, 'news_records_for', None)
-        features = news_loader(instrument_id, EventImpactFeature, as_of=evaluated_at) if callable(news_loader) else []
-        runs = news_loader(instrument_id, SearchRun, as_of=evaluated_at) if callable(news_loader) else []
+        if callable(news_loader):
+            # DI-16: news_records_for is a synchronous PostgreSQL read; running
+            # it on the loop blocks /health probes (restartCount=3 liveness
+            # starvation). Route it through the repository's existing
+            # bounded-offload boundary so it executes off the event loop.
+            features, runs = await asyncio.gather(
+                self._run_blocking(news_loader, instrument_id, EventImpactFeature, as_of=evaluated_at),
+                self._run_blocking(news_loader, instrument_id, SearchRun, as_of=evaluated_at),
+            )
+        else:
+            features, runs = [], []
+        events = await self._run_blocking(self.repository.events_for, instrument_id, source_mode=SourceMode.REAL)
+        shareholding = await self._run_blocking(
+            self.repository.shareholding_for, instrument_id, limit=8
+        )
         return StockRuleEngineInput(
             profile=profile,
             readiness=readiness,
             financial_facts=tuple(facts.get(instrument_id, ())),
             structured_snapshots=tuple(snapshots.get(instrument_id, ())),
             market_prices=tuple(prices.get(instrument_id, ())),
-            events=tuple(
-                self.repository.events_for(instrument_id, source_mode=SourceMode.REAL)
-            ),
-            shareholding=tuple(self.repository.shareholding_for(instrument_id, limit=8)),
+            events=tuple(events),
+            shareholding=tuple(shareholding),
             canonical_metadata=self.readiness_adapter.canonical_metadata_for(instrument_id),
             evaluated_at=evaluated_at,
             news_features=tuple(features), news_search_run=runs[-1] if runs else None,
@@ -363,7 +439,9 @@ class StockRuleEngineService:
             return StockRuleEngineResult.model_validate(cached).model_copy(
                 update={"cache_hit": True}
             )
-        result = self.engine.evaluate(inputs, allow_partial=allow_partial, fingerprint=fingerprint)
+        result = await asyncio.to_thread(
+            self.engine.evaluate, inputs, allow_partial=allow_partial, fingerprint=fingerprint
+        )
         await self.repository.persist_stock_rule_engine_result(
             result.model_dump(mode="json", by_alias=False)
         )
@@ -381,7 +459,7 @@ class StockRuleEngineV1:
             "version": STOCK_RULE_ENGINE_VERSION,
             # Fingerprint schema for the V1 payload. This preserves exact-cache
             # safety when explainability fields evolve before a new score rule.
-            "fingerprintContract": "STOCK_RULE_ENGINE_V1_INPUT_2_NEWS",
+            "fingerprintContract": "STOCK_RULE_ENGINE_V1_INPUT_3_OPTIONAL_NEWS",
             "newsFeatures": [f.model_dump(mode='json') for f in sorted(value.news_features,key=lambda f:str(f.feature_id))],
             "newsSearch": value.news_search_run.model_dump(mode='json') if value.news_search_run else None,
             "newsEvaluationDate": value.evaluated_at.isoformat() if value.news_features or value.news_search_run else None,
@@ -522,6 +600,7 @@ class StockRuleEngineV1:
             self._governance(value),
             self._sector_macro(value),
         ]
+        eligibility = self._require_scorable_areas(eligibility, value.readiness, areas)
         scorable = [item for item in areas if item.applicable and item.raw_score is not None]
         raw_overall = _area_weighted_score(scorable)
         quality = _area_weighted_score(
@@ -603,6 +682,49 @@ class StockRuleEngineV1:
             evidence_references=evidence,
         )
 
+    @staticmethod
+    def _require_scorable_areas(
+        eligibility: AnalysisEligibility,
+        readiness: ResearchReadinessResult,
+        areas: Sequence[AreaScoreResult],
+    ) -> AnalysisEligibility:
+        """Defense in depth for the full-research contract.
+
+        Readiness evidence and the area rules are separate code paths; a full
+        result must never contain an applicable area that the rules could not
+        score (UNSCORABLE). NOT_APPLICABLE / UNSUPPORTED areas are not
+        applicable, and a completed zero-result news check is an explicit
+        READY area (no fabricated event), so neither is caught here.
+        """
+        if not eligibility.full_analysis_allowed:
+            return eligibility
+        # Defense in depth: a full result must never contain an applicable area
+        # the rules could not score (UNSCORABLE) -- EXCEPT NEWS_GEOPOLITICAL_EVENTS,
+        # which is unconditionally exempt (CURRENT_NEWS is optional contextual
+        # research, in every state, not only a technical/provider search
+        # failure). Any OTHER applicable UNSCORABLE area still blocks,
+        # preserving the non-news contract (e.g. catalysts / order-book with
+        # no completed check).
+        unscorable = {
+            item.area
+            for item in areas
+            if item.applicable
+            and item.status == AreaScoreStatus.UNSCORABLE
+            and item.area != RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS
+        }
+        if not unscorable:
+            return eligibility
+        blocked = {item.requirement_id for item in readiness.requirements
+                   if item.rule_engine_area in unscorable} or {str(area) for area in unscorable}
+        return eligibility.model_copy(update={
+            "full_analysis_allowed": False,
+            # The critical/mandatory readiness gate passed, so a labelled
+            # partial analysis remains available only on explicit request.
+            "partial_analysis_allowed": True,
+            "blocking_requirements": sorted(set(eligibility.blocking_requirements) | blocked),
+            "reason": "APPLICABLE_RULE_ENGINE_AREA_UNSCORABLE",
+        })
+
     def _valuation(self, value: StockRuleEngineInput) -> AreaScoreResult:
         metrics: list[tuple[RuleMetricResult, int]] = []
         structured = _structured_data(value)
@@ -616,7 +738,7 @@ class StockRuleEngineV1:
         ev_ebitda = _pick(structured, "evtoebitda", "enterprisevaluetoebitda")
         peg = _pick(structured, "pegratio", "peg")
         market_cap = _pick(structured, "marketcap")
-        fcf = _pick(structured, "freecashflow") or _latest_fact(value, ("free_cash_flow",))
+        fcf = _financial_or_structured(value, structured, ("freecashflow",), ("free_cash_flow",), period_type=("ANNUAL", "TTM"))
         financial = _is_financial(value)
         if pe and pe.value > 0:
             metrics.append((_metric_result("TRAILING_PE", pe, _lower_better(pe.value, ((8, 92), (15, 78), (25, 58), (40, 32), (60, 12))), "TRAILING_PE_V1", "RATIO"), 25))
@@ -631,7 +753,8 @@ class StockRuleEngineV1:
             metrics.append((_metric_result("EV_EBITDA", ev_ebitda, _lower_better(ev_ebitda.value, ((5, 94), (8, 80), (12, 62), (20, 35), (30, 12))), "EV_EBITDA_NON_FINANCIAL_V1", "RATIO"), 15))
         if peg and peg.value > 0:
             metrics.append((_metric_result("PEG", peg, _lower_better(peg.value, ((0.5, 90), (1, 82), (1.5, 65), (2.5, 38), (4, 15))), "PEG_V1", "RATIO"), 10))
-        if fcf and market_cap and market_cap.value > 0:
+        if (fcf and market_cap and market_cap.value > 0 and fcf.unit and fcf.unit == market_cap.unit
+                and fcf.period_type in {None, "ANNUAL", "TTM"}):
             fcf_yield = _derived_datum(fcf.value / market_cap.value * 100, "PERCENT", fcf, "derived:fcf-yield", market_cap)
             metrics.append((_metric_result("FCF_YIELD", fcf_yield, _higher_better(fcf_yield.value, ((-5, 5), (0, 25), (2, 48), (5, 72), (8, 90))), "FCF_YIELD_V1", "PERCENT"), 15))
         missing = [] if metrics else ["VALUATION_BASIS"]
@@ -640,10 +763,10 @@ class StockRuleEngineV1:
     def _quality(self, value: StockRuleEngineInput) -> AreaScoreResult:
         metrics: list[tuple[RuleMetricResult, int]] = []
         structured = _structured_data(value)
-        roe = _pick(structured, "roe", "returnonequity") or _latest_fact(value, ("roe", "return_on_equity"))
-        roce = _pick(structured, "roce", "returnoncapitalemployed") or _latest_fact(value, ("roce", "return_on_capital_employed"))
-        operating_margin = _pick(structured, "operatingmargin") or _latest_fact(value, ("operating_margin", "ebitda_margin"))
-        net_margin = _pick(structured, "profitmargin", "netmargin") or _latest_fact(value, ("profit_margin", "net_margin"))
+        roe = _financial_or_structured(value, structured, ("roe", "returnonequity",), ("roe", "return_on_equity",))
+        roce = _financial_or_structured(value, structured, ("roce", "returnoncapitalemployed",), ("roce", "return_on_capital_employed",))
+        operating_margin = _financial_or_structured(value, structured, ("operatingmargin",), ("operating_margin",))
+        net_margin = _financial_or_structured(value, structured, ("profitmargin", "netmargin",), ("profit_margin", "net_margin",))
         for name, datum, weight, rule in (
             ("ROE", roe, 20, "ROE_V1"),
             ("ROCE", roce if not _is_financial(value) else None, 20, "ROCE_NON_FINANCIAL_V1"),
@@ -664,12 +787,12 @@ class StockRuleEngineV1:
             metrics.append((_metric_result("MARGIN_STABILITY", datum, _lower_better(stability, ((2, 92), (5, 78), (10, 55), (20, 25), (35, 8))), "MARGIN_STABILITY_STDDEV_V1", "PERCENT_STDDEV", display_value=stability), 12))
         ocf = _latest_fact(value, ("operating_cash_flow", "cash_flow_from_operating_activities"), period_type="ANNUAL")
         pat = annual_pat[-1] if annual_pat else _latest_fact(value, ("pat", "net_income", "net_profit"), period_type="ANNUAL")
-        if ocf and pat and pat.value != 0:
+        if ocf and pat and pat.value != 0 and _compatible_financial_data(ocf, pat):
             conversion = ocf.value / abs(pat.value)
             datum = _derived_datum(conversion, "RATIO", ocf, "derived:cash-conversion", pat)
             metrics.append((_metric_result("CASH_CONVERSION", datum, _higher_better(conversion, ((0, 8), (0.5, 40), (0.8, 65), (1, 82), (1.3, 94))), "OPERATING_CASH_TO_PAT_V1", "RATIO"), 16))
-        fcf = _pick(structured, "freecashflow") or _latest_fact(value, ("free_cash_flow",), period_type="ANNUAL")
-        if fcf and pat and pat.value != 0:
+        fcf = _financial_or_structured(value, structured, ("freecashflow",), ("free_cash_flow",), period_type="ANNUAL")
+        if fcf and pat and pat.value != 0 and _compatible_financial_data(fcf, pat):
             quality = fcf.value / abs(pat.value)
             datum = _derived_datum(quality, "RATIO", fcf, "derived:fcf-quality", pat)
             metrics.append((_metric_result("FCF_QUALITY", datum, _higher_better(quality, ((-0.5, 5), (0, 25), (0.5, 55), (0.8, 75), (1.1, 90))), "FCF_TO_PAT_V1", "RATIO"), 10))
@@ -735,33 +858,25 @@ class StockRuleEngineV1:
             return self._finish(value, RuleEngineArea.BALANCE_SHEET, metrics, [] if metrics else ["FINANCIAL_SECTOR_CAPITAL_OR_ASSET_QUALITY"], applicable=True)
 
         structured = _structured_data(value)
-        debt_equity = _pick(structured, "debttoequity")
-        debt = _pick(structured, "totaldebt") or _latest_fact(value, ("debt_or_borrowings", "total_debt"), period_type="ANNUAL")
+        debt = _latest_fact(value, ("debt_or_borrowings", "total_debt"), period_type="ANNUAL")
         equity = _latest_fact(value, ("equity", "total_equity"), period_type="ANNUAL")
-        cash = _pick(structured, "totalcash") or _latest_fact(value, ("cash_and_cash_equivalents", "cash_and_equivalents"), period_type="ANNUAL")
-        if debt_equity:
-            de_pct = debt_equity.value if abs(debt_equity.value) > 5 else debt_equity.value * 100
-            datum = _derived_datum(de_pct, "PERCENT", debt_equity, "normalized:debt-equity")
-        elif debt and equity and equity.value > 0:
-            de_pct = debt.value / equity.value * 100
-            datum = _derived_datum(de_pct, "PERCENT", debt, "derived:debt-equity", equity)
-        else:
-            datum = None
+        cash = _latest_fact(value, ("cash_and_cash_equivalents", "cash_and_equivalents"), period_type="ANNUAL")
+        datum = _debt_equity_datum(value, structured)
         if datum:
             metrics.append((_metric_result("DEBT_TO_EQUITY", datum, _lower_better(datum.value, ((0, 95), (30, 85), (60, 68), (100, 45), (200, 18))), "INDUSTRIAL_DEBT_TO_EQUITY_V1", "PERCENT"), 28))
-        if debt and cash and equity and equity.value > 0:
+        if debt and cash and equity and equity.value > 0 and _compatible_financial_data(debt, equity) and _compatible_financial_data(cash, equity):
             net_debt_equity = (debt.value - cash.value) / equity.value * 100
             nd = _derived_datum(net_debt_equity, "PERCENT", debt, "derived:net-debt-equity", cash, equity)
             metrics.append((_metric_result("NET_DEBT_TO_EQUITY", nd, _lower_better(net_debt_equity, ((-20, 98), (0, 90), (30, 75), (80, 48), (150, 18))), "NET_DEBT_TO_EQUITY_V1", "PERCENT"), 18))
-        ebitda = _latest_fact(value, ("ebitda", "ebit", "operating_income"), period_type="ANNUAL")
+        ebitda = _latest_fact(value, ("ebitda",), period_type="ANNUAL")
         finance_cost = _latest_fact(value, ("finance_cost", "interest_expense"), period_type="ANNUAL")
-        if ebitda and finance_cost and finance_cost.value > 0:
+        if ebitda and finance_cost and finance_cost.value > 0 and _compatible_financial_data(ebitda, finance_cost):
             coverage = ebitda.value / finance_cost.value
             cov = _derived_datum(coverage, "RATIO", ebitda, "derived:interest-coverage", finance_cost)
             metrics.append((_metric_result("INTEREST_COVERAGE", cov, _higher_better(coverage, ((0.5, 5), (1, 18), (2, 45), (4, 70), (8, 92))), "EBITDA_INTEREST_COVERAGE_V1", "RATIO"), 24))
         current_assets = _latest_fact(value, ("current_assets",), period_type="ANNUAL")
         current_liabilities = _latest_fact(value, ("current_liabilities",), period_type="ANNUAL")
-        if current_assets and current_liabilities and current_liabilities.value > 0:
+        if current_assets and current_liabilities and current_liabilities.value > 0 and _compatible_financial_data(current_assets, current_liabilities):
             current_ratio = current_assets.value / current_liabilities.value
             current = _derived_datum(current_ratio, "RATIO", current_assets, "derived:current-ratio", current_liabilities)
             metrics.append((_metric_result("CURRENT_RATIO", current, _higher_better(current_ratio, ((0.5, 8), (0.9, 35), (1.2, 65), (1.8, 88), (3, 82))), "CURRENT_RATIO_NON_FINANCIAL_V1", "RATIO"), 15))
@@ -777,7 +892,7 @@ class StockRuleEngineV1:
         revenue = _fact_series(value, ("revenue", "total_revenue"), "QUARTERLY")
         earnings = _fact_series(value, ("pat", "net_income", "net_profit"), "QUARTERLY")
         eps = _fact_series(value, ("eps",), "QUARTERLY")
-        ebitda = _fact_series(value, ("ebitda", "operating_income", "operating_profit"), "QUARTERLY")
+        operating_profit = _fact_series(value, ("operating_income", "operating_profit"), "QUARTERLY")
         for name, series, weight in (
             ("REVENUE_YOY", revenue, 25),
             ("PAT_YOY", earnings, 25),
@@ -794,10 +909,10 @@ class StockRuleEngineV1:
                 change, latest, prior = comparison
                 datum = _derived_datum(change, "PERCENT", latest, f"derived:quarterly-{name.lower()}", prior)
                 metrics.append((_metric_result(name, datum, _growth_score(change), f"SEQUENTIAL_{name}_LIMITED_WEIGHT_V1", "PERCENT"), weight))
-        margins = _aligned_ratios(ebitda, revenue, multiplier=Decimal("100"))
+        margins = _aligned_ratios(operating_profit, revenue, multiplier=Decimal("100"))
         if len(margins) >= 2:
             change = margins[-1] - margins[-2]
-            datum = _derived_from_many(change, "PERCENTAGE_POINTS", [*ebitda[-2:], *revenue[-2:]], "derived:quarterly-margin-trend")
+            datum = _derived_from_many(change, "PERCENTAGE_POINTS", [*operating_profit[-2:], *revenue[-2:]], "derived:quarterly-margin-trend")
             metrics.append((_metric_result("OPERATING_MARGIN_TREND", datum, _higher_better(change, ((-8, 8), (-3, 30), (0, 55), (2, 75), (5, 92))), "QUARTERLY_MARGIN_TREND_V1", "PERCENTAGE_POINTS"), 15))
         if len(earnings) >= 3:
             consistency = Decimal(sum(1 for item in earnings[-4:] if item.value > 0)) / Decimal(len(earnings[-4:])) * 100
@@ -806,9 +921,37 @@ class StockRuleEngineV1:
         return self._finish(value, RuleEngineArea.QUARTERLY_EARNINGS_TREND, metrics, [] if metrics else ["COMPARABLE_QUARTERLY_RESULTS"])
 
     def _catalysts(self, value: StockRuleEngineInput) -> AreaScoreResult:
-        relevant = [event for event in value.events if _material_catalyst(event)]
+        excluded = set().union(*(set(row.not_applicable_input_reasons) for row in value.readiness.requirements
+            if row.requirement_id == "ORDER_BOOK_CAPEX_GUIDANCE"))
+        from app.research_applicability import CONCEPT_INPUTS, event_concept
+        relevant = [event for event in value.events if _material_catalyst(event)
+            and CONCEPT_INPUTS.get(event_concept(str(event.event_type))) not in excluded]
         metrics = [(_event_metric(event, "MATERIAL_CATALYST_EVENT_V1"), 1) for event in relevant]
+        if not metrics:
+            # A completed authoritative catalyst check with no qualifying event
+            # is explicit coverage (same principle as CURRENT_NEWS): the area is
+            # READY with no score and no fabricated event. Without a completed
+            # check the area stays UNSCORABLE.
+            covered = self._completed_check_area(value, RuleEngineArea.ORDER_BOOK_CAPACITY_CATALYSTS, CATALYST_CHECK_PREFIX)
+            if covered is not None:
+                return covered
         return self._finish(value, RuleEngineArea.ORDER_BOOK_CAPACITY_CATALYSTS, metrics, [] if metrics else ["MATERIAL_ISSUER_RELEVANT_CATALYST_EVIDENCE"])
+
+    def _completed_check_area(self, value: StockRuleEngineInput, area: RuleEngineArea, prefix: str) -> AreaScoreResult | None:
+        readiness = [item for item in value.readiness.requirements if item.rule_engine_area == area]
+        checks = sorted({ref for item in readiness for ref in item.evidence_ids if ref.startswith(prefix)})
+        if not checks or any(item.status not in StockRuleEngineEligibilityPolicy.FULL_STATUSES for item in readiness):
+            return None
+        base = self._finish(value, area, [], [])
+        if base.status != AreaScoreStatus.UNSCORABLE:
+            return base
+        return base.model_copy(update={
+            "status": AreaScoreStatus.READY_STALE if any(
+                item.status == ResearchRequirementStatus.READY_STALE for item in readiness)
+                else AreaScoreStatus.READY_FRESH,
+            "missing_inputs": [],
+            "evidence_references": sorted(set(base.evidence_references) | set(checks)),
+        })
 
     def _technical(self, value: StockRuleEngineInput) -> AreaScoreResult:
         prices = _usable_prices(value.market_prices)
@@ -841,9 +984,9 @@ class StockRuleEngineV1:
         from app.news_intelligence import aggregate_impact, search_state
         normalized = aggregate_impact(value.news_features, value.evaluated_at)
         state = search_state(value.news_search_run, value.evaluated_at)
-        if normalized is not None or state == 'READY_NO_EVENTS':
-            impact = normalized if normalized is not None else 0
-            refs = sorted(str(f.feature_id) for f in value.news_features) if normalized is not None else ['search-run:'+str(value.news_search_run.run_id)]
+        if normalized is not None:
+            impact = normalized
+            refs = sorted(str(f.feature_id) for f in value.news_features)
             metric = RuleMetricResult(metric='COMPANY_NEWS_IMPACT',value=impact,unit='IMPACT_MINUS100_PLUS100',score=50+impact/2,
                 rule='COMPANY_EXPOSURE_IMPACT_V2',source='PERSISTED_NEWS_INTELLIGENCE',evidence_references=refs)
             result=self._finish(value,RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS,[(metric,1)],[])
@@ -869,6 +1012,25 @@ class StockRuleEngineV1:
             seen.add(key)
             events.append(event)
         metrics = [(_event_metric(event, "CURRENT_EVENT_IMPACT_V1"), 1) for event in events]
+        if not metrics and state in {'READY_WITH_EVENTS', 'READY_NO_EVENTS'} and value.news_search_run is not None:
+            # A completed current-news check that found no relevant event is
+            # explicit, successful coverage: the area is READY but carries no
+            # score and no fabricated event/metric. A never-run, partial,
+            # failed or stale check does not reach this branch.
+            base = self._finish(value, RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS, [], [])
+            readiness = [item for item in value.readiness.requirements
+                         if item.rule_engine_area == RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS]
+            if base.status != AreaScoreStatus.UNSCORABLE or not readiness or any(
+                    item.status not in StockRuleEngineEligibilityPolicy.FULL_STATUSES for item in readiness):
+                return base
+            reference = f"search-run:{value.news_search_run.run_id}"
+            return base.model_copy(update={
+                "status": AreaScoreStatus.READY_STALE if any(
+                    item.status == ResearchRequirementStatus.READY_STALE for item in readiness)
+                    else AreaScoreStatus.READY_FRESH,
+                "missing_inputs": [],
+                "evidence_references": sorted(set(base.evidence_references) | {reference}),
+            })
         return self._finish(value, RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS, metrics, [] if metrics else ["RELEVANT_CURRENT_EVENT_WITHIN_30_DAYS"])
 
     def _shareholding(self, value: StockRuleEngineInput) -> AreaScoreResult:
@@ -953,6 +1115,11 @@ class StockRuleEngineV1:
             evidence_id for item in readiness for evidence_id in item.evidence_ids
         }
         readiness_missing = [entry for item in readiness for entry in item.missing_input_ids]
+        from app.research_applicability import CONCEPT_INPUTS
+        concept_states = [state for item in readiness for state in item.concept_evidence_states.values()]
+        readiness_missing.extend(CONCEPT_INPUTS[concept] for item in readiness
+            for concept, state in item.concept_evidence_states.items()
+            if concept in CONCEPT_INPUTS and state not in {"READY_FRESH", "READY_STALE", "NOT_APPLICABLE"})
         missing_inputs = sorted(set(missing) | set(readiness_missing))
         if readiness and all(item.status == ResearchRequirementStatus.NOT_APPLICABLE for item in readiness):
             return AreaScoreResult(area=area, weight=STOCK_RULE_ENGINE_AREA_WEIGHTS[area],
@@ -992,9 +1159,9 @@ class StockRuleEngineV1:
         raw = _round_score(sum(Decimal(str(item.score)) * weight for item, weight in weighted_metrics) / Decimal(total_weight))
         if any(item.status == ResearchRequirementStatus.CONFLICTING for item in readiness):
             status = AreaScoreStatus.CONFLICTING
-        elif any(item.status in {ResearchRequirementStatus.MISSING, ResearchRequirementStatus.PARTIAL, ResearchRequirementStatus.FAILED, ResearchRequirementStatus.REFRESHING} for item in readiness) or missing:
+        elif any(item.status in {ResearchRequirementStatus.MISSING, ResearchRequirementStatus.PARTIAL, ResearchRequirementStatus.FAILED, ResearchRequirementStatus.REFRESHING} for item in readiness) or missing_inputs:
             status = AreaScoreStatus.PARTIAL
-        elif any(item.status == ResearchRequirementStatus.READY_STALE for item in readiness):
+        elif any(item.status == ResearchRequirementStatus.READY_STALE for item in readiness) or "READY_STALE" in concept_states:
             status = AreaScoreStatus.READY_STALE
         else:
             status = AreaScoreStatus.READY_FRESH
@@ -1199,6 +1366,34 @@ def _pick(values: Mapping[str, _Datum], *keys: str) -> _Datum | None:
     return next((values[_metric_key(key)] for key in keys if _metric_key(key) in values), None)
 
 
+def _financial_or_structured(
+    value: StockRuleEngineInput, structured: Mapping[str, _Datum],
+    structured_keys: Sequence[str], metrics: Sequence[str], *, period_type: str | tuple[str, ...] | None = None,
+) -> _Datum | None:
+    """Reuse durable authority ranks; summary presence alone is not precedence."""
+    periods = period_type if isinstance(period_type, tuple) else (period_type,)
+    candidates = [_latest_fact(value, metrics, period_type=period) for period in periods]
+    fact = max((item for item in candidates if item is not None),
+        key=lambda item: (item.as_of, item.authority), default=None)
+    summary = _pick(structured, *structured_keys)
+    return fact if fact and (summary is None or fact.authority >= summary.authority) else summary
+
+
+def _debt_equity_datum(value: StockRuleEngineInput, structured: Mapping[str, _Datum]) -> _Datum | None:
+    summary = _pick(structured, "debttoequity")
+    if summary:
+        summary = _derived_datum(summary.value if abs(summary.value) > 5 else summary.value * 100,
+            "PERCENT", summary, "normalized:debt-equity")
+    debt = _latest_fact(value, ("debt_or_borrowings", "total_debt"), period_type="ANNUAL")
+    equity = _latest_fact(value, ("equity", "total_equity"), period_type="ANNUAL")
+    if debt and equity and equity.value > 0 and _compatible_financial_data(debt, equity):
+        derived = _derived_datum(debt.value / equity.value * 100, "PERCENT", debt,
+            "derived:debt-equity", equity)
+        if summary is None or derived.authority >= summary.authority:
+            return derived
+    return summary
+
+
 def _latest_fact(
     value: StockRuleEngineInput,
     metrics: Sequence[str],
@@ -1222,23 +1417,38 @@ def _fact_series(
         if period_type and fact.key.period_type.upper() != period_type.upper():
             continue
         number = _decimal(fact.value.value)
-        as_of = fact.value.as_of_date or _period_datetime(fact.key.period_end)
+        as_of = _period_datetime(fact.key.period_end) or fact.value.as_of_date
         if number is None or as_of is None:
             continue
+        from app.normalization import normalize_financial_amount
+        number, unit = normalize_financial_amount(number, fact.value.unit)
         datum = _Datum(
             number,
             fact.source_provider,
             fact.value.source_url,
             as_of,
             f"financial:{fact.source_identity}:{fact.key.metric}:{fact.key.period_end}:{fact.key.period_type}",
-            fact.value.unit,
+            unit,
             fact_source_authority(fact.source_tier),
+            fact.key.reporting_basis,
+            fact.key.period_type,
         )
-        period_key = f"{as_of.isoformat()}:{fact.key.reporting_basis or ''}"
+        period_key = f"{as_of.isoformat()}:{fact.key.period_type}:{fact.key.reporting_basis or ''}:{unit}"
         existing = selected.get(period_key)
         if existing is None or datum.authority > existing[0]:
             selected[period_key] = (datum.authority, datum)
-    return sorted((entry[1] for entry in selected.values()), key=lambda item: item.as_of or datetime.min.replace(tzinfo=timezone.utc))
+    groups: dict[tuple, list[_Datum]] = {}
+    for _, datum in selected.values():
+        groups.setdefault((datum.period_type, datum.reporting_basis, datum.unit), []).append(datum)
+    if not groups:
+        return []
+    # A series must never interleave standalone/consolidated or annual/quarterly
+    # observations. Choose one deterministic current series, retaining gaps.
+    series = max(groups.values(), key=lambda rows: (
+        max(row.as_of for row in rows),
+        rows[0].reporting_basis == "CONSOLIDATED",
+        max(row.authority for row in rows), str(rows[0].period_type), str(rows[0].unit)))
+    return sorted(series, key=lambda item: item.as_of)
 
 
 def _metric_result(
@@ -1272,7 +1482,7 @@ def _derived_datum(value: Decimal, unit: str, primary: _Datum, evidence_id: str,
         max((item.as_of for item in values if item.as_of), default=None),
         "|".join([evidence_id, *(item.evidence_id for item in values)]),
         unit,
-        max(item.authority for item in values),
+        min(item.authority for item in values),
     )
 
 
@@ -1389,7 +1599,8 @@ def _proven_macro_exposure(event: ResearchEvent, value: StockRuleEngineInput) ->
 
 def _governance_event(event: ResearchEvent) -> bool:
     text = f"{event.title} {event.summary}".casefold()
-    return event.event_type in {ResearchEventType.MANAGEMENT_CHANGE, ResearchEventType.REGULATORY_EVENT, ResearchEventType.CREDIT_RATING, ResearchEventType.GUIDANCE_CUT} or any(term in text for term in _GOVERNANCE_TERMS)
+    from app.extraction import governance_disclosure
+    return event.event_type in {ResearchEventType.MANAGEMENT_CHANGE, ResearchEventType.REGULATORY_EVENT, ResearchEventType.CREDIT_RATING} or governance_disclosure(text)
 
 
 def _authoritative_unresolved_event(event: ResearchEvent) -> bool:
@@ -1406,19 +1617,13 @@ def _authoritative_unresolved_event(event: ResearchEvent) -> bool:
 
 def _extreme_balance_sheet_evidence(value: StockRuleEngineInput) -> list[str]:
     structured = _structured_data(value)
-    de = _pick(structured, "debttoequity")
-    if de:
-        de_pct = de.value if abs(de.value) > 5 else de.value * 100
-    else:
-        debt = _latest_fact(value, ("debt_or_borrowings", "total_debt"), period_type="ANNUAL")
-        equity = _latest_fact(value, ("equity", "total_equity"), period_type="ANNUAL")
-        if not debt or not equity or equity.value <= 0:
-            return []
-        de_pct = debt.value / equity.value * 100
-        de = _derived_datum(de_pct, "PERCENT", debt, "derived:override-debt-equity", equity)
-    ebitda = _latest_fact(value, ("ebitda", "ebit", "operating_income"), period_type="ANNUAL")
+    de = _debt_equity_datum(value, structured)
+    if de is None:
+        return []
+    de_pct = de.value
+    ebitda = _latest_fact(value, ("ebitda",), period_type="ANNUAL")
     finance_cost = _latest_fact(value, ("finance_cost", "interest_expense"), period_type="ANNUAL")
-    if de_pct <= 300 or not ebitda or not finance_cost or finance_cost.value <= 0 or ebitda.value / finance_cost.value >= 1:
+    if de_pct <= 300 or not ebitda or not finance_cost or finance_cost.value <= 0 or not _compatible_financial_data(ebitda, finance_cost) or ebitda.value / finance_cost.value >= 1:
         return []
     # Both facts must originate from an official/regulatory durable tier.
     if de.authority < fact_source_authority(FactSourceTier.OFFICIAL_NSE) or ebitda.authority < fact_source_authority(FactSourceTier.OFFICIAL_NSE) or finance_cost.authority < fact_source_authority(FactSourceTier.OFFICIAL_NSE):
@@ -1446,7 +1651,11 @@ def _comparable_yoy(series: Sequence[_Datum]) -> tuple[Decimal, _Datum, _Datum] 
     if len(series) < 2:
         return None
     latest = series[-1]
-    candidates = [item for item in series[:-1] if item.as_of and latest.as_of and 300 <= (latest.as_of - item.as_of).days <= 430]
+    candidates = [item for item in series[:-1] if item.as_of and latest.as_of
+        and item.as_of.year == latest.as_of.year - 1
+        and (item.as_of.month - 1) // 3 == (latest.as_of.month - 1) // 3
+        and item.reporting_basis == latest.reporting_basis
+        and item.period_type == latest.period_type and item.unit == latest.unit]
     if not candidates:
         return None
     prior = min(candidates, key=lambda item: abs((latest.as_of - item.as_of).days - 365))
@@ -1482,12 +1691,17 @@ def _growth_consistency(*series_values: Sequence[_Datum]) -> tuple[Decimal, list
     return Decimal(sum(changes)) / Decimal(len(changes)) * 100, evidence
 
 
+def _compatible_financial_data(left: _Datum, right: _Datum) -> bool:
+    return (left.as_of == right.as_of and left.reporting_basis == right.reporting_basis
+        and left.period_type == right.period_type and left.unit == right.unit)
+
+
 def _aligned_ratios(numerators: Sequence[_Datum], denominators: Sequence[_Datum], *, multiplier: Decimal) -> list[Decimal]:
     denominator_by_date = {item.as_of.date(): item for item in denominators if item.as_of and item.value != 0}
     ratios: list[Decimal] = []
     for numerator in numerators:
         denominator = denominator_by_date.get(numerator.as_of.date()) if numerator.as_of else None
-        if denominator:
+        if denominator and _compatible_financial_data(numerator, denominator):
             ratios.append(numerator.value / denominator.value * multiplier)
     return ratios
 
@@ -1570,8 +1784,13 @@ def _sector(value: StockRuleEngineInput) -> str | None:
 
 
 def _is_financial(value: StockRuleEngineInput) -> bool:
+    from app.research_applicability import FINANCIAL_CLASSIFICATION_TERMS
     text = f"{_sector(value) or ''} {value.canonical_metadata.get('industry') or ''}".casefold()
-    return any(token in text for token in ("bank", "financial", "nbfc", "insurance", "credit service"))
+    # Mirrors research_applicability.FINANCIAL_CLASSIFICATION_TERMS so that
+    # applicability classification and rule-engine ROCE suppression agree on
+    # what counts as a financial issuer (incl. credit/lending/leasing/mortgage/
+    # housing finance/finance company/microfinance; no IRFC special-case).
+    return any(token in text for token in FINANCIAL_CLASSIFICATION_TERMS)
 
 
 def _is_india(profile: CompanyResearchProfile) -> bool:

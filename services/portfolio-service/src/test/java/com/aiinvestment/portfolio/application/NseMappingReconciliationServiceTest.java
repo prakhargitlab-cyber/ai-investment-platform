@@ -352,6 +352,100 @@ class NseMappingReconciliationServiceTest {
         assertThat(service.reconcile(instrumentId).status()).isEqualTo("PERSISTED");
         verify(instrumentMaster).saveResolvedMapping(eq(instrumentId), eq("NSE"), eq("GOLDBEES"), isNull(), eq("NSE"),
                 eq("INR"), eq("VERIFIED"), eq("NSE_OFFICIAL_ETF_SECURITY_LIST"), eq(new BigDecimal("0.99")));
+        // Already-ETF rows are guarded out of applyAuthoritativeEtfClassification (asset type != EQUITY),
+        // so the ETF list is consulted exactly once here, from bootstrapFromOfficialEtfList -- never twice.
+        verify(etfSecurityList, times(1)).lookupByIsin(anyString());
+    }
+
+    @Test
+    void authoritativeEtfListCorrectsAStillProvisionalEquityBeforeAnyMappingExistsAndBootstrapsItAsAnEtf() {
+        InstrumentMasterEntity master = master(AssetType.EQUITY, "NSE", "INF179KC1HS2", "HDFC NIFTY NEXT 50 ETF", "HDFN50");
+        when(masters.findById(instrumentId)).thenReturn(Optional.of(master));
+        when(mappings.findByInstrumentId(instrumentId)).thenReturn(List.of());
+        when(etfSecurityList.lookupByIsin("INF179KC1HS2")).thenReturn(NseOfficialEtfSecurityList.Lookup.matched(
+                "HDFCNEXT50", "INF179KC1HS2", "HDFCAMC-HDFCNEXT50", "HDFCNIFTYNEXT50ETF"));
+
+        var outcome = service.reconcile(instrumentId);
+
+        assertThat(master.getAssetType()).isEqualTo(AssetType.ETF);
+        assertThat(outcome.status()).isEqualTo("PERSISTED");
+        verify(instrumentMaster).saveResolvedMapping(eq(instrumentId), eq("NSE"), eq("HDFCNEXT50"), isNull(), eq("NSE"),
+                eq("INR"), eq("VERIFIED"), eq("NSE_OFFICIAL_ETF_SECURITY_LIST"), eq(new BigDecimal("0.99")));
+    }
+
+    @Test
+    void trustedNseMappingShortCircuitsBeforeAnyEtfListLookupAndLeavesHistoricalEquityUnchanged() {
+        // Restored short-circuit semantics: a trusted/PERSISTED mapping returns immediately, exactly as
+        // it did before the asset-type feature, and never triggers a live ETF-list lookup -- even when
+        // the instrument is (unbeknownst to reconcile()) actually an ETF. Correcting an already-trusted
+        // historical row like this one is intentionally deferred to a separate, explicit, bounded
+        // authoritative reclassification/backfill pass, not forced into every ordinary reconcile() call.
+        InstrumentMasterEntity master = master(AssetType.EQUITY, "NSE", "INF179KC1HS2", "HDFC NIFTY NEXT 50 ETF", "HDFN50");
+        when(masters.findById(instrumentId)).thenReturn(Optional.of(master));
+        when(mappings.findByInstrumentId(instrumentId)).thenReturn(List.of(
+                mapping("NSE", "HDFN50", "VERIFIED", "NSE_OFFICIAL_ISIN_BOOTSTRAP")));
+
+        var outcome = service.reconcile(instrumentId);
+
+        assertThat(outcome.reason()).isEqualTo("TRUSTED_NSE_MAPPING_EXISTS");
+        assertThat(master.getAssetType()).isEqualTo(AssetType.EQUITY);
+        verifyNoInteractions(etfSecurityList, verifier, securityMaster, instrumentMaster);
+    }
+
+    @Test
+    void legacyBrokerNseMappingAlsoShortCircuitsBeforeAnyEtfListLookup() {
+        InstrumentMasterEntity master = master(AssetType.EQUITY, "NSE", "INF179KC1HS2", "HDFC NIFTY NEXT 50 ETF", "HDFN50");
+        when(masters.findById(instrumentId)).thenReturn(Optional.of(master));
+        when(mappings.findByInstrumentId(instrumentId)).thenReturn(List.of(
+                mapping("NSE", "HDFN50", "VERIFIED", "BROKER_IMPORT_IDENTITY")));
+
+        var outcome = service.reconcile(instrumentId);
+
+        assertThat(outcome.reason()).isEqualTo("LEGACY_NSE_MAPPING_REPAIR_REQUIRED");
+        assertThat(master.getAssetType()).isEqualTo(AssetType.EQUITY);
+        verifyNoInteractions(etfSecurityList);
+    }
+
+    @Test
+    void etfListUnavailableOrInvalidDuringGenuineReconciliationLeavesProvisionalEquityUnchangedAndContinues() {
+        InstrumentMasterEntity master = master(AssetType.EQUITY, "NSE", "INE669X01032", "GEEKAY WIRE LIMITED", "GEEWIR");
+        when(masters.findById(instrumentId)).thenReturn(Optional.of(master));
+        when(mappings.findByInstrumentId(instrumentId)).thenReturn(List.of());
+        when(etfSecurityList.lookupByIsin("INE669X01032")).thenReturn(NseOfficialEtfSecurityList.Lookup.unavailable());
+        when(securityMaster.lookupByIsin("INE669X01032")).thenReturn(NseOfficialSecurityMaster.Lookup.matched(
+                "GEEKAYWIRE", "INE669X01032", "GEEKAY WIRE LIMITED", "EQ"));
+
+        var outcome = service.reconcile(instrumentId);
+
+        assertThat(master.getAssetType()).isEqualTo(AssetType.EQUITY);
+        assertThat(outcome.status()).isEqualTo("PERSISTED");
+        assertThat(outcome.reason()).isEqualTo("OFFICIAL_MASTER_MATCHED");
+    }
+
+    @Test
+    void etfListIsNeverConsultedForAnInstrumentAlreadyClassifiedOther() {
+        InstrumentMasterEntity master = new InstrumentMasterEntity(instrumentId, "INE766A01010",
+                "Embassy Office Parks REIT", AssetType.OTHER, "INR", "IN", "NSE", "EMBASY", "ACTIVE", Instant.now());
+        when(masters.findById(instrumentId)).thenReturn(Optional.of(master));
+
+        assertThat(service.reconcile(instrumentId).reason()).isEqualTo("NOT_NSE_EQUITY");
+        verifyNoInteractions(mappings, etfSecurityList, verifier, securityMaster, instrumentMaster);
+    }
+
+    @Test
+    void unmatchedEtfListLeavesAnOrdinaryEquityUnaffected() {
+        InstrumentMasterEntity master = master(AssetType.EQUITY, "NSE", "INE669X01032", "GEEKAY WIRE LIMITED", "GEEWIR");
+        when(masters.findById(instrumentId)).thenReturn(Optional.of(master));
+        when(mappings.findByInstrumentId(instrumentId)).thenReturn(List.of());
+        when(etfSecurityList.lookupByIsin("INE669X01032")).thenReturn(NseOfficialEtfSecurityList.Lookup.noIsinMatch());
+        when(securityMaster.lookupByIsin("INE669X01032")).thenReturn(NseOfficialSecurityMaster.Lookup.matched(
+                "GEEKAYWIRE", "INE669X01032", "GEEKAY WIRE LIMITED", "EQ"));
+
+        var outcome = service.reconcile(instrumentId);
+
+        assertThat(master.getAssetType()).isEqualTo(AssetType.EQUITY);
+        assertThat(outcome.status()).isEqualTo("PERSISTED");
+        assertThat(outcome.reason()).isEqualTo("OFFICIAL_MASTER_MATCHED");
     }
 
     @Test
@@ -388,7 +482,7 @@ class NseMappingReconciliationServiceTest {
         when(mappings.findByInstrumentId(instrumentId)).thenReturn(List.of(yahoo("TALBROAUTO.NS"), trustedNse));
 
         assertThat(service.reconcile(instrumentId).reason()).isEqualTo("TRUSTED_NSE_MAPPING_EXISTS");
-        verifyNoInteractions(verifier, instrumentMaster);
+        verifyNoInteractions(verifier, instrumentMaster, etfSecurityList);
     }
 
     @Test

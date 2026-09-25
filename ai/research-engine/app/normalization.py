@@ -232,3 +232,16 @@ def normalize_numbers(text: str) -> list[NormalizedNumber]:
     for match in _PERCENT_PATTERN.finditer(text):
         values.append(NormalizedNumber(original=match.group(0), value=Decimal(match.group("number")), unit="PERCENT"))
     return values
+
+
+def normalize_financial_amount(value: Decimal, unit: str | None) -> tuple[Decimal, str | None]:
+    """Convert explicitly labelled currency scales, preserving unknown units."""
+    if not unit:
+        return value, unit
+    match = re.fullmatch(r"([A-Z]{3})[ _]+(thousands?|lakhs?|millions?|crores?|billions?)", unit.strip(), re.IGNORECASE)
+    if not match:
+        return value, unit
+    scale = match.group(2).lower().rstrip("s")
+    multiplier = {"thousand": 1000, "lakh": 100000, "million": 1000000,
+        "crore": 10000000, "billion": 1000000000}[scale]
+    return value * multiplier, match.group(1).upper()

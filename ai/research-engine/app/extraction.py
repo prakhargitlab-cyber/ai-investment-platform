@@ -16,6 +16,98 @@ from app.models import (
 from app.normalization import normalize_numbers
 
 
+# Bounded financial-results phrases only. The bare token "earnings" is
+# intentionally NOT included: a document that merely mentions "earnings" (e.g. a
+# collected-oil/recycler press release stating "earnings from recyclers") must
+# not be misclassified as an earnings release. Every phrase below only occurs in
+# a genuine financial-results context, so removing bare "earnings" cannot drop a
+# real earnings-results document while it does suppress the false positive
+# (DI-11C Fix 2). The original results phrases are preserved verbatim.
+_FINANCIAL_RESULTS_RELEASE_PHRASES: tuple[str, ...] = (
+    "quarterly results",
+    "half year results",
+    "half-year results",
+    "h1 results",
+    "q2 results",
+    "earnings release",
+    "earnings per share",
+    "quarterly earnings",
+    "annual earnings",
+    "declared earnings",
+    "earnings for the period",
+    "earnings and dividends",
+)
+
+
+def _is_results_release_text(lowered: str) -> bool:
+    """True iff lowercased document text carries a bounded financial-results
+    phrase (never a bare 'earnings' token)."""
+    return any(phrase in lowered for phrase in _FINANCIAL_RESULTS_RELEASE_PHRASES)
+
+
+def meaningful_business_statement(text: str, terms: list[str]) -> bool:
+    """Require a concrete disclosure in the same sentence as the concept."""
+    for sentence in re.split(r"[\n!?;]+|(?<=[.!?])\s+", text.casefold()):
+        if not any(term in sentence for term in terms):
+            continue
+        if any(term in sentence for term in ("no disclosure", "not disclosed", "glossary", "definition", "refer to")):
+            continue
+        if re.search(r"\b(?:stood at|amounted to|totalled|totaled|incurred|spent|approved|allocated|planned|plans to|will invest|invests|increased|decreased|grew|declined|secured|awarded|received|signed|announced|ramping up)\b", sentence):
+            return True
+        if any(term in {"order intake", "order book", "backlog"} for term in terms) and re.search(r"\b(?:order intake|order book|backlog)\s+(?:growth|decline|increase)\b", sentence):
+            return True
+        if re.search(r"(?:inr|rs\.?|crore|million|billion|lakh|usd|eur|\u20b9|\$)\s*[:=]?\s*\d|\d[\d,.]*\s*(?:crore|million|billion|lakh|mw|gw|tonnes|%)", sentence):
+            return True
+    return False
+
+
+_LEGACY_GOVERNANCE_TERMS = (
+    "corporate governance report", "auditor resignation", "resignation of auditor",
+    "auditor qualification", "qualified audit opinion", "appointment of auditor",
+    "change in management", "management change", "appointment of director",
+    "resignation of director", "board appointment", "regulatory action",
+    "regulatory penalty", "enforcement action", "litigation", "accounting fraud",
+    "financial misstatement", "related party transaction", "promoter pledge",
+)
+
+# Semantic governance classification by CONCEPT (subject x action within a
+# short phrase window), not by one-off titles -- the same principle DI-20H.4
+# applied to financial results (period cadence x financial content).
+_GOVERNANCE_SUBJECTS = {
+    "BOARD_COMPOSITION": r"(?:directors?|directorate|independent directors?|additional directors?|chair(?:man|person))",
+    "AUDITOR": r"(?:(?:statutory|secretarial|internal|cost|joint) auditors?|auditors?)",
+    "KEY_MANAGEMENT": (r"(?:managing director|whole[- ]time director|chief executive officer|chief financial officer"
+                       r"|ceo|cfo|company secretary|compliance officer|key managerial personnel|kmp)"),
+}
+_GOVERNANCE_ACTION = (r"(?:appoint\w*|re-?appoint\w*|resign\w*|cessation|change[sd]?|induct\w*|vacat\w*"
+                      r"|remov\w*|designat\w*|re-?designat\w*)")
+_GOVERNANCE_WINDOW = r"\W+(?:\w+\W+){0,5}?"
+_GOVERNANCE_CONCEPT_PATTERNS = {
+    concept: re.compile(rf"\b{_GOVERNANCE_ACTION}{_GOVERNANCE_WINDOW}{subject}\b|\b{subject}{_GOVERNANCE_WINDOW}{_GOVERNANCE_ACTION}\b")
+    for concept, subject in _GOVERNANCE_SUBJECTS.items()
+}
+_GOVERNANCE_CONCEPT_PATTERNS["GOVERNANCE_COMPLIANCE"] = re.compile(
+    r"\b(?:compliance report on corporate governance|report on corporate governance|corporate governance (?:report|compliance)"
+    r"|secretarial compliance report)\b")
+_GOVERNANCE_CONCEPT_PATTERNS["REGULATORY_ENFORCEMENT"] = re.compile(
+    r"\b(?:show[- ]cause notice|penalty (?:imposed|levied)|adjudication order|settlement order|forensic audit"
+    r"|(?:sebi|regulatory|enforcement) (?:order|action))\b")
+# Governance disclosures announce themselves in the title/opening; bounding the
+# concept scan keeps cost O(1) per document and avoids matching incidental
+# phrases deep inside financial-statement notes.
+_GOVERNANCE_CONCEPT_SCAN_CHARS = 4000
+
+
+def governance_concepts(text: str) -> frozenset[str]:
+    lowered = (text or "")[:_GOVERNANCE_CONCEPT_SCAN_CHARS].casefold()
+    return frozenset(concept for concept, pattern in _GOVERNANCE_CONCEPT_PATTERNS.items() if pattern.search(lowered))
+
+
+def governance_disclosure(text: str) -> bool:
+    lowered = text.casefold()
+    return any(term in lowered for term in _LEGACY_GOVERNANCE_TERMS) or bool(governance_concepts(text))
+
+
 class ResearchEventExtractor:
     def extract(self, document: ResearchDocument) -> list[ResearchEvent]:
         raise NotImplementedError
@@ -28,15 +120,20 @@ class RuleBasedEventExtractor(ResearchEventExtractor):
         text = document.normalized_text
         lower = text.lower()
         events: list[ResearchEvent] = []
-        if any(term in lower for term in ["new order", "order worth", "contract worth", "framework agreement", "purchase order"]):
+        if meaningful_business_statement(text, ["new order", "order worth", "contract worth", "framework agreement", "purchase order"]):
             events.append(self._event(document, ResearchEventType.NEW_ORDER, "Order or contract announcement", EventImpact.POSITIVE, TimeHorizon.MEDIUM_TERM, ["new order", "order worth", "contract worth", "framework agreement", "purchase order"]))
-        if any(term in lower for term in ["backlog", "order intake", "order book"]):
+        if meaningful_business_statement(text, ["backlog", "order intake", "order book"]):
             evidence = _evidence(text, ["backlog", "order intake", "order book"])
             impact = EventImpact.POSITIVE if any(term in evidence.lower() for term in ["increase", "grew", "growth", "+", "up "]) else EventImpact.NEUTRAL
             events.append(self._event(document, ResearchEventType.ORDER_BACKLOG_CHANGE, "Order backlog update", impact, TimeHorizon.SHORT_TERM, ["backlog", "order intake", "order book"]))
-        if any(term in lower for term in ["capex", "capital expenditure", "investment of", "invests", "will invest"]):
-            events.append(self._event(document, ResearchEventType.CAPEX, "CAPEX or investment announcement", EventImpact.UNCERTAIN, TimeHorizon.LONG_TERM, ["capex", "capital expenditure", "investment of", "invests", "will invest"]))
-        if any(term in lower for term in ["capacity expansion", "expand capacity", "production capacity", "mw"]):
+        if meaningful_business_statement(text, ["capex", "capital expenditure", "investment of", "invests", "will invest"]):
+            capex_context = _evidence(text, ["capex", "capital expenditure", "investment of", "invests", "will invest"]).lower()
+            phases = [label for label, terms in (
+                ("Incurred", ("incurred", "spent")), ("Approved", ("approved", "sanctioned")),
+                ("Planned", ("planned", "plans to", "will invest"))) if any(term in capex_context for term in terms)]
+            title = phases[0] + " CAPEX" if len(phases) == 1 else "CAPEX or investment announcement"
+            events.append(self._event(document, ResearchEventType.CAPEX, title, EventImpact.UNCERTAIN, TimeHorizon.LONG_TERM, ["capex", "capital expenditure", "investment of", "invests", "will invest"]))
+        if meaningful_business_statement(text, ["capacity expansion", "expand capacity", "production capacity"]):
             events.append(self._event(document, ResearchEventType.CAPACITY_EXPANSION, "Capacity expansion signal", EventImpact.POSITIVE, TimeHorizon.LONG_TERM, ["capacity expansion", "expand capacity", "production capacity", "volume ramp", "ramping up production"]))
         if any(term in lower for term in ["new facility", "new factory", "factory expansion", "new plant"]):
             events.append(self._event(document, ResearchEventType.NEW_FACILITY, "Facility expansion signal", EventImpact.POSITIVE, TimeHorizon.LONG_TERM, ["new facility", "new factory", "factory expansion", "new plant"]))
@@ -58,8 +155,8 @@ class RuleBasedEventExtractor(ResearchEventExtractor):
             events.append(self._event(document, ResearchEventType.CUSTOMER_LOSS, "Customer loss", EventImpact.NEGATIVE, TimeHorizon.SHORT_TERM, ["customer loss", "lost customer"]))
         if _is_annual_report(document, text):
             events.append(self._event(document, ResearchEventType.ANNUAL_REPORT, "Annual report published", EventImpact.NEUTRAL, TimeHorizon.UNKNOWN, ["annual report"]))
-        if any(term in lower for term in ["earnings", "quarterly results", "half year results", "half-year results", "h1 results", "q2 results"]):
-            events.append(self._event(document, ResearchEventType.EARNINGS_RELEASE, "Financial results release", EventImpact.NEUTRAL, TimeHorizon.IMMEDIATE, ["earnings", "quarterly results", "half year results", "half-year results", "h1 results", "q2 results"]))
+        if _is_results_release_text(lower):
+            events.append(self._event(document, ResearchEventType.EARNINGS_RELEASE, "Financial results release", EventImpact.NEUTRAL, TimeHorizon.IMMEDIATE, list(_FINANCIAL_RESULTS_RELEASE_PHRASES)))
         return _deduplicate_events(events)
 
     def _event(

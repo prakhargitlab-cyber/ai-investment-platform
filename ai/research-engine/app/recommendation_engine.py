@@ -95,8 +95,8 @@ class RecommendationEngineV1:
                 result['existing_holder_action'] = 'EXIT_REVIEW'
             elif comparison['current_long_action'] == 'REDUCE' or comparison['current_short_action'] == 'EXIT':
                 result['existing_holder_action'] = 'REDUCE'
-            elif comparison['current_short_action'] == 'PARTIAL_PROFIT':
-                result['existing_holder_action'] = 'PARTIAL_PROFIT'
+            elif comparison['current_short_action'] == 'PARTIAL_EXIT':
+                result['existing_holder_action'] = 'PARTIAL_EXIT'
                 if result['long_term_action'] != 'TOP_UP':
                     result['new_investor_action'] = 'WATCH_WAIT'
             result['top_negative_reasons'] = sorted(set(result['top_negative_reasons'] + comparison['lifecycle_reasons']))
@@ -146,12 +146,14 @@ def lifecycle(anchor, recommendation, price, previous_state=None):
                 short = 'EXIT'
                 reasons.append('SHORT_INVALIDATION_REACHED')
             elif state == 'TARGET_REACHED':
-                ss, short = 'PARTIAL_PROFIT', 'PARTIAL_PROFIT'
+                ss, short = 'PARTIAL_PROFIT', 'PARTIAL_EXIT'
                 reasons.extend(['TARGET_1_REACHED', 'SHORT_TERM_RISK_REWARD_COMPRESSED'])
                 if anchor.get('short_target_2') and p >= anchor['short_target_2'] * .97:
                     reasons.append('TARGET_2_REACHED' if p >= anchor['short_target_2'] else 'TARGET_2_APPROACHING')
+                    if p >= anchor['short_target_2']:
+                        ss, short = 'TARGET_REACHED', 'EXIT'
             elif (previous_state and short == 'WAIT'
-                  and anchor.get('short_term_action') in {'BUY', 'HOLD', 'PARTIAL_PROFIT'}):
+                  and anchor.get('short_term_action') in {'BUY', 'HOLD', 'PARTIAL_PROFIT', 'PARTIAL_EXIT'}):
                 short = 'HOLD'
         else:
             ls = state
@@ -167,10 +169,15 @@ def lifecycle(anchor, recommendation, price, previous_state=None):
         reasons.append('LONG_TERM_THESIS_BROKEN')
     elif long == 'REDUCE':
         ls = 'THESIS_WEAKENING'
-    if short == 'PARTIAL_PROFIT' and long in {'TOP_UP', 'ACCUMULATE'}:
+    if short == 'PARTIAL_EXIT' and long == 'ACCUMULATE':
         long = 'HOLD'
-    if recommendation['short_term_action'] == 'EXIT':
+    if recommendation['short_term_action'] == 'EXIT' and ss not in {'INVALIDATED', 'TARGET_REACHED'}:
         short, ss = 'EXIT', 'EXIT_REVIEW'
+    # Closed horizons cannot silently reopen because the other horizon is reviewed.
+    if previous_state and previous_state.get('current_short_action') == 'EXIT':
+        short, ss = 'EXIT', previous_state['short_term_state']
+    if previous_state and previous_state.get('long_term_state') == 'INVALIDATED':
+        long, ls = 'EXIT_REVIEW', 'INVALIDATED'
     def distance(key):
         return round((anchor[key] / p - 1) * 100, 4) if p and anchor.get(key) else None
     return dict(short_term_state=ss, long_term_state=ls, current_short_action=short,

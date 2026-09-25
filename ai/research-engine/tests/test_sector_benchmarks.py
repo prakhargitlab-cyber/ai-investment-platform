@@ -229,7 +229,8 @@ async def test_stage_b_bounded_queries(count, multiple):
     store._connection.set_trace_callback(queries.append)
     enriched = GlobalScanner(None, store).enrich_candidates(initial, sector_contexts=contexts)
     assert len(enriched) == count
-    assert len(queries) == (2 if count else 0)
+    assert len(queries) == 2 * count
+    assert all(sum(str(key) in query for key in ids) == 1 for query in queries)
     assert all('SELECT' in q for q in queries)
 
 

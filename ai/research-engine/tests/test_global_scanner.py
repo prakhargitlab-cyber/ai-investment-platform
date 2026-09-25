@@ -251,3 +251,74 @@ async def test_different_financial_period_types_are_not_false_conflicts():
     candidate = (await scan([item], store)).candidates[0]
     assert candidate.eligible_for_deep_analysis
     assert candidate.dimensions["PROFITABILITY_QUALITY"].state == "PARTIAL"
+
+
+# --- Period-aware financial TTLs in the scanner (Fix 3) ---
+
+
+@pytest.mark.asyncio
+async def test_scanner_quarterly_financial_stale_beyond_120_days():
+    """Fix 3: quarterly financial facts beyond the 120-day period-aware TTL are STALE
+    in the scanner, not masked by the generic 550-day wall-clock fallback."""
+    store = SqliteResearchPersistence()
+    item = instrument()
+    persisted(store, item, {})  # fresh price, no structured facts
+    period_end = (NOW - timedelta(days=130)).date().isoformat()  # 130 days ago
+    store.upsert_financial_fact(FinancialFact(
+        FinancialFactKey(UUID(int=1), "pat", period_end, "QUARTERLY"),
+        ProvenancedValue(value=10, source_url="https://example.test", source_name="NSE", retrieved_at=NOW),
+        FactSourceTier.OFFICIAL_NSE, "NSE", "pat"))
+    candidate = (await scan([item], store)).candidates[0]
+    assert candidate.dimensions["PROFITABILITY_QUALITY"].state == "STALE"
+
+
+@pytest.mark.asyncio
+async def test_scanner_annual_financial_fresh_within_400_days():
+    """Fix 3: annual financial facts within the 400-day period-aware TTL are fresh
+    in the scanner."""
+    store = SqliteResearchPersistence()
+    item = instrument()
+    persisted(store, item, {})
+    period_end = (NOW - timedelta(days=200)).date().isoformat()  # 200 days ago
+    store.upsert_financial_fact(FinancialFact(
+        FinancialFactKey(UUID(int=1), "equity", period_end, "ANNUAL"),
+        ProvenancedValue(value=10, source_url="https://example.test", source_name="NSE", retrieved_at=NOW),
+        FactSourceTier.OFFICIAL_NSE, "NSE", "equity"))
+    candidate = (await scan([item], store)).candidates[0]
+    assert candidate.dimensions["BALANCE_SHEET_QUALITY"].state == "AVAILABLE"
+    assert candidate.dimensions["BALANCE_SHEET_QUALITY"].score == 100
+
+
+@pytest.mark.asyncio
+async def test_scanner_genuinely_overdue_annual_is_stale():
+    """Fix 3: annual financial facts beyond the 400-day period-aware TTL are STALE."""
+    store = SqliteResearchPersistence()
+    item = instrument()
+    persisted(store, item, {})
+    period_end = (NOW - timedelta(days=500)).date().isoformat()  # 500 days ago
+    store.upsert_financial_fact(FinancialFact(
+        FinancialFactKey(UUID(int=1), "pat", period_end, "ANNUAL"),
+        ProvenancedValue(value=10, source_url="https://example.test", source_name="NSE", retrieved_at=NOW),
+        FactSourceTier.OFFICIAL_NSE, "NSE", "pat"))
+    candidate = (await scan([item], store)).candidates[0]
+    assert candidate.dimensions["PROFITABILITY_QUALITY"].state == "STALE"
+
+
+@pytest.mark.asyncio
+async def test_global_candidate_survives_critical_stale_with_current_mandatory_evidence():
+    """Fix 3: a global candidate with legitimately current (within period-aware
+    quarterly TTL) financial evidence and a fresh price survives CRITICAL_STALE
+    gates and is eligible for deep analysis."""
+    store = SqliteResearchPersistence()
+    item = instrument()
+    persisted(store, item, {})  # fresh price at NOW
+    period_end = (NOW - timedelta(days=74)).date().isoformat()  # within 120-day quarterly TTL
+    store.upsert_financial_fact(FinancialFact(
+        FinancialFactKey(UUID(int=1), "pat", period_end, "QUARTERLY"),
+        ProvenancedValue(value=10, source_url="https://example.test", source_name="NSE", retrieved_at=NOW),
+        FactSourceTier.OFFICIAL_NSE, "NSE", "pat"))
+    candidate = (await scan([item], store)).candidates[0]
+    assert candidate.eligible_for_deep_analysis
+    assert candidate.dimensions["PROFITABILITY_QUALITY"].state == "PARTIAL"
+    assert candidate.dimensions["CRITICAL_COMPLETENESS"].state == "AVAILABLE"
+    assert "CRITICAL_FINANCIAL_EVIDENCE_UNREADY" not in candidate.exclusion_reasons

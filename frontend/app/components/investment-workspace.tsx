@@ -549,7 +549,7 @@ export function InvestmentWorkspace() {
         return;
       }
       const selectedCompany = researchContext.kind === "WATCHLIST"
-        ? watchlistResearch?.instruments.find((value) => value.globalInstrumentId === selectedResearchInstrumentId)?.company
+        ? watchlistResearch?.instruments?.find((value) => value.globalInstrumentId === selectedResearchInstrumentId)?.company
         : portfolioResearchSummary?.companies.find((company) => company.instrumentId === selectedResearchInstrumentId);
       if (selectedCompany && !canRefreshResearch(selectedCompany)) {
         setResearchSummary(null);
@@ -3545,14 +3545,14 @@ function ResearchView({
   const researchSections = summary ? getResearchSections(summary, filteredEvents, eventType, impact) : [];
   const selectedPortfolioResearchCompany =
     portfolioResearchSummary?.companies.find((company) => company.instrumentId === selectedResearchInstrumentId) ?? null;
-  const selectedWatchlistItem = watchlistResearch?.instruments.find(
+  const selectedWatchlistItem = watchlistResearch?.instruments?.find(
     (item) => item.globalInstrumentId === selectedResearchInstrumentId
   ) ?? null;
   const selectedContextResearchCompany = researchContext.kind === "WATCHLIST"
     ? selectedWatchlistItem?.company ?? null
     : researchContext.kind === "SEARCH" ? searchPresentation : selectedPortfolioResearchCompany;
   const detailWatchlistItem = researchDetail?.watchlistInstrumentId
-    ? watchlistResearch?.instruments.find((item) => item.globalInstrumentId === researchDetail.watchlistInstrumentId)
+    ? watchlistResearch?.instruments?.find((item) => item.globalInstrumentId === researchDetail.watchlistInstrumentId)
     : undefined;
   const portfolioDetailResearch = researchDetail
     ? portfolioResearchSummary?.companies.find(
@@ -3683,7 +3683,7 @@ function ResearchView({
         {watchlistResearchError ? <p className="research-refresh-notice" role="alert">{watchlistResearchError}</p> : null}
         {researchContext.kind === "WATCHLIST_PENDING" || watchlistResearchLoading ? <Skeleton rows={3} /> : null}
         {(researchContext.kind === "PORTFOLIO" && portfolioResearchSummary)
-          || (researchContext.kind === "WATCHLIST" && watchlistResearch?.instruments.length) ? (
+          || (researchContext.kind === "WATCHLIST" && watchlistResearch?.instruments?.length) ? (
           <div className="portfolio-research-table" role="table" aria-label="Company research summary">
             <div className="portfolio-research-row portfolio-research-head" role="row">
               <span role="columnheader">Company</span>
@@ -3788,6 +3788,9 @@ function ResearchView({
               );
             }) : null}
             {researchContext.kind === "PORTFOLIO" ? (portfolioResearchSummary?.companies ?? []).map((company) => {
+              const ownershipIncreases = company.ownershipIncreases ?? [];
+              const shareholdingChanges = company.shareholdingChanges ?? [];
+              const catalysts = company.currentQuarterCatalysts ?? [];
               const holding = positions.find((position) => position.instrument.globalInstrumentId === company.instrumentId
                 || position.instrument.instrumentId === company.instrumentId
                 || Boolean(position.instrument.isin && position.instrument.isin === company.isin)
@@ -3815,8 +3818,8 @@ function ResearchView({
                   <span role="cell">{metricText(company.valuation.currentPe)}</span>
                   <span role="cell"><Badge tone={valuationTone(company.valuation.state)}>{company.valuation.state}</Badge><small>{company.valuation.reason}</small></span>
                   <span role="cell">{latestResultText(company)}</span>
-                  <span role="cell">{company.ownershipIncreases.length ? company.ownershipIncreases.map((value) => value === "FII_FPI" ? "FII/FPI" : value.replaceAll("_", " ")).join(" · ") : "Unavailable"}<small>{company.shareholdingChanges.length ? `${company.shareholdingChanges.length} comparable trends` : "Previous comparable period not found"}</small></span>
-                  <span role="cell">{company.currentQuarterCatalysts.length ? `${company.currentQuarterCatalysts.length} current` : company.catalystScore ?? "None verified"}</span>
+                  <span role="cell">{ownershipIncreases.length ? ownershipIncreases.map((value) => value === "FII_FPI" ? "FII/FPI" : value.replaceAll("_", " ")).join(" · ") : "Unavailable"}<small>{shareholdingChanges.length ? `${shareholdingChanges.length} comparable trends` : "Previous comparable period not found"}</small></span>
+                  <span role="cell">{catalysts.length ? `${catalysts.length} current` : company.catalystScore ?? "None verified"}</span>
                   <span role="cell">
                     {company.sourceCount} sources / {company.documentCount} docs
                   </span>

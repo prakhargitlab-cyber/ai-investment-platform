@@ -17,7 +17,7 @@ from app.repository import ResearchRepository, _InstrumentRefreshGate
 from app.settings import Settings
 from app.source_discovery import DiscoveryResult
 from app.source_registry import RegisteredResearchSource
-from app.structured_research import _STATEMENT_HEADING, _classify_financial_row, _financial_columns, _financial_number, _header_dates, _nse_statement_candidates, _parse_nse_income_statement, _parse_statement_candidate, _row_semantic_tokens, _statement_quality, latest_quarterly_result, parsed_nse_balance_sheet_periods, parsed_nse_cash_flow_periods, parsed_nse_income_statement_periods
+from app.structured_research import _STATEMENT_HEADING, _classify_financial_row, _financial_columns, _financial_number, _header_dates, _nse_cash_flow_candidates, _nse_statement_candidates, _parse_nse_income_statement, _parse_statement_candidate, _row_semantic_tokens, _statement_quality, latest_quarterly_result, parsed_nse_balance_sheet_periods, parsed_nse_cash_flow_periods, parsed_nse_income_statement_periods
 
 
 def _document(text: str) -> ResearchDocument:
@@ -28,6 +28,7 @@ def _document(text: str) -> ResearchDocument:
         normalized_text=text, content_hash="fixture", status=DocumentStatus.PROCESSED, reliability_level=ReliabilityLevel.LEVEL_A,
         source_mode=SourceMode.REAL, instrument_id=UUID("99999999-9999-9999-9999-999999999999"),
         company_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"), published_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        discovery_provider="NSE_OFFICIAL_API", entity_resolution_confidence=0.99,
     )
 
 
@@ -61,6 +62,77 @@ DEEPAK_DECEMBER_2025 = """CONSOLIDATED Statement of Unaudited Financial Results 
 ELECTRONICS_MART_DECEMBER_2025 = """CONSOLIDATED Statement of Unaudited Financial Results for the third quarter and nine months ended 31 December 2025 (Rs. in Lakhs) Particulars Quarter Ended Year Ended 31 December 2025 30 September 2025 31 December 2024 31 December 2025 31 December 2024 Revenue From Operations 1000.00 900.00 800.00 2800.00 2300.00 Net Profit for the period/year 335.04 296.45 161.42 900.00 674.04"""
 
 
+# DI-7C.1 Bug 2: a real Tempsens-style annual filing uses a
+# "Statement of Profit and Loss" heading (not the "...Financial Results"
+# phrasing every other fixture in this file uses) and is preceded by
+# genuine narrative prose, exactly like a full NSE corporate-announcement
+# PDF's extracted text -- not a hand-isolated table snippet.
+TEMPSENS_MARCH_2026 = (
+    "Tempsens Instruments (India) Limited CIN L74210RJ1980PLC002293 Regd. Office Udaipur Rajasthan "
+    "The Board of Directors of the Company at its meeting held on 29th May 2026 approved the Audited "
+    "Financial Statements of the Company for the financial year ended 31st March 2026. The Company "
+    "continued to strengthen its position as a leading manufacturer of temperature sensors and "
+    "process control instrumentation during the year under review. A detailed discussion on "
+    "operational highlights, capacity expansion and export performance is provided in the Board's "
+    "Report forming part of the Annual Report. "
+    "Statement of Profit and Loss for the year ended 31st March 2026 (Rs. in Lakhs) "
+    "Particulars Year Ended 31st March 2026 31st March 2025 "
+    "Revenue from operations 15,234.56 13,012.44 "
+    "Other income 210.33 180.22 "
+    "Total income 15,444.89 13,192.66 "
+    "Total expenses 12,100.00 11,000.00 "
+    "Profit before tax 3,344.89 2,192.66 "
+    "Tax expense 850.00 560.00 "
+    "Profit for the period/year 2,494.89 1,632.66 "
+    "Basic Earnings Per Share 9.87 6.45 "
+    "Diluted Earnings Per Share 9.85 6.43 "
+    "Notes to the financial statements form an integral part of these results. "
+    "For and on behalf of the Board of Directors."
+)
+
+
+# "Profit and Loss Account" is the older/alternate heading form used by some
+# filers instead of "Statement of Profit and Loss".  Also preceded by prose.
+TEMPSENS_PROFIT_AND_LOSS_ACCOUNT_MARCH_2026 = TEMPSENS_MARCH_2026.replace(
+    "Statement of Profit and Loss for the year ended 31st March 2026",
+    "Profit and Loss Account for the year ended 31st March 2026",
+)
+
+
+# A Consolidated + Restated variant, proving the basis/audit-status prefix
+# variants extend to the new heading forms without disturbing reporting-
+# basis detection (still driven by _reporting_basis, unchanged by this fix).
+TEMPSENS_CONSOLIDATED_RESTATED_MARCH_2026 = (
+    "Tempsens Instruments (India) Limited CIN L74210RJ1980PLC002293 Regd. Office Udaipur Rajasthan "
+    "The Board of Directors of the Company at its meeting held on 29th May 2026 approved the Restated "
+    "Consolidated Financial Statements of the Company for the financial year ended 31st March 2026 "
+    "following a scheme of arrangement with its wholly owned subsidiary during the year. "
+    "Restated Consolidated Statement of Profit and Loss for the year ended 31st March 2026 (Rs. in Lakhs) "
+    "Particulars Year Ended 31st March 2026 31st March 2025 "
+    "Revenue from operations 18,900.00 16,400.00 "
+    "Other income 260.00 220.00 "
+    "Total income 19,160.00 16,620.00 "
+    "Total expenses 15,000.00 13,500.00 "
+    "Profit before tax 4,160.00 3,120.00 "
+    "Tax expense 1,050.00 780.00 "
+    "Profit for the period/year 3,110.00 2,340.00 "
+    "Basic Earnings Per Share 12.20 9.15 "
+    "Diluted Earnings Per Share 12.18 9.13 "
+    "Notes to the restated consolidated financial statements form an integral part of these results."
+)
+
+
+# An ordinary narrative sentence that mentions "profit and loss" in prose,
+# with no tabular Particulars/date columns anywhere -- must never become a
+# statement boundary on its own.
+NARRATIVE_PROFIT_AND_LOSS_PROSE = (
+    "The chairman noted in his address to shareholders that the company's profit and loss for the "
+    "year had improved compared to the previous year, driven largely by cost discipline and steady "
+    "demand across its core markets. Management discussed profit and loss trends across the industry "
+    "in its outlook commentary and reiterated its focus on sustainable, profitable growth."
+)
+
+
 def _multi_period_statement(
     current: str,
     prior: str,
@@ -71,7 +143,7 @@ def _multi_period_statement(
     pat: str = "10.00",
 ) -> str:
     return (
-        "Statement of Unaudited Financial Results Particulars Quarter Ended Year Ended "
+        "Statement of Unaudited Financial Results (Rs. in Crore) Particulars Quarter Ended Year Ended "
         f"{current} {prior} {comparable} {annual} "
         "Revenue From Operations "
         f"{revenue} 90.00 80.00 350.00 "
@@ -95,7 +167,7 @@ def _rolling_financial_documents() -> list[ResearchDocument]:
 
 def _balance_sheet(*, current: str = "31 March 2026", prior: str = "31 March 2025", basis: str = "") -> str:
     return (
-        f"{basis} Balance Sheet Particulars As at {current} {prior} "
+        f"{basis} Balance Sheet (Rs. in Crore) Particulars As at {current} {prior} "
         "Total Assets 500.00 450.00 Total Equity 120.00 110.00 "
         "Total Liabilities 380.00 340.00 Total Current Assets 200.00 180.00 "
         "Total Current Liabilities 150.00 140.00 Cash and Cash Equivalents 25.00 20.00 "
@@ -105,7 +177,7 @@ def _balance_sheet(*, current: str = "31 March 2026", prior: str = "31 March 202
 
 def _cash_flow(*, current: str = "31 March 2026", prior: str = "31 March 2025", basis: str = "") -> str:
     return (
-        f"{basis} Statement of Cash Flows Particulars Year Ended {current} {prior} "
+        f"{basis} Statement of Cash Flows (Rs. in Crore) Particulars Year Ended {current} {prior} "
         "Net cash from operating activities 100.00 90.00 "
         "Net cash used in investing activities 40.00 35.00 "
         "Net cash from financing activities 20.00 15.00 "
@@ -491,6 +563,81 @@ def test_multi_period_parser_emits_annual_only_when_explicitly_present() -> None
     }
 
 
+def test_tempsens_shaped_statement_of_profit_and_loss_is_discovered_in_full_document_without_manual_slicing() -> None:
+    """DI-7C.1 Bug 2: a "Statement of Profit and Loss" heading, embedded in a
+    full document with narrative prose before it (never hand-isolated to
+    just the table), must be discovered and its revenue/PAT/EPS extracted.
+    """
+    periods = parsed_nse_income_statement_periods([_document(TEMPSENS_MARCH_2026)])
+    values = {
+        (period.period_end, period.period_type): {metric: value.value for metric, value in period.metrics}
+        for period in periods
+    }
+    assert values[("2026-03-31", "ANNUAL")] == {
+        "revenue": Decimal("15234.56"), "pat": Decimal("2494.89"), "eps": Decimal("9.87"),
+    }
+    assert values[("2025-03-31", "ANNUAL")] == {
+        "revenue": Decimal("13012.44"), "pat": Decimal("1632.66"), "eps": Decimal("6.45"),
+    }
+
+
+def test_profit_and_loss_account_heading_is_discovered_in_full_document() -> None:
+    """DI-7C.1 Bug 2: the older "Profit and Loss Account" heading form must
+    also be recognised, still embedded in a full document with prose.
+    """
+    periods = parsed_nse_income_statement_periods([_document(TEMPSENS_PROFIT_AND_LOSS_ACCOUNT_MARCH_2026)])
+    values = {
+        (period.period_end, period.period_type): {metric: value.value for metric, value in period.metrics}
+        for period in periods
+    }
+    assert values[("2026-03-31", "ANNUAL")] == {
+        "revenue": Decimal("15234.56"), "pat": Decimal("2494.89"), "eps": Decimal("9.87"),
+    }
+
+
+def test_restated_consolidated_statement_of_profit_and_loss_heading_variant_is_discovered() -> None:
+    """DI-7C.1 Bug 2: CONSOLIDATED/RESTATED prefix variants of the new
+    heading forms must be recognised, and reporting-basis detection (a
+    pre-existing, unmodified mechanism) must still correctly mark the
+    period CONSOLIDATED.
+    """
+    periods = parsed_nse_income_statement_periods([_document(TEMPSENS_CONSOLIDATED_RESTATED_MARCH_2026)])
+    matching = [
+        period for period in periods
+        if period.period_end == "2026-03-31" and period.period_type == "ANNUAL" and period.reporting_basis == "CONSOLIDATED"
+    ]
+    assert len(matching) == 1
+    values = {metric: value.value for metric, value in matching[0].metrics}
+    assert values == {"revenue": Decimal("18900.00"), "pat": Decimal("3110.00"), "eps": Decimal("12.20")}
+
+
+def test_ordinary_profit_and_loss_prose_does_not_become_a_statement_boundary() -> None:
+    """DI-7C.1 Bug 2 negative test: an ordinary narrative sentence that
+    merely mentions "profit and loss" (no Particulars/date table anywhere)
+    must never be treated as a statement heading or produce a spurious
+    candidate/period/result.
+    """
+    assert _STATEMENT_HEADING.search(NARRATIVE_PROFIT_AND_LOSS_PROSE) is None
+    assert parsed_nse_income_statement_periods([_document(NARRATIVE_PROFIT_AND_LOSS_PROSE)]) == []
+    assert latest_quarterly_result([_document(NARRATIVE_PROFIT_AND_LOSS_PROSE)]) is None
+
+
+def test_narrative_profit_and_loss_prose_preceding_a_real_statement_does_not_corrupt_its_boundary() -> None:
+    """The narrative sentence, placed directly in front of a genuine
+    "Statement of Profit and Loss" table in the same document, must not
+    shift or widen the real statement's boundary or its extracted values.
+    """
+    text = NARRATIVE_PROFIT_AND_LOSS_PROSE + " " + TEMPSENS_MARCH_2026
+    periods = parsed_nse_income_statement_periods([_document(text)])
+    values = {
+        (period.period_end, period.period_type): {metric: value.value for metric, value in period.metrics}
+        for period in periods
+    }
+    assert values[("2026-03-31", "ANNUAL")] == {
+        "revenue": Decimal("15234.56"), "pat": Decimal("2494.89"), "eps": Decimal("9.87"),
+    }
+
+
 def test_balance_sheet_parser_maps_explicit_as_at_columns_without_derivation() -> None:
     periods = parsed_nse_balance_sheet_periods([_document(_balance_sheet())])
     values = {period.period_end: dict(period.metrics) for period in periods}
@@ -766,7 +913,9 @@ def test_direct_aligned_eps_outranks_fallback_regardless_of_candidate_order(monk
     assert values[("2026-03-31", "QUARTERLY")]["eps"].value == Decimal("1.29")
 
 
-def test_eps_fallback_remains_available_without_a_direct_aligned_basic_row() -> None:
+def test_eps_preceding_number_fallback_is_removed_without_a_direct_aligned_basic_row() -> None:
+    """DI-20D: no preceding-token fallback -- EPS is not fabricated from nearby
+    numbers when no directly aligned Basic/Diluted row exists."""
     text = _multi_period_statement("30 June 2026", "31 March 2026", "30 June 2025", "31 March 2026")
     text += " 1.47 1.29 1.34 5.36 Earnings per equity share (Face Value of Rs.10/- per share) -Basic (Rs.)"
 
@@ -775,7 +924,10 @@ def test_eps_fallback_remains_available_without_a_direct_aligned_basic_row() -> 
         (period.period_end, period.period_type): dict(period.metrics)
         for period in periods
     }
-    assert values[("2026-03-31", "ANNUAL")]["eps"].value == Decimal("5.36")
+    # EPS numbers appear before the label but no aligned Basic/Diluted row
+    # exists, so without the unsafe preceding-token fallback the metric is
+    # correctly absent rather than fabricated.
+    assert "eps" not in values.get(("2026-03-31", "ANNUAL"), {})
 
 
 def test_direct_aligned_diluted_eps_outranks_malformed_fallback_when_basic_is_unaligned() -> None:
@@ -789,6 +941,176 @@ def test_direct_aligned_diluted_eps_outranks_malformed_fallback_when_basic_is_un
     assert values[("2026-03-31", "ANNUAL")]["eps"].value == Decimal("5.36")
     assert values[("2025-03-31", "ANNUAL")]["eps"].value == Decimal("4.98")
     assert values[("2025-12-31", "QUARTERLY")]["eps"].value == Decimal("1.38")
+
+
+# DI-20 regression lock for NCC (National Aluminium).  The DI-20 orphan-cell
+# guard must refuse to fabricate EPS from the standalone table's collapsed
+# "Basic - Diluted <revenue-scale run>" row (4911.50 / 40.95 / 5315.71 ...), and
+# must refuse to fabricate a bare +765.92 cash-flow from March's parenthesised
+# "(765.92)" investing fragment (mis-dated to 2025-03-31, sign lost).  These
+# are the exact facts that pre-guard were emitted into the NSE financial fact
+# stream; asserting their absence locks in the structural-guard refinement.
+_MALFORMED_NCC_EPS_VALUES = {Decimal("4911.50"), Decimal("40.95"), Decimal("5315.71")}
+
+
+def _ncc_fixture(filename: str) -> str:
+    return (Path(__file__).parent / "fixtures" / "nse" / "ncc" / filename).read_text(encoding="utf-8")
+
+
+def test_ncc_june_standalone_orphan_eps_run_is_not_fabricated_as_period_eps() -> None:
+    document = _document(_ncc_fixture("ncc_2026_06_30_normalized.txt"))
+    # Non-vacuous: the standalone table is still discovered as a candidate, so
+    # the absence of EPS below is the guard rejecting the orphan row, not a
+    # failure to detect the table.
+    assert _nse_statement_candidates(document.normalized_text, document.published_at, require_quarterly=False)
+    income = parsed_nse_income_statement_periods([document])
+    assert not any(
+        metric == "eps" and value.value in _MALFORMED_NCC_EPS_VALUES
+        for period in income for metric, value in period.metrics
+    ), f"orphan EPS must not be fabricated: {[(m, v.value) for p in income for m, v in p.metrics]}"
+    cash = parsed_nse_cash_flow_periods([document])
+    assert not any(
+        metric == "cash_flow_from_investing_activities" and value.value == Decimal("765.92")
+        for period in cash for metric, value in period.metrics
+    )
+
+
+def test_ncc_march_investing_activities_fragment_is_not_fabricated_without_sign_or_correct_period() -> None:
+    document = _document(_ncc_fixture("ncc_2026_03_31_normalized.txt"))
+    # Non-vacuous: the consolidated cash-flow table is still discovered as a
+    # candidate; its "Net cash used in investing activities (765.92)" row is the
+    # one that is correctly refused.
+    assert _nse_cash_flow_candidates(document.normalized_text, document.published_at)
+    income = parsed_nse_income_statement_periods([document])
+    assert not any(
+        metric == "eps" and value.value in _MALFORMED_NCC_EPS_VALUES
+        for period in income for metric, value in period.metrics
+    )
+    cash = parsed_nse_cash_flow_periods([document])
+    # "(765.92)" is a parenthesised (accounting-negative) investing outflow,
+    # fragmented by (BI)/(SB.SS) row references in a two-column ANNUAL table;
+    # it must not surface as a bare +765.92 on the off-by-one 2025-03-31 column.
+    assert not any(
+        metric == "cash_flow_from_investing_activities" and value.value == Decimal("765.92")
+        for period in cash for metric, value in period.metrics
+    ), f"investing outflow must not be fabricated: {[(m, v.value) for p in cash for m, v in p.metrics]}"
+
+
+def test_ncc_march_mixed_quarter_year_header_recovers_standalone_and_consolidated_income() -> None:
+    document = _document(_ncc_fixture("ncc_2026_03_31_normalized.txt"))
+    periods = {
+        (period.period_end, period.period_type, period.reporting_basis): {
+            metric: value.value for metric, value in period.metrics
+        }
+        for period in parsed_nse_income_statement_periods([document])
+    }
+    # Task A/C: the orphaned serial "S.No" cell before "Particulars" no longer
+    # blocks the contiguous "Quarter ended" / "Year ended" header split.  Both
+    # reporting bases are recovered distinctly (Standalone vs Consolidated).
+    assert len(periods) == 10
+    assert periods[("2026-03-31", "QUARTERLY", "STANDALONE")] == {
+        "revenue": Decimal("5315.71"), "pat": Decimal("202.88"), "eps": Decimal("3.23"),
+    }
+    assert periods[("2026-03-31", "ANNUAL", "STANDALONE")] == {
+        "revenue": Decimal("17463.49"), "pat": Decimal("576.76"), "eps": Decimal("9.19"),
+    }
+    assert periods[("2026-03-31", "QUARTERLY", "CONSOLIDATED")] == {
+        "revenue": Decimal("6232.71"), "pat": Decimal("216.77"), "eps": Decimal("3.28"),
+    }
+    assert periods[("2026-03-31", "ANNUAL", "CONSOLIDATED")] == {
+        "revenue": Decimal("20823.00"), "pat": Decimal("723.96"), "eps": Decimal("10.76"),
+    }
+    # Task D: EPS is sourced from the EPS row only.  The standalone quarter's
+    # revenue figure (5315.71) is never mis-promoted onto the EPS key.
+    assert not any(
+        metric == "eps" and value in _MALFORMED_NCC_EPS_VALUES
+        for period in periods.values() for metric, value in period.items()
+    )
+    assert not any(
+        metric == "eps" and value == Decimal("5315.71")
+        for period in periods.values() for metric, value in period.items()
+    )
+
+
+def test_ncc_march_cash_flow_operating_and_financing_recover_with_accounting_parentheses() -> None:
+    document = _document(_ncc_fixture("ncc_2026_03_31_normalized.txt"))
+    periods = {
+        (period.period_end, period.period_type, period.reporting_basis): dict(period.metrics)
+        for period in parsed_nse_cash_flow_periods([document])
+    }
+    # Task E: the sole clean NCC table (consolidated, two ANNUAL columns).
+    # Accounting parentheses denote negative magnitude: operating "(458.51)"
+    # is -458.51; "(246.68)" is -246.68.  Non-parenthesized cells 741.70 and
+    # 878.18 keep their positive sign.
+    assert periods[("2026-03-31", "ANNUAL", "CONSOLIDATED")][
+        "cash_flow_from_operating_activities"].value == Decimal("-458.51")
+    assert periods[("2026-03-31", "ANNUAL", "CONSOLIDATED")][
+        "cash_flow_from_financing_activities"].value == Decimal("878.18")
+    assert periods[("2025-03-31", "ANNUAL", "CONSOLIDATED")][
+        "cash_flow_from_operating_activities"].value == Decimal("741.70")
+    assert periods[("2025-03-31", "ANNUAL", "CONSOLIDATED")][
+        "cash_flow_from_financing_activities"].value == Decimal("-246.68")
+    # The fragmented "(BI ... (765.92)" investing row and the mojibake'd net-change
+    # row never surface.
+    assert not any(
+        "cash_flow_from_investing_activities" in period
+        or "net_change_in_cash" in period
+        for period in periods.values()
+    )
+
+
+def test_ncc_june_structurally_rejected_without_any_persisted_facts() -> None:
+    document = _document(_ncc_fixture("ncc_2026_06_30_normalized.txt"))
+    # Non-vacuous: the June standalone table is still discovered as a candidate
+    # (its orphan EPS run and 5-vs-3 column mismatch are what get rejected).
+    assert _nse_statement_candidates(document.normalized_text, document.published_at, require_quarterly=False)
+    assert parsed_nse_income_statement_periods([document]) == []
+    assert parsed_nse_cash_flow_periods([document]) == []
+
+
+def test_ncc_march_valid_parse_supersedes_persisted_malformed_ncc_facts() -> None:
+    repository = ResearchRepository(persistence=SqliteResearchPersistence())
+    document = _document(_ncc_fixture("ncc_2026_03_31_normalized.txt"))
+    # Pre-guard malformed facts scoped to THIS source: the orphan EPS run
+    # (mis-promoted revenue-scale numbers) and the fragmented investing fragment.
+    malformed = [
+        _document_fact(document, "eps", "2026-03-31", "QUARTERLY", "STANDALONE", "5315.71"),
+        _document_fact(document, "eps", "2026-03-31", "ANNUAL", "STANDALONE", "40.95"),
+        _document_fact(document, "eps", "2025-03-31", "ANNUAL", "CONSOLIDATED", "4911.50"),
+        _document_fact(document, "cash_flow_from_investing_activities", "2025-03-31", "ANNUAL", "CONSOLIDATED", "765.92"),
+    ]
+    for fact in malformed:
+        repository._persistence.upsert_financial_fact(fact)
+
+    parsed, written = repository._reconcile_persisted_official_financial_document(document)
+    assert parsed
+    assert written > 0
+    facts = {
+        fact.key: fact.value.value
+        for fact in repository.financial_facts_for(document.instrument_id)
+        if fact.source_identity == str(document.document_id)
+    }
+    # Validated EPS replaces colliding keys. The unresolved investing row is
+    # outside any proven complete scope and must remain untouched (DI-20E).
+    assert Decimal("5315.71") not in {facts[key] for key in facts if key.metric == "eps"}
+    assert Decimal("40.95") not in {facts[key] for key in facts if key.metric == "eps"}
+    assert Decimal("4911.50") not in {facts[key] for key in facts if key.metric == "eps"}
+    assert facts[FinancialFactKey(document.instrument_id, "cash_flow_from_investing_activities", "2025-03-31", "ANNUAL", "CONSOLIDATED")] == Decimal("765.92")
+    # Supersession (not just deletion): the colliding EPS key now holds the valid value.
+    assert facts[FinancialFactKey(document.instrument_id, "eps", "2026-03-31", "QUARTERLY", "STANDALONE")] == Decimal("3.23")
+    # A re-run is idempotent.
+    assert repository._reconcile_persisted_official_financial_document(document)[0]
+
+
+def test_ncc_june_zero_parse_does_not_delete_source_owned_malformed_facts() -> None:
+    repository = ResearchRepository(persistence=SqliteResearchPersistence())
+    document = _document(_ncc_fixture("ncc_2026_06_30_normalized.txt"))
+    stale = _document_fact(document, "eps", "2026-06-30", "QUARTERLY", "STANDALONE", "5315.71")
+    repository._persistence.upsert_financial_fact(stale)
+    # June is structurally rejected (zero valid facts) -> zero-trust parse must
+    # not trigger destructive cleanup of source-owned facts.
+    assert repository._reconcile_persisted_official_financial_document(document) == (False, 0)
+    assert repository.financial_facts_for(document.instrument_id) == [stale]
 
 
 class _FactRecorder:
@@ -859,7 +1181,7 @@ def test_document_scoped_reconciliation_replaces_deepak_values_without_touching_
     assert repository.financial_facts_for(document.instrument_id) == before
 
 
-def test_document_scoped_reconciliation_deletes_electronics_mart_obsolete_annual_keys_only_for_that_source() -> None:
+def test_conflicting_period_evidence_preserves_electronics_mart_source_facts() -> None:
     repository = ResearchRepository(persistence=SqliteResearchPersistence())
     document = _document(ELECTRONICS_MART_DECEMBER_2025).model_copy(update={
         "document_id": UUID("df9d629e-a0ee-4290-ada9-bbb9da6d06df"),
@@ -873,12 +1195,13 @@ def test_document_scoped_reconciliation_deletes_electronics_mart_obsolete_annual
     )
     repository._persistence.upsert_financial_fact(other)
 
-    assert repository._reconcile_persisted_official_financial_document(document)[0]
+    # The title says nine months but the table says year. DI-20E cannot
+    # authorize durable facts or deletion from this unresolved contradiction.
+    assert repository._reconcile_persisted_official_financial_document(document) == (False, 0)
     facts = {fact.key: fact for fact in repository.financial_facts_for(document.instrument_id)}
-    assert FinancialFactKey(document.instrument_id, "pat", "2025-12-31", "ANNUAL", "CONSOLIDATED") not in facts
-    assert FinancialFactKey(document.instrument_id, "pat", "2024-12-31", "ANNUAL", "CONSOLIDATED") not in facts
-    assert facts[FinancialFactKey(document.instrument_id, "pat", "2025-12-31", "QUARTERLY", "CONSOLIDATED")].value.value == Decimal("335.04")
-    assert facts[FinancialFactKey(document.instrument_id, "pat", "2024-12-31", "QUARTERLY", "CONSOLIDATED")].value.value == Decimal("161.42")
+    assert facts[FinancialFactKey(document.instrument_id, "pat", "2025-12-31", "ANNUAL", "CONSOLIDATED")].value.value == Decimal("335.04")
+    assert facts[FinancialFactKey(document.instrument_id, "pat", "2024-12-31", "ANNUAL", "CONSOLIDATED")].value.value == Decimal("674.04")
+    assert len(facts) == 3
     assert facts[other.key].source_identity == "other-official-document"
 
 
@@ -1098,7 +1421,7 @@ def test_already_persisted_official_document_recovers_zero_facts_without_redownl
     documents_before = len(repository.documents)
     parser_calls = 0
     network_calls = 0
-    original_persist = repository._persist_official_financial_facts
+    original_persist = repository._reconcile_persisted_official_financial_document
 
     def record_parser(reused_document):
         nonlocal parser_calls
@@ -1110,7 +1433,7 @@ def test_already_persisted_official_document_recovers_zero_facts_without_redownl
         network_calls += 1
         raise AssertionError("an already persisted official document must not be downloaded again")
 
-    repository._persist_official_financial_facts = record_parser  # type: ignore[method-assign]
+    repository._reconcile_persisted_official_financial_document = record_parser  # type: ignore[method-assign]
     repository._single_flight_official_filing = no_network  # type: ignore[method-assign]
 
     asyncio.run(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
@@ -1352,11 +1675,31 @@ def test_persisted_trusted_financial_document_with_revenue_and_pat_is_complete_w
 
 
 def test_latest_trusted_period_repairs_even_when_older_period_is_complete() -> None:
+    """DI-7C: "complete" now also covers balance-sheet/cash-flow facts that a
+    filing's own text expects (Steps 3/5/6).  The real IRFC OCR fixture used
+    here previously is deliberately noisy for parser-robustness coverage
+    elsewhere in this module and its Balance Sheet / Cash Flow sections do
+    not cleanly extract -- under the corrected, stricter completeness rule
+    that is itself a genuine (and intended) incompleteness signal, not a
+    fixture bug.  This test's own purpose is independent of that: a fully
+    reconciled older annual period (income *and* balance sheet *and* cash
+    flow all genuinely extracted) must not be re-selected merely because a
+    different, newer period is still missing everything -- so it uses a
+    clean, fully parseable older filing to isolate that invariant."""
     profile = _profile()
     repository = ResearchRepository()
     repository._persistence = SqliteResearchPersistence()
-    root = Path(__file__).parent / "fixtures" / "nse" / "irfc"
-    older = _document((root / "irfc_2026_03_31_normalized.txt").read_text(encoding="utf-8"))
+    older_text = (
+        "Amounts in Rs. Crore Extract of Statement of Audited Financial Results for the quarter and year ended 31st March 2026 "
+        "Particulars Quarter Ended Year Ended 31st March 31st December 31st March 31st March 31st March "
+        "2026 2025 2025 2026 2025 "
+        "Revenue From Operations 9,000.00 8,500.00 8,000.00 33,000.00 30,000.00 "
+        "Net Profit for the period after Tax 2,000.00 1,900.00 1,800.00 7,500.00 7,000.00 "
+        "Earning Per Share (of Rs 10 each) Basic (Rs.) 1.50 1.45 1.40 5.70 5.30 Diluted (Rs.) 1.50 1.45 1.40 5.70 5.30 "
+        + _balance_sheet(current="31 March 2026", prior="31 March 2025") + " "
+        + _cash_flow(current="31 March 2026", prior="31 March 2025")
+    )
+    older = _document(older_text)
     latest = _document(JUNE)
     repository.documents[older.document_id] = older
     repository.documents[latest.document_id] = latest

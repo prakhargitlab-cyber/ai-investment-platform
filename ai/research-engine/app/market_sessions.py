@@ -102,3 +102,23 @@ def next_session_open(market, schedules, exceptions, after):
         if bounds and bounds[0] > after:
             return bounds[0]
     return None
+
+
+def price_session_valid_until(
+    market: str,
+    schedules: list[MarketTradingSchedule],
+    exceptions: list[MarketCalendarException],
+    observation_as_of: datetime,
+) -> datetime | None:
+    """Validity ceiling for a genuine exchange close observation.
+
+    A real session-close observation stays usable through the next expected
+    trading session open, so weekends/holidays extend (rather than age)
+    validity. Returns None when the observation does not align with a completed
+    close or no calendar context exists -- the caller then falls back to the
+    policy wall-clock TTL (fail-closed / conservative).
+    """
+    session = latest_completed_session(market, schedules, exceptions, observation_as_of + timedelta(minutes=15))
+    if session is None or abs((session - observation_as_of).total_seconds()) > 15 * 60:
+        return None
+    return next_session_open(market, schedules, exceptions, session)

@@ -56,6 +56,55 @@ public class OfficialNseEtfSecurityListClient implements NseOfficialEtfSecurityL
         }
     }
 
+    /**
+     * Fetches the ETF list ONCE and returns every well-formed row -- used by bounded bulk passes
+     * (see NseOfficialEtfSecurityList#listAll) instead of calling {@link #lookupByIsin} once per
+     * instrument, which would re-download and re-parse the entire CSV for every single lookup.
+     * Unlike lookupByIsin, failure is signaled by throwing IllegalStateException rather than
+     * returning a status value, so a caller can tell "fetched successfully, zero/no matching rows"
+     * apart from "could not fetch" and avoid treating a failed fetch as authoritative absence.
+     */
+    @Override
+    public List<Listing> listAll() {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(securityListUrl)).timeout(Duration.ofSeconds(10))
+                .header("Accept", "text/csv,text/plain;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", "en-US,en;q=0.9").header("Referer", "https://www.nseindia.com/")
+                .header("User-Agent", USER_AGENT).GET().build();
+        HttpResponse<String> response;
+        try {
+            response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("NSE_ETF_LIST_UNAVAILABLE", exception);
+        } catch (Exception exception) {
+            throw new IllegalStateException("NSE_ETF_LIST_UNAVAILABLE", exception);
+        }
+        if (response.statusCode() != 200) throw new IllegalStateException("NSE_ETF_LIST_UNAVAILABLE");
+        try {
+            return parseAll(response.body());
+        } catch (Exception exception) {
+            throw new IllegalStateException("NSE_ETF_LIST_INVALID", exception);
+        }
+    }
+
+    static List<Listing> parseAll(String csv) throws Exception {
+        List<Listing> out = new ArrayList<>();
+        try (CSVParser parser = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).build()
+                .parse(new StringReader(csv))) {
+            if (!parser.getHeaderMap().keySet().containsAll(List.of("Symbol", "SecurityName", "ISINNumber")))
+                throw new IllegalArgumentException("NSE_ETF_LIST_REQUIRED_HEADERS_MISSING");
+            for (CSVRecord row : parser) {
+                String isin = InstrumentMasterEntity.normalizeIsin(value(row, "ISINNumber"));
+                String symbol = value(row, "Symbol");
+                String securityName = value(row, "SecurityName");
+                if (isin != null && symbol != null && securityName != null) {
+                    out.add(new Listing(symbol, isin, securityName, value(row, "Underlying")));
+                }
+            }
+        }
+        return out;
+    }
+
     static Lookup parse(String expectedIsin, String csv) throws Exception {
         expectedIsin = InstrumentMasterEntity.normalizeIsin(expectedIsin);
         if (expectedIsin == null) return Lookup.noIsinMatch();

@@ -46,6 +46,16 @@ public class NseMappingReconciliationService {
         List<InstrumentProviderMappingEntity> existing = mappings.findByInstrumentId(instrumentId);
         if (existing.stream().anyMatch(this::isTrustworthyNse)) return skipped(instrumentId, "TRUSTED_NSE_MAPPING_EXISTS");
         if (existing.stream().anyMatch(this::isLegacyBrokerNse)) return skipped(instrumentId, "LEGACY_NSE_MAPPING_REPAIR_REQUIRED");
+        // Restored to run only once reconciliation has genuinely proceeded past the pre-existing
+        // trusted/legacy short-circuits above (its original position, before the asset-type feature
+        // was added, made every reconcile() call -- including ones incidentally triggered for an
+        // already-trusted instrument, e.g. from unrelated broker-sync flows -- perform a live ETF-list
+        // lookup even though the short-circuit below would otherwise return immediately with no network
+        // call at all). Historical correction of an already-PERSISTED/trusted row that is actually an
+        // ETF is intentionally NOT handled here anymore; that is deferred to a separate, explicit,
+        // bounded authoritative reclassification/backfill pass, not forced into every ordinary
+        // reconcile() call.
+        applyAuthoritativeEtfClassification(master.get());
         if (master.get().getAssetType() == AssetType.ETF) return bootstrapFromOfficialEtfList(instrumentId, master.get());
         Outcome officialMaster = bootstrapFromOfficialIsin(instrumentId, master.get());
         if ("PERSISTED".equals(officialMaster.status()) || !canFallbackFromOfficialMaster(officialMaster)) return officialMaster;
@@ -172,6 +182,32 @@ public class NseMappingReconciliationService {
     private static boolean canFallbackFromOfficialMaster(Outcome outcome) {
         return "SKIPPED".equals(outcome.status()) && ("OFFICIAL_MASTER_NO_ISIN_MATCH".equals(outcome.reason())
                 || "OFFICIAL_MASTER_UNAVAILABLE".equals(outcome.reason()));
+    }
+
+    /**
+     * NSE's own dedicated ETF securities list (a separate, authoritative source from the general
+     * equity master) is stronger evidence than a provider-reported quoteType guess. Called from
+     * reconcile() only once the pre-existing trusted/legacy short-circuits have already been checked
+     * (see reconcile() above) -- i.e. only on a genuinely-provisional row that reconciliation is about
+     * to act on anyway -- so a fund trading under an ordinary equity series is never left classified as
+     * an operating-company equity merely because the ingestion-time default has not yet been corrected,
+     * without forcing a live ETF-list lookup onto every incidental reconcile() call for an
+     * already-trusted instrument. Only ever moves a still-provisional EQUITY row to ETF; never touches a
+     * row that has already been classified one way or the other (see
+     * InstrumentMasterEntity.applyValidatedAssetType). Does NOT retroactively correct a row that is
+     * already trusted/PERSISTED and short-circuited above -- that historical-correction case is
+     * intentionally left to a separate, explicit, bounded authoritative reclassification/backfill pass.
+     */
+    private void applyAuthoritativeEtfClassification(InstrumentMasterEntity master) {
+        if (master.getAssetType() != AssetType.EQUITY) return;
+        String isin = InstrumentMasterEntity.normalizeIsin(master.getIsin());
+        if (isin == null) return;
+        NseOfficialEtfSecurityList.Lookup lookup = etfSecurityList.lookupByIsin(isin);
+        if ("MATCHED".equals(lookup.status())) {
+            master.applyValidatedAssetType(AssetType.ETF);
+            log.info("nse_reconciliation_authoritative_asset_type globalInstrumentId={} assetType=ETF source=NSE_OFFICIAL_ETF_SECURITY_LIST",
+                    master.getInstrumentId());
+        }
     }
 
     static boolean eligible(InstrumentMasterEntity master) {

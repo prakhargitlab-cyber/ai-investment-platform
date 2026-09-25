@@ -402,3 +402,166 @@ async def test_targeted_refresh_keeps_other_durable_failure_states():
     snapshot = adapter.load_by_global_instrument_id(INSTRUMENT_ID, ResearchRequirementRegistry.default().requirements)
     assert snapshot.failure_reasons["CURRENT_NEWS"] == "ACQUISITION_TIMEOUT"
     assert snapshot.failure_reasons["VALUATION_INPUTS"] == "PROVIDER_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_persister_stamps_last_price_at_to_observation_time_not_retrieval():
+    # Regression for last_price_at semantics: a stale Friday-close quote that is
+    # re-downloaded "today" must keep its observation time, so refresh eligibility
+    # (price_sync_eligible) can correctly flag it for re-fetch.
+    repository = FakeRepository()
+    observed = datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc)   # Friday 15:30 IST close
+    retrieved = datetime(2026, 9, 14, 18, 0, tzinfo=timezone.utc)   # Monday re-download
+    normalized = result(
+        observedAt=observed.isoformat(),
+        retrievedAt=retrieved.isoformat(),
+        structuredFacts=[
+            {
+                "metric": "latestPrice", "value": "250", "unit": "INR",
+                "asOf": observed.isoformat(), "publishedAt": None,
+                "sourceUrl": "https://finance.yahoo.com/quote/READY.NS",
+                "confidence": 0.8, "rawFieldOrigin": "regularMarketPrice",
+            }
+        ],
+    )
+    await YahooMcpResultPersister(repository).persist(normalized, repository.item)
+    record = repository.structured[-1]
+    assert record.market_as_of == observed
+    assert record.last_price_at == observed       # observation time, NOT retrieval time
+    assert record.last_price_at != retrieved
+
+
+@pytest.mark.asyncio
+async def test_persisted_news_article_source_independence_key_is_deterministic_sha256_hex():
+    # Regression: source_independence_key is a fixed-width CHAR(64) column.
+    # It must never hold the raw article URL (which is neither guaranteed to
+    # be 64 characters nor safe to store there -- see StringDataRightTruncation
+    # / format defects this replaces), only a deterministic SHA-256 hex digest
+    # built from the repository's established content_hash(...) convention.
+    from app.normalization import content_hash
+
+    long_url = "https://news.example.test/a/" + ("x" * 2200) + "?id=1"
+    repository = FakeRepository()
+    normalized = result(
+        news=[
+            {
+                "headline": "Board approves buyback",
+                "url": long_url,
+                "publishedAt": NOW.isoformat(),
+                "publisher": "Example Wire",
+                "issuerSymbol": "READY.NS",
+                "summary": "The board approved a share buyback programme.",
+            }
+        ],
+    )
+    await YahooMcpResultPersister(repository).persist(normalized, repository.item)
+    assert len(repository.evidence) == 1
+    document, event = repository.evidence[0]
+
+    # The complete URL round-trips unchanged (never truncated).
+    assert document.canonical_url == long_url
+    assert document.original_url == long_url
+    assert len(long_url) > 2048
+
+    key = document.source_independence_key
+    assert key is not None
+    assert len(key) == 64
+    assert key == key.lower()
+    assert all(c in "0123456789abcdef" for c in key)
+    assert key == content_hash(long_url.casefold())
+
+    # Deterministic: persisting the same canonical source again yields the
+    # same identity key, and a differently-cased URL is treated as the same
+    # source (case-insensitive), matching the prior casefold() intent.
+    repository_again = FakeRepository()
+    await YahooMcpResultPersister(repository_again).persist(normalized, repository_again.item)
+    assert repository_again.evidence[0][0].source_independence_key == key
+
+    upper_variant = result(
+        news=[
+            {
+                "headline": "Board approves buyback",
+                "url": long_url.upper(),
+                "publishedAt": NOW.isoformat(),
+                "publisher": "Example Wire",
+                "issuerSymbol": "READY.NS",
+                "summary": "The board approved a share buyback programme.",
+            }
+        ],
+    )
+    repository_ci = FakeRepository()
+    await YahooMcpResultPersister(repository_ci).persist(upper_variant, repository_ci.item)
+    assert repository_ci.evidence[0][0].source_independence_key == key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label,url", [
+    ("normal-url", "https://news.example.test/event-identity/board-buyback"),
+    ("over-2000-chars", "https://news.example.test/event-identity/" + ("q" * 2100)),
+])
+async def test_persisted_news_event_independence_key_is_deterministic_sha256_hex_and_keeps_tool_tier(label, url):
+    # Regression: research_events.independence_key is also a fixed-width
+    # CHAR(64) column. It previously stored a raw, unbounded
+    # "YAHOO_FINANCE_MCP:<url>" string (StringDataRightTruncation risk for
+    # long URLs, same defect class as source_independence_key). It must now
+    # be a deterministic 64-char lowercase SHA-256 hex digest built from the
+    # shared content_hash() helper for both a normal-length and a >2000-char
+    # URL, while still preserving the ability to recognize a Yahoo-MCP-sourced
+    # event for source-tier classification
+    # (app.research_readiness_runtime._event_source), since that no longer
+    # reads a literal prefix out of independence_key.
+    from app.normalization import content_hash
+    from app.research_readiness import ResearchSourceTier
+    from app.research_readiness_runtime import _event_source
+
+    if label == "over-2000-chars":
+        assert len(url) > 2000
+    repository = FakeRepository()
+    normalized = result(
+        news=[
+            {
+                "headline": "Board approves capacity expansion",
+                "url": url,
+                "publishedAt": NOW.isoformat(),
+                "publisher": "Example Wire",
+                "issuerSymbol": "READY.NS",
+                "summary": "The board approved a capacity expansion plan.",
+            }
+        ],
+    )
+    await YahooMcpResultPersister(repository).persist(normalized, repository.item)
+    assert len(repository.evidence) == 1
+    document, event = repository.evidence[0]
+
+    key = event.independence_key
+    assert key is not None
+    assert len(key) == 64
+    assert key == key.lower()
+    assert all(c in "0123456789abcdef" for c in key)
+    expected = content_hash(f"YAHOO_FINANCE_MCP:{url.casefold()}")
+    assert key == expected
+
+    # Deterministic repeat for the same semantic source.
+    repository_again = FakeRepository()
+    await YahooMcpResultPersister(repository_again).persist(normalized, repository_again.item)
+    assert repository_again.evidence[0][1].independence_key == key
+
+    # Existing semantics require provider/source distinction: the same URL
+    # attributed to a different source identity must not collide.
+    other_source_key = content_hash(f"OTHER_PROVIDER:{url.casefold()}")
+    assert other_source_key != key
+
+    # Source-tier classification still recognizes this event as Yahoo MCP
+    # tool-sourced (APPROVED_EXTERNAL_TOOL), now via hash verification rather
+    # than a literal "YAHOO_FINANCE_MCP:" prefix check.
+    source, tier = _event_source(event, "CURRENT_NEWS")
+    assert source == "APPROVED_EXTERNAL_TOOL"
+    assert tier == ResearchSourceTier.APPROVED_EXTERNAL_TOOL
+
+    # An event whose independence_key does NOT match the Yahoo MCP convention
+    # for its own source_url (i.e. a different, non-Yahoo source identity)
+    # must not be misclassified as Yahoo MCP tool-sourced.
+    impostor = event.model_copy(update={"independence_key": other_source_key})
+    impostor_source, impostor_tier = _event_source(impostor, "CURRENT_NEWS")
+    assert impostor_source != "APPROVED_EXTERNAL_TOOL"
+    assert impostor_tier != ResearchSourceTier.APPROVED_EXTERNAL_TOOL

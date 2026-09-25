@@ -5,9 +5,33 @@ from uuid import NAMESPACE_URL, uuid5
 from urllib.parse import urlparse
 from app.business_exposure import BusinessEvidence, SourceReference, extract_profile, query_plan
 from app.news_intelligence import ProviderOutcome, aggregate_search, extract_impacts
-from app.source_discovery import SearchDateWindow, CandidateSearchResult, classify_source, reliability_for_classification, source_type_for_classification
+from app.source_discovery import SearchDateWindow, CandidateSearchResult, _candidate_rank, classify_source, reliability_for_classification, source_type_for_classification
 from app.normalization import canonicalize_url, content_hash, extract_text, extract_published_at
 from app.models import ResearchDocument, SourceMode
+from app.source_discovery import SearchProviderError
+
+
+_WRAPPED_PREFIX='SEARCH_PROVIDER_UNAVAILABLE:'
+
+
+def _query_failure_code(exc):
+    """Stable, secret-free technical code for one failed query.
+
+    Provider errors already carry fixed codes built by the adapter (never raw
+    response text or credentials); other exceptions contribute only their
+    class name. The redundant SearXNG wrapper prefix is removed so specific
+    codes (RATE_LIMITED, TIMEOUT, DEGRADED) stay classifiable."""
+    if isinstance(exc, SearchProviderError):
+        code=str(exc).strip() or 'SEARCH_PROVIDER_UNAVAILABLE'
+        if code.startswith(_WRAPPED_PREFIX) and code[len(_WRAPPED_PREFIX):].startswith('SEARCH_PROVIDER_'):
+            code=code[len(_WRAPPED_PREFIX):]
+        return code
+    return f'SEARCH_QUERY_FAILED:{type(exc).__name__}'
+
+
+def _join_codes(*codes):
+    values=sorted({part for code in codes if code for part in str(code).split('|') if part})
+    return '|'.join(values) or None
 
 
 def persisted_yahoo_discovery(repository, company, now):
@@ -35,6 +59,50 @@ def persisted_yahoo_discovery(repository, company, now):
     if row.get('outcome')=='SUCCESS' and not candidates: state='PARTIAL'
     return [ProviderOutcome(provider='YAHOO_FINANCE_MCP',outcome=state,candidate_count=len(candidates),
         queries_planned=1,queries_completed=int(success),failure_code=None if success else 'PERSISTED_YAHOO_SEARCH_FAILED')],candidates
+
+# Only literal exchange (NSE) corporate-announcement documents are reused as
+# CURRENT_NEWS candidates here -- not every OFFICIAL_COMPANY document another
+# requirement persisted, which may exist for unrelated purposes (e.g. a
+# financial-facts PDF) and would otherwise be double-purposed as "news"
+# without ever having been selected as a news candidate.
+_OFFICIAL_NEWS_CLASSIFICATIONS = {'EXCHANGE'}
+
+
+def persisted_official_discovery(repository, company):
+    """Reuse already-persisted NSE corporate-announcement documents as
+    CURRENT_NEWS candidates before any generic search runs.
+
+    These documents were already fetched and persisted by
+    OfficialFilingDiscovery for other mandatory requirements (financial
+    results, shareholding, order book/capex/guidance, governance). No new
+    network call is made here: this only looks at what is already on file
+    for this instrument, so an authoritative, CAPTCHA-free exchange
+    disclosure can satisfy company-news evidence -- and, because the
+    downstream fetch loop reuses a persisted document by canonical URL
+    instead of re-fetching it, the same announcement is never downloaded
+    twice for the sake of CURRENT_NEWS.
+
+    Returns ([], []) when no such document exists, mirroring
+    persisted_yahoo_discovery: a provider outcome with zero planned queries
+    would corrupt aggregate_search's completeness classification, so nothing
+    is contributed rather than a hollow SUCCESS_EMPTY outcome.
+    """
+    candidates = []
+    for doc in repository.documents_for(company.instrument_id, source_mode=SourceMode.REAL):
+        if doc.source_classification not in _OFFICIAL_NEWS_CLASSIFICATIONS:
+            continue
+        if not doc.normalized_text:
+            continue
+        candidates.append(CandidateSearchResult(
+            doc.title or '', doc.canonical_url, '', doc.discovered_at or doc.retrieved_at,
+            doc.discovery_provider or 'NSE_OFFICIAL_API', 'persisted-official-filing',
+            'persisted official filing', 'CURRENT_NEWS'))
+    if not candidates:
+        return [], []
+    outcome = ProviderOutcome(provider='OFFICIAL_FILING_REUSE', outcome='SUCCESS_WITH_RESULTS',
+        candidate_count=len(candidates), queries_planned=1, queries_completed=1, failure_code=None)
+    return [outcome], candidates
+
 
 def persisted_business_evidence(repository, company):
     evidence=[]
@@ -74,33 +142,67 @@ async def acquire_news(repository, company, *, providers, industry=None, now=Non
     buckets=[[q for q in plan if q[0]==tier] for tier in (1,2,3,4)]
     plan=[b[i] for i in range(max(map(len,buckets),default=0)) for b in buckets if i<len(b)][:max_queries]
     outcomes,supplemental=persisted_yahoo_discovery(repository,company,started)
+    official_outcomes,official_supplemental=persisted_official_discovery(repository,company)
+    outcomes=outcomes+official_outcomes
     candidates={canonicalize_url(row.url):row for row in supplemental}
+    for row in official_supplemental: candidates.setdefault(canonicalize_url(row.url),row)
     for provider in sorted(providers,key=lambda p:p.provider_name):
         if provider.provider_name.lower() == 'disabled':
             outcomes.append(ProviderOutcome(provider=provider.provider_name,outcome='FAILED',candidate_count=0,
                 queries_planned=len(plan),queries_completed=0,failure_code='SEARCH_PROVIDER_DISABLED'))
             continue
-        completed=0; count=0; failed=False; degraded=False
+        # Provider outcome is decided by query-plan completion: a query that
+        # returned usable results is complete even if some underlying
+        # meta-search engines were unresponsive (kept as a diagnostic). A query
+        # that raised, or returned nothing while engines were unresponsive
+        # (CAPTCHA / 429 / outage), is a failed query -- never a valid empty.
+        completed=0; count=0; degraded_queries=0; codes=[]
         for _,query in plan:
             try:
                 rows=await provider.discover(company,'CURRENT_NEWS',SearchDateWindow(query_limit=1,explicit_queries=(query,)))
-                completed+=1; count+=len(rows)
-                degraded |= bool(getattr(provider,'last_query_degraded',False))
-                for row in rows: candidates.setdefault(canonicalize_url(row.url),row)
-            except Exception:
-                failed=True
+            except Exception as exc:
+                codes.append(_query_failure_code(exc))
+            else:
+                degraded=bool(getattr(provider,'last_query_degraded',False))
+                if degraded and not rows:
+                    codes.append('SEARCH_PROVIDER_DEGRADED')
+                else:
+                    completed+=1; count+=len(rows); degraded_queries+=int(degraded)
+                    for row in rows: candidates.setdefault(canonicalize_url(row.url),row)
             await sleep(repository.settings.market_data_population_request_interval_seconds)
-        state=('PARTIAL' if failed or degraded else 'SUCCESS_WITH_RESULTS' if count else 'SUCCESS_EMPTY') if completed else 'FAILED'
+        failed=bool(codes)
+        state=('PARTIAL' if failed else 'SUCCESS_WITH_RESULTS' if count else 'SUCCESS_EMPTY') if completed else 'FAILED'
         outcomes.append(ProviderOutcome(provider=provider.provider_name,outcome=state,candidate_count=count,
-            queries_planned=len(plan),queries_completed=completed,failure_code='SEARCH_PROVIDER_UNAVAILABLE' if failed else None))
-    features=[]; incomplete=len(candidates)>max_documents
-    for url,candidate in sorted(candidates.items())[:max_documents]:
+            queries_planned=len(plan),queries_completed=completed,failure_code=_join_codes(*codes),
+            degraded_queries=degraded_queries))
+    features=[]; document_codes=[]
+    documents_fetched = 0          # real network fetch attempts (excludes persisted-document reuse)
+    usable_documents = 0           # documents that yielded company-relevant CURRENT_NEWS evidence
+    # Rank candidates by relevance + recency (exchange/regulatory authority,
+    # filing/ownership relevance, freshness, HTML-over-PDF) rather than by URL,
+    # so the most usable CURRENT_NEWS candidate is fetched first. `max_documents`
+    # bounds *usable* evidence, while a separate, strictly-bounded attempt
+    # allowance (`max_attempts`) lets a failing / oversized / unextractable
+    # candidate fall through to the next ranked candidate without permanently
+    # consuming a usable slot. Canonical-equivalent URLs are already collapsed in
+    # `candidates`, so each URL is attempted at most once. The per-item try/except
+    # continues the run instead of aborting the batch.
+    ranked_candidates = sorted(candidates.items(), key=lambda kv: _candidate_rank(company, kv[1]), reverse=True)
+    max_attempts = min(len(ranked_candidates), max_documents * 2)
+    for url,candidate in ranked_candidates:
+        if usable_documents >= max_documents:
+            break
+        if documents_fetched >= max_attempts:
+            break
+        stage='DOCUMENT_FETCH_FAILED'
         try:
-            existing=next((d for d in repository.documents.values() if d.canonical_url==url),None)
+            existing=next((d for d in repository.documents_for(company.instrument_id) if d.canonical_url==url),None)
             if existing:
                 document=existing
             else:
+                documents_fetched += 1
                 fetched=await repository._fetcher.fetch(url)  # Existing redirects/SSRF/robots/size policy.
+                stage='EXTRACTION_FAILED'
                 title,body=extract_text(fetched.text,fetched.content_type)
                 if not body: raise ValueError('EMPTY_DOCUMENT')
                 classification=classify_source(urlparse(fetched.final_url).hostname or '',company,candidate)
@@ -112,17 +214,68 @@ async def acquire_news(repository, company, *, providers, industry=None, now=Non
                     reliability_level=reliability_for_classification(classification),source_mode='REAL',status='PARSED',
                     retrieved_at=stamp,discovered_at=candidate.discovered_at,
                     published_at=extract_published_at(fetched.text),discovery_provider=candidate.provider)
+                stage='DOCUMENT_PERSIST_FAILED'
                 await repository._run_blocking_persistence(repository._persistence.upsert_document,document)
-                repository.documents[document.document_id]=document
+                repository.remember_persisted_document(document)
+            stage='EXTRACTION_FAILED'
             if not document.normalized_text: raise ValueError('DOCUMENT_BODY_UNAVAILABLE')
             extracted=extract_impacts(exposure,document,now=now or datetime.now(timezone.utc))
+            if not extracted:
+                # Usable fetch but no company-relevant event: does not consume a
+                # usable slot; continue to the next ranked candidate.
+                continue
+            usable_documents += 1
             for feature in extracted:
                 features.append(await repository.append_news_record(feature))
         except Exception:
-            incomplete=True
+            # Attempted but failed: consumes an attempt, not a usable slot;
+            # recorded as a diagnostic so a genuinely empty run is retryable,
+            # but never used to certify no-events when usable evidence was obtained.
+            document_codes.append(stage)
+    # Incompleteness is "technical document failures OR candidate-pool exhaustion
+    # occurred AND zero usable CURRENT_NEWS evidence was obtained" -- i.e. a real
+    # attempt was made but produced no usable evidence. Crucially, a run that DID
+    # obtain usable evidence is never forced partial, even if some candidates
+    # failed or the candidate pool exceeded max_documents. Two things are left
+    # untouched: (a) a completed search with zero candidates (SUCCESS_EMPTY)
+    # certifies explicit zero-result coverage (COMPLETE_NO_EVENTS); and (b) a
+    # completed search whose fetched documents simply found no company news (no
+    # technical failure, candidate pool within max_documents) is also
+    # COMPLETE_NO_EVENTS. Only a technical failure (fetch/extraction/persistence)
+    # that consumed a bounded attempt without producing usable evidence -- or a
+    # candidate pool that exhausted max_documents with zero usable evidence --
+    # becomes PARTIAL and carries the specific retryable reason plus
+    # DOCUMENT_BUDGET_EXHAUSTED. This never certifies no-events when usable
+    # evidence was in fact obtained, and never discards successful results merely
+    # because the candidate pool exceeded max_documents (no SUCCESS_EMPTY
+    # conversion).
+    incomplete = (bool(document_codes) or len(ranked_candidates) > max_documents) and usable_documents == 0
     if incomplete:
-        outcomes=[p.model_copy(update={'outcome':'PARTIAL'}) if p.outcome.startswith('SUCCESS') else p for p in outcomes]
+        document_codes.append('DOCUMENT_BUDGET_EXHAUSTED')
+        outcomes=[p.model_copy(update={'outcome':'PARTIAL','failure_code':_join_codes(p.failure_code,*document_codes)})
+                  if p.outcome.startswith('SUCCESS') else p for p in outcomes]
     run=aggregate_search(company.instrument_id,outcomes,started_at=started,completed_at=now or datetime.now(timezone.utc),
         qualifying_events=len({f.event_key for f in features}),query_plan=plan)
     await repository.append_news_record(run)
+    # FIX B: bridge real CURRENT_NEWS activity into the deep-investigation
+    # RequirementAcquisitionBudget. Without this, an attempted news search used a
+    # separate internal budget and left discovery_attempted/queries_reserved/
+    # documents_attempted at zero, so deep_investigation mis-classified a real
+    # attempt as ACQUISITION_NOT_DUE. Only the CURRENT_NEWS requirement owns a
+    # per-requirement budget; ordinary (no-budget) callers are untouched.
+    from app.deep_investigation import acquisition_budget
+    _news_budget = acquisition_budget(company.instrument_id)
+    if _news_budget is not None and _news_budget.requirement_id == "CURRENT_NEWS":
+        _news_budget.discovery_attempted = True
+        _completed_queries = sum(getattr(p, "queries_completed", 0) for p in outcomes)
+        if _completed_queries:
+            _news_budget.reserve_queries(_completed_queries)
+        _news_budget.documents_attempted = min(
+            _news_budget.documents_attempted + documents_fetched,
+            _news_budget.max_documents,
+        )
+        if run.outcome in ("SEARCH_PARTIAL", "SEARCH_FAILED"):
+            _code = _join_codes(*(p.failure_code for p in outcomes if p.failure_code))
+            if _code and _code not in _news_budget.failures:
+                _news_budget.failures.append(_code)
     return run,features

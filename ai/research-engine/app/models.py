@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import AnyHttpUrl, AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from app.pdf_structure import PdfTextStructure
 
 
 def _to_camel(value: str) -> str:
@@ -599,6 +600,7 @@ class ResearchDocument(ResearchBaseModel):
     document_subtype: DocumentSubtype | None = None
     raw_text: str | None = Field(default=None, exclude=True)
     normalized_text: str | None = Field(default=None, exclude=True)
+    pdf_structure: PdfTextStructure | None = Field(default=None, exclude=True)
     content_hash: str
     instrument_id: UUID | None = None
     company_id: UUID | None = None

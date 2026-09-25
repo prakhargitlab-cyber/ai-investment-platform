@@ -494,6 +494,16 @@ aiServices:
     tag: latest
     port: 8000
     scalingClass: NEEDS_DISTRIBUTED_LOCK
+    # LOCAL/DEV safety ceiling for the full-market Global Opportunity Scanner
+    # cycle. The baseline acquisition worker-pool is bounded to
+    # _BASELINE_CONCURRENCY and NSE PDF *extraction* is already capped to 1, but
+    # concurrent PDF *download* + parsed text can still push a cycle past the
+    # default 768Mi limit (OOMKilled before global_market_scan persisted). The
+    # request stays conservative at the aiServiceDefaults 256Mi; only the limit
+    # is raised. This is a safety net, not the primary fix.
+    resources:
+      limits:
+        memory: 1536Mi
   - name: valuation-engine
     image: ai-investment/valuation-engine
     tag: latest
@@ -558,6 +568,14 @@ research:
     enabled: false
     databaseBackend: postgres
     databaseSchema: research
+  # Narrow, research-engine-only switch for the in-process Global
+  # Opportunity scheduler. Defaults true so existing environments keep
+  # today's behavior (the scheduler already starts whenever research
+  # persistence is enabled). Deliberately independent of the broad,
+  # chart-wide featureFlags.scheduledJobsEnabled, which no service in
+  # this codebase currently reads.
+  opportunityScheduler:
+    enabled: true
   distributedLock:
     backend: process
     acquireTimeoutSeconds: 30

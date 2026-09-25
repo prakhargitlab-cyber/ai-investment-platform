@@ -172,3 +172,39 @@ async def test_exact_top_n_uses_opportunity_order_not_screening_order(monkeypatc
     assert [e.global_instrument_id.int for e in result.top_n] == [2,3]
     assert result.rank_eligible_count == 3
     assert result.top_n[0].opportunity_score > result.top_n[1].opportunity_score
+
+
+@pytest.mark.asyncio
+async def test_top_n_none_returns_all_rank_eligible_not_capped(monkeypatch):
+    """UI-1C: top_n=None (the production Radar V2 path) exposes EVERY rank-eligible
+    investigated entry in ranking.top_n in global rank order -- no 4/25/100 cap.
+    shortlist_limit only bounds investigation *priority*; it never caps results, so
+    with 30 candidates (shortlist_limit=30) all rank-eligible entries are exposed."""
+    service, rows, _, _ = setup(monkeypatch, 30)
+    unbounded = await service.run(rows, as_of=NOW, shortlist_limit=30, top_n=None)
+    eligible = [e for e in unbounded.evaluated_entries if e.rank_eligible]
+    # Unbounded mode: ranking.top_n == ALL rank-eligible entries (not capped).
+    assert len(unbounded.top_n) == len(eligible) == unbounded.rank_eligible_count
+    assert unbounded.top_n == eligible
+    # shortlist_limit only bounded investigation priority, never the result set:
+    # 30 candidates shortlisted and all rank-eligible entries are exposed (>25).
+    assert len(eligible) > 25
+    # evaluated_entries remain complete regardless of the (legacy) top_n knob.
+    assert len(unbounded.evaluated_entries) == len(eligible)
+
+
+@pytest.mark.asyncio
+async def test_bounded_top_n_truncates_rank_eligible_tail_but_keeps_evaluated(monkeypatch):
+    """UI-1C: a legacy integer top_n (a display/test knob) still means 'return the
+    first N rank-eligible entries', preserving generic scanner semantics. The
+    bounded tail never reaches publication -- publication iterates
+    ranking.evaluated_entries, which stays complete in both modes."""
+    service, rows, _, _ = setup(monkeypatch, 6)
+    unbounded = await service.run(rows, as_of=NOW, shortlist_limit=6, top_n=None)
+    eligible = [e for e in unbounded.evaluated_entries if e.rank_eligible]
+    bounded = await service.run(rows, as_of=NOW, shortlist_limit=6, top_n=2)
+    # Bounded mode truncates ranking.top_n to the first 2 rank-eligible entries.
+    assert len(bounded.top_n) == min(2, len(eligible))
+    assert bounded.top_n == unbounded.top_n[:min(2, len(eligible))]
+    # evaluated_entries remain complete in BOTH modes (no truncation).
+    assert len(bounded.evaluated_entries) == len(unbounded.evaluated_entries)

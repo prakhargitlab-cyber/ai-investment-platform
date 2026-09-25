@@ -643,6 +643,18 @@ export type ResearchSummary = {
   sourceMix: Record<string, number>;
 };
 
+/**
+ * Normalize a ResearchSummary so partial successful responses cannot crash
+ * rendering code that expects event/document collections.
+ */
+export function normalizeResearchSummary(raw: ResearchSummary): ResearchSummary {
+  return {
+    ...raw,
+    recentEvents: Array.isArray(raw.recentEvents) ? raw.recentEvents : [],
+    documents: Array.isArray(raw.documents) ? raw.documents : [],
+  };
+}
+
 export type ProvenancedValue = {
   value: unknown;
   unit?: string | null;
@@ -800,6 +812,28 @@ export type PortfolioResearchCompany = {
   durableCategoryEvidence?: CatalystScore["categoryEvidence"];
   sourceDiversity: { sourcesFound: number; domainsFound: number; officialSources: number; exchangeSources: number; companySources: number; secondarySources: number };
 };
+
+/**
+ * Normalize a PortfolioResearchCompany so optional/partial backend fields are
+ * always present as arrays.  The research backend may omit financial, ownership
+ * or catalyst histories on a successful (200) response -- the TS type marks them
+ * required, but the runtime contract is partial.  Coercing here lets every
+ * consumer safely call `company.<array>.length` / `.map(...)` without null
+ * guards, and a fully-populated response is returned by reference unchanged.
+ */
+export function normalizeCompany(
+  raw: PortfolioResearchCompany
+): PortfolioResearchCompany {
+  return {
+    ...raw,
+    financialResultHistory: Array.isArray(raw.financialResultHistory) ? raw.financialResultHistory : [],
+    balanceSheetHistory: Array.isArray(raw.balanceSheetHistory) ? raw.balanceSheetHistory : [],
+    cashFlowHistory: Array.isArray(raw.cashFlowHistory) ? raw.cashFlowHistory : [],
+    shareholdingChanges: Array.isArray(raw.shareholdingChanges) ? raw.shareholdingChanges : [],
+    ownershipIncreases: Array.isArray(raw.ownershipIncreases) ? raw.ownershipIncreases : [],
+    currentQuarterCatalysts: Array.isArray(raw.currentQuarterCatalysts) ? raw.currentQuarterCatalysts : [],
+  };
+}
 
 export type PortfolioResearchSummary = {
   portfolioId: string;
@@ -971,12 +1005,14 @@ export const brokerApi = {
 
 export const researchApi = {
   listCompanies: () => request<ResearchProfile[]>("/api/v1/research/companies"),
-  getSummary: (instrumentId: string) => request<ResearchSummary>(`/api/v1/research/companies/${instrumentId}/summary`),
+  getSummary: (instrumentId: string) =>
+    request<ResearchSummary>(`/api/v1/research/companies/${instrumentId}/summary`)
+      .then(normalizeResearchSummary),
   getCompanyPresentation: (instrumentId: string, region: SectorPerformance["region"]) => {
     const params = new URLSearchParams({ region });
     return request<PortfolioResearchCompany>(
       `/api/v1/research/companies/${instrumentId}/presentation?${params.toString()}`
-    );
+    ).then(normalizeCompany);
   },
   getEvents: (instrumentId: string, filters?: { eventType?: string; impact?: string; reliability?: string }) => {
     const params = new URLSearchParams();
@@ -1014,9 +1050,17 @@ export const researchApi = {
   removeWatchlistInstrument: (watchlistId: string, globalInstrumentId: string) =>
     request<void>(`/api/v1/research/watchlists/${watchlistId}/instruments/${globalInstrumentId}`, { method: "DELETE" }),
   getWatchlistResearch: (watchlistId: string) =>
-    request<WatchlistResearchPresentation>(`/api/v1/research/watchlists/${watchlistId}/research`),
+    request<WatchlistResearchPresentation>(`/api/v1/research/watchlists/${watchlistId}/research`)
+      .then((presentation) => ({
+        ...presentation,
+        instruments: (presentation.instruments ?? []).map((instrument) => ({
+          ...instrument,
+          company: normalizeCompany(instrument.company)
+        }))
+      })),
   getPortfolioSummary: (portfolioId: string) =>
-    request<PortfolioResearchSummary>(`/api/v1/research/portfolios/${portfolioId}/summary`),
+    request<PortfolioResearchSummary>(`/api/v1/research/portfolios/${portfolioId}/summary`)
+      .then((summary) => ({ ...summary, companies: (summary.companies ?? []).map(normalizeCompany) })),
   searchInstruments: (region: SectorPerformance["region"], query: string, limit = 20) => {
     const params = new URLSearchParams({ region, q: query, limit: String(limit) });
     return request<ResearchInstrumentMatch[]>(

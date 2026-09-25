@@ -72,7 +72,7 @@ def test_ranges_and_determinism():
 
 
 @pytest.mark.parametrize('price,state,action', [(1120, 'TARGET_APPROACHING', 'BUY'),
-    (1150, 'PARTIAL_PROFIT', 'PARTIAL_PROFIT'), (1185, 'PARTIAL_PROFIT', 'PARTIAL_PROFIT'),
+    (1150, 'PARTIAL_PROFIT', 'PARTIAL_EXIT'), (1185, 'PARTIAL_PROFIT', 'PARTIAL_EXIT'),
     (930, 'INVALIDATED', 'EXIT'), (950, 'INVALIDATION_APPROACHING', 'BUY'),
     (990, 'IN_ENTRY_ZONE', 'BUY'), (1010, 'ENTRY_APPROACHING', 'BUY')])
 def test_lifecycle(price, state, action):
@@ -108,9 +108,9 @@ def test_dedupe_history_immutable_state_updates_and_restart(tmp_path):
     moved = deepcopy(again)
     moved.update(snapshot_id=str(uuid4()), current_price=1185., generated_at=(NOW+timedelta(hours=2)).isoformat())
     publish(store, [moved])
-    assert store.recommendation_states()[0]['current_short_action'] == 'PARTIAL_PROFIT'
+    assert store.recommendation_states()[0]['current_short_action'] == 'PARTIAL_EXIT'
     assert store.recommendation_history()[0] == original[0]
-    assert SqliteResearchPersistence(path).opportunity_current()['previous_recommendations'][0]['current_short_action'] == 'PARTIAL_PROFIT'
+    assert SqliteResearchPersistence(path).opportunity_current()['previous_recommendations'][0]['current_short_action'] == 'PARTIAL_EXIT'
 
 
 def test_database_rejects_history_mutation_and_failed_publish_rolls_back():
@@ -140,9 +140,11 @@ def test_global_top_order_membership_independence_and_suppression():
     first = publish(SqliteResearchPersistence(), rows, 4)
     second = publish(SqliteResearchPersistence(), [dict(r, held=True, watchlisted=True) for r in reversed(rows)], 4)
     keys = lambda r: [c['global_instrument_id'] for c in r['top_short_term']]
-    assert keys(first) == keys(second) == [str(UUID(int=n)) for n in range(1, 5)]
-    assert len(first['top_long_term']) == 4
-    assert len(publish(SqliteResearchPersistence(), [snapshot(i) for i in range(1, 6)], 2)['top_short_term']) == 2
+    # RADAR V2 UI-1: top_n is metadata only — ALL rank-eligible snapshots are
+    # preserved (6 rows, #6 suppressed by rank_eligible=False, so 5 remain).
+    assert keys(first) == keys(second) == [str(UUID(int=n)) for n in range(1, 6)]
+    assert len(first['top_long_term']) == 5
+    assert len(publish(SqliteResearchPersistence(), [snapshot(i) for i in range(1, 6)], 2)['top_short_term']) == 5
     assert nse_equities([instrument(), instrument(2) | {'exchange': 'NYSE'}, instrument(3) | {'assetType': 'ETF'}]) == [instrument()]
 
 
@@ -248,6 +250,12 @@ async def test_dashboard_read_has_no_compute_or_providers(monkeypatch):
     from app import main
     store = SqliteResearchPersistence()
     publish(store, [snapshot()])
+    # Also populate V14 dedicated global suggestion tables so the radar has data
+    from test_global_suggestion_lifecycle import make_card, make_scan
+    v14_scan = make_scan()
+    v14_card = make_card(1, action='STRONG_BUY', horizon='SHORT_TERM', price=1000.0,
+                         fingerprint='fp-dashboard-integration')
+    store.persist_global_suggestion_lifecycle(v14_scan, [v14_card])
     monkeypatch.setattr(main.repository, '_persistence', store)
     def forbidden(*a, **kw): raise AssertionError('Provider or computation in GET')
     monkeypatch.setattr(RecommendationEngineV1, 'evaluate', forbidden)

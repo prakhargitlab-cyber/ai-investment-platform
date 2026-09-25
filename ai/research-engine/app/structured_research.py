@@ -30,6 +30,7 @@ from app.models import (
     ValuationStateEvidence,
 )
 from app.fact_precedence import FinancialFact, FactSourceTier, SUPPORTED_FINANCIAL_SOURCE_TIERS, fact_source_authority
+from app.financial_structure_types import FinancialColumn
 
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,26 @@ _NSE_MONTH_DAY_DATE = re.compile(r"\b([A-Za-z]{3,12})\s+(\d{1,2})(?:[lI]?st|nd|r
 _NSE_NUMERIC_DATE = re.compile(r"\b(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*([2Z][0-9Z]{3})\b")
 _NSE_DAY_MONTH = re.compile(r"\b(\d{1,2})(?:[lI]?st|nd|rd|th|tli)?\s*[\"'.,-]*\s*([A-Za-z\s]{3,12}?)(?=\s+\d|\s+Z?\d{3}|\s+\d{1,2}(?:[lI]?st|nd|rd|th|tli)?|\s*$)", re.I)
 _MONTHS = {name: index for index, name in enumerate(("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"), 1)}
-_STATEMENT_HEADING = re.compile(r"\b(?:extract\s+of\s+)?(?:stateme[no]t\s+of\s+)?(?:(?:(?:unaud(?:\.?ited|[il]ted)|umaudtoed|aud[il]ted|standalone|consolidated)\s+){0,2})(?:f[il]nanc[il]al|fl\s+nclal)\s+results\b|\bquarterly\s+financial\s+results\b", re.I)
+# DI-7C.1 Bug 2: statement-heading discovery was anchored ONLY to
+# "...financial results" phrasing and never recognised the standard
+# Profit & Loss statement headings used by many NSE filings (for example
+# "Statement of Profit and Loss", "Profit and Loss Account", "Statement of
+# Income", "Income Statement").  Each new alternative below stays anchored
+# to a genuine statement-heading phrase (never a bare "profit and loss" or
+# bare "income"), with only the standard basis/audit-status prefixes
+# ("consolidated", "standalone", "restated", "audited", "unaudited")
+# optionally preceding it, so ordinary narrative prose that happens to
+# mention "profit and loss" cannot become a statement boundary.
+_STATEMENT_HEADING_PREFIX = r"(?:(?:(?:unaud(?:\.?ited|[il]ted)|aud[il]ted|standalone|consolidated|restated)\s+){0,2})"
+_STATEMENT_HEADING = re.compile(
+    r"\b(?:extract\s+of\s+)?(?:stateme[no]t\s+of\s+)?(?:(?:(?:unaud(?:\.?ited|[il]ted)|umaudtoed|aud[il]ted|standalone|consolidated)\s+){0,2})(?:f[il]nanc[il]al|fl\s+nclal)\s+results\b"
+    r"|\bquarterly\s+financial\s+results\b"
+    r"|\b" + _STATEMENT_HEADING_PREFIX + r"stateme[no]t\s+of\s+profit\s*(?:and|&)\s*loss\b"
+    r"|\b" + _STATEMENT_HEADING_PREFIX + r"profit\s+(?:and|&)\s+loss\s+account\b"
+    r"|\b" + _STATEMENT_HEADING_PREFIX + r"stateme[no]t\s+of\s+income\b"
+    r"|\b" + _STATEMENT_HEADING_PREFIX + r"income\s+statement\b",
+    re.I,
+)
 _STATEMENT_END = re.compile(r"\bstatement\s+of\s+(?:assets|financial\s+position|cash\s+flows?)\b|\bcash\s+flow\s+statement\b", re.I)
 _GROUP_RE = re.compile(r"\b(quarter|nine\s+months?|half\s+year|year)\s+ended\b", re.I)
 _PARTICULARS_RE = re.compile(r"\b(?:particulars|partlculars|parriculars|p8mculars)\b", re.I)
@@ -52,7 +72,7 @@ _PARTICULARS_RE = re.compile(r"\b(?:particulars|partlculars|parriculars|p8mcular
 # them.  Match only the contiguous table-header suffix; this cannot pull an
 # earlier narrative reference to a reporting period into the candidate.
 _PRE_PARTICULARS_GROUPS_RE = re.compile(
-    r"(?:(?:\b(?:quarter|nine\s+months?|half\s+year|year)\s+ended\b)\s*)+(?:(?:s[il]|no\.?)\s*)?$",
+    r"(?:(?:\b(?:quarter|nine\s+months?|half\s+year|year)\s+ended\b)\s*)+(?:(?:s[il]|s\.?\s*no\.?|sr\.?\s*no\.?|no\.?)\s*)?$",
     re.I,
 )
 _ROW_REFERENCE_FORMULA_RE = re.compile(
@@ -60,14 +80,6 @@ _ROW_REFERENCE_FORMULA_RE = re.compile(
 )
 _BALANCE_SHEET_HEADING = re.compile(r"\b(?:balance\s+sheet|statement\s+of\s+(?:financial\s+position|assets\s+and\s+liabilities))\b", re.I)
 _CASH_FLOW_HEADING = re.compile(r"\b(?:cash\s+fl\s*ows?\s+statement|statement\s+(?:of|for\s+the)\s+cash\s+fl\s*ows?)\b", re.I)
-
-
-@dataclass(frozen=True)
-class FinancialColumn:
-    index: int
-    period_end: str
-    period_type: str
-    header_group: str
 
 
 @dataclass(frozen=True)
@@ -191,6 +203,32 @@ def latest_quarterly_result_from_facts(facts: list[FinancialFact]) -> QuarterlyR
     )
 
 
+def _semantic_period_key(period_end: str) -> str:
+    """Return ``period_end``'s calendar-date identity for period grouping.
+
+    DI-7C.1 Bug 1: NSE persists a clean date-only ``period_end`` such as
+    ``2026-03-31``, while Yahoo can persist an equivalent period as a
+    datetime-style string such as ``2026-03-31T00:00:00`` (with or without a
+    timezone suffix).  Grouping and "newest period" selection previously
+    compared/sorted these raw strings lexically, which could both wrongly
+    rank a datetime-style string as a *later* period than an equivalent
+    date-only string, and wrongly split one real reporting period into two
+    separate groups -- silently dropping the other source's facts from a
+    presented history.  This normalizes ONLY the local comparison/grouping
+    key to the calendar date; it is never written back to a FinancialFact,
+    a FinancialFactKey, or any persisted row, and a value that is not a
+    recognizable ISO date/datetime prefix is returned unchanged so it keeps
+    participating in grouping/sorting exactly as before.
+    """
+    if not period_end:
+        return period_end
+    candidate = period_end.strip()
+    date_part = candidate[:10]
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_part):
+        return date_part
+    return candidate
+
+
 def financial_result_history_from_facts(
     facts: list[FinancialFact], *, period_type: str | None = None,
 ) -> list[FinancialResultPeriod]:
@@ -211,7 +249,7 @@ def financial_result_history_from_facts(
             or fact.key.metric not in {"revenue", "operating_income", "ebit", "ebitda", "pat", "eps"}
         ):
             continue
-        values = grouped.setdefault(fact.key.period_type, {}).setdefault((fact.key.period_end, fact.key.reporting_basis), {})
+        values = grouped.setdefault(fact.key.period_type, {}).setdefault((_semantic_period_key(fact.key.period_end), fact.key.reporting_basis), {})
         existing = values.get(fact.key.metric)
         if existing is None or fact_source_authority(fact.source_tier) > fact_source_authority(existing.source_tier):
             values[fact.key.metric] = fact
@@ -279,7 +317,7 @@ def financial_statement_history_from_facts(
             or fact.key.metric not in metrics
         ):
             continue
-        values = grouped.setdefault((fact.key.period_end, fact.key.period_type, fact.key.reporting_basis), {})
+        values = grouped.setdefault((_semantic_period_key(fact.key.period_end), fact.key.period_type, fact.key.reporting_basis), {})
         existing = values.get(fact.key.metric)
         if existing is None or fact_source_authority(fact.source_tier) > fact_source_authority(existing.source_tier):
             values[fact.key.metric] = fact
@@ -636,9 +674,8 @@ def parsed_nse_income_statement_periods(documents: list[ResearchDocument]) -> li
                 rank = _statement_quality(statement)
                 for metric, value in values.items():
                     # For the same document and fact key, a direct aligned
-                    # EPS row is structurally stronger than the legacy
-                    # preceding-token fallback.  Table quality only breaks
-                    # ties within the same extraction kind.
+                    # EPS row is structurally stronger than an unaligned one.
+                    # Table quality only breaks ties within the same extraction kind.
                     metric_rank = (int(metric != "eps" or eps_direct_columns[column.index]), *rank)
                     ranking_key = (key, metric)
                     if metric_rank > metric_rankings.get(ranking_key, (-1, -1, -1, -1, -1)):
@@ -707,9 +744,9 @@ def parsed_nse_cash_flow_periods(documents: list[ResearchDocument]) -> list[Pars
             basis = _reporting_basis(statement.region)
             unit = _reported_unit(statement.unit_context[:400], statement.unit_context[:800])
             rows = {
-                "cash_flow_from_operating_activities": _aligned_row_cells(statement, r"\bnet\s+cash\s+(?:(?:flow\s*/?\s*\(?used\)?\s+in|flow\s+from|generated\s+from|from))\s+(?:operating|operations)\s+activities\b"),
-                "cash_flow_from_investing_activities": _aligned_row_cells(statement, r"\bnet\s+cash\s+(?:(?:flow\s*/?\s*\(?used\)?\s+in|flow\s+from|used\s+in|from))\s+investing\s+activities\b"),
-                "cash_flow_from_financing_activities": _aligned_row_cells(statement, r"\bnet\s+cash\s+(?:(?:flow\s*/?\s*\(?used\)?\s+in|flow\s+from|used\s+in|from))\s+financing\s+activities\b"),
+                "cash_flow_from_operating_activities": _aligned_row_cells(statement, r"\bnet\s+cash\s+(?:flows?\s+)?(?:\(\s*used\s+in\s*\)\s*/\s*generated\s+from|generated\s+from\s*/\s*\(?used\)?\s*in|flow\s*/?\s*\(?used\)?\s+in|flow\s+from|generated\s+from|used\s+in|from)\s+(?:operating|operations)\s+activities\b"),
+                "cash_flow_from_investing_activities": _aligned_row_cells(statement, r"\bnet\s+cash\s+(?:flows?\s+)?(?:\(\s*used\s+in\s*\)\s*/\s*generated\s+from|generated\s+from\s*/\s*\(?used\)?\s*in|flow\s*/?\s*\(?used\)?\s+in|flow\s+from|generated\s+from|used\s+in|from)\s+investing\s+activities\b"),
+                "cash_flow_from_financing_activities": _aligned_row_cells(statement, r"\bnet\s+cash\s+(?:flows?\s+)?(?:\(\s*used\s+in\s*\)\s*/\s*generated\s+from|generated\s+from\s*/\s*\(?used\)?\s*in|flow\s*/?\s*\(?used\)?\s+in|flow\s+from|generated\s+from|used\s+in|from)\s+financing\s+activities\b"),
                 "net_change_in_cash": _aligned_row_cells(statement, r"\bnet\s+(?:increase|decrease|change)\s+in\s+cash(?:\s+and\s+cash\s+equivalents?)?\b"),
             }
             for column in statement.columns:
@@ -1690,22 +1727,7 @@ def _statement_eps_candidate(
     else:
         direct_cells = tuple(None for _ in statement.columns)
         direct_flags = tuple(False for _ in statement.columns)
-    row_region = _structural_row_text(statement.region)
-    label = re.search(r"earn(?:ing|lng)s?\s+per\s+(?:equity|eciuity)\s+(?:sh(?:are|are)|sr\)?are)\b", row_region, re.I)
-    fallback_cells: tuple[Decimal | None, ...] | None = None
-    if label:
-        tokens = list(re.finditer(r"\S+", row_region[max(0, label.start() - 120):label.start()]))
-        fallback_values = [_financial_number(token.group()) for token in tokens]
-        valid = [cell for cell in fallback_values if cell is not None]
-        if len(valid) >= len(statement.columns):
-            fallback_cells = tuple(valid[-len(statement.columns):])
-    if fallback_cells is None:
-        return (direct_cells if any(direct_flags) else basic_cells), direct_flags
-    cells = tuple(
-        direct_cells[index] if direct_flags[index] else fallback_cells[index]
-        for index in range(len(statement.columns))
-    )
-    return cells, direct_flags
+    return direct_cells, direct_flags
 
 
 def _aligned_row_value(statement: FinancialStatement, label_pattern: str) -> Decimal | None:
@@ -1751,6 +1773,51 @@ def _aligned_row_cells(statement: FinancialStatement, label_pattern: str) -> tup
     prefix = re.sub(r"\bfrom\s+continuing\s+operations\b\s*(?:\([^)]+\))?", "", prefix, flags=re.I)
     if re.search(r"[A-Za-z]", prefix):
         return None
+    # DI-20 structural guard: a metric row's aligned cells must be the numeric
+    # cells belonging to THAT row.  In a flattened/OCR-collapsed statement a
+    # row label can be immediately followed by many more numeric cells than the
+    # table has columns -- those excess cells belong to orphaned downstream
+    # rows (e.g. a "Basic/Diluted" label followed by revenue/expense scale
+    # values instead of EPS).  ``first_index`` above can land on a non-numeric
+    # OCR word (e.g. ``Diluted`` contains ``l``); skip such leading non-numeric
+    # tokens, then count the contiguous numeric run that the row actually owns.
+    # Never infer a metric from numeric position: reject an unbounded run rather
+    # than guessing.  A couple of trailing row/note references (e.g. "(5)") are
+    # tolerated to match the existing +2 allowance.
+    contiguous_run = 0
+    found_number = False
+    for token in tokens[first_index:]:
+        token_text = token.group(0)
+        if is_separator(token_text):
+            continue
+        if _financial_number(token_text) is None:
+            if found_number:
+                break
+            continue
+        contiguous_run += 1
+        found_number = True
+    if contiguous_run > len(statement.columns) + 2:
+        return None
+    # DI-20 orphan-cell guard (refined): when ``first_index`` lands on a genuine
+    # label *word* with no digit at all -- e.g. a stray ``Diluted`` / ``Oiluted``
+    # / ``(BI`` stranded between the row label and its cells -- a downstream
+    # label word sits between the row label and its cells and shifts every value
+    # one column to the right, and only a lone run (fewer than the column count)
+    # is stranded there.  Those numbers belong to a collapsed downstream row,
+    # never this row's metric; reject rather than align by position.
+    #
+    # A *number-shaped* first token that ``_financial_number`` cannot parse --
+    # e.g. an OCR artefact whose letters do not translate to digits -- is still
+    # this row's first cell, not a label word.  Let it through as ``None`` and
+    # keep the remaining cells aligned, so a directly aligned row retains its
+    # proven values instead of being rejected wholesale.  This distinguishes the
+    # IRFC-style multi-number row (an intact run whose first cell is OCR-corrupted)
+    # from the NCC orphan-number case (a bare label word that contains only
+    # digit-shape letters like ``l``/``I`` but no actual digit) without any
+    # company-specific condition.
+    first_token = tokens[first_index].group(0)
+    if not re.search(r"\d", first_token) and 0 < contiguous_run < len(statement.columns):
+        return None
     raw_cells = _coalesce_split_financial_cells(
         [token.group(0) for token in tokens[first_index:] if not is_separator(token.group(0))]
     )[:len(statement.columns)]
@@ -1790,15 +1857,28 @@ def _structural_row_text(text: str) -> str:
         ("Re`/enue FiwTi oneratlan", "Revenue From operations"),
     ):
         text = text.replace(corrupted, repaired)
-    return re.sub(r"contjp.{4}i\?gop,engtions", "continuing operations", text)
+    text = re.sub(r"contjp.{4}i\?gop,engtions", "continuing operations", text)
+    # Intra-word box-drawing runs are an OCR/extraction artefact (UTF-8 bytes
+    # mis-decoded as a legacy single-byte encoding) that splice a non-letter into
+    # a row label, e.g. ``ca┬╖sh`` for ``cash``.  Collapse runs flanked
+    # by letters only; numeric cells use a plain period and contain no such code
+    # points, so this never alters a financial value.
+    text = re.sub(r"(?<=[A-Za-z])[\u2500-\u257F]+(?=[A-Za-z])", "", text)
+    return text
 
 
 def _financial_number(raw: str) -> Decimal | None:
-    """Parse a whole OCR cell only when bounded substitutions yield one valid number."""
-    token = raw.strip().strip("()[]:;")
+    """Parse a whole OCR cell only when bounded substitutions yield one valid number.
+
+    Accounting parentheses denote a negative magnitude: ``(458.51)`` parses to
+    ``Decimal("-458.51")``.  An explicit inner sign is not double-negated.
+    """
+    stripped = raw.strip()
+    is_parenthesized = stripped.startswith("(") and stripped.endswith(")") and len(stripped) > 2
+    token = stripped.strip("()[]:;")
     if not re.fullmatch(r"[-+0-9,\.ZSOIl|]+", token, re.I):
         return None
-    normalized = token.translate(str.maketrans({"Z": "2", "z": "2", "S": "5", "s": "5", "O": "0", "o": "0", "I": "1", "l": "1", "|": "1"}))
+    normalized = token.translate(str.maketrans({"Z": "2", "z": "2", "S": "5", "s": "5", "O": "0", "o": "0", "I": "1", "i": "1", "l": "1", "|": "1"}))
     if re.fullmatch(r"\d{1,3}\.\d{3}\.\d{2}", normalized):
         normalized = normalized.replace(".", ",", 1)
     if not re.fullmatch(
@@ -1806,7 +1886,14 @@ def _financial_number(raw: str) -> Decimal | None:
         normalized,
     ):
         return None
-    return _decimal(normalized)
+    value = _decimal(normalized)
+    if value is None:
+        return None
+    # Accounting parentheses carry the negative sign; avoid double-negation
+    # when the inner token already carries an explicit sign.
+    if is_parenthesized and value > 0:
+        return -value
+    return value
 
 
 def _nse_table_period_end(text: str) -> str | None:

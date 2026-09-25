@@ -16,6 +16,8 @@ def test_tmcv_mandatory_balance_dates_not_newer_supporting_income(period,status)
     profile=_profile(); repo=DurableRepositoryFixture(profile,complete=False)
     repo.facts=[_fact(profile,'total_debt','100',period,'QUARTERLY'),
         _fact(profile,'total_equity','200',period,'QUARTERLY'),
+        # CASH is a required balance input (full-research contract); same period.
+        _fact(profile,'cash_and_cash_equivalents','50',period,'QUARTERLY'),
         _fact(profile,'finance_cost','10','2026-06-30','QUARTERLY')]
     adapter=RepositoryResearchReadinessAdapter(repo)
     result=ResearchReadinessService(adapter).assess(profile.instrument_id,jurisdiction='INDIA',now=NOW)
@@ -25,7 +27,7 @@ def test_tmcv_mandatory_balance_dates_not_newer_supporting_income(period,status)
     policy=FreshnessPolicyRegistry.default().get('QUARTERLY_FINANCIALS')
     assert policy.maximum_age==timedelta(days=120)
     if status=='READY_STALE':
-        assert balance.missing_reason=='FRESHNESS_POLICY_EXPIRED:DEBT,EQUITY'
+        assert balance.missing_reason=='FRESHNESS_POLICY_EXPIRED:CASH,DEBT,EQUITY'
     else:
         assert balance.age==NOW-datetime(2026,6,30,tzinfo=timezone.utc)
 
@@ -105,5 +107,7 @@ def test_persisted_search_coverage_readiness_without_provider(provider_state,exp
     news=result.for_requirement('CURRENT_NEWS')
     assert news.status==expected
     assert news.coverage_pct==coverage
-    assert not news.mandatory
+    # Full-research contract: current news is a mandatory check; only a completed
+    # search (SUCCESS_EMPTY -> explicit zero-result coverage) satisfies it.
+    assert news.mandatory
     assert repo.provider_calls==0

@@ -15,7 +15,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Protocol, Sequence
 from uuid import UUID
 
-from app.research_applicability import RequirementApplicability
+from app.research_applicability import RequirementApplicability, CONCEPT_INPUTS
 
 
 class RuleEngineArea(StrEnum):
@@ -59,6 +59,23 @@ class ResearchRequirementStatus(StrEnum):
     NOT_APPLICABLE = "NOT_APPLICABLE"
     REFRESHING = "REFRESHING"
     FAILED = "FAILED"
+
+
+# The single, authoritative definition of "this requirement status still
+# needs acquisition work" -- used by the refresh planner to decide what to
+# target, and by the readiness runtime to decide what remains unresolved
+# after execution (including after a budget timeout). Keeping this as one
+# shared constant, rather than re-typing the same five-member set in each
+# call site, is what prevents them from silently drifting apart.
+REQUIREMENT_STATUSES_NEEDING_ACQUISITION = frozenset(
+    {
+        ResearchRequirementStatus.READY_STALE,
+        ResearchRequirementStatus.PARTIAL,
+        ResearchRequirementStatus.MISSING,
+        ResearchRequirementStatus.CONFLICTING,
+        ResearchRequirementStatus.FAILED,
+    }
+)
 
 
 class ResearchSupportedAction(StrEnum):
@@ -220,7 +237,10 @@ class ResearchRequirementRegistry:
                         input_("LATEST_USABLE_PRICE", mandatory),
                         input_("EARNINGS_BASIS", mandatory),
                         input_("PE", important),
-                        input_("PB", important),
+                        # Full-research contract: PB anchors valuation for every issuer
+                        # (18/8 subrule weight); PE stays IMPORTANT because it is
+                        # undefined for non-positive earnings (no NA semantics yet).
+                        input_("PB", mandatory),
                         input_("EV_EBITDA", supporting),
                         input_("FCF_YIELD", supporting),
                         input_("HISTORICAL_OR_PEER_VALUATION", supporting),
@@ -232,11 +252,13 @@ class ResearchRequirementRegistry:
                     True,
                     "ANNUAL_FINANCIALS",
                     inputs=(
+                        # Every input below feeds a weighted quality subrule; ROCE is
+                        # removed per issuer only by explicit applicability (financials).
                         input_("PROFITABILITY_HISTORY", mandatory),
-                        input_("ROE", important),
-                        input_("ROCE", important),
-                        input_("MARGINS", important),
-                        input_("CASH_CONVERSION_OR_FCF_QUALITY", important),
+                        input_("ROE", mandatory),
+                        input_("ROCE", mandatory),
+                        input_("MARGINS", mandatory),
+                        input_("CASH_CONVERSION_OR_FCF_QUALITY", mandatory),
                     ),
                 ),
                 ResearchRequirement(
@@ -247,8 +269,8 @@ class ResearchRequirementRegistry:
                     inputs=(
                         input_("REVENUE_HISTORY", mandatory),
                         input_("EARNINGS_HISTORY", mandatory),
-                        input_("QUARTERLY_YOY_QOQ_TRENDS", important),
-                        input_("ANNUAL_CAGR_INPUTS", important),
+                        input_("QUARTERLY_YOY_QOQ_TRENDS", mandatory),
+                        input_("ANNUAL_CAGR_INPUTS", mandatory),
                     ),
                 ),
                 ResearchRequirement(
@@ -259,7 +281,7 @@ class ResearchRequirementRegistry:
                     inputs=(
                         input_("DEBT", mandatory),
                         input_("EQUITY", mandatory),
-                        input_("CASH", important),
+                        input_("CASH", mandatory),
                         input_("INTEREST_COVERAGE_INPUTS", supporting),
                         input_("LIQUIDITY_CURRENT_RATIO_INPUTS", supporting),
                     ),
@@ -274,21 +296,26 @@ class ResearchRequirementRegistry:
                         input_("COMPARABLE_QUARTERS", mandatory),
                         input_("QUARTERLY_REVENUE", mandatory),
                         input_("QUARTERLY_PAT", mandatory),
+                        # EPS feeds EPS_YOY (15). EBITDA/operating profit stays IMPORTANT:
+                        # the quarterly margin-trend rule reads operating_income /
+                        # operating_profit only, so an EBITDA fact would not make that
+                        # subrule scorable (documented contract ambiguity).
                         input_("QUARTERLY_EBITDA_OR_OPERATING_PROFIT", important),
-                        input_("QUARTERLY_EPS", important),
+                        input_("QUARTERLY_EPS", mandatory),
                         input_("QUARTERLY_MARGINS", important),
                     ),
                 ),
                 ResearchRequirement(
                     "ORDER_BOOK_CAPEX_GUIDANCE",
                     RuleEngineArea.ORDER_BOOK_CAPACITY_CATALYSTS,
-                    False,
+                    True,
                     "ORDER_BOOK_CAPEX_GUIDANCE",
-                    importance=important,
                     inputs=(
+                        # Concept inputs are removed only by explicit per-issuer
+                        # applicability (e.g. ORDER_BOOK for financials, all for ETFs).
                         input_("MATERIAL_CATALYST_EVIDENCE", mandatory),
-                        input_("ORDER_BOOK_OR_MAJOR_CONTRACT", important),
-                        input_("CAPACITY_OR_CAPEX_OR_COMMISSIONING", important),
+                        input_("ORDER_BOOK_OR_MAJOR_CONTRACT", mandatory),
+                        input_("CAPACITY_OR_CAPEX_OR_COMMISSIONING", mandatory),
                         input_("MANAGEMENT_GUIDANCE", supporting),
                     ),
                 ),
@@ -306,26 +333,30 @@ class ResearchRequirementRegistry:
                     "HISTORICAL_PRICE_SERIES",
                     inputs=(
                         input_("DURABLE_PRICE_OBSERVATIONS", mandatory),
-                        input_("FIFTY_OBSERVATION_TECHNICAL_BASIS", important),
+                        input_("FIFTY_OBSERVATION_TECHNICAL_BASIS", mandatory),
                         input_("ONE_HUNDRED_FIFTY_OBSERVATION_TECHNICAL_BASIS", supporting),
                     ),
                 ),
                 ResearchRequirement(
                     "CURRENT_NEWS",
                     RuleEngineArea.NEWS_GEOPOLITICAL_EVENTS,
-                    False,
+                    True,
                     "CURRENT_NEWS",
+                    # Covered by an in-window issuer event OR by a completed search
+                    # run (SEARCH_COMPLETE_*: explicit zero-result coverage, no event
+                    # is fabricated). Never-run / partial / failed search is not full.
                     inputs=(input_("RELEVANT_CURRENT_EVENT_EVIDENCE", mandatory),),
                 ),
                 ResearchRequirement(
                     "SHAREHOLDING",
                     RuleEngineArea.SHAREHOLDING,
-                    False,
+                    True,
                     "SHAREHOLDING",
-                    importance=important,
+                    # Stock-level durable NSE snapshot, QUARTERLY freshness; outside
+                    # the Indian disclosure regime it is explicitly UNSUPPORTED.
                     inputs=(
                         input_("LATEST_VALID_SHAREHOLDING_PERIOD", mandatory),
-                        input_("PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES", important),
+                        input_("PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES", mandatory),
                         input_("PROMOTER_PLEDGE", supporting),
                     ),
                 ),
@@ -829,6 +860,7 @@ class DurableResearchSnapshot:
     failure_reasons: Mapping[str, str] = field(default_factory=dict)
     applicability_by_requirement: Mapping[str, RequirementApplicability] = field(default_factory=dict)
     acquisition_observations: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    document_diagnostics: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         _require_global_instrument_id(self.global_instrument_id)
@@ -989,6 +1021,8 @@ class ResearchRequirementReadiness:
     classification: str | None = None
     classification_source: str | None = None
     not_applicable_input_reasons: Mapping[str, str] = field(default_factory=dict)
+    concept_applicability: Mapping[str, RequirementApplicability] = field(default_factory=dict)
+    concept_evidence_states: Mapping[str, str] = field(default_factory=dict)
     acquisition_observation: Mapping[str, Any] | None = None
 
 
@@ -1002,6 +1036,7 @@ class ResearchReadinessResult:
     critical_completeness_pct: int = 0
     confidence: ResearchDataConfidence = ResearchDataConfidence.LOW
     confidence_pct: int = 0
+    document_diagnostics: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         _require_global_instrument_id(self.global_instrument_id)
@@ -1044,12 +1079,18 @@ class ResearchReadinessService:
         *,
         jurisdiction: str = "GLOBAL",
         now: datetime | None = None,
+        evidence_only: bool = False,
     ) -> ResearchReadinessResult:
         instrument_id = _require_global_instrument_id(global_instrument_id)
         evaluated_at = now or datetime.now(timezone.utc)
         _require_aware(evaluated_at, "now")
         requirements = self.requirement_registry.requirements
         snapshot = self.data_source.load_by_global_instrument_id(instrument_id, requirements)
+        if evidence_only:
+            # Acquisition sufficiency checks classify committed evidence while
+            # the owner is still marked REFRESHING. Do not mutate shared state;
+            # all authority, coverage, freshness and conflict gates still apply.
+            snapshot = replace(snapshot, refreshing_requirement_ids=frozenset())
         if snapshot.global_instrument_id != instrument_id:
             raise ValueError("Durable snapshot globalInstrumentId does not match the request")
         classified = tuple(
@@ -1078,6 +1119,7 @@ class ResearchReadinessService:
             critical_completeness_pct=critical_completeness,
             confidence=confidence,
             confidence_pct=confidence_pct,
+            document_diagnostics=snapshot.document_diagnostics,
         )
 
     def _classify(
@@ -1090,10 +1132,24 @@ class ResearchReadinessService:
         policy = self.freshness_registry.get(requirement.freshness_policy_id)
         applicability = snapshot.applicability_by_requirement.get(requirement.requirement_id, RequirementApplicability())
         def with_applicability(value):
-            return replace(value, applicability=applicability.state,
+            states = {}
+            for concept, decision in applicability.concepts.items():
+                if decision.state == "NOT_APPLICABLE":
+                    states[concept] = "NOT_APPLICABLE"
+                    continue
+                rows = tuple(e for e in snapshot.evidence_for(requirement.requirement_id)
+                    if CONCEPT_INPUTS[concept] in e.covered_input_ids)
+                if not rows:
+                    states[concept] = "MISSING"
+                else:
+                    authority = self.authority_registry.policy_for(requirement.requirement_id, jurisdiction)
+                    selected = min(rows, key=lambda e: (authority.rank(e), -(e.as_of or e.retrieved_at).timestamp()))
+                    states[concept] = "PARTIAL" if not selected.complete else "READY_FRESH" if policy.is_fresh(selected, now) else "READY_STALE"
+            return replace(value, concept_evidence_states=states, applicability=applicability.state,
                 applicability_reason=applicability.reason, classification=applicability.classification,
                 classification_source=applicability.source,
                 not_applicable_input_reasons=applicability.excluded_inputs,
+                concept_applicability=applicability.concepts,
                 acquisition_observation=snapshot.acquisition_observations.get(requirement.requirement_id))
         news_state = snapshot.acquisition_observations.get(requirement.requirement_id, {}).get('news_readiness')
         if requirement.requirement_id == 'CURRENT_NEWS' and news_state in {'PARTIAL_SEARCH','FAILED_SEARCH','STALE_SEARCH'}:
@@ -1118,6 +1174,9 @@ class ResearchReadinessService:
             )
 
         durable_evidence = snapshot.evidence_for(requirement.requirement_id)
+        if applicability.excluded_inputs:
+            durable_evidence = tuple(e for e in durable_evidence if not e.covered_input_ids or
+                set(e.covered_input_ids) - set(applicability.excluded_inputs) - {"MATERIAL_CATALYST_EVIDENCE"})
         eligible = self.coverage_service.score_input_evidence(requirement, durable_evidence, policy, now)
         authority = self.authority_registry.policy_for(requirement.requirement_id, jurisdiction)
         resolution = self.conflict_resolver.resolve(requirement, eligible, authority)
@@ -1266,16 +1325,10 @@ class ResearchReadinessService:
             ]
             if not candidates:
                 return False
-            selected = sorted(
-                candidates,
-                key=lambda item: (
-                    authority.rank(item),
-                    -(item.as_of or item.published_at or item.retrieved_at).timestamp(),
-                    -item.retrieved_at.timestamp(),
-                    item.evidence_id,
-                ),
-            )[0]
-            if not policy.is_fresh(selected, now):
+            # A fresher valid candidate must not be displaced by an older
+            # authoritative candidate. Accept the input if *any* candidate is
+            # fresh (valid-until unexpired, or within the policy maximum_age).
+            if not any(policy.is_fresh(item, now) for item in candidates):
                 return False
         return True
 
@@ -1390,6 +1443,7 @@ class ResearchRefreshTarget:
     reason: ResearchRequirementStatus
     authority_policy: ProviderAuthorityPolicy
     existing_evidence_ids: tuple[str, ...]
+    excluded_input_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1406,15 +1460,7 @@ class ResearchRefreshPlan:
 class ResearchRefreshPlanner:
     """Plan mandatory targeted work; planning itself never invokes a provider."""
 
-    _TARGET_STATUSES = frozenset(
-        {
-            ResearchRequirementStatus.READY_STALE,
-            ResearchRequirementStatus.PARTIAL,
-            ResearchRequirementStatus.MISSING,
-            ResearchRequirementStatus.CONFLICTING,
-            ResearchRequirementStatus.FAILED,
-        }
-    )
+    _TARGET_STATUSES = REQUIREMENT_STATUSES_NEEDING_ACQUISITION
 
     def __init__(self, authority_registry: ProviderAuthorityRegistry | None = None) -> None:
         self.authority_registry = authority_registry or ProviderAuthorityRegistry.default()
@@ -1439,9 +1485,17 @@ class ResearchRefreshPlanner:
                 reason=item.status,
                 authority_policy=self.authority_registry.policy_for(item.requirement_id, jurisdiction),
                 existing_evidence_ids=item.evidence_ids,
+                excluded_input_ids=tuple(sorted(set(item.not_applicable_input_reasons) | {
+                    CONCEPT_INPUTS[concept] for concept, state in item.concept_evidence_states.items()
+                    if state == "READY_FRESH"})),
             )
             for item in readiness.requirements
-            if item.status in self._TARGET_STATUSES
+            if (item.status in self._TARGET_STATUSES or (selected is not None and any(
+                state in self._TARGET_STATUSES for state in item.concept_evidence_states.values())))
+            # Optional news acquisition is explicit, never part of automatic broad
+            # readiness work. A mandatory current-news check (full-research
+            # contract) must be performed, so it is planned like any other gap.
+            and (item.requirement_id != 'CURRENT_NEWS' or item.mandatory or selected is not None)
             and (selected is None or item.requirement_id in selected)
             and (item.mandatory or include_non_mandatory or selected is not None)
         )

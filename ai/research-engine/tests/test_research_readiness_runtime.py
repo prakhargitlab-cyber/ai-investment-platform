@@ -802,7 +802,7 @@ class MetadataOnlyOrchestrator:
             "updatedAt": NOW.isoformat(),
         }
 
-    def register_global_profile_metadata(self, instrument_id, _metadata):
+    def register_global_profile_metadata(self, instrument_id, _metadata, *, reason_out=None):
         return instrument_id == self.profile.instrument_id
 
 
@@ -921,7 +921,7 @@ def test_readiness_response_is_deterministic_and_has_no_stock_score() -> None:
     assert first["confidence"] in {"LOW", "MEDIUM", "HIGH"}
 
 
-def test_nse_quarterly_pdf_new_write_persists_metadata_and_facts_without_content(tmp_path) -> None:
+def test_nse_quarterly_pdf_persists_normalized_parser_input_without_pdf_bytes(tmp_path) -> None:
     persistence = SqliteResearchPersistence(tmp_path / "research.sqlite")
     repository = ResearchRepository(
         settings=Settings(research_demo_enabled=False), persistence=persistence
@@ -961,7 +961,7 @@ def test_nse_quarterly_pdf_new_write_persists_metadata_and_facts_without_content
     )
 
     assert document.normalized_text
-    assert persisted.normalized_text is None
+    assert persisted.normalized_text == document.normalized_text
     assert persisted.raw_text is None
     assert persisted.canonical_url == SOURCE_URL
     assert any(fact.key.metric == "revenue" and fact.key.period_type == "QUARTERLY" for fact in facts)
@@ -970,7 +970,7 @@ def test_nse_quarterly_pdf_new_write_persists_metadata_and_facts_without_content
     assert list(tmp_path.glob("*.pdf")) == []
 
 
-def test_nse_financial_result_classification_never_persists_unparsed_pdf_text(tmp_path) -> None:
+def test_nse_financial_result_retains_normalized_input_for_future_parser_reconciliation(tmp_path) -> None:
     persistence = SqliteResearchPersistence(tmp_path / "research.sqlite")
     repository = ResearchRepository(
         settings=Settings(research_demo_enabled=False), persistence=persistence
@@ -1003,7 +1003,7 @@ def test_nse_financial_result_classification_never_persists_unparsed_pdf_text(tm
     )
 
     assert document.normalized_text
-    assert persisted.normalized_text is None
+    assert persisted.normalized_text == document.normalized_text
     assert persisted.raw_text is None
     assert persisted.canonical_url == SOURCE_URL
     assert repository.financial_facts_for(profile.instrument_id) == []

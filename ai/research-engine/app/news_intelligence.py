@@ -22,6 +22,10 @@ class ProviderOutcome(ResearchBaseModel):
     queries_planned: int = Field(ge=0)
     queries_completed: int = Field(ge=0)
     failure_code: str | None = None
+    # Diagnostic only: completed queries that returned usable results while
+    # some underlying meta-search engines were unresponsive. Completion is
+    # decided by the query plan, not by this count.
+    degraded_queries: int = Field(default=0, ge=0)
     @model_validator(mode='after')
     def valid_counts(self):
         if self.queries_completed>self.queries_planned: raise ValueError('INVALID_SEARCH_COUNTS')

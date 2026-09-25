@@ -27,6 +27,7 @@ class Repository:
         self.documents[d.document_id]=d; self._persistence.upsert_document(d)
         self._fetcher=SimpleNamespace(fetch=self.fetch)
     def documents_for(self,*a,**k): return list(self.documents.values())
+    def remember_persisted_document(self,d): self.documents[d.document_id]=d
     def structured_market_snapshots_for(self,keys): return {k:[] for k in keys}
     async def append_news_record(self,value): return self._persistence.append_news_record(value)
     async def _run_blocking_persistence(self,fn,*args): return fn(*args)
@@ -45,7 +46,10 @@ async def no_sleep(seconds): pass
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind,expected',[('empty','SEARCH_COMPLETE_NO_EVENTS'),('fail','SEARCH_FAILED'),('disabled','SEARCH_FAILED'),('degraded','SEARCH_PARTIAL')])
+# 'degraded' here returns no rows while reporting unresponsive engines: that is a
+# failed query (never a valid empty), so a plan where every query is like that
+# is SEARCH_FAILED (see test_news_search_completion_semantics.py).
+@pytest.mark.parametrize('kind,expected',[('empty','SEARCH_COMPLETE_NO_EVENTS'),('fail','SEARCH_FAILED'),('disabled','SEARCH_FAILED'),('degraded','SEARCH_FAILED')])
 async def test_worker_search_outcomes(kind,expected):
     provider=DisabledSearchDiscoveryProvider() if kind=='disabled' else Provider(fail=kind=='fail',degraded=kind=='degraded')
     repo=Repository()
@@ -72,14 +76,14 @@ async def test_worker_exposure_queries_persist_features_and_bounded_spacing():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure',['fetch','budget'])
-async def test_document_incompleteness_never_certifies_no_events(failure):
+@pytest.mark.parametrize('failure,expected',[('fetch','SEARCH_PARTIAL'),('budget','SEARCH_COMPLETE_WITH_EVENTS')])
+async def test_document_incompleteness_never_certifies_no_events(failure,expected):
     repo=Repository(); provider=Provider(results=[candidate(),candidate('https://publisher.test/second')])
     if failure=='fetch':
         async def broken(url): raise RuntimeError('private error')
         repo._fetcher.fetch=broken
     run,_=await acquire_news(repo,company(),providers=[provider],now=NOW,sleep=no_sleep,max_documents=1)
-    assert run.outcome=='SEARCH_PARTIAL'
+    assert run.outcome==expected
 
 
 @pytest.mark.asyncio
@@ -112,3 +116,76 @@ async def test_persisted_yahoo_empty_plus_web_events_requires_no_yahoo_call():
 def test_competitor_action_in_same_document_not_attributed_to_company():
     from app.news_intelligence import extract_impacts
     assert not extract_impacts(profile(),document('Generic Cable Limited reported sales. Other Manufacturer confirmed fraud.'),now=NOW)
+
+@pytest.mark.asyncio
+async def test_excess_candidates_with_events_is_complete_not_partial():
+    # BELRISE scenario: candidate pool exceeds max_documents, but usable
+    # CURRENT_NEWS evidence was obtained -- COMPLETE_WITH_EVENTS, never PARTIAL
+    # just because candidates > max_documents.
+    repo = Repository()
+    provider = Provider(results=[candidate(f'https://publisher.test/n{i}') for i in range(5)])
+    run, features = await acquire_news(repo, company(), providers=[provider],
+        industry='Wires and cables', now=NOW, sleep=no_sleep, max_queries=1, max_documents=2)
+    assert run.outcome == 'SEARCH_COMPLETE_WITH_EVENTS'
+    assert features
+    assert len(repo.fetches) <= 2  # usable evidence caps at max_documents
+
+
+@pytest.mark.asyncio
+async def test_failed_top_candidate_falls_through_to_next_ranked():
+    # A failing, higher-ranked candidate must not permanently consume a usable
+    # slot; the next ranked candidate is tried and can satisfy CURRENT_NEWS.
+    repo = Repository()
+    async def selective(url):
+        repo.fetches.append(url)
+        if 'nseindia' in url:
+            raise RuntimeError('private error')
+        return SimpleNamespace(text='<html><title>Copper reaches record high</title><body>Pressure on cable makers.</body></html>',
+            content_type='text/html', final_url=url)
+    repo._fetcher.fetch = selective
+    failing = candidate('https://www.nseindia.com/news/1')   # exchange -> ranks first (authority 3)
+    good = candidate('https://publisher.test/news')          # ranks lower
+    provider = Provider(results=[failing, good])
+    run, features = await acquire_news(repo, company(), providers=[provider],
+        industry='Wires and cables', now=NOW, sleep=no_sleep, max_queries=1, max_documents=6)
+    assert run.outcome == 'SEARCH_COMPLETE_WITH_EVENTS'
+    assert features
+    assert len(repo.fetches) == 2  # both attempted: failure is an attempt, not a usable slot
+
+
+def test_html_candidate_ranks_above_equivalent_pdf():
+    from app.source_discovery import _candidate_rank
+    profile = company()
+    html = candidate('https://publisher.test/news')
+    pdf = candidate('https://publisher.test/news.pdf')
+    assert _candidate_rank(profile, html) > _candidate_rank(profile, pdf)
+
+
+@pytest.mark.asyncio
+async def test_canonical_equivalent_urls_do_not_double_consume_budget():
+    # Identical canonical URLs collapse before the document budget; one canonical
+    # URL consumes at most one attempt/usable slot.
+    repo = Repository()
+    dup_url = 'https://publisher.test/news'
+    provider = Provider(results=[candidate(dup_url), candidate(dup_url)])
+    run, features = await acquire_news(repo, company(), providers=[provider],
+        industry='Wires and cables', now=NOW, sleep=no_sleep, max_queries=1, max_documents=6)
+    assert run.outcome == 'SEARCH_COMPLETE_WITH_EVENTS'
+    assert features
+    assert len(repo.fetches) == 1  # one canonical URL -> one attempt
+
+
+@pytest.mark.asyncio
+async def test_zero_usable_evidence_after_attempts_is_partial_with_budget_exhausted():
+    # Genuine exhaustion: candidates existed and were attempted, but zero usable
+    # CURRENT_NEWS evidence resulted -- SEARCH_PARTIAL carrying
+    # DOCUMENT_BUDGET_EXHAUSTED (never converted to SUCCESS_EMPTY).
+    repo = Repository()
+    async def broken(url):
+        raise RuntimeError('private error')
+    repo._fetcher.fetch = broken
+    provider = Provider(results=[candidate(f'https://publisher.test/n{i}') for i in range(3)])
+    run, _ = await acquire_news(repo, company(), providers=[provider],
+        industry='Wires and cables', now=NOW, sleep=no_sleep, max_queries=1, max_documents=6)
+    assert run.outcome == 'SEARCH_PARTIAL'
+    assert any(p.failure_code and 'DOCUMENT_BUDGET_EXHAUSTED' in p.failure_code for p in run.providers)

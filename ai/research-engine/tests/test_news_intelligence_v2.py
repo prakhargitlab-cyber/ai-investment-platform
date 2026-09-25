@@ -147,7 +147,7 @@ def test_v1_zero_vs_missing_negative_and_severe(monkeypatch):
     from app.stock_rule_engine import StockRuleEngineV1
     engine=StockRuleEngineV1(); base=replace(_inputs(events=[]),evaluated_at=NOW)
     neutral=engine._news(replace(base,news_search_run=run()))
-    assert neutral.raw_score==50
+    assert neutral.raw_score is None
     missing=engine._news(replace(base,news_search_run=run([outcome(state='FAILED')])))
     assert missing.raw_score is None
     f=extract_impacts(profile(),document(),now=NOW)[0]
@@ -215,8 +215,8 @@ def test_ranker_news_renormalization_and_risk_gate(kind,monkeypatch):
     rule.risk_overrides=engine._risk_overrides(value)
     result=GlobalOpportunityRanker().score(candidate,rule)
     assert result.rank_eligible==(kind!='severe')
-    assert result.score_coverage==(93 if kind=='missing' else 100)
+    assert result.score_coverage==(93 if kind in {'missing', 'zero'} else 100)
     assert GlobalOpportunityRanker().score(candidate,rule)==result
-    if kind=='zero': assert area(rule,'NEWS_GEOPOLITICAL_EVENTS').raw_score==50
+    if kind=='zero': assert area(rule,'NEWS_GEOPOLITICAL_EVENTS').raw_score is None
     if kind=='adverse': assert area(rule,'NEWS_GEOPOLITICAL_EVENTS').raw_score<50
     if kind=='positive': assert area(rule,'NEWS_GEOPOLITICAL_EVENTS').raw_score>50

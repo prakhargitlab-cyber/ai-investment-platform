@@ -1,6 +1,6 @@
 from datetime import date, datetime, time, timezone
 
-from app.market_sessions import MarketCalendarException, MarketTradingSchedule, class_due, market_session_status, price_sync_eligible
+from app.market_sessions import MarketCalendarException, MarketTradingSchedule, class_due, market_session_status, price_session_valid_until, price_sync_eligible
 from app.persistence import SqliteResearchPersistence
 
 
@@ -39,6 +39,13 @@ def test_market_schedule_and_exception_time_deserialization_accepts_postgres_tim
         def __init__(self, rows): self.rows = rows
         def fetchall(self): return self.rows
     class Connection:
+        # DI-16B: read persistence methods now wrap SELECTs in
+        # ``with self._connection:``, so any stubbed connection must support
+        # the context-manager protocol (real psycopg3/sqlite3 connections do).
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
         def execute(self, sql):
             if "market_trading_schedules" in sql:
                 return Result([{
@@ -58,3 +65,27 @@ def test_market_schedule_and_exception_time_deserialization_accepts_postgres_tim
     assert schedule.regular_close_time == time(15, 30)
     assert exception.open_time == time(9, 15)
     assert exception.close_time == time(12, 0)
+
+
+def test_price_session_valid_until_extends_close_through_next_session_open():
+    friday_close = datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc)  # 15:30 IST
+    monday_open = datetime(2026, 9, 14, 3, 45, tzinfo=timezone.utc)    # 09:15 IST
+    assert price_session_valid_until("NSE", NSE, [], friday_close) == monday_open
+
+
+def test_price_session_valid_until_persists_across_holiday():
+    friday_close = datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc)
+    tuesday_open = datetime(2026, 9, 15, 3, 45, tzinfo=timezone.utc)   # Mon Sep 14 holiday
+    holidays = [MarketCalendarException("NSE", date(2026, 9, 14), "CLOSED")]
+    assert price_session_valid_until("NSE", NSE, holidays, friday_close) == tuesday_open
+
+
+def test_price_session_valid_until_rejects_non_close_observation():
+    # A mid-session observation is not a genuine close -> no session validity.
+    mid_session = datetime(2026, 9, 11, 7, 0, tzinfo=timezone.utc)  # 12:30 IST
+    assert price_session_valid_until("NSE", NSE, [], mid_session) is None
+
+
+def test_price_session_valid_until_is_none_without_calendar_context():
+    friday_close = datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc)
+    assert price_session_valid_until("NSE", [], [], friday_close) is None

@@ -1,5 +1,6 @@
 package com.aiinvestment.research;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.flywaydb.core.Flyway;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -45,7 +46,10 @@ class ResearchFlywayMigrationTest {
                 "global_daily_market_bars",
                 "global_stock_rule_engine_results",
                 "market_trading_schedules",
-                "market_trading_calendar_exceptions"
+                "market_trading_calendar_exceptions",
+                "global_opportunity_cycle_run",
+                "global_opportunity_cycle_progress",
+                "global_opportunity_cycle_active"
         );
         assertThat(tables).doesNotContain("research_refresh_jobs");
 
@@ -94,9 +98,61 @@ class ResearchFlywayMigrationTest {
                 """,
                 String.class
         );
-        assertThat(version).isEqualTo("13");
+        assertThat(version).isEqualTo("14");
         assertThat(tables).contains("global_opportunity_snapshot", "stock_recommendation_history",
                 "recommendation_current_state", "global_opportunity_top_selection", "recommendation_backtest_run");
+        assertThat(tables).contains("global_market_scan", "global_stock_suggestion",
+                "global_stock_suggestion_history", "global_stock_suggestion_current");
+
+        List<String> marketScanColumns = jdbcTemplate.queryForList(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = 'research' AND table_name = 'global_market_scan'",
+                String.class
+        );
+        assertThat(marketScanColumns).contains(
+                "scan_id", "started_at", "completed_at", "status", "market", "exchange",
+                "universe_count", "shortlist_count", "evaluated_count", "rank_eligible_count",
+                "suppressed_count", "engine_version", "controlled", "failure_reason_code", "created_at"
+        );
+
+        List<String> suggestionColumns = jdbcTemplate.queryForList(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = 'research' AND table_name = 'global_stock_suggestion'",
+                String.class
+        );
+        assertThat(suggestionColumns).contains(
+                "suggestion_id", "scan_id", "global_instrument_id", "symbol", "company_name",
+                "horizon", "initial_action", "suggested_at", "suggested_price", "rank",
+                "opportunity_score", "confidence", "coverage", "data_state",
+                "entry_range_low", "entry_range_high", "fair_value", "target_1", "target_2",
+                "invalidation_price", "reasons", "risks", "evidence_snapshot",
+                "engine_version", "recommendation_fingerprint", "created_at"
+        );
+        assertThat(suggestionColumns).doesNotContain("user_id");
+
+        List<String> historyColumns = jdbcTemplate.queryForList(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = 'research' AND table_name = 'global_stock_suggestion_history'",
+                String.class
+        );
+        assertThat(historyColumns).contains(
+                "event_id", "suggestion_id", "scan_id", "global_instrument_id", "horizon",
+                "action", "action_at", "action_price", "rank", "opportunity_score",
+                "confidence", "reasons", "risks", "evidence_snapshot",
+                "engine_version", "event_fingerprint"
+        );
+        assertThat(historyColumns).doesNotContain("user_id");
+
+        List<String> currentColumns = jdbcTemplate.queryForList(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = 'research' AND table_name = 'global_stock_suggestion_current'",
+                String.class
+        );
+        assertThat(currentColumns).contains(
+                "global_instrument_id", "horizon", "suggestion_id", "latest_action",
+                "latest_action_at", "latest_price", "original_suggested_at",
+                "original_suggested_price", "current_rank", "opportunity_score",
+                "confidence", "coverage", "entry_range_low", "entry_range_high",
+                "fair_value", "target_1", "target_2", "invalidation_price",
+                "reasons", "risks", "evidence_snapshot", "engine_version", "last_scan_id"
+        );
+        assertThat(currentColumns).doesNotContain("user_id");
 
         Integer nseSessions = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM research.market_trading_schedules WHERE market_code = 'NSE'", Integer.class
@@ -147,6 +203,13 @@ class ResearchFlywayMigrationTest {
     void existingVersionTenUpgradesAndRepeatedMigrationIsANoOp() {
         // Optional disposable PostgreSQL database lets the same upgrade test run
         // against the production dialect without changing application bootstrap.
+        // V13 creates PL/pgSQL triggers, which H2 (MODE=PostgreSQL) cannot execute,
+        // so this upgrade path is only meaningful against real PostgreSQL. Run it
+        // with -DdailyBarsUpgradeJdbcUrl=<disposable PostgreSQL>; the research-engine
+        // suite validates the same V10 -> V16 path on real PostgreSQL
+        // (tests/test_postgres_migrations_and_checkpoint.py).
+        Assumptions.assumeTrue(System.getProperty("dailyBarsUpgradeJdbcUrl") != null,
+                "V13+ migrations require real PostgreSQL (H2 cannot run PL/pgSQL)");
         String url = System.getProperty("dailyBarsUpgradeJdbcUrl",
                 "jdbc:h2:mem:dailyBarUpgrade;DB_CLOSE_DELAY=-1;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE");
         String username = System.getProperty("dailyBarsUpgradeUsername", "sa");
@@ -163,7 +226,7 @@ class ResearchFlywayMigrationTest {
             """);
         Flyway upgrade = Flyway.configure().dataSource(url, username, password)
                 .schemas("research").defaultSchema("research").table("flyway_schema_history_research").load();
-        assertThat(upgrade.migrate().migrationsExecuted).isEqualTo(3);
+        assertThat(upgrade.migrate().migrationsExecuted).isEqualTo(6); // V11..V16
         assertThat(upgrade.migrate().migrationsExecuted).isZero();
         assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_daily_market_bars", Integer.class)).isZero();
         assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_market_price_observations", Integer.class)).isEqualTo(1);

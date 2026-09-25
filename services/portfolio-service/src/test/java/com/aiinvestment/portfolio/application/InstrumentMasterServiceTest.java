@@ -315,6 +315,66 @@ class InstrumentMasterServiceTest {
         verify(mappings, never()).save(any(InstrumentProviderMappingEntity.class));
     }
 
+    @Test
+    void investmentVehicleBootstrapCanonicalizesAsOtherNotEquity() {
+        InstrumentMasterEntity master = service.canonicalizeOfficialInvestmentVehicle(
+                "INE0CCU23011", "EMBASSY", "Embassy Office Parks REIT");
+
+        assertThat(master.getAssetType()).isEqualTo(AssetType.OTHER);
+        assertThat(master.getPrimaryExchange()).isEqualTo("NSE");
+        assertThat(master.getPrimarySymbol()).isEqualTo("EMBASSY");
+        assertProvidersSavedExactly("NSE");
+        assertThat(savedMappings().get(0).getResolutionSource()).isEqualTo("NSE_OFFICIAL_INVESTMENT_VEHICLE_BOOTSTRAP");
+    }
+
+    @Test
+    void investmentVehicleBootstrapNeverRewritesAnAlreadyExistingMastersAssetType() {
+        UUID masterId = UUID.randomUUID();
+        InstrumentMasterEntity existing = new InstrumentMasterEntity(masterId, "INE0CCU23011",
+                "Embassy Office Parks REIT", AssetType.EQUITY, "INR", "IN", "NSE", "EMBASSY", "ACTIVE",
+                java.time.Instant.now());
+        when(masters.findByNormalizedIsin("INE0CCU23011")).thenReturn(Optional.of(existing));
+
+        InstrumentMasterEntity resolved = service.canonicalizeOfficialInvestmentVehicle(
+                "INE0CCU23011", "EMBASSY", "Embassy Office Parks REIT");
+
+        assertThat(resolved).isSameAs(existing);
+        assertThat(resolved.getAssetType()).isEqualTo(AssetType.EQUITY);
+        verify(masters, never()).saveAndFlush(any());
+    }
+
+    @Test
+    void validatedAssetTypeNeverFlipsBackFromAnAlreadyClassifiedNonEquityType() {
+        InstrumentMasterEntity etf = new InstrumentMasterEntity(UUID.randomUUID(), "INF179KC1HS2",
+                "HDFC Nifty Next 50 ETF", AssetType.ETF, "INR", "IN", "NSE", "HDFN50", "ACTIVE", java.time.Instant.now());
+        etf.applyValidatedAssetType(AssetType.EQUITY);
+        assertThat(etf.getAssetType()).isEqualTo(AssetType.ETF);
+
+        InstrumentMasterEntity reit = new InstrumentMasterEntity(UUID.randomUUID(), "INE0CCU23011",
+                "Embassy Office Parks REIT", AssetType.OTHER, "INR", "IN", "NSE", "EMBASSY", "ACTIVE", java.time.Instant.now());
+        reit.applyValidatedAssetType(AssetType.EQUITY);
+        assertThat(reit.getAssetType()).isEqualTo(AssetType.OTHER);
+
+        InstrumentMasterEntity provisional = new InstrumentMasterEntity(UUID.randomUUID(), "INE187D01029",
+                "Talbros Automotive Components", AssetType.EQUITY, "INR", "IN", "NSE", "TALAUT", "ACTIVE", java.time.Instant.now());
+        provisional.applyValidatedAssetType(AssetType.ETF);
+        assertThat(provisional.getAssetType()).isEqualTo(AssetType.ETF);
+        provisional.applyValidatedAssetType(AssetType.EQUITY);
+        assertThat(provisional.getAssetType()).isEqualTo(AssetType.ETF);
+    }
+
+    @Test
+    void applyValidatedAssetTypeIgnoresNullEvidenceFromAFailedOrUnrecognizedQuoteType() {
+        UUID masterId = UUID.randomUUID();
+        InstrumentMasterEntity provisional = new InstrumentMasterEntity(masterId, "INE187D01029",
+                "Talbros Automotive Components", AssetType.EQUITY, "INR", "IN", "NSE", "TALAUT", "ACTIVE", java.time.Instant.now());
+        when(masters.findById(masterId)).thenReturn(Optional.of(provisional));
+
+        service.applyValidatedAssetType(masterId, "MUTUALFUND");
+
+        assertThat(provisional.getAssetType()).isEqualTo(AssetType.EQUITY);
+    }
+
     private InstrumentEntity row(String isin, String company) {
         return new InstrumentEntity(UUID.randomUUID(), "ICICI_DIRECT", "source-row", isin, "TALAUT", "NSE", "XNSE",
                 company, AssetType.EQUITY, "IN", "INR", null, null);

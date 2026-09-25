@@ -35,6 +35,37 @@ class Settings(BaseSettings):
     research_request_timeout_seconds: float = 10.0
     research_connect_timeout_seconds: float = 3.0
     research_max_content_bytes: int = 1_500_000
+    # Bounded retention of full ResearchDocument bodies (raw/normalized text,
+    # PDF structure) after durable persistence; see app/document_cache.py.
+    # Sized for active work (Stage2 concurrency x per-candidate document
+    # budget), not for total documents processed. Evicted bodies reload from
+    # research_documents.
+    research_document_cache_max_documents: int = 64
+    research_document_cache_max_bytes: int = 64 * 1024 * 1024
+    # Resident instruments whose research events are kept in memory (LRU);
+    # evicted instruments reload from research_events on demand.
+    research_event_cache_max_instruments: int = 256
+    # DB lease for resumable production opportunity cycles (app/cycle_checkpoint.py).
+    # A crashed owner's cycle is taken over after this many seconds.
+    research_opportunity_cycle_lease_seconds: int = 300
+    # Bounded in-cycle repair passes over technically failed deep candidates
+    # (Slice 4). Total attempts per candidate per cycle, across restarts, are
+    # capped by app/cycle_checkpoint.DEFAULT_MAX_ATTEMPTS.
+    research_opportunity_repair_passes: int = 1
+    # Backoff before re-attempting the NSE financial-authority upgrade after a
+    # TECHNICAL failure (a successful/empty check keeps the 3-day window).
+    research_authority_retry_backoff_seconds: int = 900
+    # Bounded Stage-2 (deep) acquisition look-ahead (Slice 7). Benchmarked 1..4
+    # (tests/test_slice7_stage2_concurrency.py): 2 is the smallest value with a
+    # meaningful gain (-43% latency-bound, -28% with real ingestion); 3 adds ~5%,
+    # 4 regresses (CPU-bound ingestion). Memory is bounded by the document cache
+    # at every value; results are identical. 1 = sequential.
+    research_stage2_concurrency: int = 2
+    # NSE corporate-announcement structured `category`/`subCategory` values that
+    # denote governance disclosures. Empty by default: no real NSE governance
+    # category values are captured in the repository, so none are invented.
+    # Populate from a captured NSE payload; titles remain the fallback.
+    research_nse_governance_categories: list[str] = []
     research_max_redirects: int = 5
     research_max_retries: int = 2
     # Official filings are fetched as part of an interactive refresh.  Keep a
@@ -79,6 +110,35 @@ class Settings(BaseSettings):
     sec_edgar_companyfacts_endpoint: str = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
     sec_edgar_user_agent: str = "AIInvestmentResearchBot/0.1 contact=research-compliance@example.invalid"
     sec_edgar_timeout_seconds: float = 10.0
+    # India macro foundation (RBI repo rate, India CPI): acquisition +
+    # persistence + read model only in this iteration -- not consumed by
+    # the Rule Engine, readiness, or ranking. Unset by default: this sandbox
+    # could not verify a live data.gov.in resource, so nothing is guessed;
+    # each endpoint must be an operator-verified data.gov.in OGD resource URL.
+    india_macro_enabled: bool = False
+    india_macro_rbi_repo_rate_endpoint: str | None = None
+    india_macro_rbi_repo_rate_api_key: str | None = None
+    india_macro_cpi_endpoint: str | None = None
+    india_macro_cpi_api_key: str | None = None
+    india_macro_rbi_freshness_seconds: int = 5_184_000
+    india_macro_cpi_freshness_seconds: int = 3_024_000
+    # US macro foundation (Fed policy rate, US CPI): acquisition + persistence
+    # + read model only, extending the same macro framework above. The FRED
+    # endpoint/response schema were directly verified against official docs
+    # (see app/us_macro_provider.py); only the API key is credential-gated
+    # and unset by default.
+    us_macro_enabled: bool = False
+    us_macro_fred_api_key: str | None = None
+    us_macro_fed_freshness_seconds: int = 4_838_400
+    us_macro_cpi_freshness_seconds: int = 3_024_000
+    # Macro event calendar foundation (FOMC, RBI MPC meeting dates):
+    # acquisition + persistence + read model only, no consensus/expected
+    # values, no scoring. FOMC's endpoint is the verified official page;
+    # RBI has no configured endpoint because no parser is implemented yet
+    # (see app/rbi_mpc_calendar_provider.py).
+    macro_event_calendar_enabled: bool = False
+    fomc_calendar_freshness_seconds: int = 604_800
+    rbi_mpc_calendar_freshness_seconds: int = 604_800
     eodhd_api_key: str | None = None
     eodhd_base_url: str = "https://eodhd.com/api"
     eodhd_timeout_seconds: float = 10.0
@@ -98,6 +158,15 @@ class Settings(BaseSettings):
     research_database_statement_timeout_seconds: int = 30
     research_distributed_lock_backend: str = "process"
     research_distributed_lock_acquire_timeout_seconds: int = 30
+    # Narrow, research-engine-only switch for the in-process Global
+    # Opportunity scheduler (GlobalOpportunityScheduler). Defaults True so
+    # existing environments keep today's behavior (the scheduler already
+    # starts whenever persistence is enabled) unless explicitly opted out.
+    # Deliberately separate from the broad, chart-wide
+    # AIP_FEATURE_SCHEDULED_JOBS_ENABLED flag, which no service in this
+    # codebase currently reads -- flipping that flag would not affect this
+    # scheduler and could unintentionally gate unrelated future jobs.
+    research_opportunity_scheduler_enabled: bool = True
     research_mcp_first_enabled: bool = False
     research_mcp_gateway_base_url: str = "http://mcp-gateway"
     research_mcp_gateway_timeout_seconds: float = 10.0
@@ -257,6 +326,20 @@ class Settings(BaseSettings):
         if not normalized:
             raise ValueError("research MCP service identity is required")
         return normalized
+
+    @field_validator("research_stage2_concurrency")
+    @classmethod
+    def validate_stage2_concurrency(cls, value: int) -> int:
+        if not 1 <= value <= 8:
+            raise ValueError("research_stage2_concurrency must be between 1 and 8")
+        return value
+
+    @field_validator("research_document_cache_max_documents", "research_document_cache_max_bytes")
+    @classmethod
+    def validate_document_cache_bounds(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("Document cache bounds must be positive")
+        return value
 
     @field_validator("research_official_document_max_bytes")
     @classmethod

@@ -86,3 +86,16 @@ def merge_fact(existing: FinancialFact | None, incoming: FinancialFact | None, *
 
 def _missing(value: object) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def newer_official_disclosure(existing: FinancialFact | None, incoming: FinancialFact) -> bool:
+    """Publication ordering only; callers must first prove an explicit revision."""
+    if existing is None or existing.key != incoming.key:
+        return False
+    if any(f.source_tier != FactSourceTier.OFFICIAL_NSE or f.source_provider != "NSE"
+           or f.source_mode != SourceMode.REAL for f in (existing, incoming)):
+        return False
+    previous, revised = existing.value.published_at, incoming.value.published_at
+    retrieved = incoming.value.retrieved_at
+    return bool(previous and revised and previous.tzinfo and revised.tzinfo
+                and retrieved.tzinfo and previous < revised <= retrieved)

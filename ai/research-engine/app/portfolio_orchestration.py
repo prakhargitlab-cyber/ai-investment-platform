@@ -28,7 +28,7 @@ from app.repository import ResearchRepository
 from app.scoring import canonical_read_model_score
 from app.settings import Settings
 from app.source_registry import registered_sources_for
-from app.structured_research import enrich_company_research
+from app.structured_research import enrich_company_research, financial_statement_history_from_facts
 from app.structured_market import StructuredProviderError, StructuredResearchProvider, YahooFinanceProvider, _is_financial_identity
 from app.market_sessions import class_due, market_session_status, price_sync_eligible
 from app.international_fundamentals import InternationalFundamentalsResult, international_provider_for
@@ -367,6 +367,7 @@ class PortfolioResearchOrchestrator:
         *,
         correlation_id: str | None = None,
         identity_headers: dict[str, str | None] | None = None,
+        reason_out: dict | None = None,
     ) -> bool:
         """Restore a process-local profile from the global instrument master API.
 
@@ -374,6 +375,11 @@ class PortfolioResearchOrchestrator:
         portfolio instrument ID.  The returned shape is normalized to the same
         instrument representation used by portfolio-position orchestration so
         provider mapping selection remains centralized here.
+
+        When ``reason_out`` is supplied, a Gate-1 registration rejection reason
+        is populated when the equity profile cannot be registered (same set of
+        reason codes as ``_register_equity_profile_from_instrument``).  Omitting
+        it preserves the pre-existing boolean return behaviour.
         """
         try:
             self.repository.profile(global_instrument_id)
@@ -409,14 +415,24 @@ class PortfolioResearchOrchestrator:
         asset_type = _instrument_asset_type(instrument)
         if asset_type == "ETF":
             return self._resolve_etf_profile(instrument, register_missing=True) is not None
-        return self._resolve_profile(instrument, register_missing=True) is not None
+        return self._resolve_profile(instrument, register_missing=True, reason_out=reason_out) is not None
 
     def register_global_profile_metadata(
         self,
         global_instrument_id: UUID,
         payload: dict,
+        *,
+        reason_out: dict | None = None,
     ) -> bool:
-        """Hydrate the process-local public profile from an already-read identity row."""
+        """Hydrate the process-local public profile from an already-read identity row.
+
+        When ``reason_out`` is supplied, a Gate-1 registration rejection reason
+        (``UNSUPPORTED_ASSET_TYPE``, ``MISSING_TICKER``, ``UNKNOWN_TICKER``,
+        ``MISSING_EXCHANGE``, ``UNKNOWN_EXCHANGE``, ``MISSING_COMPANY_NAME``,
+        ``COMPANY_NAME_EQUALS_TICKER``) is populated so the caller can surface
+        ``COMPANY_NOT_RESOLVED:<REASON>``.  Omitting it preserves the
+        pre-existing boolean return behaviour.
+        """
         instrument = _global_master_instrument(payload, global_instrument_id)
         if _instrument_asset_type(instrument) == "ETF":
             return self._resolve_etf_profile(instrument, register_missing=True) is not None
@@ -445,6 +461,7 @@ class PortfolioResearchOrchestrator:
                 _normalize_exchange(
                     instrument.get("canonicalMic") or instrument.get("mic")
                 ),
+                reason_out=reason_out,
             )
         if profile is None:
             return False
@@ -765,7 +782,7 @@ class PortfolioResearchOrchestrator:
         if asset_type == "ETF":
             profile = self._resolve_etf_profile(instrument, register_missing=True)
             result.companies_resolved += 1
-            documents_before = len(self.repository.documents_for(profile.instrument_id)) if profile else 0
+            documents_before = self.repository.document_count_for(profile.instrument_id) if profile else 0
             if profile:
                 await self.refresh_instrument(
                     profile.instrument_id,
@@ -774,7 +791,7 @@ class PortfolioResearchOrchestrator:
                     structured_records=structured_records.get(profile.instrument_id, []),
                     market_data=market_data,
                 )
-            documents_after = len(self.repository.documents_for(profile.instrument_id)) if profile else documents_before
+            documents_after = self.repository.document_count_for(profile.instrument_id) if profile else documents_before
             result.documents_created += max(documents_after - documents_before, 0)
             result.companies_degraded += 1
             result.companies.append(_etf_company_from_profile(profile, instrument, self.repository.documents_for(profile.instrument_id) if profile else [], self.repository.last_refresh.get(profile.instrument_id) if profile else None, self.repository.last_live_error.get(profile.instrument_id) if profile else "ETF_RESEARCH_NOT_REFRESHED"))
@@ -783,10 +800,13 @@ class PortfolioResearchOrchestrator:
             result.companies_resolved += 1
             result.companies.append(_unsupported_asset_company(instrument, asset_type))
             return result
-        profile = self._resolve_profile(instrument, register_missing=True)
+        profile_reason: dict = {}
+        profile = self._resolve_profile(instrument, register_missing=True, reason_out=profile_reason)
         if profile is None:
             result.companies_failed += 1
-            result.companies.append(PortfolioResearchCompany(instrument_id=_safe_uuid(instrument.get("instrumentId")), company_name=_instrument_name(instrument), ticker=_instrument_ticker(instrument), exchange=_instrument_exchange(instrument), isin=instrument.get("isin"), provider=instrument.get("provider"), provider_instrument_id=instrument.get("providerInstrumentId"), asset_type=asset_type or None, status="COMPANY_NOT_RESOLVED", safe_error_code="COMPANY_NOT_RESOLVED", safe_error_message="Holding identity did not match a registered research company."))
+            not_resolved_reason = profile_reason.get("reason")
+            not_resolved_code = f"COMPANY_NOT_RESOLVED:{not_resolved_reason}" if not_resolved_reason else "COMPANY_NOT_RESOLVED"
+            result.companies.append(PortfolioResearchCompany(instrument_id=_safe_uuid(instrument.get("instrumentId")), company_name=_instrument_name(instrument), ticker=_instrument_ticker(instrument), exchange=_instrument_exchange(instrument), isin=instrument.get("isin"), provider=instrument.get("provider"), provider_instrument_id=instrument.get("providerInstrumentId"), asset_type=asset_type or None, status="COMPANY_NOT_RESOLVED", safe_error_code=not_resolved_code, safe_error_message="Holding identity did not match a registered research company."))
             return result
         result.companies_resolved += 1
         allow_demo = not _is_real_broker_instrument(instrument)
@@ -820,7 +840,7 @@ class PortfolioResearchOrchestrator:
             result.companies_degraded += int(company.status != "RESOLVED_RESEARCH_AVAILABLE")
             result.companies.append(company)
             return result
-        documents_before = len(self.repository.documents_for(profile.instrument_id))
+        documents_before = self.repository.document_count_for(profile.instrument_id)
         events_before = len(self.repository.events_for(profile.instrument_id))
         try:
             await self.refresh_instrument(
@@ -831,7 +851,7 @@ class PortfolioResearchOrchestrator:
                 instrument=instrument,
                 structured_outcome=structured_outcome,
             )
-            result.documents_created += max(len(self.repository.documents_for(profile.instrument_id)) - documents_before, 0)
+            result.documents_created += max(self.repository.document_count_for(profile.instrument_id) - documents_before, 0)
             result.events_created += max(len(self.repository.events_for(profile.instrument_id)) - events_before, 0)
             summary = self.repository.summary(profile.instrument_id, allow_demo=allow_demo)
             company = _company_from_summary(summary, status=_status_from_summary(summary, self.repository.last_live_error.get(profile.instrument_id)), source_instrument=instrument, safe_error_code=self.repository.last_live_error.get(profile.instrument_id))
@@ -992,14 +1012,18 @@ class PortfolioResearchOrchestrator:
         # and verified provider mappings.  Absence of prior research must not
         # make that global instrument unavailable: register its process-local
         # research profile so the UI can offer the first refresh.
+        profile_reason: dict = {}
         profile = self._resolve_profile(
             instrument,
             register_missing=_safe_uuid(instrument.get("globalInstrumentId")) is not None,
+            reason_out=profile_reason,
         )
         if profile is None:
             enriched = _enriched_equity_company(instrument)
             if enriched is not None:
                 return enriched
+            not_resolved_reason = profile_reason.get("reason")
+            not_resolved_code = f"COMPANY_NOT_RESOLVED:{not_resolved_reason}" if not_resolved_reason else "COMPANY_NOT_RESOLVED"
             return PortfolioResearchCompany(
                 instrument_id=_safe_uuid(instrument.get("instrumentId")),
                 company_name=_instrument_name(instrument),
@@ -1010,7 +1034,7 @@ class PortfolioResearchOrchestrator:
                 provider_instrument_id=instrument.get("providerInstrumentId"),
                 asset_type=asset_type or None,
                 status="COMPANY_NOT_RESOLVED",
-                safe_error_code="COMPANY_NOT_RESOLVED",
+                safe_error_code=not_resolved_code,
                 safe_error_message="Holding identity did not match a registered research company.",
             )
         if not instrument.get("provider"):
@@ -1071,7 +1095,7 @@ class PortfolioResearchOrchestrator:
             exchange=snapshot.resolution.exchange, currency=snapshot.resolution.currency, quote_type=snapshot.resolution.quote_type,
             source_url=snapshot.source_url, source_name=snapshot.source_name, source_type=snapshot.source_type,
             source_identity=snapshot.resolution.provider_ticker, market_as_of=snapshot.market_as_of, retrieved_at=snapshot.retrieved_at, persisted_at=now,
-            last_price_at=now if _positive_decimal_fact(facts.get("latestPrice")) is not None else None,
+            last_price_at=snapshot.market_as_of if _positive_decimal_fact(facts.get("latestPrice")) is not None else None,
             last_valuation_at=now if any(key in facts for key in ("trailingPE", "forwardPE", "priceToBook")) else None,
             last_fundamentals_at=now if any(key in facts for key in ("trailingEPS", "roe", "roa", "roce")) else None,
             last_analyst_at=now if any(key.startswith("publicAnalyst") for key in facts) else None,
@@ -1116,7 +1140,13 @@ class PortfolioResearchOrchestrator:
         now = datetime.now(timezone.utc)
         choices = records.get(company.instrument_id, [])
         record = _preferred_structured_record(choices)
-        _attach_durable_structured_market(company, record, schedules, exceptions, now, self.settings)
+        facts_by_instrument = await self.repository.financial_facts_for_instruments(
+            {company.instrument_id}
+        )
+        _attach_durable_structured_market(
+            company, record, schedules, exceptions, now, self.settings,
+            financial_facts=facts_by_instrument.get(company.instrument_id, []),
+        )
 
     async def _finalize_global_company(
         self, company: PortfolioResearchCompany
@@ -1274,9 +1304,9 @@ class PortfolioResearchOrchestrator:
             research_instrument = dict(instrument)
             research_instrument["instrumentId"] = instrument.get("globalInstrumentId") or instrument.get("instrumentId")
             for mapping in instrument.get("providerMappings") or []:
-                if not _trusted_provider_mapping(mapping):
-                    continue
                 provider = str(mapping.get("provider") or "").upper()
+                if not _trusted_mapping_for_provider(mapping, provider):
+                    continue
                 if provider == "YAHOO_FINANCE":
                     research_instrument.update({
                         "structuredProviderTicker": mapping.get("providerSymbol"),
@@ -1296,7 +1326,9 @@ class PortfolioResearchOrchestrator:
             instruments.append(research_instrument)
         return instruments
 
-    def _resolve_profile(self, instrument: dict, *, register_missing: bool) -> CompanyResearchProfile | None:
+    def _resolve_profile(
+        self, instrument: dict, *, register_missing: bool, reason_out: dict | None = None
+    ) -> CompanyResearchProfile | None:
         instrument_id = _safe_uuid(instrument.get("instrumentId"))
         provider = str(instrument.get("provider") or "").upper()
         provider_instrument_id = str(instrument.get("providerInstrumentId") or "").upper()
@@ -1304,13 +1336,26 @@ class PortfolioResearchOrchestrator:
         ticker = str(_instrument_ticker(instrument) or "").upper()
         exchange = _instrument_exchange(instrument)
         mic = _normalize_exchange(instrument.get("canonicalMic") or instrument.get("mic"))
-        for profile in self.repository.list_profiles():
+        profiles = self.repository.list_profiles()
+        # An exact instrument_id match is the strongest possible identity signal
+        # and must never be shadowed by a weaker (provider/ISIN/ticker+exchange)
+        # match against a *different*, earlier-iterated profile -- e.g. a
+        # portfolio-position profile registered under a legacy/broker-specific
+        # identity that happens to share an ISIN or ticker+exchange with the
+        # canonical global instrument. Check it first, across the whole list,
+        # before any fuzzy criterion runs at all -- otherwise a canonical
+        # global-search instrument can be silently rebound to the wrong
+        # (portfolio-specific) profile merely because that profile happens to
+        # appear earlier in iteration order.
+        if instrument_id:
+            for profile in profiles:
+                if profile.instrument_id == instrument_id:
+                    return _hydrate_verified_exchange_mappings(profile, instrument)
+        for profile in profiles:
             if provider and provider_instrument_id:
                 known = {key.upper(): value.upper() for key, value in profile.provider_instrument_ids.items()}
                 if known.get(provider) == provider_instrument_id:
                     return _hydrate_verified_exchange_mappings(profile, instrument)
-            if instrument_id and profile.instrument_id == instrument_id:
-                return _hydrate_verified_exchange_mappings(profile, instrument)
             if isin and profile.isin and profile.isin.upper() == isin:
                 return _hydrate_verified_exchange_mappings(profile, instrument)
             known_markets = {profile.exchange.upper(), profile.mic.upper()}
@@ -1320,7 +1365,9 @@ class PortfolioResearchOrchestrator:
                 return _hydrate_verified_exchange_mappings(profile, instrument)
         if not register_missing:
             return None
-        return self._register_equity_profile_from_instrument(instrument, provider, provider_instrument_id, isin, ticker, exchange, mic)
+        return self._register_equity_profile_from_instrument(
+            instrument, provider, provider_instrument_id, isin, ticker, exchange, mic, reason_out=reason_out
+        )
 
     def _resolve_etf_profile(self, instrument: dict, *, register_missing: bool) -> EtfResearchProfile | None:
         instrument_id = _safe_uuid(instrument.get("instrumentId"))
@@ -1369,16 +1416,47 @@ class PortfolioResearchOrchestrator:
             ticker: str,
             exchange: str,
             mic: str,
+            reason_out: dict | None = None,
         ) -> CompanyResearchProfile | None:
         asset_type = _instrument_asset_type(instrument)
         company_name = _instrument_name(instrument)
         currency = str(instrument.get("tradingCurrency") or instrument.get("currency") or "").upper()
         country = str(instrument.get("country") or "").upper()
+        # Each guard below is checked in the same left-to-right order as the
+        # original combined boolean expressions it replaces, so the accepted/
+        # rejected outcome for any given instrument is unchanged -- only the
+        # specific rejection reason (when reason_out is supplied) is new.
         if asset_type not in {"", "EQUITY"}:
+            if reason_out is not None:
+                reason_out["reason"] = "UNSUPPORTED_ASSET_TYPE"
             return None
-        if not ticker or ticker == "UNKNOWN" or not exchange or exchange == "UNKNOWN":
+        if not ticker:
+            if reason_out is not None:
+                reason_out["reason"] = "MISSING_TICKER"
             return None
-        if not company_name or company_name.upper() in {"UNKNOWN", ticker}:
+        if ticker == "UNKNOWN":
+            if reason_out is not None:
+                reason_out["reason"] = "UNKNOWN_TICKER"
+            return None
+        if not exchange:
+            if reason_out is not None:
+                reason_out["reason"] = "MISSING_EXCHANGE"
+            return None
+        if exchange == "UNKNOWN":
+            if reason_out is not None:
+                reason_out["reason"] = "UNKNOWN_EXCHANGE"
+            return None
+        if not company_name:
+            if reason_out is not None:
+                reason_out["reason"] = "MISSING_COMPANY_NAME"
+            return None
+        if company_name.upper() == "UNKNOWN":
+            if reason_out is not None:
+                reason_out["reason"] = "MISSING_COMPANY_NAME"
+            return None
+        if company_name.upper() == ticker:
+            if reason_out is not None:
+                reason_out["reason"] = "COMPANY_NAME_EQUALS_TICKER"
             return None
         instrument_id = _safe_uuid(instrument.get("instrumentId")) or uuid5(
             NAMESPACE_URL,
@@ -1396,7 +1474,8 @@ class PortfolioResearchOrchestrator:
                 **({"YAHOO_FINANCE": str(instrument.get("structuredProviderTicker"))} if instrument.get("structuredProviderTicker") else {}),
                 **{str(mapping.get("provider")).upper(): str(mapping.get("providerSymbol") or mapping.get("providerInstrumentId"))
                     for mapping in instrument.get("providerMappings") or []
-                    if _trusted_provider_mapping(mapping) and mapping.get("provider")
+                    if mapping.get("provider")
+                    and _trusted_mapping_for_provider(mapping, str(mapping.get("provider")).upper())
                     and (mapping.get("providerSymbol") or mapping.get("providerInstrumentId"))},
             },
             isin=isin or None,
@@ -1729,7 +1808,6 @@ def _company_aliases(company_name: str, ticker: str) -> list[str]:
 def _global_master_instrument(payload: dict, global_instrument_id: UUID) -> dict:
     """Normalize the public global-instrument API to the position instrument shape."""
     mappings = [mapping for mapping in payload.get("providerMappings") or [] if isinstance(mapping, dict)]
-    verified = [mapping for mapping in mappings if _trusted_provider_mapping(mapping)]
     instrument = {
         "instrumentId": str(global_instrument_id),
         "globalInstrumentId": str(global_instrument_id),
@@ -1744,9 +1822,11 @@ def _global_master_instrument(payload: dict, global_instrument_id: UUID) -> dict
         "currency": payload.get("currency"),
         "providerMappings": mappings,
     }
-    for mapping in verified:
+    for mapping in mappings:
         provider = str(mapping.get("provider") or "").upper()
         symbol = mapping.get("providerSymbol")
+        if not _trusted_mapping_for_provider(mapping, provider):
+            continue
         if provider == "NSE" and symbol:
             instrument["nseSymbol"] = symbol
         elif provider == "BSE" and (symbol or mapping.get("providerInstrumentId")):
@@ -1766,17 +1846,34 @@ def _global_master_instrument(payload: dict, global_instrument_id: UUID) -> dict
 
 
 def _hydrate_verified_exchange_mappings(profile: CompanyResearchProfile, instrument: dict) -> CompanyResearchProfile:
-    """Keep a reused global profile current with verified exchange identities."""
+    """Keep a reused global profile current with verified exchange identities.
+
+    NSE identity follows a stricter, non-additive contract than every other
+    provider here: it is populated only from data this function's upstream
+    producers can prove is currently VERIFIED (see _trusted_nse_provider_mapping),
+    and -- unlike every other provider, which only ever adds/overwrites -- a
+    previously-trusted NSE symbol is actively removed once fresh provider-
+    mapping data is supplied and no longer shows a VERIFIED NSE mapping. This
+    stops a stale NSE identity from silently surviving on a reused profile
+    merely because the profile object already existed. If no fresh mapping
+    data is supplied at all (``providerMappings`` absent from ``instrument``),
+    nothing is inferred either way and the existing NSE entry is left alone.
+    """
     mappings = dict(profile.provider_instrument_ids)
+    has_mapping_data = "providerMappings" in instrument
     if instrument.get("nseSymbol"):
         mappings["NSE"] = str(instrument["nseSymbol"])
+    elif has_mapping_data:
+        mappings.pop("NSE", None)
     if instrument.get("bseSymbol"):
         mappings["BSE"] = str(instrument["bseSymbol"])
     if instrument.get("structuredProviderTicker"):
         mappings["YAHOO_FINANCE"] = str(instrument["structuredProviderTicker"])
     for mapping in instrument.get("providerMappings") or []:
+        provider = str(mapping.get("provider") or "").upper()
+        if provider == "NSE":
+            continue
         if _trusted_provider_mapping(mapping):
-            provider = str(mapping.get("provider") or "").upper()
             value = mapping.get("providerSymbol") or mapping.get("providerInstrumentId")
             if provider and value:
                 mappings[provider] = str(value)
@@ -1797,9 +1894,9 @@ def _refresh_profile_from_global_instrument(profile: CompanyResearchProfile, ins
     profile.aliases = _company_aliases(profile.company_name, profile.ticker)
     authoritative: dict[str, str] = {}
     for mapping in instrument.get("providerMappings") or []:
-        if not _trusted_provider_mapping(mapping):
-            continue
         provider = str(mapping.get("provider") or "").upper()
+        if not _trusted_mapping_for_provider(mapping, provider):
+            continue
         value = mapping.get("providerSymbol") or mapping.get("providerInstrumentId")
         if provider and value:
             authoritative[provider] = str(value)
@@ -1813,6 +1910,33 @@ def _trusted_provider_mapping(mapping: object) -> bool:
         str(mapping.get("provider") or "").upper() == "NSE"
         and str(mapping.get("resolutionSource") or mapping.get("resolution_source") or "").upper() == "BROKER_IMPORT_IDENTITY"
     )
+
+
+def _trusted_nse_provider_mapping(mapping: object) -> bool:
+    """NSE identity is held to Java's own VERIFIED-only bar.
+
+    RESOLVED remains an acceptable provisional trust level for every other
+    provider via _trusted_provider_mapping() above, but Java's own domain
+    code (InstrumentMasterService) assigns RESOLVED to lower-confidence,
+    non-NSE-specific matches and excludes it from its own reusable-mapping
+    list -- so a RESOLVED NSE mapping must never become an authoritative NSE
+    provider identity here. Only an exact "VERIFIED" status qualifies; a
+    missing status, "REJECTED", "PENDING", "FAILED", or any other value is
+    NOT eligible -- trust is never inferred. The existing broker-import
+    exclusion still applies on top of that.
+    """
+    if not isinstance(mapping, dict) or str(mapping.get("status") or "").upper() != "VERIFIED":
+        return False
+    return str(mapping.get("resolutionSource") or mapping.get("resolution_source") or "").upper() != "BROKER_IMPORT_IDENTITY"
+
+
+def _trusted_mapping_for_provider(mapping: object, provider: str) -> bool:
+    """Provider-aware trust dispatch: NSE uses the stricter VERIFIED-only bar
+    above; every other provider keeps the existing VERIFIED/RESOLVED bar
+    unchanged."""
+    if provider == "NSE":
+        return _trusted_nse_provider_mapping(mapping)
+    return _trusted_provider_mapping(mapping)
 
 
 def _eligible_for_official_nse_research(profile: CompanyResearchProfile) -> bool:
@@ -1852,7 +1976,7 @@ def _attach_structured_market(company: PortfolioResearchCompany, snapshot, error
         company.safe_error_message = "Structured market evidence is available; public document discovery remains incomplete."
 
 
-def _attach_durable_structured_market(company: PortfolioResearchCompany, record, schedules, exceptions, now, settings) -> None:
+def _attach_durable_structured_market(company: PortfolioResearchCompany, record, schedules, exceptions, now, settings, financial_facts: list | None = None) -> None:
     if record is None:
         company.structured_provider_status = "NEVER_FETCHED"
         company.price_freshness = "NEVER_FETCHED"
@@ -1865,7 +1989,7 @@ def _attach_durable_structured_market(company: PortfolioResearchCompany, record,
     company.structured_provider_status = record.acquisition_status
     company.price_freshness = "FRESH" if not class_due(record.last_price_at, settings.structured_market_price_freshness_seconds, now) else "STALE"
     company.public_analyst = _public_analyst_from_record(record, now, settings)
-    company.market_fundamentals = _market_fundamentals_from_record(record, now, settings)
+    company.market_fundamentals = _market_fundamentals_from_record(record, now, settings, financial_facts=financial_facts)
     latest = _positive_decimal_fact(record.snapshot.facts.get("latestPrice"))
     previous = _decimal_fact(record.snapshot.facts.get("previousClose"))
     company.current_price = latest
@@ -1906,10 +2030,24 @@ def _public_analyst_from_record(record, now, settings) -> PublicAnalyst | None:
     )
 
 
-def _market_fundamentals_from_record(record, now, settings) -> MarketFundamentals | None:
+def _market_fundamentals_from_record(record, now, settings, financial_facts: list | None = None) -> MarketFundamentals | None:
     keys = {"market_cap":"marketCap","enterprise_value":"enterpriseValue","trailing_pe":"trailingPE","forward_pe":"forwardPE","price_to_book":"priceToBook","price_to_sales":"priceToSales","ev_to_revenue":"evToRevenue","ev_to_ebitda":"evToEbitda","peg_ratio":"pegRatio","trailing_eps":"trailingEps","forward_eps":"forwardEps","book_value_per_share":"bookValue","roe":"roe","roa":"roa","debt_to_equity":"debtToEquity","profit_margin":"profitMargin","operating_margin":"operatingMargin","revenue_growth":"revenueGrowth","earnings_growth":"earningsGrowth","total_cash":"totalCash","total_debt":"totalDebt","free_cash_flow":"freeCashFlow","operating_cash_flow":"operatingCashFlow"}
     selected = {field: record.snapshot.facts[key] for field, key in keys.items() if record.snapshot.facts.get(key) is not None}
     if not selected: return None
+    if financial_facts and "operating_cash_flow" not in selected:
+        history = financial_statement_history_from_facts(
+            financial_facts,
+            period_type={"QUARTERLY", "ANNUAL"},
+            metrics={"operating_cash_flow", "cash_flow_from_operating_activities"},
+            limit=1,
+        )
+        for _period in history:
+            _ocf = _period.metrics.get("operating_cash_flow")
+            if _ocf is None:
+                _ocf = _period.metrics.get("cash_flow_from_operating_activities")
+            if _ocf is not None:
+                selected["operating_cash_flow"] = _ocf
+                break
     provenance = {(v.source_name, v.source_url) for v in selected.values()}
     source_name, source_url = next(iter(provenance)) if len(provenance) == 1 else (None, None)
     financial = _is_financial_identity({"sector": getattr(record.snapshot.facts.get("sector"), "value", None), "industry": getattr(record.snapshot.facts.get("industry"), "value", None), "longName": record.snapshot.resolution.company_name})
@@ -2059,6 +2197,15 @@ def _status_from_summary(summary: ResearchSummary, live_error: str | None = None
         "DOCUMENT_FETCH_FAILED", "EXTRACTION_EMPTY",
     }:
         return live_error
+    # An authoritative NSE acquisition failure (official filing discovery or
+    # the NSE shareholding feed) is not a generic search-provider outage.
+    # Route it to the existing DOCUMENT_FETCH_FAILED status -- already a
+    # recognized failure status counted in result.failed and rendered with a
+    # negative tone -- rather than letting it fall into the SEARCH_PROVIDER
+    # catch-all below, which would misreport an NSE-side failure as a search
+    # outage.
+    if live_error and live_error.startswith(("OFFICIAL_FILING_", "NSE_SHAREHOLDING_")):
+        return "DOCUMENT_FETCH_FAILED"
     if live_error and live_error.startswith("SEARCH_PROVIDER_UNAVAILABLE"):
         return "SEARCH_PROVIDER_UNAVAILABLE"
     if live_error == "GOOGLE_PROVIDER_UNAVAILABLE" or (live_error and live_error.startswith("SEARCH_PROVIDER")):

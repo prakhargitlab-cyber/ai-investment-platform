@@ -95,6 +95,17 @@ class PriceHistory:
     rejected_count: int
     duplicate_count: int
     currency: str | None
+    # Historical-market-data integrity layer (see _quarantine_implausible_indices):
+    # observations that passed every format/provenance/conflict check above but
+    # are a structurally implausible isolated spike/crash relative to their
+    # immediate neighbors on both sides. Excluded from `observations` (so they
+    # can never become a swing low/high, support/resistance level, 52-week
+    # extreme, DMA input, or ATR/ADX candle) but never deleted from durable
+    # persistence -- the raw rows remain exactly as stored; only this
+    # in-memory technical-feature view omits them, and their dates are kept
+    # here for diagnostics/provenance and to truthfully reduce confidence
+    # (see TechnicalFeatureEngine.compute's conflict_factor).
+    quarantined_dates: tuple[date, ...] = ()
 
 
 def utc(value: datetime) -> datetime:
@@ -109,6 +120,63 @@ def finite_number(value) -> Decimal | None:
         return number if number.is_finite() and isfinite(float(number)) else None
     except (InvalidOperation, ValueError, OverflowError):
         return None
+
+
+# A single-day move beyond this ratio (either direction) never occurs in
+# ordinary NSE trading: individual-stock circuit filters cap ordinary daily
+# moves at 5/10/20% (SEBI price bands), so anything beyond a 2x/0.5x day-over-
+# day change is always either a genuine corporate action (split/bonus/
+# reverse-split/rights, whose exchange-adjusted "previous close" legitimately
+# jumps like this on its ex-date) or a data error -- never ordinary trading.
+# This is a generic, scale-invariant, exchange-behavior-grounded ratio, not a
+# per-symbol or absolute-price threshold: it applies identically whether the
+# stock trades at Rs 10 or Rs 10,000.
+_IMPLAUSIBLE_SINGLE_DAY_RATIO = 2.0
+# How close the observation AFTER a candidate anomaly must return to the
+# level BEFORE it to count as "reverted" (a bad tick that never held) rather
+# than "persisted" (a genuine, sustained level shift this function must
+# never quarantine). A generous band around parity to absorb ordinary next-
+# day noise on top of the reversion itself.
+_REVERSION_TOLERANCE = 1.15
+
+
+def _quarantine_implausible_indices(values: list[float]) -> set[int]:
+    """Surrounding-series-continuity integrity check: flag indices whose
+    value is a structurally implausible ISOLATED spike/crash, distinguished
+    from a genuine, persisting corporate-action-driven level shift by what
+    the very next observation does.
+
+    For each interior index i (never the first or last -- there is no way
+    to confirm reversion without an observation on both sides, and treating
+    an unconfirmed edge move as corrupt would risk discarding a genuine,
+    still-unfolding price move):
+      1. Candidate anomaly: values[i] deviates from values[i-1] by more than
+         _IMPLAUSIBLE_SINGLE_DAY_RATIO in either direction.
+      2. Reverted (quarantine it): values[i+1] is back within
+         _REVERSION_TOLERANCE of values[i-1] -- the series behaves as if the
+         anomalous point never happened.
+      3. Persisted (leave it untouched, never quarantined): values[i+1] is
+         NOT back near values[i-1] -- the new level held, so this is a real,
+         sustained move (a corporate action or a genuine large price change),
+         which must never be silently deleted or adjusted.
+
+    Only isolated single-point anomalies are detected this way -- a run of
+    two or more consecutive corrupted points requires a different technique
+    and is a known limitation (see the consolidated report).
+    """
+    n = len(values)
+    quarantined: set[int] = set()
+    for i in range(1, n - 1):
+        prior, current, following = values[i - 1], values[i], values[i + 1]
+        if prior <= 0 or current <= 0 or following <= 0:
+            continue
+        deviation = current / prior
+        if not (deviation > _IMPLAUSIBLE_SINGLE_DAY_RATIO or deviation < 1 / _IMPLAUSIBLE_SINGLE_DAY_RATIO):
+            continue
+        reversion = following / prior
+        if 1 / _REVERSION_TOLERANCE < reversion < _REVERSION_TOLERANCE:
+            quarantined.add(i)
+    return quarantined
 
 
 def normalize_price_history(instrument_id: UUID, observations: Iterable[MarketPriceObservation], *,
@@ -148,8 +216,11 @@ def normalize_price_history(instrument_id: UUID, observations: Iterable[MarketPr
         # No provider is assumed more authoritative. Only identical-price ties
         # use provenance to select a stable representative.
         output.append(min(current, key=lambda row: (row.provider, row.source_url, utc(row.retrieved_at))))
-    return PriceHistory(tuple(output), tuple(conflicts), bool(conflicts and max(grouped) in conflicts),
-                        rejected, duplicates, currency or next(iter(currencies), None))
+    quarantine_indices = _quarantine_implausible_indices([float(row.price) for row in output])
+    quarantined_dates = tuple(sorted(utc(output[i].observed_at).date() for i in quarantine_indices))
+    clean_output = [row for i, row in enumerate(output) if i not in quarantine_indices]
+    return PriceHistory(tuple(clean_output), tuple(conflicts), bool(conflicts and max(grouped) in conflicts),
+                        rejected, duplicates, currency or next(iter(currencies), None), quarantined_dates)
 
 
 class TechnicalFeatureSnapshot(ResearchBaseModel):
@@ -234,6 +305,15 @@ class TechnicalFeatureSnapshot(ResearchBaseModel):
     conflicting_dates: list[date] = Field(default_factory=list)
     rejected_observation_count: int = 0
     duplicate_observation_count: int = 0
+    # Historical-market-data integrity layer: observations excluded as
+    # structurally implausible isolated spikes/crashes (see
+    # _quarantine_implausible_indices). Never deleted from durable
+    # persistence -- this is the technical-feature view's own diagnostic of
+    # what it excluded and why, so an isolated bad tick can be investigated
+    # without ever becoming a swing low/high, support/resistance level,
+    # 52-week extreme, or recommendation entry range.
+    quarantined_observation_count: int = 0
+    quarantined_dates: list[date] = Field(default_factory=list)
 
 
 def percentage(value: float, reference: float) -> float:
@@ -272,8 +352,26 @@ def normalize_daily_history(instrument_id, bars, *, as_of, currency, trusted_pro
             conflicts.append(day)
         else:
             output.append(min(current, key=lambda bar: (bar.provider_symbol or '', bar.source_url)))
-    return PriceHistory(tuple(output), tuple(conflicts), bool(conflicts and max(grouped) in conflicts),
-        rejected, duplicates, currency or next(iter(currencies), None)), bool(grouped)
+    # OHLC-aware integrity screen: a bar is quarantined (the WHOLE bar --
+    # never just one field -- since a single corrupted provider record
+    # typically has its entire OHLC row wrong, and this keeps candle-derived
+    # features like ATR/ADX, which combine high/low/close together,
+    # internally consistent) if ANY of its close/high/low is a structurally
+    # implausible isolated spike/crash on ITS OWN neighbor-sequence. See
+    # _quarantine_implausible_indices.
+    quarantine_indices: set[int] = set()
+    for field in ("close", "high", "low"):
+        # high/low (unlike close, already gated non-None/positive above) may
+        # legitimately be absent on a volume-only bar; NaN cleanly opts such
+        # a gap out of every comparison in _quarantine_implausible_indices
+        # (never > or < anything, itself or as a neighbor) rather than
+        # requiring index-shifting gap-handling logic here.
+        series = [float(value) if (value := getattr(bar, field)) is not None else float("nan") for bar in output]
+        quarantine_indices |= _quarantine_implausible_indices(series)
+    quarantined_dates = tuple(sorted(output[i].trading_date for i in quarantine_indices))
+    clean_output = [bar for i, bar in enumerate(output) if i not in quarantine_indices]
+    return PriceHistory(tuple(clean_output), tuple(conflicts), bool(conflicts and max(grouped) in conflicts),
+        rejected, duplicates, currency or next(iter(currencies), None), quarantined_dates), bool(grouped)
 
 
 def _wilder(values, period=14):
@@ -404,7 +502,9 @@ class TechnicalFeatureEngine:
             observation_count=n, history_readiness=readiness, currency=history.currency,
             history_start=stamp(rows[0]) if rows else None, history_end=stamp(rows[-1]) if rows else None,
             conflicting_dates=list(history.conflicting_dates), rejected_observation_count=history.rejected_count,
-            duplicate_observation_count=history.duplicate_count)
+            duplicate_observation_count=history.duplicate_count,
+            quarantined_observation_count=len(history.quarantined_dates),
+            quarantined_dates=list(history.quarantined_dates))
         result.daily_bar_observation_count = len(daily_history.observations)
         if selection_reason:
             result.source_diagnostics.append(selection_reason)
@@ -417,6 +517,12 @@ class TechnicalFeatureEngine:
             result.source_diagnostics.append('INELIGIBLE_DAILY_BARS_EXCLUDED')
         if use_daily and history.conflicting_dates:
             result.source_diagnostics.append('MIXED_NOT_ALLOWED')
+        if history.quarantined_dates:
+            # Truthful degradation (never FULL_HISTORY/confidence=100 read as
+            # unconditionally clean): a diagnostic marker, visible alongside
+            # the existing NSE_DAILY_HISTORY_*/MIXED_NOT_ALLOWED markers, plus
+            # the confidence reduction below (conflict_factor).
+            result.source_diagnostics.append('QUARANTINED_IMPLAUSIBLE_OBSERVATIONS_EXCLUDED')
         # A latest-price conflict invalidates current features, even with a long
         # historical tail. History metadata and conflict diagnostics are retained.
         usable = bool(rows) and not history.current_conflict
@@ -524,7 +630,13 @@ class TechnicalFeatureEngine:
         core = ["dma20", "dma50", "dma100", "dma200", "rsi14", "macd_signal", "return1_m", "return3_m",
                 "return6_m", "return1_y", "trend_slope20", "trend_slope50"]
         coverage = sum(getattr(result, field) is not None for field in core) / len(core)
-        conflict_factor = n / (n + len(history.conflicting_dates)) if n else 0
+        # Both a currency/price conflict AND a quarantined implausible
+        # observation are the same kind of thing for confidence purposes:
+        # evidence that had to be excluded from an otherwise-usable series.
+        # Neither is zero/default-substituted -- excluded observations are
+        # simply not counted in the numerator, the same treatment
+        # conflicting_dates already received before this pass.
+        conflict_factor = n / (n + len(history.conflicting_dates) + len(history.quarantined_dates)) if n else 0
         result.confidence = round(100 * coverage * conflict_factor * (0.5 if stale else 1), 6) if usable else 0
         result.missing_inputs = sorted(set(result.missing_inputs))
         # Rounding is only at the output boundary, after state/score decisions.

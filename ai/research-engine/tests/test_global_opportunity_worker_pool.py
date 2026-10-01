@@ -57,7 +57,11 @@ def _make_service(monkeypatch, *, concurrency=None, delay=0.02, fail_keys=()):
         readiness_runtime=None,
         clock=lambda: NOW,
     )
-    service.repository.profile = lambda key: SimpleNamespace(instrument_id=key)
+    service.repository.profile = lambda key: SimpleNamespace(
+        instrument_id=key, exchange="NSE", country="IN",
+        ticker=f"SYM{key.int}", company_name=f"Company{key.int}",
+        market="NSE",
+    )
     service.readiness_adapter = MagicMock()  # remember_canonical_metadata -> noop
     if concurrency is not None:
         service._BASELINE_CONCURRENCY = concurrency
@@ -177,7 +181,11 @@ async def test_worker_pool_cancellation_drains_cleanly(monkeypatch):
         readiness_runtime=None,
         clock=lambda: NOW,
     )
-    service.repository.profile = lambda key: SimpleNamespace(instrument_id=key)
+    service.repository.profile = lambda key: SimpleNamespace(
+        instrument_id=key, exchange="NSE", country="IN",
+        ticker=f"SYM{key.int}", company_name=f"Company{key.int}",
+        market="NSE",
+    )
     service.readiness_adapter = MagicMock()
     monkeypatch.setattr(orch_mod, "jurisdiction_for_profile", lambda profile: "IN")
     service.readiness = MagicMock()

@@ -73,8 +73,40 @@ class Settings(BaseSettings):
     research_official_document_max_attempts_per_refresh: int = 3
     research_official_document_timeout_seconds: float = 8.0
     research_official_document_extraction_timeout_seconds: float = 12.0
+    # Distinct from the extraction timeout above (Guardian Review Slice 4):
+    # this bounds only how long a PDF may wait for an extraction-worker
+    # permit before being rejected as PDF_EXTRACTION_QUEUE_TIMEOUT: queue
+    # admission time is not the same failure mode as a stuck/slow parse, and
+    # conflating them under one value made queue saturation and slow-parse
+    # timeouts indistinguishable. Defaults to the same value as the
+    # extraction timeout above; tune independently only when there is
+    # comparable evidence for queue admission itself.
+    research_pdf_extraction_queue_timeout_seconds: float = 12.0
     research_pdf_extraction_concurrency: int = 1
     research_official_document_max_transport_failures_per_host: int = 1
+    # Guardian Review (Issue 3, STAGE2_LIVE_RUN_DEFECTS_20260930.md): the
+    # per-host transport-failure count above is tracked in
+    # _OfficialFilingBatchState, which is created fresh on every
+    # _fetch_official_filings() call. A single readiness cycle calls it
+    # once per capability group needing official filings for the SAME
+    # instrument, so a host that just tripped the failure budget in one
+    # group's batch was, before this setting existed, immediately
+    # retried from zero in the next group's batch moments later. This
+    # cooldown is consulted/updated in the repository-instance-level
+    # (not per-batch) `_official_host_cooldowns` map so the budget
+    # survives across batches for the same (instrument, host) pair, while
+    # still allowing a legitimate retry once it elapses.
+    research_official_document_host_cooldown_seconds: float = 60.0
+    # Bounded, conservative overlap for independent official-filing fetches
+    # WITHIN a single instrument (never across requirement groups, never
+    # across instruments): the network fetch + PDF extraction inside
+    # _single_flight_official_filing is the expensive part of
+    # _fetch_official_filings; everything that decides WHETHER to fetch
+    # (budget/reuse/content-type/attempt-budget/host-failure checks) stays
+    # fully serialized under a dispatch lock regardless of this value.
+    # Default 2 is deliberately conservative -- see the concurrency-bound
+    # report for this change for the rationale.
+    research_official_document_fetch_concurrency: int = 2
     research_playwright_enabled: bool = False
     research_playwright_concurrency: int = 1
     research_search_enabled: bool = False
@@ -167,6 +199,16 @@ class Settings(BaseSettings):
     # codebase currently reads -- flipping that flag would not affect this
     # scheduler and could unintentionally gate unrelated future jobs.
     research_opportunity_scheduler_enabled: bool = True
+    # Operator-controlled recovery pause (two-phase cancellation contract,
+    # section 2 of STOCK_RADAR_CONTROLLED_VALIDATION_RUNBOOK). Default False
+    # (off): all recovery, takeover, scheduling, and manual submission
+    # behavior is unchanged. When True: the worker refuses to resume an
+    # active cycle at startup, the scheduler refuses new submissions, and
+    # manual POST /opportunities/cycles is rejected. The cancellation
+    # REQUEST/STATUS API (GET /status, DELETE /cancel) remains available.
+    # Cancellation finalization of an unowned CANCEL_REQUESTED cycle is
+    # still possible via a dedicated fenced operator endpoint while paused.
+    research_opportunity_recovery_paused: bool = False
     research_mcp_first_enabled: bool = False
     research_mcp_gateway_base_url: str = "http://mcp-gateway"
     research_mcp_gateway_timeout_seconds: float = 10.0

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time as _time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -17,12 +18,16 @@ from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
+from app import cycle_timing
+from app.readiness_signals import evidence_notifications
+
 from app.research_applicability import classify_requirements, CONCEPT_INPUTS, CONCEPT_CATEGORIES
 from app.market_sessions import price_session_valid_until
 from app.normalization import content_hash
 
 from app.fact_precedence import FactSourceTier, FinancialFact
-from app.historical_market_data import has_year_historical_coverage
+from app.historical_market_data import HistoricalPriceIdentityConflict, HistoricalPriceProviderError, HistoricalPricePersistenceError, has_year_historical_coverage
+from app.structured_market import derive_and_verify_nse_yahoo_mapping, _exchange_family
 from app.models import (
     CompanyResearchProfile,
     DocumentStatus,
@@ -38,6 +43,7 @@ from app.models import (
 )
 from app.research_readiness import (
     DurableResearchSnapshot,
+    FreshnessPolicyRegistry,
     ProviderAuthorityRegistry,
     REQUIREMENT_STATUSES_NEEDING_ACQUISITION,
     ResearchEvidence,
@@ -293,6 +299,27 @@ class RepositoryResearchReadinessAdapter:
                 as_of=catalyst_checked_at, published_at=catalyst_checked_at, event_date=catalyst_checked_at,
                 covered_input_ids=("MATERIAL_CATALYST_EVIDENCE", "ORDER_BOOK_OR_MAJOR_CONTRACT",
                                    "CAPACITY_OR_CAPEX_OR_COMMISSIONING", "MANAGEMENT_GUIDANCE")))
+        governance_checked_at = _completed_authoritative_check(
+            acquisition.get("GOVERNANCE_HISTORY", {}).get("history", []))
+        if governance_checked_at is not None:
+            # STEP-8A: same principle as the catalyst check above and the
+            # CURRENT_NEWS clean search -- the latest authoritative NSE
+            # governance-category check (REGULATORY/MANAGEMENT/RISKS)
+            # completed. It covers GOVERNANCE_EVIDENCE as "checked"; it is
+            # not an event/document and carries no score, and is always an
+            # ADDITIONAL evidence entry -- a genuine document/event found by
+            # _append_documents/_append_events above is never replaced or
+            # shadowed by it. _completed_authoritative_check only recognizes
+            # a completed (SUCCESS or SUCCESS_EMPTY) NSE-provider check, so a
+            # never-run, FAILED, generic-search-only (provider != NSE), or
+            # (per the repository.py partial-budget guard) partially-covered
+            # check adds nothing here.
+            evidence["GOVERNANCE_HISTORY"].append(ResearchEvidence(
+                evidence_id="governance-check:NSE:" + governance_checked_at.isoformat(),
+                requirement_id="GOVERNANCE_HISTORY", source="NSE",
+                source_tier=ResearchSourceTier.OFFICIAL, retrieved_at=governance_checked_at,
+                as_of=governance_checked_at, published_at=governance_checked_at, event_date=governance_checked_at,
+                covered_input_ids=("GOVERNANCE_EVIDENCE",)))
         persisted_failures = {key: value["failure_reason"] for key, value in acquisition.items()
             if value.get("outcome") == "FAILED" and value.get("failure_reason")}
         supported = set(evidence)
@@ -318,7 +345,34 @@ class RepositoryResearchReadinessAdapter:
         def unit_for(fact):
             return normalize_financial_amount(Decimal(0), fact.value.unit)[1]
         periods_by_series: dict[tuple, dict[str, set[str]]] = {}
-        quarterly_metrics: dict[tuple, dict[str, set[str]]] = {}
+        # Quarterly revenue<->earnings comparability (QUARTERLY_YOY_QOQ_TRENDS /
+        # QUARTERLY_FINANCIALS.COMPARABLE_QUARTERS) has two DIFFERENT unit
+        # requirements that must not be conflated:
+        #   - WITHIN one metric family across time, unit must stay consistent
+        #     (a revenue quarter reported in USD is not comparable to one
+        #     reported in INR merely because both are "revenue" -- this is
+        #     the same protection periods_by_series/REVENUE_HISTORY already
+        #     give a single metric, extended here to the family as a whole).
+        #   - ACROSS metric families (revenue vs earnings), unit need NOT
+        #     match: revenue and earnings are different physical measures by
+        #     nature (e.g. INR vs INR/share for EPS) and legitimately never
+        #     share a unit, so requiring one would make cross-metric
+        #     quarterly-trend coverage unsatisfiable for any issuer whose
+        #     earnings are reported per-share (KPIGREEN's NSE EPS).
+        # So each (reporting_basis, family) tracks its periods PER UNIT, and
+        # the family's own comparable series is its single largest same-unit
+        # bucket (the ordinary case has exactly one unit per family, so this
+        # is a no-op there) -- family-vs-family intersection then compares
+        # two internally-consistent series without requiring their units to
+        # agree with each other. Reporting basis (CONSOLIDATED/STANDALONE/
+        # UNKNOWN) is still the discriminator that must never be mixed.
+        # periods_by_series and annual_periods below are per-metric-own-
+        # history checks (REVENUE_HISTORY, EARNINGS_HISTORY,
+        # ANNUAL_CAGR_INPUTS all read a single metric's own period count,
+        # never a cross-metric intersection), so their existing (basis, unit)
+        # key is untouched -- it already gives each metric the same
+        # same-unit-across-time protection described above.
+        quarterly_metrics: dict[str, dict[str, dict[str, set[str]]]] = {}
         all_quarterly_periods: set[str] = set()
         annual_periods: dict[tuple, set[str]] = {}
         for fact in real:
@@ -326,25 +380,42 @@ class RepositoryResearchReadinessAdapter:
             if not fact.key.period_end:
                 continue
             period = fact.key.period_end[:10]
-            basis = (fact.key.reporting_basis or "UNKNOWN", unit_for(fact))
+            reporting_basis = fact.key.reporting_basis or "UNKNOWN"
+            unit = unit_for(fact)
+            basis = (reporting_basis, unit)
             periods_by_series.setdefault((fact.key.period_type, basis), {}).setdefault(metric, set()).add(period)
             if fact.key.period_type == "QUARTERLY":
                 all_quarterly_periods.add(period)
-                family = "revenue" if metric in {"revenue", "total_revenue"} else "pat" if metric in {"pat", "net_income", "net_profit"} else metric
-                quarterly_metrics.setdefault(basis, {}).setdefault(family, set()).add(period)
+                # "eps" is a legitimate earnings measure (see EARNINGS_HISTORY
+                # / EARNINGS_BASIS below, which already treat it as such) --
+                # it must join the same family as pat/net_income/net_profit
+                # here too, or an issuer whose NSE quarterly filings report
+                # EPS but no separate PAT/net-income line (KPIGREEN) would
+                # never have anything to intersect revenue against.
+                family = (
+                    "revenue" if metric in {"revenue", "total_revenue"}
+                    else "earnings" if metric in {"eps", "pat", "net_income", "net_profit"}
+                    else metric
+                )
+                quarterly_metrics.setdefault(reporting_basis, {}).setdefault(family, {}).setdefault(unit, set()).add(period)
             elif fact.key.period_type == "ANNUAL":
                 annual_periods.setdefault(basis, set()).add(period)
         latest_quarter = max(all_quarterly_periods, default=None)
 
+        def _dominant_quarterly_periods(reporting_basis: str, family: str) -> set[str]:
+            by_unit = quarterly_metrics.get(reporting_basis, {}).get(family, {})
+            return max(by_unit.values(), key=len, default=set())
+
         for fact in real:
             metric = _metric(fact.key.metric)
+            reporting_basis = fact.key.reporting_basis or "UNKNOWN"
             coverage = _financial_fact_coverage(
                 fact,
                 metric,
-                periods_by_series.get((fact.key.period_type, (fact.key.reporting_basis or "UNKNOWN", unit_for(fact))), {}),
-                quarterly_metrics.get((fact.key.reporting_basis or "UNKNOWN", unit_for(fact)), {}).get("revenue", set())
-                    & quarterly_metrics.get((fact.key.reporting_basis or "UNKNOWN", unit_for(fact)), {}).get("pat", set()),
-                annual_periods.get((fact.key.reporting_basis or "UNKNOWN", unit_for(fact)), set()),
+                periods_by_series.get((fact.key.period_type, (reporting_basis, unit_for(fact))), {}),
+                _dominant_quarterly_periods(reporting_basis, "revenue")
+                    & _dominant_quarterly_periods(reporting_basis, "earnings"),
+                annual_periods.get((reporting_basis, unit_for(fact)), set()),
                 latest_quarter,
             )
             for requirement_id, covered_inputs in coverage.items():
@@ -563,17 +634,8 @@ class RepositoryResearchReadinessAdapter:
         if not snapshots:
             return
         snapshot = snapshots[0]
-        categories = {str(value.category) for value in snapshot.values}
-        covered = {"LATEST_VALID_SHAREHOLDING_PERIOD"}
-        if categories & {
-            ShareholdingCategory.PROMOTER.value,
-            ShareholdingCategory.FII_FPI.value,
-            ShareholdingCategory.DII.value,
-            ShareholdingCategory.PUBLIC_RETAIL.value,
-        }:
-            covered.add("PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES")
-        if ShareholdingCategory.PROMOTER_PLEDGE.value in categories:
-            covered.add("PROMOTER_PLEDGE")
+        from app.research_applicability import shareholding_input_coverage
+        covered = shareholding_input_coverage(snapshot)
         evidence["SHAREHOLDING"].append(
             ResearchEvidence(
                 evidence_id=f"shareholding:{snapshot.id}",
@@ -689,6 +751,7 @@ class CapabilityExecutionProgress:
     executed_capabilities: list[str] = field(default_factory=list)
     failures: dict[str, str] = field(default_factory=dict)
     satisfied_requirement_ids: set[str] = field(default_factory=set)
+    completed_capabilities: set[str] = field(default_factory=set)
 
     def executed(self, capability: str) -> None:
         if capability not in self.executed_capabilities:
@@ -698,6 +761,9 @@ class CapabilityExecutionProgress:
         self.failures[requirement_id] = _combined_failure_reason(
             self.failures.get(requirement_id), reason
         )
+
+    def completed(self, capability: str) -> None:
+        self.completed_capabilities.add(capability)
 
     def satisfied(self, requirement_id: str) -> None:
         self.satisfied_requirement_ids.add(requirement_id)
@@ -742,7 +808,16 @@ class ExistingResearchCapabilityExecutor:
                 progress.executed("STRUCTURED_MARKET")
             try:
                 outcome = await self.orchestrator.ensure_structured_market(
-                    global_instrument_id, structured_classes
+                    global_instrument_id, structured_classes, baseline_only=True,
+                    # Item 2: the current asyncio task is this one ensure()
+                    # call's own execution -- execute_primary and a later
+                    # execute_approved_fallbacks for the SAME requirement set
+                    # run as plain sequential awaits within it (never a
+                    # separately spawned task), so sharing this identity lets
+                    # them reuse one ticker acquisition for this candidate/
+                    # cycle, while a different ensure() call (a different
+                    # task) always gets its own fresh context.
+                    acquisition_context=asyncio.current_task(),
                 )
                 if outcome.error:
                     for requirement_id in requirement_ids & {
@@ -758,6 +833,9 @@ class ExistingResearchCapabilityExecutor:
                     failures[requirement_id] = type(exc).__name__
                     if progress is not None:
                         progress.failed(requirement_id, type(exc).__name__)
+            # Cancellation skips this point, leaving the capability in flight.
+            if progress is not None:
+                progress.completed("STRUCTURED_MARKET")
 
         financial = requirement_ids & _FINANCIAL_REQUIREMENTS
         repository_categories: set[str] = set()
@@ -862,9 +940,25 @@ class ExistingResearchCapabilityExecutor:
             try:
                 await self._ensure_historical_prices(global_instrument_id)
             except Exception as exc:
-                failures["HISTORICAL_PRICE_SERIES"] = type(exc).__name__
+                # A stable, truthful technical-failure reason (identity
+                # conflict, missing verified mapping, provider/persistence
+                # unavailability) must survive into the failure ledger, not
+                # collapse into a bare exception class name that discards
+                # exactly the information needed to tell a technical failure
+                # apart from a genuinely-unavailable one.
+                reason = (
+                    str(exc)
+                    if isinstance(exc, (ValueError, HistoricalPriceIdentityConflict,
+                                        HistoricalPriceProviderError, HistoricalPricePersistenceError))
+                    and str(exc)
+                    else type(exc).__name__
+                )
+                failures["HISTORICAL_PRICE_SERIES"] = reason
                 if progress is not None:
-                    progress.failed("HISTORICAL_PRICE_SERIES", type(exc).__name__)
+                    progress.failed("HISTORICAL_PRICE_SERIES", reason)
+            # Cancellation skips this point, leaving the capability in flight.
+            if progress is not None:
+                progress.completed("HISTORICAL_MARKET_DATA")
 
         return CapabilityExecutionResult(tuple(dict.fromkeys(executed)), failures)
 
@@ -878,7 +972,8 @@ class ExistingResearchCapabilityExecutor:
             return CapabilityExecutionResult()
         try:
             outcome = await self.orchestrator.ensure_structured_market(
-                global_instrument_id, {"FUNDAMENTALS"}
+                global_instrument_id, {"FUNDAMENTALS"},
+                acquisition_context=asyncio.current_task(),
             )
             failures = (
                 {requirement_id: outcome.error for requirement_id in financial}
@@ -892,41 +987,111 @@ class ExistingResearchCapabilityExecutor:
                 {requirement_id: type(exc).__name__ for requirement_id in financial},
             )
 
+    async def _derive_verified_nse_yahoo_mapping(self, profile) -> str | None:
+        """Generic global fallback when a profile has no verified Yahoo
+        mapping yet (the systemic VERIFIED_YAHOO_MAPPING_REQUIRED failure
+        that blocked 75/76 real Stage-2 candidates): derive a candidate from
+        the canonical NSE symbol and verify it via the existing live
+        Yahoo-resolution identity gate, never a fabricated mapping. Scoped
+        to NSE-listed instruments only, matching the production NSE-universe
+        contract; never invented for a symbol/company with no evidence.
+        """
+        if _exchange_family(profile.exchange, profile.ticker) != "XNSE":
+            return None
+        structured_provider = getattr(self.orchestrator, "structured_provider", None)
+        if structured_provider is None:
+            return None
+        return await derive_and_verify_nse_yahoo_mapping(
+            structured_provider,
+            nse_ticker=profile.ticker,
+            isin=profile.isin,
+            company_name=profile.company_name,
+            currency=profile.currency,
+            instrument_id=profile.instrument_id,
+        )
+
     async def _ensure_historical_prices(self, global_instrument_id: UUID) -> int:
         profile = self.repository.profile(global_instrument_id)
         provider_ticker = profile.provider_instrument_ids.get("YAHOO_FINANCE")
         if not provider_ticker:
-            raise ValueError("VERIFIED_HISTORICAL_MAPPING_REQUIRED")
+            provider_ticker = await self._derive_verified_nse_yahoo_mapping(profile)
+            if not provider_ticker:
+                raise ValueError("VERIFIED_HISTORICAL_MAPPING_REQUIRED")
+            # Reuse durably for the remainder of this process's lifetime:
+            # profile is the same process-local CompanyResearchProfile object
+            # every subsequent ensure() call for this instrument reads via
+            # self.repository.profile(...), so a warm re-run of the same
+            # candidate never re-verifies a mapping that is still valid. This
+            # is in-memory/process-lifetime reuse, not cross-restart durable
+            # persistence -- no schema/store in this codebase currently owns
+            # a durable global Yahoo-mapping cache (see Slice 2 report).
+            profile.provider_instrument_ids["YAHOO_FINANCE"] = provider_ticker
         observations = (
             await self.repository.market_price_observations_for_instruments(
                 {global_instrument_id}
             )
         ).get(global_instrument_id, [])
         now = datetime.now(timezone.utc)
-        observed_at = [value.observed_at for value in observations]
+        usable = [value for value in observations if value.price is not None
+                  and Decimal(str(value.price)).is_finite() and Decimal(str(value.price)) > 0
+                  and value.observed_at <= now]
+        # A fresh NSE quote must not hide the missing tail of Yahoo's daily
+        # history. Its high-water mark belongs to the historical provider.
+        historical = [value for value in usable if value.provider == "YAHOO_FINANCE"]
+        observed_at = [value.observed_at for value in historical or usable]
         has_year = bool(observed_at) and has_year_historical_coverage(
             min(observed_at), max(observed_at), len(observed_at)
         )
-        start = (
-            max(observed_at) + timedelta(days=1)
-            if has_year
-            else now
-            - timedelta(
-                days=self.market_data_population_jobs.settings.market_data_population_initial_lookback_days
-            )
-        )
-        end = now + timedelta(days=1)
-        if has_year and start.date() >= end.date():
+        initial_start = (now - timedelta(days=self.market_data_population_jobs.settings.market_data_population_initial_lookback_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        ranges = []
+        receipt_prefix = f"urn:research:price-backfill:v1:{provider_ticker}:"
+        loader = getattr(self.repository, "_latest_acquisition_observation", None)
+        receipt = None
+        if callable(loader):
+            receipt = await self.repository._run_blocking_persistence(loader, global_instrument_id, "HISTORICAL_PRICE_BACKFILL", "YAHOO_FINANCE")
+        checked_start = None
+        if receipt and receipt.get("outcome") == "CHECKED" and (receipt.get("source_url") or "").startswith(receipt_prefix):
+            try:
+                checked_start = datetime.fromisoformat(receipt["source_url"][len(receipt_prefix):]).date()
+            except ValueError:
+                pass
+        if not observed_at:
+            ranges.append((initial_start, end, True))
+        else:
+            first = min(observed_at).replace(hour=0, minute=0, second=0, microsecond=0)
+            if not has_year and initial_start.date() < first.date() and (checked_start is None or checked_start > initial_start.date()):
+                ranges.append((initial_start, first, True))
+            tail = (max(observed_at) + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            if tail.date() < end.date():
+                ranges.append((tail, end, False))
+        if not ranges:
             return 0
         instrument = {
             "globalInstrumentId": str(global_instrument_id),
             "structuredProviderTicker": provider_ticker,
             "ticker": profile.ticker,
             "currency": profile.currency,
+            # Required for the pre-persistence identity gate
+            # (verify_historical_price_identity) to compare what Yahoo
+            # actually returns against this canonical instrument's own
+            # identity, not merely echo the requested symbol back.
+            "isin": profile.isin,
+            "companyName": profile.company_name,
+            "canonicalName": profile.company_name,
+            "exchange": profile.exchange,
         }
-        return await self.market_data_population_jobs.population.populate(
-            [instrument], start=start, end=end
-        )
+        written = 0
+        for start, stop, backfill in ranges:
+            written += await self.market_data_population_jobs.population.populate([instrument], start=start, end=stop)
+            # Only a completed provider/persistence operation certifies the
+            # attempted prefix (e.g. a recent listing has no earlier prices).
+            # This receipt is never price evidence or a freshness extension.
+            recorder = getattr(self.repository, "record_acquisition_observation", None)
+            if backfill and callable(recorder):
+                await recorder(global_instrument_id, "HISTORICAL_PRICE_BACKFILL", "YAHOO_FINANCE", "CHECKED", now,
+                               source_url=receipt_prefix + start.date().isoformat())
+        return written
 
 
 @dataclass(frozen=True)
@@ -983,6 +1148,27 @@ class ResearchReadinessRuntime:
         self.executor = executor
         self.ensure_timeout_seconds = ensure_timeout_seconds
         self._flights: dict[UUID, _EnsureFlight] = {}
+        # Bounded per-instrument cache of the most recent durability-check
+        # ResearchReadinessResult, reused only for evidence_only=True reads.
+        # This collapses the repeated sufficiency pre-checks in deep_investigation
+        # (_requirement_sufficient / _group_sufficient / allow_document) that
+        # re-read identical durable evidence while no persistence mutation has
+        # occurred between them. The cache is keyed by instrument and carries:
+        #   - the cached result
+        #   - the repository._readiness_mutation_generation observed when cached
+        # Reuse is ONLY permitted when (a) evidence_only=True (the caller
+        # classifies committed evidence and performs no provider/owning work),
+        # (b) the generation is unchanged (no persistence mutation has
+        #     committed new evidence/observations since the snapshot), and
+        # (c) the requested `now` is compatible: either now is None
+        #     (sub-second `generated_at` drift is immaterial -- no freshness
+        #      policy has sub-second granularity, so re-classification with a
+        #      fresh now cannot change an evidence_only sufficiency outcome), or
+        #     `now` is identical to the cached evaluated_at. A durable
+        #     read() (evidence_only=False) or any mutation invalidates the
+        #     entry, so the final authoritative verification (investigate
+        #     L589) and post-mutation re-reads always hit the DB.
+        self._evidence_readiness_cache: dict[UUID, tuple[ResearchReadinessResult, int]] = {}
 
     async def read(
         self,
@@ -994,16 +1180,61 @@ class ResearchReadinessRuntime:
     ) -> ResearchReadinessResult:
         if isinstance(self.data_source, RepositoryResearchReadinessAdapter):
             self.data_source._evaluation_times[global_instrument_id] = now or datetime.now(timezone.utc)
+        # Evidence-only reads are durability-classification sufficiency checks
+        # (deep_investigation._requirement_sufficient / _group_sufficient /
+        # allow_document) that re-read identical committed evidence while no
+        # persistence mutation has occurred between them. Reuse the cached
+        # result when it is still durability-current; otherwise fall through to
+        # the authoritative reload that also refreshes market_session_data and
+        # re-runs assess. Durable reads (evidence_only=False) and reads after a
+        # mutation (generation changed) bypass the cache so the final
+        # verification and post-mutation re-reads stay authoritative.
+        #
+        # Safety invariants:
+        #   1. The cache is cleared on EVERY durable read (evidence_only=False)
+        #      at the end of this method, so an evidence-only snapshot cannot
+        #      leak across the durable reads that bracket an investigate() flow
+        #      (initial read, per-requirement dispatch reads, group-member
+        #      reads, the news final read, and the final verification read).
+        #      Any evidence_only read therefore always falls between two
+        #      durable reads of the same flow.
+        #   2. The repository._readiness_mutation_generation counter is
+        #      incremented on every persistence *write*, so a cached snapshot
+        #      is only reused when no write has committed new evidence/
+        #      observations since it was taken.
+        #   3. Reuse requires now is None (the callers' mode) -- the cached
+        #      result carries its own generated_at, and evidence_only is a
+        #      sufficiency pre-check, so a sub-second-old classification over
+        #      unchanged durable evidence is equivalent to a fresh one (no
+        #      freshness policy has sub-second granularity). An explicit now
+        #      is only reused when identical to the cached generated_at.
+        if evidence_only:
+            cached = self._evidence_readiness_cache.get(global_instrument_id)
+            if cached is not None:
+                cached_result, cached_generation = cached
+                generation = getattr(self.repository, "_readiness_mutation_generation", 0)
+                now_compatible = now is None or now == cached_result.generated_at
+                if cached_generation == generation and now_compatible:
+                    return cached_result
         if callable(getattr(self.repository, "market_session_data", None)):
             profile = self.repository.profile(global_instrument_id)
             self.data_source._sessions[global_instrument_id] = await self.repository.market_session_data({value for value in (profile.mic, profile.exchange) if value})
-        return await self.repository._run_blocking_persistence(
+        result = await self.repository._run_blocking_persistence(
             self.readiness_service.assess,
             global_instrument_id,
             jurisdiction=jurisdiction,
             now=now,
             evidence_only=evidence_only,
         )
+        if evidence_only:
+            generation = getattr(self.repository, "_readiness_mutation_generation", 0)
+            self._evidence_readiness_cache[global_instrument_id] = (result, generation)
+        else:
+            # Durable reads supersede any cached evidence-only snapshot so a
+            # classification from a previous flow/window can never leak past a
+            # fresh authoritative reload.
+            self._evidence_readiness_cache.pop(global_instrument_id, None)
+        return result
 
     async def ensure(
         self,
@@ -1021,7 +1252,10 @@ class ResearchReadinessRuntime:
         Neither mode treats transport success or elapsed time as readiness.
         """
         selected = self._validated_requirement_ids(requirement_ids)
+        _read_started = _time.monotonic()
         readiness = await self.read(global_instrument_id, jurisdiction=jurisdiction)
+        cycle_timing.record_readiness_load_elapsed((_time.monotonic() - _read_started) * 1000)
+        _plan_started = _time.monotonic()
         plan = self.planner.plan(
             readiness,
             jurisdiction=jurisdiction,
@@ -1047,13 +1281,16 @@ class ResearchReadinessRuntime:
                 authority_policy=self.authority_registry.policy_for(quarterly.requirement_id, jurisdiction),
                 existing_evidence_ids=quarterly.evidence_ids,
             )))
+        cycle_timing.record_planning_elapsed((_time.monotonic() - _plan_started) * 1000)
         planned_ids = tuple(target.requirement_id for target in plan.targets)
         if not plan.targets:
             return TargetedEnsureResult(readiness, (), ())
 
         existing = self._flights.get(global_instrument_id)
         if existing is not None:
+            _single_flight_started = _time.monotonic()
             shared_execution = await asyncio.shield(existing.task)
+            cycle_timing.record_single_flight_wait_elapsed((_time.monotonic() - _single_flight_started) * 1000)
             attempted = existing.requirement_ids
             readiness = await self.read(global_instrument_id, jurisdiction=jurisdiction)
             remaining = self.planner.plan(
@@ -1106,11 +1343,15 @@ class ResearchReadinessRuntime:
             raise
         recorder = getattr(self.repository, "record_acquisition_observation", None)
         if callable(recorder):
+            _obs_started = _time.monotonic()
             for target in plan.targets:
                 failure = execution.failures.get(target.requirement_id)
                 await recorder(global_instrument_id, target.requirement_id, "READINESS_EXECUTOR",
                     "FAILED" if failure else "COMPLETED", datetime.now(timezone.utc), failure_reason=failure)
+            cycle_timing.record_observation_recording_elapsed((_time.monotonic() - _obs_started) * 1000)
+        _final_read_started = _time.monotonic()
         readiness = await self.read(global_instrument_id, jurisdiction=jurisdiction)
+        cycle_timing.record_final_readiness_reload_elapsed((_time.monotonic() - _final_read_started) * 1000)
         logger.info("readiness_re_evaluated globalInstrumentId=%s source=DURABLE acquisitionCompleted=true",
                     global_instrument_id)
         return TargetedEnsureResult(
@@ -1135,7 +1376,7 @@ class ResearchReadinessRuntime:
             # latency budget is an observation interval, not its job lifetime.
             # Existing network/document/provider limits still bound operations;
             # do not pass the expired interactive deadline into later targets.
-            task = asyncio.create_task(self._execute_plan(
+            task = asyncio.create_task(self._execute_plan_until_ready(
                 plan, jurisdiction=jurisdiction, correlation_id=correlation_id,
                 identity_headers=identity_headers, progress=progress, deadline=None))
             logger.info("acquisition_started globalInstrumentId=%s owner=BACKGROUND_CYCLE",
@@ -1146,7 +1387,8 @@ class ResearchReadinessRuntime:
                     logger.info("orchestration_wait_expired globalInstrumentId=%s budgetSeconds=%s acquisitionState=RUNNING inFlight=%s",
                                 plan.global_instrument_id, self.ensure_timeout_seconds,
                                 [capability for capability in progress.executed_capabilities
-                                 if capability.rsplit(':', 1)[-1] not in progress.failures
+                                 if capability not in progress.completed_capabilities
+                                 and capability.rsplit(':', 1)[-1] not in progress.failures
                                  and capability.rsplit(':', 1)[-1] not in progress.satisfied_requirement_ids])
                 result = await task
                 logger.info("acquisition_completed globalInstrumentId=%s failures=%d",
@@ -1168,7 +1410,7 @@ class ResearchReadinessRuntime:
         deadline = asyncio.get_event_loop().time() + self.ensure_timeout_seconds
         try:
             async with asyncio.timeout(self.ensure_timeout_seconds):
-                return await self._execute_plan(
+                return await self._execute_plan_until_ready(
                     plan,
                     jurisdiction=jurisdiction,
                     correlation_id=correlation_id,
@@ -1203,7 +1445,8 @@ class ResearchReadinessRuntime:
             # is a post-hoc re-read, not a record of what was executing).
             in_flight = sorted(
                 capability for capability in progress.executed_capabilities
-                if capability.rsplit(':', 1)[-1] not in progress.failures
+                if capability not in progress.completed_capabilities
+                and capability.rsplit(':', 1)[-1] not in progress.failures
                 and capability.rsplit(':', 1)[-1] not in progress.satisfied_requirement_ids
             )
             logger.warning(
@@ -1218,6 +1461,64 @@ class ResearchReadinessRuntime:
             return _PlanExecutionResult(
                 tuple(progress.executed_capabilities), failures
             )
+
+    async def _execute_plan_until_ready(
+        self,
+        plan: ResearchRefreshPlan,
+        *,
+        jurisdiction: str,
+        correlation_id: str | None,
+        identity_headers: Mapping[str, str | None] | None,
+        progress: CapabilityExecutionProgress,
+        deadline: float | None,
+    ) -> _PlanExecutionResult:
+        changed = asyncio.Event()
+        with evidence_notifications(plan.global_instrument_id, changed):
+            task = asyncio.create_task(self._execute_plan(
+                plan, jurisdiction=jurisdiction, correlation_id=correlation_id,
+                identity_headers=identity_headers, progress=progress, deadline=deadline,
+            ))
+        wakeup = asyncio.create_task(changed.wait())
+        try:
+            while True:
+                await asyncio.wait({task, wakeup}, return_when=asyncio.FIRST_COMPLETED)
+                if task.done():
+                    return await task
+                changed.clear()
+                # A commit is a reason to reassess, not proof of success.
+                # Ignore only the REFRESHING overlay; all durable freshness,
+                # coverage, conflict and provenance rules still apply.
+                self._evidence_readiness_cache.pop(plan.global_instrument_id, None)
+                readiness = await self.read(
+                    plan.global_instrument_id, jurisdiction=jurisdiction, evidence_only=True,
+                )
+                if task.done():
+                    return await task
+                if all(
+                    self._requires_acquisition(target.reason)
+                    and not self._requires_acquisition(readiness.for_requirement(target.requirement_id).status)
+                    and readiness.for_requirement(target.requirement_id).status != ResearchRequirementStatus.REFRESHING
+                    for target in plan.targets
+                ):
+                    # The shared plan owns its child. Retire it before releasing
+                    # the flight so no redundant provider tail is orphaned and
+                    # followers keep the same single-flight result. Explicit
+                    # authority upgrades (targets already fresh at planning)
+                    # must still complete their requested authority work.
+                    task.cancel()
+                    result, = await asyncio.gather(task, return_exceptions=True)
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                        raise result
+                    if isinstance(result, _PlanExecutionResult):
+                        return result
+                    self.data_source.finish_refresh(plan.global_instrument_id)
+                    return _PlanExecutionResult(tuple(progress.executed_capabilities), {})
+                wakeup = asyncio.create_task(changed.wait())
+        finally:
+            for child in (task, wakeup):
+                if not child.done():
+                    child.cancel()
+            await asyncio.gather(task, wakeup, return_exceptions=True)
 
     async def _execute_plan(
         self,
@@ -1287,9 +1588,18 @@ class ResearchReadinessRuntime:
                 failures[requirement_id] = _combined_failure_reason(
                     failures.get(requirement_id), reason
                 )
-        final_readiness = await self.read(
-            plan.global_instrument_id, jurisdiction=jurisdiction
-        )
+            # A fallback may have persisted structured snapshots that change
+            # readiness, so the final failure classification must re-read
+            # durable state. When no fallback ran, no durable writes occurred
+            # between the after_primary read above and here, so reusing that
+            # read avoids a redundant full reload (facts/observations/documents/
+            # events/shareholding/acquisition-observations/news + market_session_data)
+            # that would observe an identical snapshot.
+            final_readiness = await self.read(
+                plan.global_instrument_id, jurisdiction=jurisdiction
+            )
+        else:
+            final_readiness = after_primary
         unresolved_failures = {
             requirement_id: reason
             for requirement_id, reason in failures.items()
@@ -1553,6 +1863,9 @@ def _financial_fact_coverage(
         add("BALANCE_SHEET_FACTS", "INTEREST_COVERAGE_INPUTS")
     if metric in {"current_assets", "current_liabilities", "current_ratio"}:
         add("BALANCE_SHEET_FACTS", "LIQUIDITY_CURRENT_RATIO_INPUTS")
+    from app.research_applicability import LENDER_BALANCE_SHEET_INPUT, LENDER_BALANCE_SHEET_METRICS
+    if any(metric in aliases for aliases in LENDER_BALANCE_SHEET_METRICS.values()):
+        add("BALANCE_SHEET_FACTS", LENDER_BALANCE_SHEET_INPUT)
     if fact.key.period_type == "QUARTERLY":
         if fact.key.period_end and fact.key.period_end[:10] == latest_quarter:
             add("QUARTERLY_FINANCIALS", "LATEST_QUARTERLY_RESULT")
@@ -1627,11 +1940,15 @@ def _positive_number(value: Any) -> bool:
         return False
 
 
+_ANNUAL_FINANCIAL_MAX_AGE = FreshnessPolicyRegistry.default().get("ANNUAL_FINANCIALS").maximum_age
+
+
 def _evidence_from_financial_fact(
     fact: FinancialFact, requirement_id: str, covered_input_ids: tuple[str, ...]
 ) -> ResearchEvidence:
     source, tier = _financial_source(fact)
     as_of = fact.value.as_of_date or _period_datetime(fact.key.period_end)
+    annual_growth = requirement_id == "GROWTH_FACTS" and fact.key.period_type == "ANNUAL"
     return ResearchEvidence(
         evidence_id=(
             f"financial:{fact.source_identity}:{fact.key.metric}:{fact.key.period_end}:"
@@ -1651,7 +1968,11 @@ def _evidence_from_financial_fact(
         confidence=fact.value.confidence,
         source_url=fact.value.source_url,
         covered_input_ids=covered_input_ids,
-        valid_until=(as_of + timedelta(days=120 if fact.key.period_type == "QUARTERLY" else 400)
+        # Annual CAGR baselines follow the existing annual reporting policy.
+        # Applying GROWTH_FACTS' quarterly TTL to them expires March results in
+        # July, months before another annual report could exist.
+        valid_until=(as_of + _ANNUAL_FINANCIAL_MAX_AGE if annual_growth and as_of else
+            as_of + timedelta(days=120 if fact.key.period_type == "QUARTERLY" else 400)
             if requirement_id in ("VALUATION_INPUTS", "BALANCE_SHEET_FACTS") and as_of and fact.key.period_type in {"QUARTERLY", "ANNUAL"} else None),
     )
 

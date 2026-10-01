@@ -57,7 +57,7 @@ FINAL_STATES = frozenset({CandidateState.COMPLETED, CandidateState.EVIDENCE_UNAV
 
 PHASE_BASELINE = "BASELINE"
 PHASE_DEEP = "DEEP"
-ACTIVE_RUN_STATUSES = ("ACCEPTED", "RUNNING", "PUBLISHED")
+ACTIVE_RUN_STATUSES = ("ACCEPTED", "RUNNING", "PUBLISHED", "CANCEL_REQUESTED")
 
 # Existing orchestrator dispositions (global_opportunity_orchestration.py) ->
 # checkpoint state. Technical failures are never business rejections.
@@ -74,6 +74,7 @@ DISPOSITION_STATE: dict[str, CandidateState] = {
     "PROFILE_IDENTITY_MISMATCH": CandidateState.TERMINAL_OUTCOME,
     "CANONICAL_INELIGIBLE": CandidateState.TERMINAL_OUTCOME,
     "BASELINE_ACQUISITION_FAILED": CandidateState.RETRYABLE_FAILURE,
+    "PROFILE_MISSING_AFTER_HYDRATION": CandidateState.RETRYABLE_FAILURE,
 }
 
 DEFAULT_MAX_ATTEMPTS = 3
@@ -88,7 +89,7 @@ SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS global_opportunity_cycle_run (
     cycle_id TEXT PRIMARY KEY,
     market TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('ACCEPTED','RUNNING','PUBLISHED','COMPLETED','FAILED')),
+    status TEXT NOT NULL CHECK (status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED','COMPLETED','FAILED','CANCELLED')),
     parameters TEXT NOT NULL,
     as_of TEXT,
     selection TEXT,
@@ -188,7 +189,17 @@ class CycleRunPersistenceMixin:
 
     def claim_cycle_run(self, cycle_id: str, owner_id: str, *, lease_seconds: int = DEFAULT_LEASE_SECONDS,
                         now: datetime | None = None) -> bool:
-        """Atomically take (or keep) the lease when free, ours, or expired."""
+        """Atomically take (or keep) the lease when free, ours, or expired.
+
+        CANCEL_REQUESTED is included so the current lease-holder can re-claim
+        and drain in-flight work through the worker's _run_one path. A
+        DIFFERENT worker cannot claim a CANCEL_REQUESTED cycle because:
+        (1) _maybe_take_over and start() refuse it before claiming, and
+        (2) even if a different worker somehow reached claim with an expired
+        lease, it would drain to terminal CANCELLED -- which is the same
+        outcome as the original owner draining. The invariant we guarantee is:
+        no new candidates are admitted (checked in the orchestrator's admission
+        loop) and the cycle reaches terminal CANCELLED (not PUBLISHED)."""
         now = now or _now()
         with self._connection:
             cursor = self._connection.execute(
@@ -196,7 +207,7 @@ class CycleRunPersistenceMixin:
                 " resume_count = resume_count + CASE WHEN status <> 'ACCEPTED' AND (owner_id IS NULL OR owner_id <> ?) THEN 1 ELSE 0 END, "
                 " status = CASE WHEN status = 'ACCEPTED' THEN 'RUNNING' ELSE status END, "
                 " owner_id = ?, lease_expires_at = ?, updated_at = ? "
-                "WHERE cycle_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED') "
+                "WHERE cycle_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED') "
                 " AND (owner_id IS NULL OR owner_id = ? OR lease_expires_at IS NULL OR lease_expires_at < ?)",
                 (owner_id, owner_id, _iso(now + timedelta(seconds=lease_seconds)), _iso(now), str(cycle_id),
                  owner_id, _iso(now)))
@@ -208,7 +219,7 @@ class CycleRunPersistenceMixin:
         with self._connection:
             cursor = self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET lease_expires_at = ?, updated_at = ? "
-                "WHERE cycle_id = ? AND owner_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED')",
+                "WHERE cycle_id = ? AND owner_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED')",
                 (_iso(now + timedelta(seconds=lease_seconds)), _iso(now), str(cycle_id), owner_id))
             return self._cycle_rowcount(cursor) == 1
 
@@ -234,7 +245,7 @@ class CycleRunPersistenceMixin:
                 (*params, str(cycle_id), owner_id))
             if self._cycle_rowcount(cursor) != 1:
                 raise CycleOwnershipLost(str(cycle_id))
-            if fields.get("status") in ("COMPLETED", "FAILED"):
+            if fields.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
                 self._connection.execute(
                     "UPDATE global_opportunity_cycle_run SET owner_id = NULL, lease_expires_at = NULL WHERE cycle_id = ?",
                     (str(cycle_id),))
@@ -248,8 +259,134 @@ class CycleRunPersistenceMixin:
                 (error_code, _iso(_now()), str(cycle_id)))
             self._connection.execute("DELETE FROM global_opportunity_cycle_active WHERE cycle_id = ?", (str(cycle_id),))
 
+    def request_cycle_cancel(self, cycle_id: str, error_code: str = 'CYCLE_CANCELLED') -> bool:
+        """Durable, idempotent operator cancellation REQUEST (two-phase).
+
+        Phase 1 (request): sets status='CANCEL_REQUESTED' for any still-active
+        run (ACCEPTED/RUNNING/PUBLISHED). The active slot, owner_id, and
+        lease_expires_at are PRESERVED so the current lease-holder worker can
+        drain in-flight work and maintain lease renewal during draining. A
+        CANCEL_REQUESTED run is not resumable by a *different* worker (the
+        worker's ``_maybe_take_over`` and ``start`` refuse it), but the owner
+        keeps writing progress until it finishes and coerces to terminal.
+
+        Phase 2 (terminal): the owning worker, after draining, calls
+        ``cancel_cycle_run`` to flip to terminal 'CANCELLED' and release
+        ownership + the active slot.
+
+        Completed/FAILED/CANCEL_REQUESTED/CANCELLED runs are left untouched
+        (idempotent: a second request is a no-op). Ownership-agnostic (like
+        ``fail_unowned_cycle_run``): an operator may request cancellation
+        regardless of which worker currently holds the lease.
+
+        Returns True if a row was transitioned to CANCEL_REQUESTED.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                "UPDATE global_opportunity_cycle_run SET status = 'CANCEL_REQUESTED', error_code = ?, "
+                "updated_at = ? "
+                "WHERE cycle_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED')",
+                (error_code, _iso(_now()), str(cycle_id)))
+            rowcount = self._cycle_rowcount(cursor)
+            # Do NOT delete the active slot here: the current owner must keep
+            # draining. The worker's cancel_cycle_run() removes it on terminal.
+        return rowcount == 1
+
+    def cancel_cycle_run(self, cycle_id: str, owner_id: str, *, error_code: str = 'CYCLE_CANCELLED') -> bool:
+        """Worker-side terminal transition to CANCELLED, fenced on the current owner.
+
+        Used by the owning worker after draining in-flight work: only the lease
+        holder may coerce the run from CANCEL_REQUESTED (or RUNNING if the
+        worker initiated the cancel) to terminal CANCELLED. Releases ownership,
+        lease, and the active slot. Preserves all progress rows. Idempotent on
+        already-CANCELLED runs.
+
+        Returns True if the run was transitioned to CANCELLED.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                "UPDATE global_opportunity_cycle_run SET status = 'CANCELLED', error_code = ?, "
+                "owner_id = NULL, lease_expires_at = NULL, updated_at = ? "
+                "WHERE cycle_id = ? AND owner_id = ? AND status IN ('CANCEL_REQUESTED','RUNNING','PUBLISHED','ACCEPTED')",
+                (error_code, _iso(_now()), str(cycle_id), owner_id))
+            rowcount = self._cycle_rowcount(cursor)
+            if rowcount == 1:
+                self._connection.execute("DELETE FROM global_opportunity_cycle_active WHERE cycle_id = ?", (str(cycle_id),))
+        return rowcount == 1
+
+    def cycle_cancellation_requested(self, cycle_id: str) -> bool:
+        """Read-only check: has a durable cancellation (REQUESTED or terminal)
+        been recorded for this cycle?
+
+        A CANCEL_REQUESTED cycle is not resumable by any worker (different
+        owner cannot claim; same owner drains to terminal). A CANCELLED cycle
+        is permanently terminal.
+        """
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT 1 FROM global_opportunity_cycle_run "
+                "WHERE cycle_id = ? AND status IN ('CANCEL_REQUESTED','CANCELLED')",
+                (str(cycle_id),)).fetchone()
+        return row is not None
+
+    def cycle_cancel_status(self, cycle_id: str) -> str | None:
+        """Read-only: return the cancellation status ('CANCEL_REQUESTED' or
+        'CANCELLED') if the cycle has been cancelled, else None."""
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT status FROM global_opportunity_cycle_run WHERE cycle_id = ?",
+                (str(cycle_id),)).fetchone()
+        if row is None:
+            return None
+        status = dict(row).get("status")
+        if status in ("CANCEL_REQUESTED", "CANCELLED"):
+            return status
+        return None
+
+    def cancel_cycle_run_unowned(self, cycle_id: str, *, reason: str | None = None) -> bool:
+        """Operator-fenced terminal transition for an UNOWNED CANCEL_REQUESTED cycle.
+
+        Used by the dedicated ``/cycles/{id}/finalize-cancel`` endpoint (ADMIN-gated)
+        while a recovery pause is active or when the original owning worker has
+        terminated without finalizing its own drain. This does NOT invoke the
+        research runner -- it only performs the Phase 2 (terminal) transition:
+        CANCEL_REQUESTED -> CANCELLED, releasing ownership/lease and removing the
+        active slot.
+
+        Fenced by the status set (only CANCEL_REQUESTED -> CANCELLED is allowed),
+        NOT by owner_id, because the cycle may be unowned (lease expired, owner pod
+        gone). The endpoint gating + the status WHERE clause together ensure a
+        terminal PUBLISHED/COMPLETED/FAILED cycle can never be retroactively
+        cancelled. Idempotent: already-CANCELLED returns False.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                "UPDATE global_opportunity_cycle_run SET status = 'CANCELLED', "
+                "error_code = ?, owner_id = NULL, lease_expires_at = NULL, updated_at = ? "
+                "WHERE cycle_id = ? AND status = 'CANCEL_REQUESTED'",
+                (reason or 'CYCLE_CANCELLED', _iso(_now()), str(cycle_id)))
+            rowcount = self._cycle_rowcount(cursor)
+            if rowcount == 1:
+                self._connection.execute("DELETE FROM global_opportunity_cycle_active WHERE cycle_id = ?", (str(cycle_id),))
+        return rowcount == 1
+
     def _fence_cycle_publication(self, cycle_id: str, owner_id: str) -> None:
-        """Called INSIDE publish_opportunity_cycle's transaction."""
+        """Called INSIDE publish_opportunity_cycle's transaction.
+
+        Refuses to flip a cycle to PUBLISHED if it has been cancelled (terminal
+        CANCELLED) or if a cancellation has been requested (CANCEL_REQUESTED):
+        both are not RUNNING, so the ownership/lease fence on
+        ``status = 'RUNNING'`` already prevents publication. The explicit
+        CANCEL_REQUESTED/CANCELLED check makes that invariant obvious and
+        testable.
+        """
+        status = self._connection.execute(
+            "SELECT status FROM global_opportunity_cycle_run WHERE cycle_id = ?",
+            (str(cycle_id),)).fetchone()
+        if status is not None:
+            current = dict(status).get("status")
+            if current in ("CANCEL_REQUESTED", "CANCELLED"):
+                raise CycleOwnershipLost(str(cycle_id))
         cursor = self._connection.execute(
             "UPDATE global_opportunity_cycle_run SET status = 'PUBLISHED', updated_at = ? "
             "WHERE cycle_id = ? AND owner_id = ? AND status = 'RUNNING'", (_iso(_now()), str(cycle_id), owner_id))
@@ -370,6 +507,41 @@ class CycleCheckpoint:
 
 def state_for_disposition(disposition: str | None) -> CandidateState:
     return DISPOSITION_STATE.get(disposition or "", CandidateState.RETRYABLE_FAILURE)
+
+
+# The three truthful terminal meanings the production research-accounting
+# contract must distinguish for every applicable instrument, once a cycle
+# reaches completion or is reconstructed after a restart (Slice DI-20H
+# Defect 3). ``state`` (persisted per (cycle, phase, instrument) row in
+# ``global_opportunity_cycle_progress``) already carries this distinction on
+# its own: ``_checkpoint_deep_outcome`` resolves any technical-vs-genuine
+# override (disposition + failure_class) *before* calling ``finish()``, so
+# the stored ``state`` column alone -- without re-reading failure_class from
+# the payload -- is sufficient to reconstruct the correct meaning after
+# recovery. This mapping makes that already-true invariant explicit and
+# testable; it does not change what gets persisted or how it is computed.
+TERMINAL_MEANING: dict[CandidateState, str] = {
+    CandidateState.COMPLETED: "FULLY_ANALYZED",
+    CandidateState.EVIDENCE_UNAVAILABLE: "DATA_GENUINELY_UNAVAILABLE",
+    CandidateState.RETRYABLE_FAILURE: "TECHNICAL_FAILURE_RETRY_REQUIRED",
+    # A business/identity disposition (CANONICAL_INELIGIBLE, PROFILE_
+    # HYDRATION_FAILED, PROFILE_IDENTITY_MISMATCH, ...) is terminal but is not
+    # one of the three research-accounting meanings above -- the instrument
+    # was never a candidate for research accounting in the first place.
+    CandidateState.TERMINAL_OUTCOME: "TERMINAL_OUTCOME",
+}
+
+
+def terminal_meaning(state: CandidateState) -> str | None:
+    """The truthful final-accounting meaning of a persisted checkpoint state.
+
+    Returns None for PENDING/IN_PROGRESS (no terminal meaning yet -- the
+    candidate has not finished this phase). Every final state maps to
+    exactly one of the meanings above; there is no silent/unmapped state:
+    ``CandidateState`` is a closed StrEnum and every one of its members is a
+    key in ``TERMINAL_MEANING`` except PENDING/IN_PROGRESS.
+    """
+    return TERMINAL_MEANING.get(state)
 
 
 def new_owner_id() -> str:

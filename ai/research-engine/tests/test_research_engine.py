@@ -2974,6 +2974,16 @@ async def test_official_timeout_uses_host_failure_budget_and_future_refresh_can_
         research_official_document_max_attempts_per_refresh=3,
         research_official_document_max_transport_failures_per_host=1,
         research_official_document_timeout_seconds=1.0,
+        # Pinned to serial (c=1): this test's whole point is the host-failure
+        # budget halting further attempts to this host after exactly ONE
+        # recorded failure. Under real overlap (concurrency > 1) a second
+        # same-host attempt can already be in flight before the first one's
+        # failure is recorded -- an accepted, documented consequence of
+        # bounded concurrency (see the fetch-concurrency change's residual
+        # risks), not a violation of the host-failure budget itself. That
+        # concurrent-overlap behavior has its own dedicated coverage in
+        # tests/test_slice_official_filing_concurrency.py.
+        research_official_document_fetch_concurrency=1,
     )
     repository = ResearchRepository(settings=settings)
     profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
@@ -3648,7 +3658,12 @@ def test_existing_durable_financial_result_is_the_only_reason_a_failed_refresh_c
 
 @pytest.mark.asyncio
 async def test_official_fetch_is_newest_first_and_bounded_without_concurrency() -> None:
-    settings = Settings(research_live_enabled=True, research_official_document_max_attempts_per_refresh=3)
+    # Explicitly pinned to serial (c=1): this test's ConcurrentProbe fetcher
+    # exists specifically to prove max_active == 1 in that regime. The
+    # bounded-concurrency case (c=2 genuinely overlapping) has its own
+    # dedicated coverage in tests/test_slice_official_filing_concurrency.py.
+    settings = Settings(research_live_enabled=True, research_official_document_max_attempts_per_refresh=3,
+                        research_official_document_fetch_concurrency=1)
     repository = ResearchRepository(settings=settings)
     profile = next(profile for profile in repository.profiles if profile.ticker == "RELIANCE")
     sources = [_official_financial_result_source(profile, f"newest-{index}") for index in range(5)]

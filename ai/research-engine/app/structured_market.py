@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import re
 import asyncio
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
@@ -13,6 +15,7 @@ from uuid import UUID
 import httpx
 import yfinance as yf
 
+from app import cycle_timing
 from app.models import ProvenancedValue, StructuredInstrumentResolution, StructuredMarketSnapshot
 from app.settings import Settings
 
@@ -52,13 +55,41 @@ class YahooFinanceProvider:
         self._cache: dict[str, tuple[datetime, StructuredMarketSnapshot]] = {}
         self.ticker_factory = ticker_factory or yf.Ticker
         self.use_yfinance = client is None or ticker_factory is not None
+        # Explicit, caller-scoped same-cycle ticker reuse (Item 2): keyed by
+        # the caller-supplied `acquisition_context` (never a time window --
+        # a prior time-based attempt broke independent-retry freshness
+        # contracts in test_baseline_market_reuse.py). Each context holds,
+        # per ticker, either the live yf.Ticker instance already used in
+        # that context (so yfinance's own per-instance property caching
+        # transparently reuses .info/.news/statement fetches for a second
+        # call with the SAME context+ticker) or a recorded ("FAILED", exc)
+        # marker so a repeat failure in the same context is reraised
+        # without a second network attempt. Absent/None context => untouched
+        # original behavior (a fresh ticker_factory() call every time).
+        # Bounded like the discovery module's own per-symbol row cache so a
+        # long-lived process does not accumulate unbounded context entries.
+        self._context_tickers: "OrderedDict[object, dict[str, Any]]" = OrderedDict()
+        self._context_tickers_max = 64
 
-    async def collect(self, instrument: dict[str, Any]) -> StructuredMarketSnapshot:
+    async def collect(self, instrument: dict[str, Any], *, acquisition_context: object | None = None) -> StructuredMarketSnapshot:
+        return await self._collect(instrument, acquisition_context=acquisition_context)
+
+    async def collect_baseline(self, instrument: dict[str, Any], *, acquisition_context: object | None = None) -> StructuredMarketSnapshot:
+        """Collect market inputs without news or historical financial statements.
+
+        Readiness has already found a durable evidence gap. Bypass the combined
+        snapshot cache: a recently retrieved but stale/partial quote must not
+        prevent a real refresh, and this subset must not populate the full cache.
+        """
+        return await self._collect(instrument, baseline_only=True, acquisition_context=acquisition_context)
+
+    async def _collect(self, instrument: dict[str, Any], *, baseline_only: bool = False,
+                        acquisition_context: object | None = None) -> StructuredMarketSnapshot:
         identity = strongest_company_identity(instrument)
         cache_key = _identity_key(instrument, identity)
         cached = self._cache.get(cache_key)
         now = datetime.now(timezone.utc)
-        if cached and cached[0] > now:
+        if not baseline_only and cached and cached[0] > now:
             return cached[1]
         durable_ticker = _clean_identity(instrument.get("structuredProviderTicker"))
         durable_status = str(instrument.get("structuredProviderStatus") or "").upper()
@@ -75,9 +106,14 @@ class YahooFinanceProvider:
                 instrument.get("instrumentId"), self.provider_name, durable_ticker, durable_status)
         else:
             resolution = await self.resolve_instrument(instrument, identity)
-        snapshot = await self._collect_resolved(resolution)
+        snapshot = await self._collect_resolved(resolution, baseline_only=baseline_only, acquisition_context=acquisition_context)
         # A combined snapshot may contain a quote, so its reuse window follows the shorter market-price TTL.
-        self._cache[cache_key] = (now + timedelta(seconds=self.settings.structured_market_price_freshness_seconds), snapshot)
+        if not baseline_only:
+            self._cache[cache_key] = (now + timedelta(seconds=self.settings.structured_market_price_freshness_seconds), snapshot)
+        else:
+            # A later full research call must not write an older cached quote
+            # back over the market data we have just refreshed.
+            self._cache.pop(cache_key, None)
         return snapshot
 
     async def resolve_instrument(self, instrument: dict[str, Any], identity: str | None = None) -> StructuredInstrumentResolution:
@@ -161,6 +197,12 @@ class YahooFinanceProvider:
 
     async def _resolve_verified_nse_candidate(self, instrument: dict[str, Any], identity: str,
                                               candidate_symbol: str) -> StructuredInstrumentResolution:
+        # Guardian Review Slice 6 (MAPPING_RESOLUTION): this is the exact
+        # network call Slice 2's global Yahoo-mapping fallback depends on,
+        # and it previously had zero timing attribution -- any time spent
+        # here was invisible, silently absorbed into the coarse
+        # runtime_ensure_elapsed_ms bucket.
+        _mapping_started = time.monotonic()
         try:
             response = await self.client.get(self.search_url, params={"q": candidate_symbol, "quotesCount": 10, "newsCount": 0})
             response.raise_for_status()
@@ -169,6 +211,8 @@ class YahooFinanceProvider:
             logger.info("yahoo_mapping_resolution globalInstrumentId=%s candidateSource=VERIFIED_NSE candidate=%s outcome=PROVIDER_UNAVAILABLE reason=%s",
                         instrument.get("instrumentId"), candidate_symbol, type(exc).__name__)
             raise StructuredProviderError("STRUCTURED_PROVIDER_UNAVAILABLE") from exc
+        finally:
+            cycle_timing.record_mapping_resolution_elapsed((time.monotonic() - _mapping_started) * 1000)
         matches = [item for item in quotes if isinstance(item, dict)
                    and str(item.get("symbol") or "").upper() == candidate_symbol]
         if len(matches) != 1:
@@ -192,10 +236,12 @@ class YahooFinanceProvider:
             resolved_at=datetime.now(timezone.utc), status="VERIFIED_NSE_CANDIDATE",
         )
 
-    async def _collect_resolved(self, resolution: StructuredInstrumentResolution) -> StructuredMarketSnapshot:
+    async def _collect_resolved(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False,
+                                 acquisition_context: object | None = None) -> StructuredMarketSnapshot:
         if self.use_yfinance:
-            return await asyncio.to_thread(self._collect_resolved_yfinance, resolution)
-        return await self._collect_resolved_http(resolution)
+            return await asyncio.to_thread(self._collect_resolved_yfinance, resolution, baseline_only=baseline_only,
+                                            acquisition_context=acquisition_context)
+        return await self._collect_resolved_http(resolution, baseline_only=baseline_only)
 
     async def collect_verified(
         self, resolution: StructuredInstrumentResolution
@@ -213,15 +259,52 @@ class YahooFinanceProvider:
             raise StructuredProviderError("COMPANY_NOT_RESOLVED")
         return await self._collect_resolved(resolution)
 
-    def _collect_resolved_yfinance(self, resolution: StructuredInstrumentResolution) -> StructuredMarketSnapshot:
+    def _context_ticker_slot(self, acquisition_context: object) -> dict[str, Any]:
+        slot = self._context_tickers.get(acquisition_context)
+        if slot is None:
+            slot = {}
+            self._context_tickers[acquisition_context] = slot
+        self._context_tickers.move_to_end(acquisition_context)
+        while len(self._context_tickers) > self._context_tickers_max:
+            self._context_tickers.popitem(last=False)
+        return slot
+
+    def _collect_resolved_yfinance(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False,
+                                    acquisition_context: object | None = None) -> StructuredMarketSnapshot:
         ticker = resolution.provider_ticker
         retrieved = datetime.now(timezone.utc)
+        slot = self._context_ticker_slot(acquisition_context) if acquisition_context is not None else None
+        if slot is not None:
+            cached_state = slot.get(ticker)
+            if isinstance(cached_state, tuple) and cached_state[0] == "FAILED":
+                # Same-context, same-ticker: a prior attempt in this exact
+                # candidate/cycle already failed. Reuse that outcome instead
+                # of hitting finance.yahoo.com again -- bounded strictly to
+                # this context, never a permanent cache (a new context, i.e.
+                # a new candidate/cycle, always gets a fresh attempt).
+                raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{cached_state[1]}")
         try:
-            provider = self.ticker_factory(ticker)
+            # Reusing the SAME yf.Ticker instance for a second call with the
+            # identical (acquisition_context, ticker) lets yfinance's own
+            # per-instance property caching transparently satisfy .info/
+            # .news/statement access without a second network round trip --
+            # no manual field-level cache is needed, and a caller that still
+            # needs data this context hasn't fetched yet (e.g. baseline_only
+            # fetched .info but not .news) gets it fetched fresh exactly
+            # once, on the shared instance, visible to any later same-context
+            # call too.
+            provider = slot.get(ticker) if slot is not None and not isinstance(slot.get(ticker), tuple) else None
+            if provider is None:
+                provider = self.ticker_factory(ticker)
             info = provider.info or {}
-            raw_news = provider.news or []
+            raw_news = [] if baseline_only else provider.news or []
         except Exception as exc:
+            if slot is not None:
+                slot[ticker] = ("FAILED", type(exc).__name__)
             raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{type(exc).__name__}") from exc
+        else:
+            if slot is not None:
+                slot[ticker] = provider
         if not isinstance(info, dict):
             raise StructuredProviderError("STRUCTURED_PROVIDER_UNAVAILABLE:INVALID_INFO")
         _validate_returned_identity(
@@ -239,7 +322,7 @@ class YahooFinanceProvider:
         if returned_type not in {"EQUITY", "STOCK", "ETF", "MUTUALFUND"}:
             raise StructuredProviderError("PERSISTED_MAPPING_CONFLICT:QUOTE_TYPE")
         income_statement = balance_sheet = quarterly_income = quarterly_balance = cashflow = quarterly_cashflow = None
-        if returned_type in {"EQUITY", "STOCK"}:
+        if not baseline_only and returned_type in {"EQUITY", "STOCK"}:
             try:
                 income_statement = getattr(provider, "income_stmt", None)
                 balance_sheet = getattr(provider, "balance_sheet", None)
@@ -274,7 +357,7 @@ class YahooFinanceProvider:
             accepted_fields_count=len(facts) + len(news),
         )
 
-    async def _collect_resolved_http(self, resolution: StructuredInstrumentResolution) -> StructuredMarketSnapshot:
+    async def _collect_resolved_http(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False) -> StructuredMarketSnapshot:
         ticker = resolution.provider_ticker
         retrieved = datetime.now(timezone.utc)
         quote_payload: dict[str, Any] = {}
@@ -291,6 +374,8 @@ class YahooFinanceProvider:
             errors.append(type(exc).__name__)
         try:
             modules = "price,summaryDetail,defaultKeyStatistics,financialData,assetProfile,calendarEvents,earnings,earningsHistory,earningsTrend,recommendationTrend,institutionOwnership,majorHoldersBreakdown"
+            if baseline_only:
+                modules = "price,summaryDetail,defaultKeyStatistics,financialData,assetProfile"
             response = await self.client.get(self.summary_url.format(ticker=quote(ticker, safe="")), params={"modules": modules})
             response.raise_for_status()
             values = response.json().get("quoteSummary", {}).get("result", [])
@@ -299,9 +384,12 @@ class YahooFinanceProvider:
         except Exception as exc:
             errors.append(type(exc).__name__)
         try:
-            response = await self.client.get(self.search_url, params={"q": ticker, "quotesCount": 0, "newsCount": 10})
-            response.raise_for_status()
-            for item in response.json().get("news", []):
+            news_payload = {}
+            if not baseline_only:
+                response = await self.client.get(self.search_url, params={"q": ticker, "quotesCount": 0, "newsCount": 10})
+                response.raise_for_status()
+                news_payload = response.json()
+            for item in news_payload.get("news", []):
                 if not isinstance(item, dict) or not item.get("title") or not item.get("link"):
                     continue
                 news.append({
@@ -429,24 +517,107 @@ def _trusted_nse_candidate_reason(instrument: dict[str, Any], identity: str, can
     candidate_currency = str(candidate.get("currency") or "").upper()
     if expected_currency and candidate_currency and expected_currency != candidate_currency:
         return "CURRENCY_MISMATCH"
-    expected_isin = str(instrument.get("isin") or "").upper()
-    candidate_isin = str(candidate.get("isin") or "").upper()
-    if expected_isin and candidate_isin:
-        # An exact official ISIN match is the strongest identity signal this
-        # gate has -- two different companies cannot share an ISIN -- so it
-        # is authoritative on its own and is never subsequently overridden by
-        # a low company-name-similarity score. This mirrors the Java
-        # NseMappingReconciliationService's EXACT_ISIN priority. A mismatched
-        # ISIN is still rejected outright; when an exact comparison cannot be
-        # made at all (either side missing an ISIN), today's name-similarity
-        # check is unchanged.
-        if expected_isin != candidate_isin:
+    return verify_identity_by_isin_or_name(
+        instrument.get("isin"), identity,
+        candidate.get("isin"), candidate.get("longname") or candidate.get("shortname"),
+    )
+
+
+async def derive_and_verify_nse_yahoo_mapping(
+    provider: "YahooFinanceProvider",
+    *,
+    nse_ticker: str,
+    isin: str | None,
+    company_name: str,
+    currency: str | None,
+    instrument_id: Any = None,
+) -> str | None:
+    """Derive an NSE Yahoo ticker candidate from a canonical NSE symbol
+    (``TICKER.NS``) and verify it through the exact same identity gate the
+    live Yahoo-resolution path already enforces (YahooFinanceProvider.
+    _resolve_verified_nse_candidate -> _trusted_nse_candidate_reason), rather
+    than a second, weaker definition. This is how a fresh, non-portfolio NSE
+    instrument -- one global-search never independently reconciles a Yahoo
+    mapping for -- obtains its first verified mapping for historical-price
+    acquisition. Returns the verified Yahoo symbol, or None if verification
+    fails; never fabricates or guesses a mapping.
+    """
+    candidate_symbol = f"{nse_ticker.strip().upper()}.NS"
+    instrument = {
+        "instrumentId": str(instrument_id) if instrument_id else None,
+        "isin": isin,
+        "tradingCurrency": currency,
+        "currency": currency,
+    }
+    try:
+        resolution = await provider._resolve_verified_nse_candidate(instrument, company_name, candidate_symbol)
+    except StructuredProviderError as exc:
+        logger.info(
+            "global_yahoo_mapping_rejected instrumentId=%s candidate=%s reason=%s",
+            instrument_id, candidate_symbol, str(exc),
+        )
+        return None
+    return resolution.provider_ticker
+
+
+def verify_identity_by_isin_or_name(
+    expected_isin: Any, expected_name: str, returned_isin: Any, returned_name: Any,
+) -> str | None:
+    """ISIN-exact-priority-else-name-similarity canonical identity gate.
+
+    Extracted unchanged from _trusted_nse_candidate_reason's own tail so the
+    live Yahoo-resolution path and any other acquisition path that needs to
+    verify a provider's returned identity against a canonical instrument
+    share one definition rather than maintaining two. An exact official ISIN
+    match is the strongest identity signal available -- two different
+    companies cannot share an ISIN -- so it is authoritative on its own and
+    is never overridden by a low name-similarity score. A mismatched ISIN is
+    rejected outright; when an exact comparison cannot be made at all
+    (either side missing an ISIN), this falls back to name similarity.
+    """
+    expected_isin_u = str(expected_isin or "").upper()
+    returned_isin_u = str(returned_isin or "").upper()
+    if expected_isin_u and returned_isin_u:
+        if expected_isin_u != returned_isin_u:
             return "ISIN_MISMATCH"
         return None
-    candidate_name = str(candidate.get("longname") or candidate.get("shortname") or "")
-    if not candidate_name or _name_similarity(identity, candidate_name) < 0.55:
+    returned_name_s = str(returned_name or "")
+    if not returned_name_s or _name_similarity(expected_name, returned_name_s) < 0.55:
         return "COMPANY_NAME_MISMATCH"
     return None
+
+
+def verify_historical_price_identity(
+    *,
+    expected_isin: Any,
+    expected_name: str,
+    expected_exchange_family: str,
+    expected_currency: Any,
+    returned_isin: Any,
+    returned_name: Any,
+    returned_exchange: Any,
+    returned_currency: Any,
+) -> str | None:
+    """Pre-persistence identity gate for Yahoo historical-price acquisition.
+
+    Verifies that data actually RETURNED by the provider for an
+    already-resolved ticker still belongs to the canonical instrument the
+    ticker was recorded against -- catching a mapping that silently points
+    at the wrong company (the INFY-canonical-UUID/HCL-INSYS.NS corruption
+    class), not merely an echo of the requested symbol. Composed from the
+    same exchange-family/currency/ISIN-or-name checks the live resolution
+    path already enforces (_exchange_family, verify_identity_by_isin_or_name)
+    rather than a second, conflicting definition. Returns None when
+    verified, else a stable rejection reason string.
+    """
+    returned_listing = _exchange_family(returned_exchange, "")
+    if expected_exchange_family and returned_listing and expected_exchange_family != returned_listing:
+        return "EXCHANGE_MISMATCH"
+    expected_currency_u = str(expected_currency or "").upper()
+    returned_currency_u = str(returned_currency or "").upper()
+    if expected_currency_u and returned_currency_u and expected_currency_u != returned_currency_u:
+        return "CURRENCY_MISMATCH"
+    return verify_identity_by_isin_or_name(expected_isin, expected_name, returned_isin, returned_name)
 
 
 def _candidate_score(instrument: dict[str, Any], identity: str, candidate: dict[str, Any]) -> float:

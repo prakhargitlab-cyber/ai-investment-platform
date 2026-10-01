@@ -84,6 +84,12 @@ class GlobalOpportunityScheduler:
         """True when a cycle run is currently in-flight."""
         return getattr(self.worker, 'active', None) is not None
 
+    @property
+    def _recovery_paused(self) -> bool:
+        """Mirrors the worker's recovery-pause check for the scheduler loop."""
+        settings = getattr(getattr(self.worker, 'repository', None), 'settings', None)
+        return bool(getattr(settings, 'research_opportunity_recovery_paused', False))
+
     def _load_schedules(self) -> tuple[list[MarketTradingSchedule], list[MarketCalendarException]]:
         """Load NSE schedules and exceptions from persistence (DB-backed calendar)."""
         schedules = self.persistence.load_market_schedules({self.market_code})
@@ -186,9 +192,17 @@ class GlobalOpportunityScheduler:
         # explicit/programmatic caller.
         if self.active:
             return False
+        if self._recovery_paused:
+            return False
         if self._has_valid_production_snapshot():
             return False
-        parameters = dict(top_n=4, shortlist_limit=25, candidate_ids=None)
+        # Production submission: candidate_ids=None means the complete
+        # applicable deep-research universe, never a bounded shortlist.
+        # run_global_opportunity_cycle already forces this unbounded whenever
+        # candidate_ids is None regardless of what's passed here; None is
+        # passed explicitly too so this call site cannot silently reintroduce
+        # a finite cap on its own.
+        parameters = dict(top_n=4, shortlist_limit=None, candidate_ids=None)
         try:
             result = self.worker.submit(parameters)
             now = self.clock()
@@ -210,8 +224,26 @@ class GlobalOpportunityScheduler:
 
     def _maybe_submit(self) -> bool:
         """Decide whether to submit a cycle and do so if due. Returns True if submitted."""
+        if self._recovery_paused:
+            logger.info("scheduler operation=OPPORTUNITY_CYCLE_SKIP phase=RECOVERY_PAUSED reason=pause_active")
+            return False
         if self.active:
             return False
+        # Stop admitting new candidates: if the active cycle has been cancelled
+        # (durable status='CANCELLED'), do not submit a new cycle until the
+        # operator clears it.
+        active_run = None
+        try:
+            active_run = self.persistence.active_cycle_run(self.market_code) \
+                if hasattr(self.persistence, 'active_cycle_run') else None
+        except AttributeError:
+            active_run = None
+        if active_run is not None:
+            run_status = active_run.get('status')
+            if run_status in ('CANCEL_REQUESTED', 'CANCELLED'):
+                logger.info("scheduler operation=OPPORTUNITY_CYCLE_SKIP phase=%s reason=%s cycleId=%s",
+                            "CANCEL_CHECK", run_status, active_run.get('cycle_id'))
+                return False
         now = self.clock()
         schedules, exceptions = self._load_schedules()
         status = market_session_status(self.market_code, schedules, exceptions, now)
@@ -228,7 +260,13 @@ class GlobalOpportunityScheduler:
         if phase is None:
             return False
         # Submit a production (non-controlled) cycle.
-        parameters = dict(top_n=4, shortlist_limit=25, candidate_ids=None)
+        # Production submission: candidate_ids=None means the complete
+        # applicable deep-research universe, never a bounded shortlist.
+        # run_global_opportunity_cycle already forces this unbounded whenever
+        # candidate_ids is None regardless of what's passed here; None is
+        # passed explicitly too so this call site cannot silently reintroduce
+        # a finite cap on its own.
+        parameters = dict(top_n=4, shortlist_limit=None, candidate_ids=None)
         try:
             result = self.worker.submit(parameters)
             if phase == "MARKET_HOURS":

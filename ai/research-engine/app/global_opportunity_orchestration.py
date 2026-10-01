@@ -28,6 +28,7 @@ truncates publication, which iterates ranking.evaluated_entries.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from copy import deepcopy
@@ -39,6 +40,7 @@ from pydantic import Field
 
 from decimal import Decimal, InvalidOperation
 
+from app import cycle_timing
 from app.global_scanner import GlobalScanCandidate, GlobalScanner, StageBCandidate
 from app.cycle_checkpoint import (CandidateState, CycleOwnershipLost, PHASE_BASELINE, PHASE_DEEP,
                                   state_for_disposition)
@@ -63,6 +65,30 @@ logger = logging.getLogger(__name__)
 class _BaselineOutcome:
     # The caller needs only acquisition disposition, never the readiness graph.
     planned_requirement_ids: tuple[str, ...]
+
+
+def _baseline_jurisdiction(profile) -> str:
+    """jurisdiction_for_profile(), widened to accept an EtfResearchProfile.
+
+    EtfResearchProfile has no ``country`` field (unlike CompanyResearchProfile),
+    so an ETF profile's jurisdiction is derived from ``exchange`` alone; this is
+    the exact same exchange-based branch jurisdiction_for_profile already uses,
+    just reached via getattr instead of a required attribute access. Behaviour
+    for a CompanyResearchProfile is unchanged -- getattr returns its real
+    ``country`` value.
+    """
+    country = (getattr(profile, "country", "") or "").strip().upper()
+    exchange = profile.exchange.strip().upper()
+    if country in {"IN", "IND", "INDIA"} or exchange in {"NSE", "XNSE", "BSE", "XBOM"}:
+        return "INDIA"
+    if country in {"US", "USA", "UNITED STATES"}:
+        return "USA"
+    if country in {
+        "AT", "BE", "CH", "CZ", "DE", "DK", "ES", "EU", "FI", "FR", "GB", "IE",
+        "IT", "LU", "NL", "NO", "PL", "PT", "SE", "UK",
+    }:
+        return "EUROPE"
+    return "GLOBAL"
 
 
 class OpportunityEntry(ResearchBaseModel):
@@ -202,6 +228,7 @@ class GlobalOpportunityOrchestrator:
     _KNOWN_STAGE2_FAILURE_REASONS = frozenset({
         "PROFILE_HYDRATION_FAILED",
         "PROFILE_IDENTITY_MISMATCH",
+        "PROFILE_MISSING_AFTER_HYDRATION",
     })
 
     _TECHNICAL_EVIDENCE_FIELDS: tuple = (
@@ -312,13 +339,27 @@ class GlobalOpportunityOrchestrator:
                 payload.setdefault("primarySymbol", payload.get("ticker"))
                 if not self.profile_hydrator(key, payload):
                     return key, None, "PROFILE_HYDRATION_FAILED"
-                profile = self.repository.profile(key)
+                # register_global_profile_metadata hydrates either a
+                # CompanyResearchProfile (repository.profiles) or an
+                # EtfResearchProfile (repository.etf_profiles) -- ETFs are
+                # routed exclusively into the latter store. Resolve whichever
+                # store actually holds this instrument instead of assuming
+                # CompanyResearchProfile storage. A hydration success that
+                # lands in neither store is a genuine, retryable anomaly --
+                # not an identity mismatch and not swallowed.
+                try:
+                    profile = self.repository.profile(key)
+                except StopIteration:
+                    try:
+                        profile = self.repository.etf_profile(key)
+                    except StopIteration:
+                        return key, None, "PROFILE_MISSING_AFTER_HYDRATION"
                 if profile.instrument_id != key:
                     return key, None, "PROFILE_IDENTITY_MISMATCH"
                 self.readiness_adapter.remember_canonical_metadata(key, payload)
                 result = await self.readiness.ensure(
                     key,
-                    jurisdiction=jurisdiction_for_profile(profile),
+                    jurisdiction=_baseline_jurisdiction(profile),
                     requirement_ids=BASELINE_REQUIREMENT_IDS,
                     identity_headers=identity_headers,
                 )
@@ -431,18 +472,19 @@ class GlobalOpportunityOrchestrator:
     def _unscorable_failures(self, key, blocking, cycle_failures):
         """Classify why readiness was full but the rules could not score.
 
-        Technical failures recorded this cycle, or the latest durable
-        (non-executor) acquisition observation being FAILED, keep the
-        candidate retryable. Otherwise readiness declared the durable evidence
-        complete, so there is nothing further to acquire: the required rule
-        input is genuinely unavailable (RULE_AREA_UNSCORABLE, terminal)."""
+        Ready evidence with no supported score is a contract/input gap, not
+        proof of authoritative absence. Preserve acquisition diagnostics, but
+        keep the disagreement retryable even when a prior check was empty or
+        a refresh was not due. The mandatory scoring gate remains closed."""
         from app.deep_investigation import _prior_failure
         failures = blocking_failures(cycle_failures, blocking)
         for requirement_id in blocking:
-            if requirement_id in failures:
-                continue
-            prior = _prior_failure(self.readiness, key, requirement_id) if self.readiness is not None else None
-            failures[requirement_id] = prior or "RULE_AREA_UNSCORABLE"
+            prior = failures.get(requirement_id)
+            if not prior and self.readiness is not None:
+                prior = _prior_failure(self.readiness, key, requirement_id)
+            failures[requirement_id] = "|".join(dict.fromkeys(
+                [part for part in str(prior or "").split("|") if part] + ["RULE_AREA_UNSCORABLE"]
+            ))
         return failures
 
     async def _checkpoint_deep_outcome(self, checkpoint, key, diagnostics, rules, by_id, investigation_matrix):
@@ -647,7 +689,7 @@ class GlobalOpportunityOrchestrator:
 
     async def run(self, canonical_instruments: Iterable[dict], *, as_of: datetime,
                   sector_contexts: Mapping[UUID, SectorContext] | None = None,
-                  shortlist_limit: int = 25, top_n: int | None = 10,
+                  shortlist_limit: int | None = 25, top_n: int | None = 10,
                   review_ids: Iterable[UUID] = (), identity_headers=None,
                   correlation_id=None, discovery_v2=False, rotation_after=None,
                   checkpoint=None) -> OpportunityRanking:
@@ -656,7 +698,13 @@ class GlobalOpportunityOrchestrator:
         # NOT a result cap: production passes top_n=None here, and
         # shortlist_limit only governs the priority investigation working set,
         # never the size of the published qualifying set.
-        if (type(shortlist_limit) is not int or not 1 <= shortlist_limit <= 100
+        # shortlist_limit=None means UNBOUNDED: the production contract
+        # (candidate_ids=None, enforced by run_global_opportunity_cycle) is
+        # that the complete applicable deep-research universe is processed,
+        # never truncated by a fixed-size working set. Controlled/manual
+        # cycles keep passing a real 1..100 int to bound their sample.
+        if (not (shortlist_limit is None
+                 or (type(shortlist_limit) is int and 1 <= shortlist_limit <= 100))
                 or (top_n is not None and (type(top_n) is not int or not 0 <= top_n <= 100))):
             raise ValueError("INVALID_OPPORTUNITY_LIMIT")
         if as_of.tzinfo is None or as_of.utcoffset() is None:
@@ -812,11 +860,20 @@ class GlobalOpportunityOrchestrator:
                 rotation_after = restored_selection.get("rotation_after", rotation_after)
             elif discovery_v2:
                 from app.opportunity_discovery import discover
+                # discover()'s budget bounds per-path nomination bookkeeping
+                # only -- with full_universe=True (always the case here) it
+                # already includes every eligible candidate in its result
+                # regardless of budget, but budget must still be a real
+                # positive int (it drives internal range()/slice arithmetic).
+                # Production (shortlist_limit is None/falsy) passes the full
+                # pool size so nomination-priority bookkeeping is not
+                # arbitrarily narrowed either.
+                discover_budget = shortlist_limit if shortlist_limit else max(1, len(pre_review_pool))
                 deep_candidates, nominations, rotation_after = await discover(
-                    baseline_scan.candidates, pre_review_pool, budget=shortlist_limit,
+                    baseline_scan.candidates, pre_review_pool, budget=discover_budget,
                     as_of=evaluation_at, repository=self.repository, run_blocking=self._run_blocking,
                     rotation_after=rotation_after, exclude_ids=review_id_set, full_universe=True)
-                shortlist = deep_candidates[:shortlist_limit]
+                shortlist = deep_candidates[:shortlist_limit] if shortlist_limit else deep_candidates
             if checkpoint is not None and restored_selection is None:
                 await checkpoint.save_selection({
                     "deep_ids": [str(c.global_instrument_id) for c in deep_candidates],
@@ -915,6 +972,21 @@ class GlobalOpportunityOrchestrator:
             phase_index = -1
             inflight: dict = {}
             started_attempts: set = set()
+            # Live references to CURRENT_NEWS background acquisitions started
+            # by investigate() (see app/deep_investigation.py) are tracked in
+            # the process-lifetime `current_news_background_tasks` registry
+            # (app/background_task_registry.py), not a phase-local set. A
+            # phase-local set drained by *this* phase's own `finally:` block
+            # would make mandatory Stage-2/cycle completion wait for the
+            # slowest optional CURRENT_NEWS search -- exactly the wait
+            # CURRENT_NEWS's optional/non-blocking contract forbids (Section H,
+            # consolidated fix pass). The registry still guarantees nothing is
+            # orphaned and every exception is observed (see its own
+            # done-callback); only *when* that's guaranteed moves from "before
+            # this phase ends" to "the registry's own done-callback, plus
+            # process shutdown" (app/main.py's `research_lifespan`).
+            from app.background_task_registry import current_news_background_tasks
+            pending_news_tasks = current_news_background_tasks
 
             async def _acquire_deep(item):
                 item_key = item.global_instrument_id
@@ -923,20 +995,30 @@ class GlobalOpportunityOrchestrator:
                 item_payload.setdefault("primarySymbol", item_payload.get("ticker"))
                 if not self.profile_hydrator(item_key, item_payload):
                     raise ValueError("PROFILE_HYDRATION_FAILED")
-                item_profile = self.repository.profile(item_key)
+                # Same ETF-aware resolution as baseline acquisition above:
+                # hydration may have landed this instrument in
+                # repository.etf_profiles rather than repository.profiles.
+                try:
+                    item_profile = self.repository.profile(item_key)
+                except StopIteration:
+                    try:
+                        item_profile = self.repository.etf_profile(item_key)
+                    except StopIteration:
+                        raise ValueError("PROFILE_MISSING_AFTER_HYDRATION")
                 if item_profile.instrument_id != item_key:
                     raise ValueError("PROFILE_HYDRATION_FAILED")
                 self.readiness_adapter.remember_canonical_metadata(item_key, item_payload)
                 if discovery_v2:
                     from app.deep_investigation import investigate
                     item_result, item_plan, item_matrix = await investigate(
-                        self.readiness, item_key, jurisdiction=jurisdiction_for_profile(item_profile),
+                        self.readiness, item_key, jurisdiction=_baseline_jurisdiction(item_profile),
                         nomination_paths=tuple(n['path'] for n in nominations.get(str(item_key), ())),
                         company_context={k: item_payload.get(k) for k in ('sector', 'industry', 'assetType')},
-                        identity_headers=identity_headers, correlation_id=correlation_id)
+                        identity_headers=identity_headers, correlation_id=correlation_id,
+                        background_tasks=pending_news_tasks)
                     return item_profile, item_payload, item_result, item_plan, item_matrix
                 item_result = await self.readiness.ensure(
-                    item_key, jurisdiction=jurisdiction_for_profile(item_profile), requirement_ids=None,
+                    item_key, jurisdiction=_baseline_jurisdiction(item_profile), requirement_ids=None,
                     identity_headers=identity_headers, wait_for_completion=True)
                 return item_profile, item_payload, item_result, None, None
 
@@ -987,9 +1069,24 @@ class GlobalOpportunityOrchestrator:
                 inflight.pop(item_key, None)
                 return head.result()
 
+            _cycle_timing_recorder = cycle_timing.CycleTimingRecorder(
+                cycle_id=str(correlation_id) if correlation_id else None)
+            _cycle_timing_token = cycle_timing.bind_recorder(_cycle_timing_recorder)
+            _cycle_timing_recorder.mark_stage2_start()
             try:
                 for candidate in _deep_schedule():
                     key = candidate.global_instrument_id
+                    # Stop admitting NEW candidates promptly if this cycle's
+                    # cancellation has been requested (either via the durable
+                    # two-phase request or a terminal CANCELLED). In-flight
+                    # acquisition tasks (inflight) are still drained by the
+                    # existing _prefetch_ahead / _take_acquisition backpressure,
+                    # and completed evidence rows are preserved.
+                    if checkpoint is not None and (key not in repairing) and await self._run_blocking(
+                            checkpoint.persistence.cycle_cancellation_requested, checkpoint.cycle_id):
+                        logger.info("opportunity_cycle_cancel_during_stage2 cycleId=%s instrument=%s",
+                                    checkpoint.cycle_id, key)
+                        break
                     deep_attempted_count += 1
                     local_attempts[key] = local_attempts.get(key, 0) + 1
                     if checkpoint is not None:
@@ -1042,7 +1139,7 @@ class GlobalOpportunityOrchestrator:
                         readiness_result = ensure_result.readiness if ensure_result is not None else None
                         if ensure_result is not None and readiness_result is None:
                             readiness_result = await self.readiness.read(
-                                key, jurisdiction=jurisdiction_for_profile(profile), now=evaluation_at)
+                                key, jurisdiction=_baseline_jurisdiction(profile), now=evaluation_at)
 
                         if ensure_result is None or readiness_result is None:
                             logger.info("stage2_candidate_readiness instrument_id=%s state=SOURCE_UNAVAILABLE", key)
@@ -1146,9 +1243,9 @@ class GlobalOpportunityOrchestrator:
                                     # could not produce a fully analyzed result
                                     # (applicable required area UNSCORABLE / not
                                     # full). This is never an ordinary ranking
-                                    # rejection: classify it as technical (retry)
-                                    # or genuine unavailability, exactly like a
-                                    # readiness shortfall, and keep it out of Stage B.
+                                    # rejection or proof of evidence absence:
+                                    # keep the gap technical/retryable and out
+                                    # of Stage B.
                                     blocking = incomplete
                                     acquisition_failures = self._unscorable_failures(
                                         key, blocking, ensure_result.failures)
@@ -1240,8 +1337,8 @@ class GlobalOpportunityOrchestrator:
                         ensure_result = readiness_result = None
                         enriched = refreshed = plan = matrix = None
                         if deep_attempted_count % 10 == 0 or deep_attempted_count == len(deep_candidates):
-                            logger.info("stage2_deep_progress: completed=%d/%d active=0/1",
-                                        deep_attempted_count, len(deep_candidates))
+                            logger.info("stage2_deep_progress: completed=%d/%d active=%d/%d",
+                                        deep_attempted_count, len(deep_candidates), _running(), stage2_concurrency)
             finally:
                 # Crash/cancellation/ownership loss: never orphan look-ahead
                 # acquisitions (provider calls) or leave them un-awaited.
@@ -1250,6 +1347,33 @@ class GlobalOpportunityOrchestrator:
                 if inflight:
                     await asyncio.gather(*inflight.values(), return_exceptions=True)
                 inflight.clear()
+                # CURRENT_NEWS background acquisitions are deliberately NOT
+                # drained here. They live in the process-lifetime
+                # `current_news_background_tasks` registry (added to it, not
+                # to a phase-local set -- see the declaration above), so
+                # this phase -- and therefore this cycle -- can complete
+                # without waiting for the slowest optional per-candidate
+                # news search. Nothing is orphaned: the registry retains a
+                # live reference to every task until it finishes and
+                # observes/logs its exception via its own done-callback
+                # regardless of whether anything ever awaits it explicitly.
+                # True process shutdown drains whatever is still
+                # outstanding -- see app/main.py's `research_lifespan`.
+                _cycle_timing_recorder.mark_stage2_complete()
+                _cycle_timing_recorder.note_concurrency(stage2_peak_inflight)
+                cycle_timing.unbind_recorder(_cycle_timing_token)
+                _timing_report = _cycle_timing_recorder.report()
+                logger.info(
+                    "stage2_timing_report cycle_id=%s stage2WallClockMs=%s maxConcurrentMandatoryInvestigations=%s "
+                    "trackedOperations=%s droppedOperations=%s aggregatePdfQueueWaitMs=%s aggregateProviderWaitMs=%s "
+                    "aggregatePersistenceWaitMs=%s slowestOperationsJson=%s persistenceOperationTimingJson=%s",
+                    _timing_report["cycle_id"], _timing_report["stage2_wall_clock_ms"],
+                    _timing_report["max_concurrent_mandatory_investigations"], _timing_report["tracked_operation_count"],
+                    _timing_report["dropped_operation_count"], _timing_report["aggregate_pdf_queue_wait_ms"],
+                    _timing_report["aggregate_provider_wait_ms"], _timing_report["aggregate_persistence_wait_ms"],
+                    json.dumps(_timing_report["slowest_operations"]),
+                    json.dumps(_timing_report["persistence_operation_timing"]),
+                )
 
 
             for candidate_id in baseline_eligible_ids:

@@ -956,6 +956,17 @@ async def test_usable_historical_parsed_document_reuses_before_network_and_fresh
         title="Reliance Industries Limited Financial Results", content_type="application/pdf",
         document_type=DocumentType.PDF_REFERENCE, content_hash="c" * 64, status=DocumentStatus.PARSED,
         reliability_level=ReliabilityLevel.LEVEL_A, entity_resolution_confidence=0.99, source_mode=SourceMode.REAL,
+        # Guardian Review (Item 14): nse_authority_rejection() (financial_projection.py)
+        # also requires discovery_provider == "NSE_OFFICIAL_API" for a document
+        # to qualify as an authoritative NSE source when _reusable_official_document
+        # is called with source= (the financial-scope branch) -- this fixture
+        # predates that requirement, so without it the document was silently
+        # rejected as UNQUALIFIED_NSE_SOURCE inside _fetch_official_filings
+        # (though a DIRECT, source=-less call to _reusable_official_document,
+        # which skips the financial branch entirely, still found it reusable --
+        # that direct assertion earlier in this test was passing for the wrong
+        # reason). Stale-fixture defect, not a production one.
+        discovery_provider="NSE_OFFICIAL_API",
         normalized_text="Reliance Industries Limited quarterly financial results revenue 1000 crore PAT 100 crore.")
     persistence = SqliteResearchPersistence(database)
     persistence.upsert_document(parsed)
@@ -1080,7 +1091,19 @@ async def test_reusable_official_documents_do_not_consume_category_fair_network_
             canonical_url=financial[index].url, original_url=financial[index].url, source_type=SourceType.EXCHANGE_ANNOUNCEMENT,
             source_classification=SourceClassification.EXCHANGE, source_name="NSE", content_type="application/pdf",
             document_type=DocumentType.PDF_REFERENCE, content_hash=(str(index + 7) * 64), status=DocumentStatus.PROCESSED,
-            reliability_level=ReliabilityLevel.LEVEL_A, entity_resolution_confidence=0.99, source_mode=SourceMode.REAL)
+            reliability_level=ReliabilityLevel.LEVEL_A, entity_resolution_confidence=0.99, source_mode=SourceMode.REAL,
+            # Same stale-fixture defect as above: nse_authority_rejection() requires
+            # discovery_provider == "NSE_OFFICIAL_API" for the fair-budget reuse
+            # check inside _fetch_official_filings to treat this PROCESSED document
+            # as authoritative and skip re-fetching it. It also independently
+            # requires bool(document.normalized_text) (or extracted financial
+            # facts already on file, which this fixture has neither) for a
+            # financial-category reuse candidate -- without it
+            # _reusable_official_document() falls through to None and the
+            # document is treated as not-yet-fetched, consuming a network
+            # attempt it should never need.
+            discovery_provider="NSE_OFFICIAL_API",
+            normalized_text=f"Reliance Industries Limited financial results filing {index}.")
         repository.documents[document.document_id] = document
 
     class FailingFetcher:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -25,6 +26,7 @@ from app.models import (
     StructuredMarketSnapshotRecord,
 )
 from app.repository import ResearchRepository
+from app.readiness_signals import evidence_committed
 from app.scoring import canonical_read_model_score
 from app.settings import Settings
 from app.source_registry import registered_sources_for
@@ -59,6 +61,26 @@ class WatchlistNotFoundError(Exception):
 
 class WatchlistRegionMismatchError(Exception):
     """The canonical instrument region does not match the target watchlist."""
+
+
+def _accepts_acquisition_context(func) -> bool:
+    """True when `func` declares an `acquisition_context` keyword (or **kwargs).
+
+    Item 2 (same-cycle Yahoo ticker reuse): the explicit acquisition
+    context is an opt-in extension to the StructuredResearchProvider
+    protocol (YahooFinanceProvider.collect/collect_baseline). Passing it
+    unconditionally would raise TypeError against every other provider
+    implementation and test double that does not declare it, so this is
+    checked once per call rather than assumed.
+    """
+    try:
+        params = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "acquisition_context" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in params
+    )
 
 
 class PortfolioResearchOrchestrator:
@@ -568,6 +590,8 @@ class PortfolioResearchOrchestrator:
         market_data=None,
         requested_classes: set[str] | None = None,
         force_requested: bool = False,
+        baseline_only: bool = False,
+        acquisition_context: object | None = None,
     ) -> StructuredReconciliationOutcome:
         """Reconcile durable structured state; summaries never call this path."""
         if not self.settings.structured_provider_enabled or _instrument_asset_type(instrument) not in {"EQUITY", "ETF"}:
@@ -591,9 +615,32 @@ class PortfolioResearchOrchestrator:
         if not due:
             return StructuredReconciliationOutcome(record.snapshot if record else None, None, frozenset(), status)
         try:
-            snapshot = await self.structured_provider.collect(instrument)
-            await self._persist_structured_snapshot(instrument_id, snapshot)
-            await self.repository.persist_yahoo_statement_facts_async(instrument_id, snapshot)
+            collect_baseline = getattr(self.structured_provider, "collect_baseline", None)
+            # Item 2 (same-cycle Yahoo ticker reuse): only pass the explicit
+            # acquisition context to a provider that actually declares it --
+            # the StructuredResearchProvider protocol and most test doubles
+            # do not accept this keyword, and this must never break them.
+            context_kwargs = (
+                {"acquisition_context": acquisition_context}
+                if acquisition_context is not None and _accepts_acquisition_context(
+                    collect_baseline if baseline_only and callable(collect_baseline) else self.structured_provider.collect
+                )
+                else {}
+            )
+            if baseline_only and callable(collect_baseline):
+                snapshot = await collect_baseline(instrument, **context_kwargs)
+            else:
+                snapshot = await self.structured_provider.collect(instrument, **context_kwargs)
+            if baseline_only:
+                previous = next((item for item in records
+                    if item.provider == snapshot.resolution.provider
+                    and item.provider_instrument_id == snapshot.resolution.provider_ticker), None)
+                await self._persist_structured_snapshot(instrument_id, snapshot, previous=previous)
+            else:
+                await self._persist_structured_snapshot(instrument_id, snapshot)
+            evidence_committed(instrument_id)
+            if not baseline_only:
+                await self.repository.persist_yahoo_statement_facts_async(instrument_id, snapshot)
             logger.info("structured_provider_complete canonical_instrument=%s dueClasses=%s marketStatus=%s", instrument_id, sorted(due), status)
             return StructuredReconciliationOutcome(snapshot, None, frozenset(due), status)
         except Exception as exc:
@@ -608,6 +655,9 @@ class PortfolioResearchOrchestrator:
         self,
         instrument_id: UUID,
         requested_classes: set[str],
+        *,
+        baseline_only: bool = False,
+        acquisition_context: object | None = None,
     ) -> StructuredReconciliationOutcome:
         """Run one explicitly selected structured-market capability.
 
@@ -618,7 +668,9 @@ class PortfolioResearchOrchestrator:
             instrument_id,
             self._instrument_for_registered_profile(instrument_id),
             requested_classes=requested_classes,
+            acquisition_context=acquisition_context,
             force_requested=True,
+            baseline_only=baseline_only,
         )
 
     async def refresh_international_fundamentals(
@@ -1087,7 +1139,7 @@ class PortfolioResearchOrchestrator:
             snapshot,
         )
 
-    async def _persist_structured_snapshot(self, instrument_id: UUID, snapshot) -> None:
+    async def _persist_structured_snapshot(self, instrument_id: UUID, snapshot, *, previous=None) -> None:
         now = datetime.now(timezone.utc)
         facts = snapshot.facts
         record = StructuredMarketSnapshotRecord(
@@ -1101,6 +1153,25 @@ class PortfolioResearchOrchestrator:
             last_analyst_at=now if any(key.startswith("publicAnalyst") for key in facts) else None,
             last_success_at=now, last_provider_attempt_at=now, acquisition_status="SUCCESS", snapshot=snapshot,
         )
+        if previous is not None:
+            # A baseline refresh omits research fields. Retain their original
+            # provenance and dates; never give old values the new quote's date.
+            retained = {key: value.model_copy(update={
+                "as_of_date": (value.as_of_date or previous.market_as_of
+                               or value.published_at or value.retrieved_at or previous.retrieved_at),
+                "retrieved_at": value.retrieved_at or previous.retrieved_at,
+            }) for key, value in previous.snapshot.facts.items() if key not in facts}
+            merged = snapshot.model_copy(update={
+                "facts": {**retained, **facts},
+                "statement_facts": previous.snapshot.statement_facts,
+                "news": previous.snapshot.news,
+            })
+            record = record.model_copy(update={
+                "snapshot": merged,
+                **{name: getattr(record, name) or getattr(previous, name)
+                   for name in ("last_price_at", "last_valuation_at", "last_fundamentals_at", "last_analyst_at")},
+            })
+            snapshot = merged
         await self.repository.persist_structured_market_snapshot_async(record)
         self._store_structured_snapshot(instrument_id, snapshot)
 

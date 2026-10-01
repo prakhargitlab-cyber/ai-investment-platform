@@ -12,6 +12,9 @@ from app.source_discovery import SearchProviderError
 
 
 _WRAPPED_PREFIX='SEARCH_PROVIDER_UNAVAILABLE:'
+# Guardian Review Issue 5 -- see the bounded-degraded-provider comment
+# in acquire_news() below.
+_MAX_CONSECUTIVE_DEGRADED_QUERIES = 3
 
 
 def _query_failure_code(exc):
@@ -156,19 +159,51 @@ async def acquire_news(repository, company, *, providers, industry=None, now=Non
         # meta-search engines were unresponsive (kept as a diagnostic). A query
         # that raised, or returned nothing while engines were unresponsive
         # (CAPTCHA / 429 / outage), is a failed query -- never a valid empty.
-        completed=0; count=0; degraded_queries=0; codes=[]
-        for _,query in plan:
+        #
+        # Guardian Review (STAGE2_LIVE_RUN_DEFECTS_20260930.md, Issue 5):
+        # bounded degraded-provider work. Each explicit_queries call bypasses
+        # SearxngSearchDiscoveryProvider's own cross-call backoff on purpose
+        # (the CURRENT_NEWS completion-semantics fix), which is correct for a
+        # provider that is merely slow on ONE query -- but it also means
+        # nothing here stopped issuing all `max_queries` (up to 14) queries
+        # to a provider that has been degraded for every single one of them
+        # THIS call. _MAX_CONSECUTIVE_DEGRADED_QUERIES is a per-call-only
+        # circuit breaker: after that many CONSECUTIVE degraded/empty
+        # responses from the SAME provider in the SAME acquire_news() call,
+        # remaining queries to it are skipped for this call. This never
+        # touches candidate ranking or which queries get issued -- tier
+        # fairness (buckets/plan above) is unchanged for every query that DID
+        # run -- and it resets on the very next call (no persisted state), so
+        # a future freshness retry is unaffected. The run is still marked
+        # PARTIAL/retryable (not SUCCESS), so this never fabricates success.
+        completed=0; count=0; degraded_queries=0; codes=[]; consecutive_degraded=0
+        for query_index,(_,query) in enumerate(plan):
             try:
                 rows=await provider.discover(company,'CURRENT_NEWS',SearchDateWindow(query_limit=1,explicit_queries=(query,)))
             except Exception as exc:
                 codes.append(_query_failure_code(exc))
+                consecutive_degraded=0
             else:
                 degraded=bool(getattr(provider,'last_query_degraded',False))
                 if degraded and not rows:
                     codes.append('SEARCH_PROVIDER_DEGRADED')
+                    consecutive_degraded+=1
                 else:
                     completed+=1; count+=len(rows); degraded_queries+=int(degraded)
+                    consecutive_degraded=0
                     for row in rows: candidates.setdefault(canonicalize_url(row.url),row)
+            if consecutive_degraded>=_MAX_CONSECUTIVE_DEGRADED_QUERIES and query_index+1<len(plan):
+                # Bounded degraded-provider work: stop issuing further queries
+                # to a provider that has been degraded/empty for this many
+                # CONSECUTIVE queries in THIS call. Deliberately does not
+                # append a distinct marker code here -- 'SEARCH_PROVIDER_DEGRADED'
+                # is already recorded per degraded query above and _join_codes
+                # dedupes identical codes, so the provider's failure
+                # classification (FAILED/PARTIAL + SEARCH_PROVIDER_DEGRADED) is
+                # unchanged by whether the run stopped here or continued
+                # through every remaining query -- only the amount of wasted
+                # work against an already-proven-unresponsive provider changes.
+                break
             await sleep(repository.settings.market_data_population_request_interval_seconds)
         failed=bool(codes)
         state=('PARTIAL' if failed else 'SUCCESS_WITH_RESULTS' if count else 'SUCCESS_EMPTY') if completed else 'FAILED'

@@ -274,6 +274,20 @@ class OpportunityPersistenceMixin:
             value = decode(row)
             if value.get('record_kind') == 'CYCLE_JOB':
                 latest.setdefault(value['cycle_id'], value)
+        # Cancellation is committed on the durable run, independently of the
+        # worker's immutable job log. A stopped/old worker may never append a
+        # cancellation event, or may append a stale RUNNING event afterward.
+        # Project the authoritative state without rewriting historical events.
+        for row in self._connection.execute(
+            "SELECT cycle_id, status, updated_at, error_code, parameters FROM global_opportunity_cycle_run "
+            "WHERE status IN ('CANCEL_REQUESTED','CANCELLED')"
+        ).fetchall():
+            run = dict(row)
+            job = latest.setdefault(run['cycle_id'], {
+                'cycle_id': run['cycle_id'], 'record_kind': 'CYCLE_JOB',
+                'parameters': json.loads(run['parameters']),
+            })
+            job.update({key: run[key] for key in ('status', 'updated_at', 'error_code')})
         return list(latest.values())
 
     def recommendation_history(self, instrument_id=None):

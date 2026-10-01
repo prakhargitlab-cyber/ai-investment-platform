@@ -844,10 +844,19 @@ class StockRuleEngineV1:
 
     def _balance_sheet(self, value: StockRuleEngineInput) -> AreaScoreResult:
         metrics: list[tuple[RuleMetricResult, int]] = []
-        if _is_financial(value):
-            capital = _latest_fact(value, ("capital_adequacy", "capital_adequacy_ratio"))
-            gross_npa = _latest_fact(value, ("gross_npa", "gross_npa_ratio"))
-            net_npa = _latest_fact(value, ("net_npa", "net_npa_ratio"))
+        # Use regulated lenders/HFCs only for sector-ratio scoring.
+        # Asset management companies are financial but use corporate balance sheet path.
+        from app.research_applicability import balance_sheet_applicability, LENDER_BALANCE_SHEET_INPUT, LENDER_BALANCE_SHEET_METRICS
+        contract = balance_sheet_applicability(
+            value.canonical_metadata.get("officialIndustry") or value.canonical_metadata.get("industry"), _sector(value))
+        readiness = value.readiness.for_requirement("BALANCE_SHEET_FACTS")
+        excluded_inputs = (readiness.not_applicable_input_reasons
+            if readiness and readiness.applicability_reason == "BALANCE_SHEET_SUBTYPE_INPUTS"
+            else contract.excluded_inputs)
+        if LENDER_BALANCE_SHEET_INPUT not in excluded_inputs:
+            capital = _latest_fact(value, LENDER_BALANCE_SHEET_METRICS["CAPITAL_ADEQUACY"])
+            gross_npa = _latest_fact(value, LENDER_BALANCE_SHEET_METRICS["GROSS_NPA"])
+            net_npa = _latest_fact(value, LENDER_BALANCE_SHEET_METRICS["NET_NPA"])
             if capital:
                 pct = _as_percent(capital.value)
                 metrics.append((_metric_result("CAPITAL_ADEQUACY", _derived_datum(pct, "PERCENT", capital, "normalized:capital-adequacy"), _higher_better(pct, ((9, 20), (12, 50), (15, 72), (18, 90))), "FINANCIAL_CAPITAL_ADEQUACY_V1", "PERCENT"), 50))
@@ -1047,7 +1056,7 @@ class StockRuleEngineV1:
             datum = _shareholding_datum(latest, promoter.percentage, _enum_text(promoter.category))
             metrics.append((_metric_result("PROMOTER_HOLDING", datum, _higher_better(datum.value, ((0, 25), (20, 45), (40, 65), (55, 78), (70, 82))), "PROMOTER_HOLDING_LEVEL_V1", "PERCENT"), 25))
         pledge = latest_values.get(ShareholdingCategory.PROMOTER_PLEDGE)
-        if pledge:
+        if pledge is not None:
             datum = _shareholding_datum(latest, pledge.percentage, _enum_text(pledge.category))
             metrics.append((_metric_result("PROMOTER_PLEDGE", datum, _lower_better(datum.value, ((0, 95), (5, 75), (15, 48), (30, 20), (50, 5))), "PROMOTER_PLEDGE_V1", "PERCENT"), 35))
         if len(snapshots) >= 2:
@@ -1080,9 +1089,45 @@ class StockRuleEngineV1:
         latest = value.shareholding[-1] if value.shareholding else None
         if latest:
             pledge = next((entry for entry in latest.values if entry.category == ShareholdingCategory.PROMOTER_PLEDGE), None)
-            if pledge:
+            if pledge is not None:
                 datum = _shareholding_datum(latest, pledge.percentage, "PROMOTER_PLEDGE_GOVERNANCE")
                 metrics.append((_metric_result("PROMOTER_PLEDGE_GOVERNANCE", datum, _lower_better(datum.value, ((0, 95), (5, 75), (15, 45), (30, 18), (50, 5))), "PROMOTER_PLEDGE_GOVERNANCE_V1", "PERCENT"), 1))
+        if not metrics:
+            # STEP-8A / DI-GOV-1: this area is scored from value.events (and
+            # shareholding pledge) only -- it deliberately never loads
+            # value.documents/full document bodies here (compact-evidence
+            # constraint). But readiness (research_readiness_runtime.py)
+            # already knows whether GOVERNANCE_HISTORY's mandatory
+            # GOVERNANCE_EVIDENCE input is genuinely covered: by a real
+            # persisted governance DOCUMENT this area cannot see directly
+            # (_append_documents), by an actual event (already scored
+            # above), or by an explicit authoritative NSE clean-check
+            # (_completed_authoritative_check -- never a generic-search
+            # zero-result, never a partial/failed/never-run check; see
+            # research_readiness_runtime.py and the repository.py partial-
+            # budget guard). When every GOVERNANCE_HISTORY readiness item is
+            # READY_FRESH/READY_STALE, the area is genuinely scorable even
+            # though no event produced a metric here -- mirrors _news()'s
+            # CURRENT_NEWS clean-search upgrade: no fabricated score (empty
+            # metrics), and an incomplete/technical/unknown/partial state is
+            # never upgraded because readiness itself would not be READY_*
+            # for it.
+            base = self._finish(value, RuleEngineArea.MANAGEMENT_GOVERNANCE, [], [])
+            readiness_items = [item for item in value.readiness.requirements
+                                if item.rule_engine_area == RuleEngineArea.MANAGEMENT_GOVERNANCE]
+            if base.status == AreaScoreStatus.UNSCORABLE and readiness_items and all(
+                    item.status in {ResearchRequirementStatus.READY_FRESH, ResearchRequirementStatus.READY_STALE}
+                    for item in readiness_items):
+                references: set[str] = set(base.evidence_references)
+                for item in readiness_items:
+                    references.update(item.evidence_ids)
+                return base.model_copy(update={
+                    "status": AreaScoreStatus.READY_STALE if any(
+                        item.status == ResearchRequirementStatus.READY_STALE for item in readiness_items)
+                        else AreaScoreStatus.READY_FRESH,
+                    "missing_inputs": [],
+                    "evidence_references": sorted(references),
+                })
         return self._finish(value, RuleEngineArea.MANAGEMENT_GOVERNANCE, metrics, [] if metrics else ["STRUCTURED_GOVERNANCE_EVIDENCE"])
 
     def _sector_macro(self, value: StockRuleEngineInput) -> AreaScoreResult:
@@ -1784,6 +1829,10 @@ def _sector(value: StockRuleEngineInput) -> str | None:
 
 
 def _is_financial(value: StockRuleEngineInput) -> bool:
+    """Return True if the issuer is a financial company (banking, lending, insurance,
+    asset management, etc.). This determines whether ROCE-based quality scoring
+    is suppressed for financial issuers who don't use traditional capital employed.
+    """
     from app.research_applicability import FINANCIAL_CLASSIFICATION_TERMS
     text = f"{_sector(value) or ''} {value.canonical_metadata.get('industry') or ''}".casefold()
     # Mirrors research_applicability.FINANCIAL_CLASSIFICATION_TERMS so that
@@ -1791,6 +1840,33 @@ def _is_financial(value: StockRuleEngineInput) -> bool:
     # what counts as a financial issuer (incl. credit/lending/leasing/mortgage/
     # housing finance/finance company/microfinance; no IRFC special-case).
     return any(token in text for token in FINANCIAL_CLASSIFICATION_TERMS)
+
+
+def _financial_subtype(value: StockRuleEngineInput) -> str:
+    """Classify a financial issuer's subtype for balance-sheet scoring.
+
+    Returns one of:
+    - "FINANCIAL_SECTOR" for regulated lenders/HFCs/banks/NBFCs that publish
+      capital adequacy, gross NPA, net NPA ratios.
+    - "ASSET_MANAGEMENT" for investment/asset management companies that do not.
+    - "CORPORATE" for non-financial or unknown issuers.
+
+    This shared contract ensures consistency across research_applicability,
+    stock_rule_engine, and structured_research.
+    """
+    from app.research_applicability import classify_financial_subtype
+    sector = _sector(value)
+    industry = value.canonical_metadata.get("industry")
+    return classify_financial_subtype(industry, sector)
+
+
+def _is_regulated_lender_or_hfc(value: StockRuleEngineInput) -> bool:
+    """Return True if the issuer is a regulated lender/HFC/banking/NBFC entity.
+
+    Combined with BALANCE_SHEET_FACTS readiness, this determines whether
+    capital_adequacy/gross_npa/net_npa ratios are applicable scoring metrics.
+    """
+    return _financial_subtype(value) == "FINANCIAL_SECTOR"
 
 
 def _is_india(profile: CompanyResearchProfile) -> bool:

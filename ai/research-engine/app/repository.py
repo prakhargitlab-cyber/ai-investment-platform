@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 import logging
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from uuid import UUID
 
 from app.deduplication import DocumentDeduplicator
+from app.financial_projection import nse_authority_rejection
 from app.document_cache import BoundedDocumentCache, DocumentRef, _ref as _document_ref
 from app.event_store import BoundedEventStore
 from app.failure_taxonomy import TECHNICAL_RETRYABLE, classify_reason as classify_failure_reason
@@ -23,6 +26,7 @@ from app.models import (
     DocumentSubtype,
     DocumentStatus,
     DocumentType,
+    EntityResolution,
     EtfResearchProfile,
     PlatformEvent,
     ReliabilityLevel,
@@ -40,6 +44,7 @@ from app.models import (
     DailyMarketBar,
 )
 from app.normalization import canonicalize_url, content_hash, detect_document_type, extract_published_at, extract_text, normalize_text
+from app import cycle_timing
 from app.research_fetching import FetchError, HttpResearchFetcher, PdfExtractionTimeoutError, RestrictedFetchError, TransportFetchError
 from app.scoring import CatalystScorer, canonical_read_model_score
 from app.settings import Settings
@@ -67,6 +72,10 @@ from app.financial_authority import authoritative_financial_upgrade_required
 logger = logging.getLogger(__name__)
 _TRUSTED_NSE_PROFILE_IDENTITY = object()
 
+# Bump when the financial parser/projection contract changes. Receipts certify
+# unchanged parsing work only; they never satisfy a readiness requirement.
+FINANCIAL_PARSER_VERSION = "2"
+
 
 @dataclass(frozen=True)
 class _InstrumentRefreshGate:
@@ -88,6 +97,23 @@ class _InstrumentRefreshGate:
 class _CategoryRefreshStrategy:
     name: str
     lightweight_check_interval: timedelta
+
+
+@dataclass
+class _OfficialFilingBatchState:
+    """Shared, mutable accounting for one _fetch_official_filings() batch.
+
+    Every read/write of these fields happens while the batch's
+    ``dispatch_lock`` is held (see _fetch_official_filings), so this is
+    exactly as race-safe as the single local-variable set the original
+    fully-serial loop used -- concurrency is only ever introduced around the
+    network fetch itself, never around this state.
+    """
+    cursor: int = 0
+    attempted: int = 0
+    completed_without_failure: bool = True
+    stop: bool = False
+    host_transport_failures: dict = field(default_factory=dict)
 
 
 _SHORT_TTL = _CategoryRefreshStrategy("SHORT_TTL", timedelta(minutes=5))
@@ -353,12 +379,43 @@ class ResearchRepository:
         # This is deliberately process-local.  Persistence remains the durable
         # cross-process deduplication boundary.
         self._official_filing_flights: dict[tuple[UUID, str], asyncio.Task[ResearchDocument]] = {}
+        # Guardian Review (Issue 3, STAGE2_LIVE_RUN_DEFECTS_20260930.md):
+        # repository-instance-level (survives across separate
+        # _fetch_official_filings() batch calls for the same instrument, e.g.
+        # one call per capability group), keyed by (instrument_id, host),
+        # value = monotonic time.monotonic() timestamp until which that host
+        # is in cooldown for that instrument. A fresh per-batch
+        # _OfficialFilingBatchState.host_transport_failures counter is still
+        # used WITHIN one batch (unchanged); this map is the ACROSS-batches
+        # memory that counter never had.
+        self._official_host_cooldowns: dict[tuple[UUID, str], float] = {}
         self._instrument_refresh_flights: dict[UUID, asyncio.Task[ResearchSummary]] = {}
         # The production persistence adapter owns one synchronous database
         # connection.  Worker operations are serialized per repository so two
         # refreshes do not interleave transactions on that connection.
         self._persistence_worker_lock = threading.RLock()
         self._news_worker_lock = asyncio.Lock()
+        # Bounded per-repository cache of market-session metadata (trading
+        # schedules + calendar exceptions) keyed by the market set. Schedules
+        # are refreshed by a separate, dedicated schedule-refresh flow (never by
+        # the readiness acquisition path), so within a single investigate flow
+        # the same market set is requested on every read(). Caching collapses
+        # those repeated locked loads. The cache is invalidated conservatively:
+        # any persistence *write* (upsert_/record_/insert_/complete_/start_/_persist/_reconcile/_apply/_create_)
+        # clears it, so schedule data is never served stale across a mutation
+        # boundary. Read operations never clear it. See
+        # `_invalidate_market_session_cache` + the write-prefix check in
+        # `_run_blocking_persistence`.
+        self._market_session_cache: dict[frozenset[str], tuple] = {}
+        # Monotonic counter bumped on every persistence *write*. The readiness
+        # runtime reads this to decide whether its cached evidence-only
+        # ResearchReadinessResult is still durable-current (i.e. no mutation has
+        # persisted new evidence/observations since the snapshot was taken).
+        # This is a bounded, process-local staleness sentinel -- it does NOT
+        # replace durable reads; it only lets an evidence_only read skip a
+        # reload when the caller already holds an equivalent snapshot and no
+        # intervening persistence mutation occurred.
+        self._readiness_mutation_generation: int = 0
         self._seed_demo_data()
         self._load_persisted_research()
 
@@ -503,11 +560,65 @@ class ResearchRepository:
         await self._run_blocking_persistence(self._persistence.record_structured_market_failure, instrument_id, provider, datetime.now(timezone.utc), code, message)
 
     async def market_session_data(self, markets: set[str]):
+        key = frozenset(markets)
+        cached = self._market_session_cache.get(key)
+        if cached is not None:
+            return cached
         schedules, exceptions = await asyncio.gather(
             self._run_blocking_persistence(self._persistence.load_market_schedules, markets),
             self._run_blocking_persistence(self._persistence.load_market_calendar_exceptions, markets),
         )
-        return schedules, exceptions
+        result = schedules, exceptions
+        # Only cache complete (non-empty) schedule data; an empty/partial load
+        # is still authoritative for "no schedules persisted yet", so we cache
+        # it too to avoid re-running the locked loads within the same flow.
+        self._market_session_cache[key] = result
+        return result
+
+    def _invalidate_market_session_cache(self) -> None:
+        """Clear the market-session metadata cache.
+
+        Called from the persistence chokepoint on any write operation so stale
+        schedule data is never served across a mutation boundary. Safe to call
+        when the cache is empty (no-op).
+        """
+        self._market_session_cache.clear()
+
+    _PERSISTENCE_WRITE_PREFIXES = (
+        "upsert_",
+        "record_",
+        "insert_",
+        "complete_",
+        "start_",
+        "create_",
+        "_persist",
+        "_reconcile",
+        "_apply",
+        "_store",
+    )
+
+    def _is_persistence_write(self, operation) -> bool:
+        """Return True if ``operation`` is a persistence write that may mutate
+        durable state and therefore must invalidate derived caches.
+
+        Uses the operation's method ``__name__`` (e.g. ``upsert_acquisition_observation``)
+        or, for repository-level wrapper methods, ``__qualname__`` to classify.
+        Read-only loads (``load_*``, ``profile``, ``summary``, ``financial_facts_for``,
+        ``acquisition_observations_for``, ``news_records_for``,
+        ``market_session_data``, ``assess`` and similar) are not writes, so they
+        never clear the market-session cache. This is a conservative classification:
+        clearing on a write that does not touch schedule tables is safe (just a
+        cache miss on the next read); never clearing on a schedule-relevant write
+        would be the unsafe case, which this guard prevents.
+        """
+        qn = getattr(operation, "__qualname__", None) or ""
+        name = getattr(operation, "__name__", "") or ""
+        # Bound persistence-adapter methods expose the bare method name (e.g.
+        # "upsert_acquisition_observation"); repository-level wrappers expose a
+        # qualname like "ResearchRepository.record_acquisition_observation".
+        # Check the bare method name first (most precise), then the qualname.
+        label = name or qn
+        return any(label.startswith(prefix) for prefix in self._PERSISTENCE_WRITE_PREFIXES)
 
     async def _run_blocking_persistence(self, operation, *args, **kwargs):
         """Keep production database work out of the request event loop.
@@ -517,14 +628,49 @@ class ResearchRepository:
         uses the psycopg adapter, whose synchronous operations are safe to run
         in a worker thread.  Keeping this compatibility branch here avoids
         moving repository-owned state or changing the SQLite adapter contract.
+
+        Any persistence *write* invalidates the bounded market-session cache so
+        stale schedule data is never served across a mutation boundary. Read
+        operations are unaffected.
         """
+        if self._is_persistence_write(operation):
+            self._invalidate_market_session_cache()
+            self._readiness_mutation_generation += 1
         if isinstance(self._persistence, SqliteResearchPersistence) and self._persistence.__class__.__module__ != "app.postgres_persistence":
             return operation(*args, **kwargs)
-        return await asyncio.to_thread(self._run_serialized_persistence_operation, operation, args, kwargs)
+        dispatched_at = time.monotonic()
+        return await asyncio.to_thread(self._run_serialized_persistence_operation, operation, args, kwargs, dispatched_at)
 
-    def _run_serialized_persistence_operation(self, operation, args, kwargs):
+    def _run_serialized_persistence_operation(self, operation, args, kwargs, dispatched_at=None):
         with self._persistence_worker_lock:
-            return operation(*args, **kwargs)
+            op_name = (getattr(operation, "__qualname__", None)
+                       or getattr(operation, "__name__", None)
+                       or type(operation).__name__)
+            if dispatched_at is not None:
+                # Wait = time from dispatch (event loop handing this off to
+                # asyncio.to_thread) to actually holding the serialization
+                # lock -- covers both thread-pool scheduling delay and any
+                # time another persistence operation held the lock first.
+                wait_ms = (time.monotonic() - dispatched_at) * 1000
+                cycle_timing.record_persistence_wait(wait_ms)
+                # Guardian Review Slice 7 (measure first, no blind pool
+                # change): count this dispatched call by its operation name,
+                # so the cycle report can identify the highest-frequency
+                # persistence calls without any architecture change.
+                cycle_timing.record_persistence_operation(op_name)
+            op_started = time.monotonic()
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                if dispatched_at is not None:
+                    exec_ms = (time.monotonic() - op_started) * 1000
+                    cycle_timing.record_persistence_elapsed(exec_ms)
+                    # Guardian Review Slice 7 (measure-first): per-operation-
+                    # NAME timing (wait + exec), so a flat persistence_wait/
+                    # persistence_elapsed aggregate can be attributed to a
+                    # specific load_*/upsert_*/commit method. Observation-only:
+                    # no behavior/decision change.
+                    cycle_timing.record_persistence_operation_timing(op_name, wait_ms, exec_ms)
 
     def etf_profile(self, instrument_id: UUID) -> EtfResearchProfile:
         return next(profile for profile in self.etf_profiles if profile.instrument_id == instrument_id)
@@ -614,6 +760,26 @@ class ResearchRepository:
         evictable only when persistence is actually durable."""
         self.documents.put(document, durable=document.source_mode == SourceMode.REAL and self._documents_are_durable())
 
+    def _sync_persisted_document_identities(self, instrument_id: UUID) -> None:
+        # Another worker may have committed evidence since this process started.
+        # Refresh only this instrument's compact index before acquisition.
+        loader = getattr(self._persistence, "load_document_identities_for_instrument", None)
+        if callable(loader):
+            known = {ref.document_id: ref for ref in self.documents.refs_for_instrument(instrument_id)}
+            for identity in loader(instrument_id):
+                document_id, owner_id, url, digest, source_mode, sort_key = identity
+                prior = known.get(document_id)
+                if prior and (prior.canonical_url != url or prior.content_hash != digest):
+                    self._deduplicator.forget(prior.canonical_url, prior.content_hash, document_id)
+                resident = self.documents.get(document_id)
+                if resident is not None and (resident.content_hash != digest
+                        or resident.published_at != sort_key and resident.retrieved_at != sort_key
+                        or resident.status == DocumentStatus.FAILED or not resident.normalized_text):
+                    self.documents.pop(document_id, None)
+                    self._deduplicator.forget(resident.canonical_url, resident.content_hash, document_id)
+                self.documents.register_ref(DocumentRef(document_id, owner_id, source_mode, url, digest, sort_key))
+                self._deduplicator.add_identity(document_id, url, digest)
+
     def _documents_are_durable(self) -> bool:
         return bool(getattr(self._persistence, "durable_documents", True))
 
@@ -677,12 +843,30 @@ class ResearchRepository:
         return sorted(values, key=lambda event: event.event_date or event.detected_at, reverse=True)
 
     def shareholding_for(self, instrument_id: UUID, *, limit: int = 4) -> list[ShareholdingSnapshot]:
+        from app.research_applicability import shareholding_input_coverage
+
+        def selection_key(snapshot):
+            qualifying_official = (
+                snapshot.source_provider.upper() == "NSE"
+                and snapshot.reliability_level == ReliabilityLevel.LEVEL_A
+                and "PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES" in shareholding_input_coverage(snapshot)
+            )
+            official_xbrl = qualifying_official and (
+                snapshot.source_type == "NSE_SHAREHOLDING_XBRL"
+                or any((value.source_locator or "").startswith("nse-xbrl:") for value in snapshot.values)
+            )
+            # Choose an intact source snapshot; never relabel/merge another
+            # filing's values (including pledge) under the selected provenance.
+            return (snapshot.period_end, qualifying_official, official_xbrl,
+                    snapshot.published_at or datetime.min.replace(tzinfo=timezone.utc),
+                    snapshot.retrieved_at, snapshot.source_identity_key, str(snapshot.id))
+
         ordered = sorted(
             [snapshot for snapshot in self.shareholding_snapshots.values()
              if snapshot.instrument_id == instrument_id
              and snapshot.source_mode == SourceMode.REAL
              and _is_quarter_end(snapshot.period_end)],
-            key=lambda snapshot: (snapshot.period_end, snapshot.published_at or datetime.min.replace(tzinfo=timezone.utc), snapshot.retrieved_at), reverse=True,
+            key=selection_key, reverse=True,
         )
         latest_by_period: list[ShareholdingSnapshot] = []
         periods: set[datetime] = set()
@@ -877,6 +1061,13 @@ class ResearchRepository:
         metadata_only_nse_financial_result: bool = False,
     ) -> ResearchDocument:
         duplicate = self._deduplicator.add(document)
+        if duplicate and document_status != DocumentStatus.FAILED:
+            repaired = await self._run_blocking_persistence(self._persist_official_document_repair, document)
+            if repaired:
+                self._deduplicator.forget(duplicate.canonical_url, duplicate.content_hash, duplicate.document_id)
+                self._deduplicator.add(document)
+                self.remember_persisted_document(document)
+                return await self._continue_repaired_document_async(document)
         if duplicate:
             document.status = DocumentStatus.DUPLICATE
             document.duplicate_of_document_id = duplicate.document_id
@@ -936,6 +1127,12 @@ class ResearchRepository:
     ) -> ResearchDocument:
         """Apply a prepared document using the legacy synchronous semantics."""
         duplicate = self._deduplicator.add(document)
+        if duplicate and document_status != DocumentStatus.FAILED and self._persist_official_document_repair(document):
+            self._deduplicator.forget(duplicate.canonical_url, duplicate.content_hash, duplicate.document_id)
+            self._deduplicator.add(document)
+            self.remember_persisted_document(document)
+            self._reconcile_persisted_official_financial_document(document)
+            return self._continue_ingested_document_after_persistence(document, document_status=DocumentStatus.PROCESSED, financial_processed=True)
         if duplicate:
             document.status = DocumentStatus.DUPLICATE
             document.duplicate_of_document_id = duplicate.document_id
@@ -970,6 +1167,18 @@ class ResearchRepository:
         for event in (event_candidates if event_candidates is not None else self._extract_ingested_event_candidates(document, document_status=document_status)):
             self._apply_ingested_event(event, source_mode=document.source_mode)
         return self._continue_ingested_document_after_events(document)
+
+    def _persist_official_document_repair(self, document: ResearchDocument) -> bool:
+        repair = getattr(self._persistence, "repair_official_document", None)
+        return bool(callable(repair) and repair(document))
+
+    async def _continue_repaired_document_async(self, document: ResearchDocument) -> ResearchDocument:
+        await self._run_blocking_persistence(self._reconcile_persisted_official_financial_document, document)
+        candidates = await asyncio.to_thread(self._extract_ingested_event_candidates, document, document_status=DocumentStatus.PROCESSED)
+        self.platform_events.append(document_event("research.document.processed", document))
+        for event in candidates:
+            await self._apply_ingested_event_async(event, source_mode=document.source_mode)
+        return await self._continue_ingested_document_after_events_async(document)
 
     def _continue_ingested_document_after_events(self, document: ResearchDocument) -> ResearchDocument:
         if document.instrument_id:
@@ -1061,7 +1270,7 @@ class ResearchRepository:
             or not _is_nse_official_document_url(document.canonical_url)
         ):
             return document
-        has_quarterly_facts = any(
+        has_quarterly_facts = nse_financial_result or any(
             fact.key.period_type == "QUARTERLY"
             for fact in self._official_financial_fact_candidates(document)
         )
@@ -1082,28 +1291,45 @@ class ResearchRepository:
                                    discovery_provider: str | None, expected_profile: CompanyResearchProfile | None,
                                    document_status: DocumentStatus, allow_empty_content: bool,
                                    trusted_profile_identity: object | None,
-                                   document_subtype: DocumentSubtype | None = None) -> ResearchDocument:
+                                   document_subtype: DocumentSubtype | None = None,
+                                   precomputed_pdf_structure: PdfTextStructure | None = None) -> ResearchDocument:
         canonical = canonicalize_url(original_url)
         title, extracted = extract_text(body, content_type)
         normalized = normalize_text(extracted or "")
         # Transient structural sidecar only; the durable flattened-text contract is unchanged.
-        from app.pdf_structure import preserve_pdf_structure
-        pdf_structure = preserve_pdf_structure(body) if content_type == "application/pdf" else None
+        # When a caller already built this from the identical extracted text
+        # (e.g. FetchResult.pdf_structure, computed once in
+        # research_fetching.py from the very same string that becomes
+        # ``body`` here), reuse it BY IDENTITY instead of rebuilding the
+        # complete PdfTextStructure a second time -- preserve_pdf_structure is
+        # a pure function of that text, so this changes nothing about the
+        # result, only avoids recomputing it. Non-PDF content_type is
+        # unaffected either way: pdf_structure stays None regardless of what
+        # a caller passes.
+        if content_type == "application/pdf":
+            if precomputed_pdf_structure is not None:
+                pdf_structure = precomputed_pdf_structure
+            else:
+                from app.pdf_structure import preserve_pdf_structure
+                pdf_structure = preserve_pdf_structure(body)
+        else:
+            pdf_structure = None
         if source_mode == SourceMode.REAL and not allow_empty_content:
             if not normalized:
                 raise FetchError("CONTENT_EMPTY")
             if len(normalized) < 40:
                 raise FetchError("CONTENT_TOO_SHORT")
         parsed_published_at = published_at or extract_published_at(normalized)
-        resolution = self._resolver.resolve(title, normalized, canonical)
-        if expected_profile is not None and not allow_empty_content:
-            if trusted_profile_identity is _TRUSTED_NSE_PROFILE_IDENTITY:
-                resolution = resolution.model_copy(update={
-                    "instrument_id": expected_profile.instrument_id,
-                    "company_id": expected_profile.company_id,
-                    "confidence": 0.99,
-                })
-            else:
+        if expected_profile is not None and trusted_profile_identity is _TRUSTED_NSE_PROFILE_IDENTITY:
+            # The caller already verified exact NSE symbol/instrument/company
+            # ownership. A universe-wide text scan was discarded by this same
+            # binding anyway; avoid doing it for every official filing.
+            resolution = EntityResolution(instrument_id=expected_profile.instrument_id,
+                                          company_id=expected_profile.company_id,
+                                          confidence=0.99, matched_on=[])
+        else:
+            resolution = self._resolver.resolve(title, normalized, canonical)
+            if expected_profile is not None and not allow_empty_content:
                 self._validate_document_relevance(expected_profile, resolution.instrument_id, resolution.confidence)
         if expected_profile is not None and allow_empty_content:
             resolution = resolution.model_copy(update={
@@ -1144,8 +1370,12 @@ class ResearchRepository:
         """Persist only source-qualified, validated semantic NSE projections."""
         if not document.instrument_id:
             return False, 0
+        receipt = self._financial_document_parse_unchanged(document)
+        if receipt is not None:
+            return receipt == "PARSED", 0
         facts = self._official_financial_fact_candidates(document)
         if not facts:
+            self._record_financial_document_parse(document, "UNSUPPORTED")
             return False, 0
         existing = {fact.key: fact for fact in self._persistence.load_financial_facts({document.instrument_id})}
         written = 0
@@ -1160,6 +1390,7 @@ class ResearchRepository:
             revised = explicit_revision and newer_official_disclosure(prior, fact)
             if self._persistence.upsert_financial_fact(fact, allow_same_tier_correction=same_document_correction or revised):
                 written += 1
+        self._record_financial_document_parse(document, "PARSED", facts)
         return True, written
 
     def _reconcile_persisted_official_financial_document(self, document: ResearchDocument) -> tuple[bool, int]:
@@ -1168,24 +1399,78 @@ class ResearchRepository:
         Source-owned corrections and explicitly published newer revisions may
         replace comparable facts. Obsolete-key removal stays source-owned.
         """
+        receipt = self._financial_document_parse_unchanged(document)
+        if receipt is not None:
+            return receipt == "PARSED", 0
         from app.financial_projection import project_semantic_financial_facts
+        from app.structured_research import official_financial_sector_ratio_facts
         projection = project_semantic_financial_facts(document)
         facts = list(projection.facts)
+        # Mirror _official_financial_fact_candidates: persist financial-sector
+        # regulatory ratios (capital adequacy / gross NPA / net NPA) extracted
+        # from the same official document text so the reconcile path keeps the
+        # durable fact set consistent with the upsert path.
+        facts.extend(official_financial_sector_ratio_facts(document))
         if not facts:
+            self._record_financial_document_parse(document, "UNSUPPORTED")
             return False, 0
         existing = {fact.key: fact for fact in self._persistence.load_financial_facts({document.instrument_id})}
         owned = {key for key, fact in existing.items() if fact.source_identity == str(document.document_id)}
         if owned == {fact.key for fact in facts} and all(
             _same_persisted_financial_fact(existing[fact.key], fact) for fact in facts
         ):
+            self._record_financial_document_parse(document, "PARSED", facts)
             return True, 0
-        return True, self._persistence.reconcile_financial_facts_for_source(
+        written = self._persistence.reconcile_financial_facts_for_source(
             document.instrument_id,
             str(document.document_id),
             facts,
             complete_scopes=projection.scopes,
             **({"allow_official_revision": True} if self._is_explicit_financial_revision(document) else {}),
         )
+        self._record_financial_document_parse(document, "PARSED", facts)
+        return True, written
+
+    def _financial_document_parse_identity(self, document: ResearchDocument, keys=()) -> str:
+        expected = {tuple(key) for key in keys}
+        # Include projected keys owned by other sources too. If that source's
+        # comparable fact disappears, this document must be able to repair it.
+        owned = [fact for fact in self._persistence.load_financial_facts({document.instrument_id})
+                 if fact.source_identity == str(document.document_id)
+                 or (fact.key.metric, fact.key.period_end, fact.key.period_type, fact.key.reporting_basis) in expected]
+        payload = [document.model_dump(mode="json", exclude={"raw_text", "pdf_structure", "publisher", "language", "country", "exchange", "duplicate_of_document_id"}),
+                   sorted([[str(fact.key), int(fact.source_tier), fact.source_provider, fact.source_identity, str(fact.source_mode),
+                            fact.value.model_dump(mode="json")] for fact in owned], key=str)]
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        return f"urn:research:financial-parse:{FINANCIAL_PARSER_VERSION}:{digest}"
+
+    def _financial_document_parse_unchanged(self, document: ResearchDocument) -> str | None:
+        if not document.instrument_id or nse_authority_rejection(document) or not document.normalized_text:
+            return None
+        receipt = self._latest_acquisition_observation(document.instrument_id, f"FINANCIAL_PARSE:{document.document_id}", "NSE")
+        if receipt and receipt.get("outcome") in {"PARSED", "UNSUPPORTED"}:
+            locator = receipt.get("source_url") or ""
+            try:
+                keys = json.loads(parse_qs(urlparse(locator).query)["keys"][0])
+                if not isinstance(keys, list) or any(not isinstance(key, list) or len(key) != 4 for key in keys):
+                    return None
+                identity = self._financial_document_parse_identity(document, keys)
+            except (ValueError, KeyError, TypeError):
+                return None
+            if locator.partition("?")[0] == identity:
+                return receipt["outcome"]
+        return None
+
+    def _record_financial_document_parse(self, document: ResearchDocument, outcome: str, facts=()) -> None:
+        writer = getattr(self._persistence, "upsert_acquisition_observation", None)
+        if (not callable(writer) or nse_authority_rejection(document)
+                or not (document.normalized_text or "").strip()):
+            return
+        keys = sorted([[fact.key.metric, fact.key.period_end, fact.key.period_type, fact.key.reporting_basis] for fact in facts], key=str)
+        identity = self._financial_document_parse_identity(document, keys)
+        writer(document.instrument_id, f"FINANCIAL_PARSE:{document.document_id}", "NSE", outcome,
+               datetime.now(timezone.utc), identity + "?keys=" + quote(json.dumps(keys, separators=(",", ":"))),
+               "PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS" if outcome == "UNSUPPORTED" else None)
 
     def _is_explicit_financial_revision(self, document: ResearchDocument) -> bool:
         if (not document.instrument_id or document.source_mode != SourceMode.REAL
@@ -1210,8 +1495,14 @@ class ResearchRepository:
         # Legacy parsed_periods is deliberately not a trust/projection bypass.
         # Retain the keyword for callers performing rolling-window discovery.
         from app.financial_projection import project_semantic_financial_facts
+        from app.structured_research import official_financial_sector_ratio_facts
         _facts = list(project_semantic_financial_facts(document).facts)
-
+        # Surface official financial-sector regulatory ratios (capital adequacy,
+        # gross NPA, net NPA) so the StockRuleEngine financial-branch balance
+        # sheet scorer sees them as durable FinancialFact rows -- the ratio
+        # metrics are extracted from the same official document text the
+        # statement-table parser consumes, so they share its authority tier.
+        _facts.extend(official_financial_sector_ratio_facts(document))
         return _facts
 
     def _validate_document_relevance(
@@ -1512,6 +1803,12 @@ class ResearchRepository:
         budget = acquisition_budget(instrument_id)
         sources = registered_sources_for(instrument_id) if budget is None else ()
         profile = self.profile(instrument_id)
+        await self._run_blocking_persistence(self._sync_persisted_document_identities, instrument_id)
+        if budget is not None and await budget.sufficient():
+            budget.stopped = True
+            return
+        if requested_categories is None or "FINANCIAL_RESULTS" in requested_categories:
+            await self._reconcile_incomplete_persisted_official_financial_facts(profile)
         now = datetime.now(timezone.utc)
         gate = self._instrument_refresh_gate(
             profile, pre_resolved_categories, now, force=force, targeted_repair=targeted_repair,
@@ -1529,8 +1826,6 @@ class ResearchRepository:
             instrument_id,
             sorted(due_categories),
         )
-        if requested_categories is None or "FINANCIAL_RESULTS" in requested_categories:
-            await self._reconcile_incomplete_persisted_official_financial_facts(profile)
         authority_upgrade = (
             (requested_categories is None or "FINANCIAL_RESULTS" in requested_categories)
             and await self._run_blocking_persistence(self.financial_authority_upgrade_due, profile, now)
@@ -1735,6 +2030,63 @@ class ResearchRepository:
         if not missing and not shareholding_backfill_needed and not shareholding_category_enrichment_needed and not authority_upgrade:
             logger.info("official_discovery_gate globalInstrumentId=%s eligible=false reason=NO_MISSING_CATEGORIES", profile.instrument_id)
             return
+        # The dedicated ownership feed must get its bounded opportunity before
+        # generic announcement PDFs can exhaust the shared capability budget.
+        if (
+            "SHAREHOLDING_PATTERN" in due_categories
+            or shareholding_backfill_needed
+            or shareholding_category_enrichment_needed
+        ) and _eligible_for_nse_shareholding_reconciliation(profile):
+            shareholding_failure = None
+            try:
+                # NSE publishes quarterly Regulation 31 data through its
+                # dedicated shareholding feed, not necessarily as a corporate
+                # announcement attachment.  The provider returns only real,
+                # source-labelled values and durable persistence is keyed by
+                # this global instrument and the official filing identity.
+                persisted = 0
+                discovered_snapshots = await self._official_shareholding_discovery.discover(profile)
+                snapshots_to_process = [
+                    snapshot for snapshot in discovered_snapshots
+                    if self._shareholding_snapshot_needs_processing(snapshot)
+                ]
+                if not snapshots_to_process:
+                    logger.info(
+                        "research_refresh_gate globalInstrumentId=%s category=SHAREHOLDING_PATTERN outcome=LIGHTWEIGHT_CHECK_UNCHANGED latestSourceIdentity=%s",
+                        profile.instrument_id,
+                        discovered_snapshots[0].source_identity_key if discovered_snapshots else "NONE",
+                    )
+                for snapshot in snapshots_to_process:
+                    if budget is not None and not await budget.allow_document():
+                        if not self._category_has_qualifying_evidence(profile.instrument_id, "SHAREHOLDING_PATTERN"):
+                            raise FetchError("DOCUMENT_BUDGET_EXHAUSTED:NSE_SHAREHOLDING")
+                        break
+                    enriched_snapshot = await self._enrich_nse_shareholding_snapshot(snapshot)
+                    persisted += int(await self._persist_shareholding_snapshot_async(enriched_snapshot))
+                shareholding_check_succeeded = True
+                successful_check_categories.add("SHAREHOLDING_PATTERN")
+                if shareholding_backfill_needed or shareholding_category_enrichment_needed:
+                    logger.info(
+                        "shareholding_reconciliation provider=NSE globalInstrumentId=%s outcome=COMPLETE persistedCount=%s validQuarterCountBefore=%s validQuarterCountAfter=%s reason=%s",
+                        profile.instrument_id,
+                        persisted,
+                        valid_shareholding_periods,
+                        len(self.shareholding_for(profile.instrument_id, limit=4)),
+                        "FRESH_BUT_INCOMPLETE" if shareholding_backfill_needed else "LEGACY_XBRL_PROVENANCE_MISSING",
+                    )
+            except SearchProviderError as exc:
+                shareholding_failure = str(exc)
+            except (FetchError, ValueError) as exc:
+                shareholding_failure = f"NSE_SHAREHOLDING_UNAVAILABLE:{exc}"
+            if shareholding_failure:
+                self.last_live_error[profile.instrument_id] = shareholding_failure
+                if budget is not None:
+                    budget.requirement_failures["SHAREHOLDING"] = shareholding_failure
+                if callable(getattr(self._persistence, "upsert_acquisition_observation", None)):
+                    await self.record_acquisition_observation(
+                        profile.instrument_id, "SHAREHOLDING", "NSE", "FAILED",
+                        datetime.now(timezone.utc), failure_reason=shareholding_failure,
+                    )
         seen_urls = self.document_urls_for(profile.instrument_id, source_mode=SourceMode.REAL)
         # Resolve authoritative filings before broad research searches can
         # exhaust public-search engines. This is global-instrument research.
@@ -1789,6 +2141,21 @@ class ResearchRepository:
                 official_count = sum(fact.source_tier == FactSourceTier.OFFICIAL_NSE
                                      and fact.source_mode == SourceMode.REAL for fact in facts)
                 failed = discovery_failed or not fetched
+                # Downloaded result text with zero supported facts is an
+                # unresolved parser capability, not an authoritative empty
+                # result. Reuse persisted text; do not download/parse it again.
+                filing_urls = {item.source.url for item in official_filings
+                               if item.category == "FINANCIAL_RESULTS"}
+                unparsed_results = not official_count and any(
+                    document.canonical_url in filing_urls and _is_usable_durable_document(document)
+                    for document in self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)
+                )
+                if unparsed_results and not failed:
+                    failed = True
+                    self.last_live_error[profile.instrument_id] = "PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS"
+                    successful_check_categories.discard("FINANCIAL_RESULTS")
+                    if budget is not None:
+                        budget.failures.append("PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS")
                 await self.record_acquisition_observation(
                     profile.instrument_id, "QUARTERLY_FINANCIALS", "NSE",
                     "FAILED" if failed else "SUCCESS" if official_filings and official_count else "SUCCESS_EMPTY",
@@ -1818,53 +2185,31 @@ class ResearchRepository:
                             and governance_disclosure((document.title or "") + " " + document.normalized_text)
                             for document in self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL))
                     failed = discovery_failed or not fetched
+                    # STEP-8A: a shared group budget (financial + governance +
+                    # shareholding/catalyst -- see acquisition_budget()) that
+                    # was already exhausted by the time we get here means the
+                    # discovery/fetch pass did not necessarily examine every
+                    # candidate in scope. Zero found governance evidence under
+                    # that condition is genuinely PARTIAL coverage, not a
+                    # verified-clean check -- it must never be recorded as
+                    # SUCCESS_EMPTY (which downstream readiness treats as an
+                    # authoritative "nothing found" signal). Found evidence
+                    # (count>0) is unaffected: it is real regardless of
+                    # whether the budget later ran out. This does not change
+                    # the budget's own size/consumption, only which outcome
+                    # label a zero-result governance check is given.
+                    partial_budget_exhausted = (
+                        requirement_id == "GOVERNANCE_HISTORY" and not failed and not count
+                        and budget is not None and (
+                            budget.documents_attempted >= budget.max_documents
+                            or "DOCUMENT_BUDGET_EXHAUSTED" in budget.failures
+                        )
+                    )
                     await self.record_acquisition_observation(profile.instrument_id, requirement_id, "NSE",
-                        "FAILED" if failed else "SUCCESS" if count else "SUCCESS_EMPTY",
+                        "FAILED" if (failed or partial_budget_exhausted) else "SUCCESS" if count else "SUCCESS_EMPTY",
                         datetime.now(timezone.utc), evidence_count=count,
-                        failure_reason=self.last_live_error.get(profile.instrument_id) if failed else None)
-        if (
-            "SHAREHOLDING_PATTERN" in due_categories
-            or shareholding_backfill_needed
-            or shareholding_category_enrichment_needed
-        ) and _eligible_for_nse_shareholding_reconciliation(profile):
-            try:
-                # NSE publishes quarterly Regulation 31 data through its
-                # dedicated shareholding feed, not necessarily as a corporate
-                # announcement attachment.  The provider returns only real,
-                # source-labelled values and durable persistence is keyed by
-                # this global instrument and the official filing identity.
-                persisted = 0
-                discovered_snapshots = await self._official_shareholding_discovery.discover(profile)
-                shareholding_check_succeeded = True
-                successful_check_categories.add("SHAREHOLDING_PATTERN")
-                snapshots_to_process = [
-                    snapshot for snapshot in discovered_snapshots
-                    if self._shareholding_snapshot_needs_processing(snapshot)
-                ]
-                if not snapshots_to_process:
-                    logger.info(
-                        "research_refresh_gate globalInstrumentId=%s category=SHAREHOLDING_PATTERN outcome=LIGHTWEIGHT_CHECK_UNCHANGED latestSourceIdentity=%s",
-                        profile.instrument_id,
-                        discovered_snapshots[0].source_identity_key if discovered_snapshots else "NONE",
-                    )
-                for snapshot in snapshots_to_process:
-                    if budget is not None and not await budget.allow_document():
-                        break
-                    enriched_snapshot = await self._enrich_nse_shareholding_snapshot(snapshot)
-                    persisted += int(await self._persist_shareholding_snapshot_async(enriched_snapshot))
-                if shareholding_backfill_needed or shareholding_category_enrichment_needed:
-                    logger.info(
-                        "shareholding_reconciliation provider=NSE globalInstrumentId=%s outcome=COMPLETE persistedCount=%s validQuarterCountBefore=%s validQuarterCountAfter=%s reason=%s",
-                        profile.instrument_id,
-                        persisted,
-                        valid_shareholding_periods,
-                        len(self.shareholding_for(profile.instrument_id, limit=4)),
-                        "FRESH_BUT_INCOMPLETE" if shareholding_backfill_needed else "LEGACY_XBRL_PROVENANCE_MISSING",
-                    )
-            except SearchProviderError as exc:
-                self.last_live_error[profile.instrument_id] = str(exc)
-            except (FetchError, ValueError) as exc:
-                self.last_live_error[profile.instrument_id] = f"NSE_SHAREHOLDING_UNAVAILABLE:{type(exc).__name__}"
+                        failure_reason=(self.last_live_error.get(profile.instrument_id) if failed
+                            else "DOCUMENT_BUDGET_EXHAUSTED_PARTIAL_COVERAGE" if partial_budget_exhausted else None))
         # An authoritative NSE acquisition failure recorded above (official
         # filing discovery or the NSE shareholding feed) must survive every
         # non-authoritative acquisition attempt that follows in this same
@@ -1885,6 +2230,25 @@ class ResearchRepository:
                 # Financial and ownership requirements use their authoritative
                 # routes above. Generic search must not substitute presentations.
                 due_categories.difference_update({"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN"})
+            elif shareholding_check_succeeded:
+                # No targeted-repair budget on this call path (e.g. the plain
+                # /ensure route calls refresh_targeted_categories directly,
+                # never through deep_investigation.investigate() -- so
+                # acquisition_budget() is None here even though the dedicated
+                # NSE shareholding feed above WAS actually queried this
+                # refresh). shareholding_check_succeeded is True whenever
+                # that feed call completed without raising -- ZERO_RESULTS
+                # and LIGHTWEIGHT_CHECK_UNCHANGED both still mean "NSE was
+                # checked", not "never attempted". NSE is authoritative for
+                # SHAREHOLDING_PATTERN: once its authoritative state has
+                # genuinely been checked this refresh and found
+                # unchanged/empty, a generic web search must not run merely
+                # to try to manufacture shareholding evidence. A genuine NSE
+                # outage (shareholding_failure set, leaving
+                # shareholding_check_succeeded False) is NOT covered by this
+                # branch, so it still falls through to whatever fallback
+                # behavior already applies to a real authoritative failure.
+                due_categories.discard("SHAREHOLDING_PATTERN")
             discovery_categories = _search_discovery_categories(due_categories)
             discovered = (
                 _profile_source_discovery(profile, discovery_categories, seen_urls)
@@ -1981,7 +2345,21 @@ class ResearchRepository:
         if not documents:
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=SKIPPED reason=NO_QUALIFYING_PERSISTED_DOCUMENT", profile.instrument_id)
             return []
+        checked_identity = await self._run_blocking_persistence(self._financial_reconciliation_identity, profile)
+        # A parsed partial/unsupported result is still incomplete evidence, but
+        # repeating the same parser cannot fill it. Changed facts, inputs or
+        # parser version invalidate the per-document receipt independently.
+        documents = await self._run_blocking_persistence(
+            lambda: [document for document in documents if self._financial_document_parse_unchanged(document) is None])
+        if not documents:
+            await self._run_blocking_persistence(self._record_financial_reconciliation, profile, checked_identity)
+            return []
         def incomplete_window_documents():
+            from app.structured_research import official_financial_sector_ratio_facts
+            ratio_facts_by_document = {
+                document.document_id: official_financial_sector_ratio_facts(document)
+                for document in documents
+            }
             # Source freshness and derived-fact completeness are deliberately
             # independent.  Parse only the durable, trusted documents already
             # held for this instrument, then use their explicit periods to
@@ -2007,7 +2385,8 @@ class ResearchRepository:
                 for document in documents
             ]
             parsed_by_document = [
-                item for item in parsed_by_document if item[1] or item[2] or item[3]
+                item for item in parsed_by_document
+                if item[1] or item[2] or item[3] or ratio_facts_by_document[item[0].document_id]
             ]
             if not parsed_by_document:
                 return None
@@ -2024,6 +2403,7 @@ class ResearchRepository:
             # (Step 6: cash flow is only ever expected where the existing
             # parser's own ANNUAL-only semantics already say it applies).
             expected_statement_metrics_by_key: dict[tuple[str, str | None, str], set[str]] = {}
+            statement_periods: set[tuple[str, str | None, str]] = set()
 
             for document, income_periods, balance_periods, cash_periods in parsed_by_document:
                 document_periods: set[tuple[str, str | None, str]] = set()
@@ -2064,6 +2444,12 @@ class ResearchRepository:
                         available_periods.setdefault(("ANNUAL", period.reporting_basis), set()).add(period.period_end)
                         document_periods.add(key)
                         expected_statement_metrics_by_key.setdefault(key, set()).add(_CASH_FLOW_EXTRACTION_PENDING_SENTINEL)
+                statement_periods.update(document_periods)
+                for fact in ratio_facts_by_document[document.document_id]:
+                    key = (fact.key.period_type, fact.key.reporting_basis, fact.key.period_end)
+                    available_periods.setdefault(key[:2], set()).add(key[2])
+                    document_periods.add(key)
+                    expected_statement_metrics_by_key.setdefault(key, set()).add(fact.key.metric)
                 if document_periods:
                     periods_by_document[document.document_id] = document_periods
 
@@ -2095,7 +2481,9 @@ class ResearchRepository:
                 if period_type == "AS_AT":
                     expected = expected_statement_metrics_by_key.get(key, set())
                     return not expected or not (expected <= present)
-                required = {"revenue", "pat"} | expected_statement_metrics_by_key.get(key, set())
+                required = expected_statement_metrics_by_key.get(key, set())
+                if key in statement_periods:
+                    required = {"revenue", "pat"} | required
                 return not (required <= present)
 
             incomplete = {key for key in target_periods if _is_incomplete(key)}
@@ -2104,7 +2492,7 @@ class ResearchRepository:
             for document, income, balance, cash in parsed_by_document:
                 from app.financial_projection import project_semantic_financial_facts
                 projection = project_semantic_financial_facts(document)
-                candidates = projection.facts
+                candidates = (*projection.facts, *ratio_facts_by_document[document.document_id])
                 explicit_revision = self._is_explicit_financial_revision(document)
                 candidate_keys = {candidate.key for candidate in candidates}
                 rolling_dates = {key[2] for key in target_periods & periods_by_document.get(document.document_id, set())}
@@ -2134,10 +2522,16 @@ class ResearchRepository:
 
         window = await self._run_blocking_persistence(incomplete_window_documents)
         if window is None:
+            for document in documents:
+                await self._run_blocking_persistence(self._reconcile_persisted_official_financial_document, document)
+            await self._run_blocking_persistence(self._record_financial_reconciliation, profile, checked_identity)
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=SKIPPED reason=NO_PARSEABLE_QUARTERLY_RESULT", profile.instrument_id)
             return []
         selected, target_periods, incomplete = window
         if not selected:
+            for document in documents:
+                await self._run_blocking_persistence(self._reconcile_persisted_official_financial_document, document)
+            await self._run_blocking_persistence(self._record_financial_reconciliation, profile, checked_identity)
             logger.info(
                 "official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=SKIPPED reason=ROLLING_WINDOW_COMPLETE targetPeriodCount=%s",
                 profile.instrument_id,
@@ -2157,12 +2551,56 @@ class ResearchRepository:
         self,
         profile: CompanyResearchProfile,
     ) -> bool:
+        if await self._run_blocking_persistence(self._financial_reconciliation_unchanged, profile):
+            return False
         documents = await self._incomplete_persisted_official_financial_documents(profile)
         for document in documents:
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=START documentId=%s", profile.instrument_id, document.document_id)
             parsed, written = await self._run_blocking_persistence(self._reconcile_persisted_official_financial_document, document)
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s outcome=COMPLETE documentId=%s parserResult=%s factsWritten=%s", profile.instrument_id, document.document_id, "PARSED" if parsed else "NO_RESULT", written)
+        if documents:
+            # Certify only a complete, unchanged post-repair fact set. A failed
+            # or partial parse remains eligible for reconciliation/acquisition.
+            await self._incomplete_persisted_official_financial_documents(profile)
         return bool(documents)
+
+    def _financial_reconciliation_identity(self, profile: CompanyResearchProfile) -> str | None:
+        documents = self.documents_for(profile.instrument_id, source_mode=SourceMode.REAL)
+        if not documents:
+            return None
+        # This receipt certifies an unchanged local reconciliation, NOT evidence
+        # freshness or completeness. Include text, provenance and every fact so
+        # missing/corrected/contradictory inputs invalidate it. Bump v1 whenever
+        # the financial parser/projection contract changes.
+        payload = {
+            "profile": profile.model_dump(mode="json"),
+            "documents": [[document.model_dump(mode="json", exclude={"raw_text", "pdf_structure", "publisher", "language", "country", "exchange"}),
+                           content_hash(document.normalized_text or "")]
+                          for document in sorted(documents, key=lambda item: str(item.document_id))],
+            "facts": sorted([
+                [str(fact.key.instrument_id), fact.key.metric, fact.key.period_end,
+                 fact.key.period_type, fact.key.reporting_basis, int(fact.source_tier),
+                 fact.source_provider, fact.source_identity, str(fact.source_mode),
+                 fact.value.model_dump(mode="json")]
+                for fact in self._persistence.load_financial_facts({profile.instrument_id})
+            ], key=lambda item: json.dumps(item, sort_keys=True)),
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        return f"urn:research:financial-reconciliation:{FINANCIAL_PARSER_VERSION}:{digest}"
+
+    def _financial_reconciliation_unchanged(self, profile: CompanyResearchProfile) -> bool:
+        observation = self._latest_acquisition_observation(profile.instrument_id, "FINANCIAL_RECONCILIATION", "NSE")
+        return bool(observation and observation.get("outcome") == "CHECKED"
+                    and observation.get("source_url") == self._financial_reconciliation_identity(profile))
+
+    def _record_financial_reconciliation(self, profile: CompanyResearchProfile, checked_identity: str | None) -> None:
+        writer = getattr(self._persistence, "upsert_acquisition_observation", None)
+        if not callable(writer):
+            return
+        identity = self._financial_reconciliation_identity(profile)
+        if identity is not None and identity == checked_identity:
+            writer(profile.instrument_id, "FINANCIAL_RECONCILIATION", "NSE", "CHECKED",
+                   datetime.now(timezone.utc), identity)
 
     def _shareholding_snapshot_needs_processing(self, snapshot: ShareholdingSnapshot) -> bool:
         existing = next(
@@ -2200,10 +2638,16 @@ class ResearchRepository:
                 _safe_url_path(snapshot.source_url),
                 str(exc)[:160],
             )
+            from app.research_applicability import shareholding_input_coverage
+            if "PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES" not in shareholding_input_coverage(snapshot):
+                raise FetchError(f"NSE_SHAREHOLDING_XBRL_FAILED:{exc}") from exc
             return snapshot
         values = await asyncio.to_thread(parse_nse_shareholding_xbrl, result.text)
         if not values:
             logger.info("shareholding_xbrl_parse globalInstrumentId=%s outcome=REJECTED reason=NO_SUPPORTED_EXPLICIT_VALUES", snapshot.instrument_id)
+            from app.research_applicability import shareholding_input_coverage
+            if "PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES" not in shareholding_input_coverage(snapshot):
+                raise FetchError("PARSER_FAILED:NSE_SHAREHOLDING_XBRL_NO_SUPPORTED_VALUES")
             return snapshot
         logger.info("shareholding_xbrl_parse globalInstrumentId=%s outcome=SUCCESS valueCount=%s", snapshot.instrument_id, len(values))
         return snapshot.model_copy(update={"values": values})
@@ -2214,175 +2658,284 @@ class ResearchRepository:
         filings: list[DiscoveryResult],
         seen_urls: set[str],
     ) -> bool:
-        """Fetch a small, newest-first official filing set within an interactive budget."""
+        """Fetch a small, newest-first official filing set within an interactive
+        budget, overlapping up to ``research_official_document_fetch_concurrency``
+        independent network fetches for THIS instrument only.
+
+        Concurrency design (bounded official-filing fetch concurrency):
+          - A fixed pool of ``concurrency`` worker coroutines pulls filings, in
+            the same newest-first ``_fair_official_filing_order``, from a
+            single shared cursor (``_OfficialFilingBatchState.cursor``).
+          - ALL decision-making that reads or mutates shared accounting --
+            budget checks/increments, reuse lookup + reconciliation,
+            content-type skip, the per-refresh attempt-budget check, the
+            per-host transport-failure check, and recording a completed
+            fetch's outcome back into shared state -- happens while holding
+            ``dispatch_lock`` (an ``asyncio.Lock``), so it is exactly as
+            serialized -- and therefore exactly as race-safe -- as the
+            original one-filing-at-a-time loop it replaces. Nothing here
+            runs on a separate OS thread; asyncio's single event loop only
+            switches coroutines at an ``await``, so every block between two
+            ``await`` points inside the lock still runs to completion
+            without interleaving.
+          - ONLY the actual network fetch + PDF extraction
+            (``_single_flight_official_filing``, which already owns its own
+            per-URL single-flight de-duplication) runs OUTSIDE the lock,
+            which is what lets up to ``concurrency`` of them overlap.
+          - Because the shared cursor is only ever advanced under the lock,
+            no filing is ever handed to two workers, and dispatch order
+            (newest-first, core-category-first) is identical to the serial
+            loop; only completion order can now vary.
+          - With ``concurrency == 1`` there is exactly one worker, so this
+            degenerates to the original fully-serial behavior.
+        """
         from app.deep_investigation import acquisition_budget
         budget = acquisition_budget(profile.instrument_id)
-        attempted = 0
-        completed_without_failure = True
-        host_transport_failures: dict[str, int] = {}
         scheduled_filings = _fair_official_filing_order(filings)
+        await self._run_blocking_persistence(self._sync_persisted_document_identities, profile.instrument_id)
+        concurrency = max(1, self.settings.research_official_document_fetch_concurrency)
 
-        for filing_index, result in enumerate(scheduled_filings):
-            source = result.source
+        dispatch_lock = asyncio.Lock()
+        state = _OfficialFilingBatchState()
+        batch_started = time.monotonic()
+        logger.info(
+            "official_filing_fetch_batch_start provider=NSE globalInstrumentId=%s filingCount=%s concurrency=%s",
+            profile.instrument_id, len(scheduled_filings), concurrency,
+        )
 
-            if budget is not None:
-                if budget.stopped or await budget.sufficient():
-                    budget.stopped = True
-                    break
-                if not budget.accepts_date(source.official_published_at):
-                    continue
-            host = (urlparse(source.url).hostname or "").lower()
-            # Check reuse and content-type support BEFORE consuming a budget
-            # document slot. Both paths require no network fetch and must never
-            # exhaust the per-candidate document budget (DI-20H Fix 2: reusable
-            # documents and unsupported archives were consuming allow_document()
-            # slots, starving genuinely-needed fetches).
-            reusable = self._reusable_official_document(profile.instrument_id, source.url)
-            if reusable is not None:
-                if source.document_subtype and reusable.document_subtype is None:
-                    reusable.document_subtype = source.document_subtype
-                    await self._run_blocking_persistence(
-                        self._persist_ingested_document,
-                        reusable,
-                        nse_financial_result="FINANCIAL_RESULTS" in source.categories,
-                    )
-                seen_urls.add(reusable.canonical_url)
-                # Isolate a reconciliation failure so a single problematic
-                # reusable document cannot crash the entire official-filing
-                # fetch loop and prevent subsequent valid filings from being
-                # processed (DI-20H Fix 3).
-                try:
-                    await self._run_blocking_persistence(self._reconcile_reused_official_financial_facts, profile, source, reusable)
-                except Exception as exc:
-                    logger.warning(
-                        "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SKIPPED reason=RECONCILE_FAILED documentId=%s error=%s",
-                        profile.instrument_id, host, _safe_url_path(source.url),
-                        reusable.document_id, type(exc).__name__,
-                    )
-                    if budget is not None:
-                        budget.failures.append("RECONCILE_FAILED")
-                    continue
-                logger.info(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=REUSED reason=ALREADY_PERSISTED documentId=%s",
-                    profile.instrument_id,
-                    host,
-                    _safe_url_path(source.url),
-                    reusable.document_id,
-                )
-                continue
-            if _official_filing_content_type_unsupported(source.url):
-                # An unsupported archive/office attachment can never be parsed by
-                # the official-document fetch path (HttpResearchFetcher.process_network_response
-                # rejects it with FetchError "Unsupported content type", research_fetching.py:304).
-                # Skipping it here -- before `attempted += 1` and before any network
-                # fetch -- keeps a provably-unusable file from exhausting the
-                # per-refresh attempt budget (DI-11C Fix 1). Extensionless/ambiguous
-                # URLs are never skipped here.
-                logger.info(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SKIPPED reason=UNSUPPORTED_CONTENT_TYPE",
-                    profile.instrument_id,
-                    host,
-                    _safe_url_path(source.url),
-                )
-                continue
-            if budget is not None:
-                if not await budget.allow_document():
-                    break
-            if attempted >= self.settings.research_official_document_max_attempts_per_refresh:
-                logger.info(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s outcome=SKIPPED reason=ATTEMPT_BUDGET",
-                    profile.instrument_id,
-                )
-                # Continue so a later durable reusable filing can still be
-                # recorded without consuming network budget.
-                continue
-            if host_transport_failures.get(host, 0) >= self.settings.research_official_document_max_transport_failures_per_host:
-                logger.info(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s outcome=SKIPPED reason=HOST_TRANSPORT_FAILURE_BUDGET",
-                    profile.instrument_id,
-                    host,
-                )
-                remaining_hosts = {
-                    (urlparse(item.source.url).hostname or "").lower()
-                    for item in scheduled_filings[filing_index:]
-                }
-                if remaining_hosts == {host}:
+        async def _next_dispatch() -> RegisteredResearchSource | None:
+            """Advance the shared cursor and run every pre-fetch decision that
+            must stay serialized. Must be called only while holding
+            ``dispatch_lock``. Returns the source to fetch next, or None when
+            this worker should stop entirely (exhausted / budget-stopped /
+            host-failure-halted)."""
+            while True:
+                if state.stop or state.cursor >= len(scheduled_filings):
+                    return None
+                filing_index = state.cursor
+                result = scheduled_filings[filing_index]
+                state.cursor += 1
+                source = result.source
+
+                if budget is not None:
+                    if budget.stopped or await budget.sufficient():
+                        budget.stopped = True
+                        state.stop = True
+                        return None
+                    if not budget.accepts_date(source.official_published_at):
+                        continue
+                host = (urlparse(source.url).hostname or "").lower()
+                # Check reuse and content-type support BEFORE consuming a budget
+                # document slot. Both paths require no network fetch and must
+                # never exhaust the per-candidate document budget (DI-20H Fix 2:
+                # reusable documents and unsupported archives were consuming
+                # allow_document() slots, starving genuinely-needed fetches).
+                reusable = self._reusable_official_document(profile.instrument_id, source.url, source=source)
+                if reusable is not None:
+                    if source.document_subtype and reusable.document_subtype is None:
+                        reusable.document_subtype = source.document_subtype
+                        await self._run_blocking_persistence(
+                            self._persist_ingested_document,
+                            reusable,
+                            nse_financial_result="FINANCIAL_RESULTS" in source.categories,
+                        )
+                    seen_urls.add(reusable.canonical_url)
+                    # Isolate a reconciliation failure so a single problematic
+                    # reusable document cannot crash the entire official-filing
+                    # fetch loop and prevent subsequent valid filings from being
+                    # processed (DI-20H Fix 3).
+                    try:
+                        await self._run_blocking_persistence(self._reconcile_reused_official_financial_facts, profile, source, reusable)
+                    except Exception as exc:
+                        state.completed_without_failure = False
+                        logger.warning(
+                            "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SKIPPED reason=RECONCILE_FAILED documentId=%s error=%s",
+                            profile.instrument_id, host, _safe_url_path(source.url),
+                            reusable.document_id, type(exc).__name__,
+                        )
+                        if budget is not None:
+                            budget.failures.append("RECONCILE_FAILED")
+                        continue
                     logger.info(
-                        "official_document_fetch provider=NSE globalInstrumentId=%s host=%s outcome=STOPPED reason=HOST_TRANSPORT_FAILURE_BUDGET",
+                        "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=REUSED reason=ALREADY_PERSISTED documentId=%s",
                         profile.instrument_id,
                         host,
+                        _safe_url_path(source.url),
+                        reusable.document_id,
                     )
-                    break
-                continue
-            attempted += 1
-            started = time.monotonic()
-            try:
-                document, joined_in_flight = await self._single_flight_official_filing(profile, source)
-
-                if document.status != DocumentStatus.DUPLICATE:
-                    seen_urls.add(document.canonical_url)
-                if document.status != DocumentStatus.DUPLICATE and not _is_usable_durable_document(document):
-                    # A completed transport attempt is not a successful
-                    # no-change check when extraction/persistence left only a
-                    # terminal non-usable document. Keep it retryable.
-                    completed_without_failure = False
-                if joined_in_flight:
+                    continue
+                if _official_filing_content_type_unsupported(source.url):
+                    # An unsupported archive/office attachment can never be parsed
+                    # by the official-document fetch path
+                    # (HttpResearchFetcher.process_network_response rejects it
+                    # with FetchError "Unsupported content type",
+                    # research_fetching.py:304). Skipping it here -- before
+                    # `state.attempted += 1` and before any network fetch -- keeps
+                    # a provably-unusable file from exhausting the per-refresh
+                    # attempt budget (DI-11C Fix 1). Extensionless/ambiguous URLs
+                    # are never skipped here.
                     logger.info(
-                        "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=REUSED reason=IN_FLIGHT_SINGLE_FLIGHT documentId=%s",
-                        profile.instrument_id, host, _safe_url_path(source.url), document.document_id,
+                        "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SKIPPED reason=UNSUPPORTED_CONTENT_TYPE",
+                        profile.instrument_id,
+                        host,
+                        _safe_url_path(source.url),
                     )
-                logger.info(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SUCCESS reason=NONE elapsedMs=%s httpStatus=%s",
-                    profile.instrument_id,
-                    host,
-                    _safe_url_path(source.url),
-                    _elapsed_ms(started),
-                    200,
+                    continue
+                if state.attempted >= self.settings.research_official_document_max_attempts_per_refresh:
+                    logger.info(
+                        "official_document_fetch provider=NSE globalInstrumentId=%s outcome=SKIPPED reason=ATTEMPT_BUDGET",
+                        profile.instrument_id,
+                    )
+                    # Continue so a later durable reusable filing can still be
+                    # recorded without consuming network budget.
+                    if budget is not None and "DOCUMENT_BUDGET_EXHAUSTED" not in budget.failures:
+                        budget.failures.append("DOCUMENT_BUDGET_EXHAUSTED")
+                    continue
+                host_cooldown_until = self._official_host_cooldowns.get((profile.instrument_id, host))
+                cross_batch_cooldown_active = (
+                    host_cooldown_until is not None and time.monotonic() < host_cooldown_until
                 )
-                logger.info(
-                    "official_document_persist provider=NSE globalInstrumentId=%s documentType=%s outcome=%s",
-                    profile.instrument_id,
-                    document.document_type,
-                    document.status,
-                )
-            except TimeoutError:
-                completed_without_failure = False
+                if (
+                    state.host_transport_failures.get(host, 0) >= self.settings.research_official_document_max_transport_failures_per_host
+                    or cross_batch_cooldown_active
+                ):
+                    # Guardian Review (Issue 3): state.host_transport_failures
+                    # alone only remembers failures within THIS batch call.
+                    # cross_batch_cooldown_active is what makes the budget
+                    # survive across the separate _fetch_official_filings()
+                    # calls one readiness cycle makes for the same instrument
+                    # (e.g. one per capability group) -- without it, a host
+                    # that just failed out in the previous group's batch was
+                    # retried again immediately here with a fresh counter.
+                    logger.info(
+                        "official_document_fetch provider=NSE globalInstrumentId=%s host=%s outcome=SKIPPED reason=HOST_TRANSPORT_FAILURE_BUDGET crossBatchCooldown=%s",
+                        profile.instrument_id,
+                        host,
+                        cross_batch_cooldown_active,
+                    )
+                    remaining_hosts = {
+                        (urlparse(item.source.url).hostname or "").lower()
+                        for item in scheduled_filings[filing_index:]
+                    }
+                    if remaining_hosts == {host}:
+                        logger.info(
+                            "official_document_fetch provider=NSE globalInstrumentId=%s host=%s outcome=STOPPED reason=HOST_TRANSPORT_FAILURE_BUDGET",
+                            profile.instrument_id,
+                            host,
+                        )
+                        state.stop = True
+                        return None
+                    continue
+                # Only an actual dispatch consumes the shared document budget;
+                # local attempt/host-limit skips must not starve other feeds.
                 if budget is not None:
-                    budget.failures.append("NETWORK_TIMEOUT")
-                exc = TransportFetchError("NETWORK_TIMEOUT")
-                host_transport_failures[host] = host_transport_failures.get(host, 0) + 1
-                self.last_live_error[profile.instrument_id] = "OFFICIAL_FILING_FETCH_FAILED:NETWORK_TIMEOUT"
-                logger.warning(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
-                    profile.instrument_id, host, _safe_url_path(source.url), exc, _elapsed_ms(started), "NONE",
-                )
-            except TransportFetchError as exc:
-                completed_without_failure = False
-                if budget is not None:
-                    budget.failures.append(_fetch_rejection_reason(exc))
-                host_transport_failures[host] = host_transport_failures.get(host, 0) + 1
-                self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{type(exc).__name__}"
-                logger.warning(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
-                    profile.instrument_id, host, _safe_url_path(source.url), str(exc), _elapsed_ms(started), "NONE",
-                )
-            except (FetchError, RestrictedFetchError, ValueError) as exc:
-                completed_without_failure = False
-                if budget is not None:
-                    budget.failures.append(_fetch_rejection_reason(exc) if isinstance(exc, FetchError) else "PARSER_FAILED")
-                if _is_transport_fetch_failure(exc):
-                    host_transport_failures[host] = host_transport_failures.get(host, 0) + 1
-                self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{type(exc).__name__}"
-                logger.warning(
-                    "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
-                    profile.instrument_id,
-                    host,
-                    _safe_url_path(source.url),
-                    str(exc),
-                    _elapsed_ms(started),
-                    getattr(exc, "status_code", "NONE"),
-                )
-        return completed_without_failure
+                    if not await budget.allow_document():
+                        state.stop = True
+                        return None
+                state.attempted += 1
+                return source
+
+        async def _worker() -> None:
+            while True:
+                async with dispatch_lock:
+                    source = await _next_dispatch()
+                if source is None:
+                    return
+                host = (urlparse(source.url).hostname or "").lower()
+                started = time.monotonic()
+                try:
+                    document, joined_in_flight = await self._single_flight_official_filing(profile, source)
+                    async with dispatch_lock:
+                        if document.status != DocumentStatus.DUPLICATE:
+                            seen_urls.add(document.canonical_url)
+                        if document.status != DocumentStatus.DUPLICATE and not _is_usable_durable_document(document):
+                            # A completed transport attempt is not a successful
+                            # no-change check when extraction/persistence left
+                            # only a terminal non-usable document. Keep it
+                            # retryable.
+                            state.completed_without_failure = False
+                        if joined_in_flight:
+                            logger.info(
+                                "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=REUSED reason=IN_FLIGHT_SINGLE_FLIGHT documentId=%s",
+                                profile.instrument_id, host, _safe_url_path(source.url), document.document_id,
+                            )
+                        logger.info(
+                            "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=SUCCESS reason=NONE elapsedMs=%s httpStatus=%s",
+                            profile.instrument_id,
+                            host,
+                            _safe_url_path(source.url),
+                            _elapsed_ms(started),
+                            200,
+                        )
+                        logger.info(
+                            "official_document_persist provider=NSE globalInstrumentId=%s documentType=%s outcome=%s",
+                            profile.instrument_id,
+                            document.document_type,
+                            document.status,
+                        )
+                except TimeoutError:
+                    async with dispatch_lock:
+                        state.completed_without_failure = False
+                        if budget is not None:
+                            budget.failures.append("NETWORK_TIMEOUT")
+                        exc = TransportFetchError("NETWORK_TIMEOUT")
+                        state.host_transport_failures[host] = state.host_transport_failures.get(host, 0) + 1
+                        self._official_host_cooldowns[(profile.instrument_id, host)] = (
+                            time.monotonic() + self.settings.research_official_document_host_cooldown_seconds
+                        )
+                        self.last_live_error[profile.instrument_id] = "OFFICIAL_FILING_FETCH_FAILED:NETWORK_TIMEOUT"
+                        logger.warning(
+                            "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
+                            profile.instrument_id, host, _safe_url_path(source.url), exc, _elapsed_ms(started), "NONE",
+                        )
+                except TransportFetchError as exc:
+                    async with dispatch_lock:
+                        state.completed_without_failure = False
+                        if budget is not None:
+                            budget.failures.append(_fetch_rejection_reason(exc))
+                        state.host_transport_failures[host] = state.host_transport_failures.get(host, 0) + 1
+                        self._official_host_cooldowns[(profile.instrument_id, host)] = (
+                            time.monotonic() + self.settings.research_official_document_host_cooldown_seconds
+                        )
+                        self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{_fetch_rejection_reason(exc)}"
+                        logger.warning(
+                            "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
+                            profile.instrument_id, host, _safe_url_path(source.url), str(exc), _elapsed_ms(started), "NONE",
+                        )
+                except (FetchError, RestrictedFetchError, ValueError) as exc:
+                    async with dispatch_lock:
+                        state.completed_without_failure = False
+                        if budget is not None:
+                            budget.failures.append(_fetch_rejection_reason(exc) if isinstance(exc, FetchError) else "PARSER_FAILED")
+                        if _is_transport_fetch_failure(exc):
+                            state.host_transport_failures[host] = state.host_transport_failures.get(host, 0) + 1
+                            self._official_host_cooldowns[(profile.instrument_id, host)] = (
+                                time.monotonic() + self.settings.research_official_document_host_cooldown_seconds
+                            )
+                        reason = _fetch_rejection_reason(exc) if isinstance(exc, FetchError) else "PARSER_FAILED"
+                        self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{reason}"
+                        logger.warning(
+                            "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
+                            profile.instrument_id,
+                            host,
+                            _safe_url_path(source.url),
+                            str(exc),
+                            _elapsed_ms(started),
+                            getattr(exc, "status_code", "NONE"),
+                        )
+
+        workers = [asyncio.create_task(_worker()) for _ in range(concurrency)]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+        logger.info(
+            "official_filing_fetch_batch_complete provider=NSE globalInstrumentId=%s filingCount=%s concurrency=%s elapsedMs=%s",
+            profile.instrument_id, len(scheduled_filings), concurrency, _elapsed_ms(batch_started),
+        )
+        return state.completed_without_failure
 
     def _reconcile_reused_official_financial_facts(
         self,
@@ -2394,6 +2947,8 @@ class ResearchRepository:
         if reason is not None:
             logger.info("official_financial_fact_reconcile provider=NSE globalInstrumentId=%s documentId=%s outcome=SKIPPED reason=%s",
                         profile.instrument_id, document.document_id, reason)
+            return
+        if self._financial_reconciliation_unchanged(profile):
             return
         parsed, written = self._reconcile_persisted_official_financial_document(document)
         outcome, reason = ("PROCESSED", "FACTS_UPSERTED" if written else "NO_CHANGES") if parsed else ("SKIPPED", "PARSE_NO_RESULT")
@@ -2450,6 +3005,51 @@ class ResearchRepository:
         profile: CompanyResearchProfile,
         source: RegisteredResearchSource,
     ) -> ResearchDocument:
+        leader_task = asyncio.current_task()
+        # Guardian Review (late-result reconciliation): a caller-facing
+        # PdfExtractionTimeoutError does NOT mean the underlying worker
+        # thread has stopped -- it is shielded and keeps running. If this
+        # flight's `finally` popped `key` unconditionally on that timeout (as
+        # it used to), a follower arriving in that window would start a
+        # brand-new duplicate download+extraction for the same document
+        # while the first one is still silently in flight, and a late
+        # successful parse would have nowhere to go but the logs. So on a
+        # PdfExtractionTimeoutError specifically, `defer_key_cleanup` is set
+        # and the `finally` below leaves `key` in place; `_on_late_result`
+        # (passed into process_network_response_async) is what eventually
+        # pops it, once the worker's real outcome -- success or failure -- is
+        # known, persisting a late success first so it is not lost.
+        defer_key_cleanup = False
+
+        async def _on_late_result(outcome: "FetchResult | BaseException") -> None:
+            late_host = (urlparse(source.url).hostname or "").lower()
+            try:
+                if isinstance(outcome, BaseException):
+                    logger.info(
+                        "official_document_late_result provider=NSE globalInstrumentId=%s host=%s path=%s "
+                        "exception=%s outcome=LATE_FAILURE_RETRYABLE",
+                        profile.instrument_id, late_host, _safe_url_path(source.url), type(outcome).__name__,
+                    )
+                    return
+                logger.info(
+                    "official_document_late_result provider=NSE globalInstrumentId=%s host=%s path=%s "
+                    "outcome=LATE_SUCCESS_PERSISTING",
+                    profile.instrument_id, late_host, _safe_url_path(source.url),
+                )
+                await self._ingest_registered_fetch_result_async(
+                    profile, source, outcome, expected_profile=profile,
+                )
+                logger.info(
+                    "official_document_late_result provider=NSE globalInstrumentId=%s host=%s path=%s "
+                    "outcome=LATE_SUCCESS_PERSISTED",
+                    profile.instrument_id, late_host, _safe_url_path(source.url),
+                )
+            finally:
+                # Identity check: an old, already-superseded flight must not
+                # remove a newer retry flight installed for the same key.
+                if self._official_filing_flights.get(key) is leader_task:
+                    self._official_filing_flights.pop(key, None)
+
         try:
             self._validate_registered_source(profile, source)
             parsed_url = urlparse(source.url)
@@ -2475,7 +3075,11 @@ class ResearchRepository:
                         network_result,
                         max_bytes=self.settings.research_official_document_max_bytes,
                         extraction_timeout_seconds=self.settings.research_official_document_extraction_timeout_seconds,
+                        on_late_result=_on_late_result,
                     )
+                except PdfExtractionTimeoutError:
+                    defer_key_cleanup = True
+                    raise
                 finally:
                     # Release the large raw PDF bytes regardless of whether
                     # extraction succeeded or timed out (DI-20H Fix 4). The
@@ -2496,8 +3100,11 @@ class ResearchRepository:
             return await self._fetch_registered_source(profile, source, expected_profile=profile)
         finally:
             # Identity check prevents an old, cancelled flight from removing a
-            # retry flight that was installed for the same key.
-            if self._official_filing_flights.get(key) is asyncio.current_task():
+            # retry flight that was installed for the same key. A
+            # PdfExtractionTimeoutError leaves the key in place on purpose
+            # (see defer_key_cleanup above): _on_late_result pops it once the
+            # worker's true outcome is known, rather than here.
+            if not defer_key_cleanup and self._official_filing_flights.get(key) is leader_task:
                 self._official_filing_flights.pop(key, None)
 
     def _inapplicable_business_categories(self, profile: CompanyResearchProfile) -> set[str]:
@@ -2515,13 +3122,25 @@ class ResearchRepository:
                 if state.state == "NOT_APPLICABLE"))
         return set()
 
-    def _reusable_official_document(self, instrument_id: UUID, url: str) -> ResearchDocument | None:
+    def _reusable_official_document(self, instrument_id: UUID, url: str, *, source: RegisteredResearchSource | None = None) -> ResearchDocument | None:
         canonical = canonicalize_url(url)
+        financial = source is not None and "FINANCIAL_RESULTS" in source.categories
+        candidates = [document for document in self.documents_for(instrument_id, source_mode=SourceMode.REAL)
+                      if canonicalize_url(document.canonical_url) == canonical]
+        fact_documents = (
+            {item.document_id for item in self._financial_result_documents_with_extracted_facts(instrument_id)}
+            if financial and any(not item.normalized_text for item in candidates) else set()
+        )
         return next(
             (
                 document
-                for document in self.documents_for(instrument_id, source_mode=SourceMode.REAL)
-                if document.canonical_url == canonical and _is_usable_durable_document(document)
+                for document in candidates
+                if (_is_usable_durable_document(document) or document.document_id in fact_documents)
+                and (not financial or (nse_authority_rejection(document) is None
+                     and document.company_id == source.company_id
+                     and (bool(document.normalized_text) or document.document_id in fact_documents)))
+                and not (source and source.official_published_at and document.published_at
+                         and source.official_published_at > document.published_at)
             ),
             None,
         )
@@ -2647,7 +3266,15 @@ class ResearchRepository:
             documents = self._financial_result_documents_with_extracted_facts(instrument_id)
             if documents:
                 latest = documents[0]
-                return latest.retrieved_at, _explicit_quarter_end(latest.normalized_text or latest.raw_text or "")
+                identities = {str(document.document_id) for document in documents}
+                periods = [datetime.fromisoformat(_canonical_financial_period_end(fact.key.period_end)).replace(tzinfo=timezone.utc)
+                           for fact in self._persistence.load_financial_facts({instrument_id})
+                           if fact.source_identity in identities and fact.key.period_type == "QUARTERLY"
+                           and _canonical_financial_period_end(fact.key.period_end)
+                           # A future period cannot establish eligibility for
+                           # an older retrieval (e.g. a malformed OCR year).
+                           and _canonical_financial_period_end(fact.key.period_end) <= fact.value.retrieved_at.date().isoformat()]
+                return latest.retrieved_at, max(periods) if periods else _explicit_quarter_end(latest.normalized_text or latest.raw_text or "")
         evidence = self._qualifying_category_evidence(instrument_id, category)
         if evidence and isinstance(evidence.get("evidence_at"), str):
             return _parse_iso_datetime(evidence["evidence_at"]), None
@@ -2686,7 +3313,7 @@ class ResearchRepository:
         return self._qualifying_category_evidence(instrument_id, category) is not None
 
     def _financial_result_documents_with_extracted_facts(self, instrument_id: UUID) -> list[ResearchDocument]:
-        """Durable FINANCIAL_RESULTS-looking documents that actually yielded facts.
+        """Durable documents linked to authoritative extracted financial facts.
 
         DI-7C Step 4: DOCUMENT_FETCHED is not equivalent to
         FINANCIAL_FACTS_EXTRACTED.  A document whose title/text looks like a
@@ -2697,10 +3324,9 @@ class ResearchRepository:
         """
         documents = [
             document for document in self.documents_for(instrument_id, source_mode=SourceMode.REAL)
-            if _is_usable_durable_document(document) and any(
-                term in f"{document.title or ''} {document.normalized_text or ''}".lower()
-                for term in _FINANCIAL_RESULT_EVIDENCE_TERMS
-            )
+            if document.status in {DocumentStatus.PROCESSED, DocumentStatus.PARSED}
+            and nse_authority_rejection(document) is None
+            and document.company_id == self.profile(instrument_id).company_id
         ]
         if not documents:
             return []
@@ -2710,7 +3336,15 @@ class ResearchRepository:
             if fact.key.instrument_id == instrument_id
             and fact.source_tier == FactSourceTier.OFFICIAL_NSE
             and fact.source_mode == SourceMode.REAL
+            and fact.source_provider == "NSE"
+            and _canonical_financial_period_end(fact.key.period_end)
+            and any(str(document.document_id) == fact.source_identity
+                    and canonicalize_url(fact.value.source_url or "") == canonicalize_url(document.canonical_url)
+                    for document in documents)
         }
+        # The durable fact's source identity proves financial content. Legacy
+        # metadata-only rows or differently worded filing titles must not lose
+        # that evidence merely because the title lacks a financial keyword.
         return [document for document in documents if str(document.document_id) in extracted_document_ids]
 
     def _qualifying_category_evidence(self, instrument_id: UUID, category: str) -> dict[str, object] | None:
@@ -2719,6 +3353,9 @@ class ResearchRepository:
             snapshots = self.shareholding_for(instrument_id, limit=1)
             if snapshots:
                 snapshot = snapshots[0]
+                from app.research_applicability import shareholding_input_coverage
+                if "PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES" not in shareholding_input_coverage(snapshot):
+                    return None
                 return {
                     "reason": "DURABLE_REAL_SHAREHOLDING_SNAPSHOT",
                     "document_id": snapshot.research_document_id or "NONE",
@@ -2751,6 +3388,8 @@ class ResearchRepository:
             snapshots = self.shareholding_for(instrument_id, limit=1)
             if snapshots:
                 refreshed_at = snapshots[0].retrieved_at
+        if category == "FINANCIAL_RESULTS" and refreshed_at is None:
+            refreshed_at, _period_end = self._category_evidence_timing(instrument_id, category)
         if refreshed_at is None or not self._category_has_qualifying_evidence(instrument_id, category):
             return False
         if category == "FINANCIAL_RESULTS":
@@ -2794,8 +3433,40 @@ class ResearchRepository:
             budget.stopped = True
             return True
 
+        # Category-level authoritative-evidence filter for the group budget.
+        # A single generic-search pass services every member of a capability
+        # group (e.g. ORDER_BOOK_CAPEX_GUIDANCE + SHAREHOLDING +
+        # GOVERNANCE_HISTORY), so a degraded search for one category must not
+        # be attributed to an unrelated member whose authoritative evidence is
+        # already durable.  Drop any category that already has qualifying
+        # durable evidence before invoking the search provider, so the
+        # resulting failure (if any) is attributable only to the categories
+        # that genuinely lack evidence.
+        #
+        # SHAREHOLDING_PATTERN is the authoritative case: a durable real NSE
+        # shareholding snapshot (DURABLE_REAL_SHAREHOLDING_SNAPSHOT) is
+        # authoritative evidence and must win over a non-authoritative
+        # SEARCH_PROVIDER_DEGRADED transport failure -- never the reverse.
+        search_categories = set(missing)
+        for category in sorted(search_categories):
+            if self._category_has_qualifying_evidence(profile.instrument_id, category):
+                logger.info(
+                    "search_fallback_skipped_category globalInstrumentId=%s category=%s reason=QUALIFYING_DURABLE_EVIDENCE",
+                    profile.instrument_id, category,
+                )
+                search_categories.discard(category)
+        if not search_categories:
+            # Every pending category already has qualifying durable evidence:
+            # run no generic search and append no failure, but do NOT mark the
+            # whole group budget stopped -- other members of the capability
+            # group are resolved by their own evidence and this call simply has
+            # nothing left to search.
+            logger.info("search_fallback_skipped globalInstrumentId=%s requirement=%s reason=NO_CATEGORIES_NEED_SEARCH",
+                        profile.instrument_id, budget.requirement_id if budget is not None else "NONE")
+            return True
+
         try:
-            discovered = await self._search_discovery.discover(profile, missing, seen_urls)
+            discovered = await self._search_discovery.discover(profile, search_categories, seen_urls)
         except SearchProviderError as exc:
             if budget is not None:
                 budget.failures.append("SOURCE_UNAVAILABLE:" + str(exc)[:160])
@@ -2805,8 +3476,16 @@ class ResearchRepository:
             logger.warning("research_discovery_terminal company=%s provider=%s status=SEARCH_PROVIDER_UNAVAILABLE reason=%s",
                 profile.company_name, self._search_discovery.provider.provider_name, reason)
             return False
+        # Keep this acquisition's outcome across awaited document fetches;
+        # another Stage-2 candidate can replace the service's last_stats.
+        stats = self._search_discovery.last_stats
         if not discovered:
-            stats = self._search_discovery.last_stats
+            if stats.provider_failure_count:
+                reason = "SEARCH_PROVIDER_DEGRADED"
+                if budget is not None and reason not in budget.failures:
+                    budget.failures.append(reason)
+                _set_live_error(reason)
+                return False
             if stats.candidate_count == 0:
                 terminal = "SEARCH_RETURNED_ZERO_RESULTS"
             else:
@@ -2833,38 +3512,41 @@ class ResearchRepository:
                 self._validate_registered_source(profile, source)
                 document = await self._fetch_registered_source(profile, source, expected_profile=profile)
                 if document.status == DocumentStatus.DUPLICATE:
-                    self._search_discovery.last_stats.reject("DUPLICATE")
+                    stats.reject("DUPLICATE")
                     continue
                 fetched_documents += 1
-                self._search_discovery.last_stats.reject("SEARCH_RESULT_ACCEPTED")
+                stats.reject("SEARCH_RESULT_ACCEPTED")
             except RestrictedFetchError as exc:
-                self._search_discovery.last_stats.reject("ROBOTS_OR_ACCESS_BLOCKED")
+                stats.reject("ROBOTS_OR_ACCESS_BLOCKED")
                 fetch_failures["ROBOTS_OR_ACCESS_BLOCKED"] = fetch_failures.get("ROBOTS_OR_ACCESS_BLOCKED", 0) + 1
                 _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}")
             except FetchError as exc:
                 failure = _fetch_rejection_reason(exc)
-                self._search_discovery.last_stats.reject(failure)
+                stats.reject(failure)
                 fetch_failures[failure] = fetch_failures.get(failure, 0) + 1
                 _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}")
             except ValueError as exc:
-                self._search_discovery.last_stats.reject("PARSER_FAILED")
+                stats.reject("PARSER_FAILED")
                 fetch_failures["PARSER_FAILED"] = fetch_failures.get("PARSER_FAILED", 0) + 1
                 _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:{exc}")
             except Exception as exc:
-                self._search_discovery.last_stats.reject("HTTP_FETCH_FAILED")
+                stats.reject("HTTP_FETCH_FAILED")
                 fetch_failures["HTTP_FETCH_FAILED"] = fetch_failures.get("HTTP_FETCH_FAILED", 0) + 1
                 _set_live_error(f"SEARCH_SOURCE_UNAVAILABLE:{source.source_id}:HTTP_FETCH_FAILED")
         if fetched_documents > 0:
-            _clear_live_error()
+            if stats.provider_failure_count:
+                _set_live_error("SEARCH_PROVIDER_DEGRADED")
+            else:
+                _clear_live_error()
         elif discovered:
             _set_live_error("DOCUMENT_FETCH_FAILED")
-        self._search_discovery.last_stats.documents_fetched = fetched_documents
-        self._search_discovery.last_stats.events_extracted = self.events.applied - extracted_before
+        stats.documents_fetched = fetched_documents
+        stats.events_extracted = self.events.applied - extracted_before
         logger.info("research_fetch_complete company=%s provider=%s accepted_results=%s document_fetch_count=%s extraction_count=%s terminal_status=%s failure_reasons=%s",
             profile.company_name, self._search_discovery.provider.provider_name, len(discovered), fetched_documents,
-            self._search_discovery.last_stats.events_extracted,
+            stats.events_extracted,
             "RESOLVED_PARTIAL_DATA" if fetched_documents else "DOCUMENT_FETCH_FAILED", fetch_failures)
-        return not fetch_failures
+        return not fetch_failures and stats.provider_failure_count == 0
 
     async def _refresh_etf_search_discovery(self, profile: EtfResearchProfile) -> None:
         categories = {"ETF_PROFILE", "ETF_PERFORMANCE", "INDEX_OUTLOOK", "ETF_RISK"}
@@ -2913,6 +3595,12 @@ class ResearchRepository:
         expected_profile: CompanyResearchProfile | None = None,
     ) -> ResearchDocument:
         self._validate_registered_source(profile, source)
+        if self._has_trusted_nse_profile_identity(profile, source, profile):
+            await self._run_blocking_persistence(self._sync_persisted_document_identities, profile.instrument_id)
+            reusable = self._reusable_official_document(profile.instrument_id, source.url, source=source)
+            if reusable is not None:
+                await self._run_blocking_persistence(self._reconcile_reused_official_financial_facts, profile, source, reusable)
+                return reusable
         result = await self._fetcher.fetch(source.url)
         return await self._ingest_registered_fetch_result_async(profile, source, result, expected_profile=expected_profile)
 
@@ -2938,6 +3626,13 @@ class ResearchRepository:
                 expected_profile=expected_profile, document_status=document_status,
                 allow_empty_content=result.extraction_status != "EXTRACTED", trusted_profile_identity=trusted_identity,
                 document_subtype=source.document_subtype,
+                # ResearchFetcher already built this from the identical
+                # extracted text when content_type is application/pdf
+                # (FetchResult.pdf_structure); reuse it instead of having
+                # _prepare_ingested_document rebuild the complete
+                # PdfTextStructure a second time. getattr guards non-FetchResult
+                # test doubles that predate this field.
+                precomputed_pdf_structure=getattr(result, "pdf_structure", None),
             )
         except Exception:
             logger.info("document_ingest_stage globalInstrumentId=%s stage=PREPARE elapsedMs=%s outcome=FAILED", profile.instrument_id, _elapsed_ms(started))

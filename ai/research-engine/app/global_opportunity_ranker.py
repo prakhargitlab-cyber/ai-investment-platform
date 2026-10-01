@@ -45,6 +45,15 @@ WEIGHTS = MappingProxyType(dict(VALUATION=18, FUNDAMENTAL_BUSINESS_QUALITY=16,
     SHAREHOLDING=4, MANAGEMENT_GOVERNANCE=5, TECHNICAL=7, SECTOR=3))
 CRITICAL_AREAS = frozenset({'VALUATION', 'FUNDAMENTAL_BUSINESS_QUALITY',
     'BALANCE_SHEET', 'QUARTERLY_EARNINGS_TREND', 'MANAGEMENT_GOVERNANCE'})
+# STEP-8C: the one Rule Engine area backed by a requirement the readiness
+# eligibility gate treats as unconditionally optional/non-blocking
+# (StockRuleEngineEligibilityPolicy._current_news_is_optional_and_non_blocking
+# -- CURRENT_NEWS only). A genuinely unscorable optional area is real,
+# visible diagnostic information (same as an unusable TECHNICAL/SECTOR
+# dimension already is, below), but it must never read as a fundamental
+# investment-negative reason the way 'MISSING:<AREA>' does for a mandatory
+# gap -- see the OPTIONAL_AREAS branch in the loop below.
+OPTIONAL_AREAS = frozenset({'NEWS_GEOPOLITICAL_EVENTS'})
 
 
 class GlobalOpportunityResult(ResearchBaseModel):
@@ -114,6 +123,29 @@ class GlobalOpportunityRanker:
                     gates.add('CRITICAL_' + code)
             elif area and area.status in {'READY_FRESH', 'PARTIAL'} and area.raw_score is not None:
                 values[name] = (_score(area.raw_score), _score(rule.confidence_score))
+            elif area and area.status in {'READY_FRESH', 'PARTIAL'} and area.raw_score is None:
+                # STEP-8B: a READY_FRESH/PARTIAL area with no raw_score is not
+                # missing evidence -- it is verified-clean/checked-but-unscored
+                # coverage (e.g. StockRuleEngineV1._governance's authoritative
+                # zero-event governance check, or _news's clean current-news
+                # search: both deliberately upgrade an UNSCORABLE result's
+                # status without fabricating a score). It genuinely contributes
+                # neither a score nor a diagnostic: excluded from `values`
+                # (unchanged from before -- raw_score is never usable here)
+                # and, unlike before, no longer flagged as MISSING. A true
+                # UNSCORABLE/absent area (no `area`, or any other status) still
+                # falls through to the MISSING branch below unchanged.
+                pass
+            elif name in OPTIONAL_AREAS:
+                # STEP-8C: present but genuinely unscorable (never run, still
+                # in progress, or a technical/partial/failed provider check --
+                # NOT a verified-clean check, which is handled above). The
+                # underlying requirement is unconditionally optional and
+                # non-blocking, so this is context availability, not a
+                # fundamental negative: labelled the same way an unusable
+                # optional TECHNICAL/SECTOR dimension already is below,
+                # never 'MISSING:' (which implies a mandatory gap).
+                negatives.add('UNAVAILABLE:' + name)
             else:
                 negatives.add('MISSING:' + name)
 

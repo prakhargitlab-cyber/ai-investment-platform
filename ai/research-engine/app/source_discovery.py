@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app import cycle_timing
 from app.models import (
     CompanyResearchProfile,
     DocumentSubtype,
@@ -104,6 +105,11 @@ class SearchProviderConfigurationError(RuntimeError):
 
 class SearchProviderError(RuntimeError):
     pass
+
+
+class _SearchCandidates(list):
+    """Carry partial-provider failure on the result, not shared mutable state."""
+    failure_reason: str | None = None
 
 
 class BraveCompatibleSearchDiscoveryProvider:
@@ -231,15 +237,40 @@ class SearxngSearchDiscoveryProvider:
         *,
         max_results_per_query: int = 5,
         client: httpx.AsyncClient | None = None,
+        degraded_backoff_seconds: float = 30.0,
     ) -> None:
         if not endpoint:
             raise SearchProviderConfigurationError("SEARCH_PROVIDER_NOT_CONFIGURED:endpoint")
         self.endpoint = endpoint
         self.max_results_per_query = min(max(max_results_per_query, 1), 20)
         self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0))
+        self._degraded_backoff_seconds = degraded_backoff_seconds
+        self._degraded_until = 0.0
+        self._degraded_reason: str | None = None
 
     async def discover(self, company: CompanyResearchProfile | EtfResearchProfile, category: str, date_window: SearchDateWindow) -> list[CandidateSearchResult]:
-        results: list[CandidateSearchResult] = []
+        # CURRENT_NEWS acquisition (app.news_acquisition.acquire_news) drives
+        # this provider with one discover() call per already-planned query,
+        # via `date_window.explicit_queries` -- up to max_queries distinct,
+        # independent search terms issued in a single bounded acquisition
+        # pass. Cross-call degradation backoff (_degraded_reason/_degraded_
+        # until) exists to stop a *repeated* request to a provider already
+        # known to be down (see
+        # test_degraded_provider_attempts_bounded_and_recover_after_backoff,
+        # where the SAME category set is retried twice back-to-back); it
+        # must never suppress a DIFFERENT, still-unattempted query in a
+        # bounded plan that was never going to repeat it. CURRENT_NEWS is
+        # already bounded by its own max_queries/max_documents budget and
+        # surfaces degradation per-query via last_query_degraded/
+        # degraded_queries, so backoff adds no protection there and, applied
+        # indiscriminately, silently drops every query after the first
+        # degraded one -- reducible to one real HTTP call regardless of
+        # max_queries.
+        explicit_query_mode = date_window.explicit_queries is not None
+        if not explicit_query_mode and self._degraded_reason and time.monotonic() < self._degraded_until:
+            self.last_query_degraded = True
+            raise SearchProviderError(self._degraded_reason)
+        results = _SearchCandidates()
         failures: list[str] = []
         self.last_query_degraded = False
         for query_id, query in enumerate(_bounded_search_queries(company, category, date_window), start=1):
@@ -294,13 +325,18 @@ class SearxngSearchDiscoveryProvider:
             # evidence that the company had no matching public information.
             # Let the aggregate service treat this as retryable provider
             # degradation rather than a successful zero-result check.
-            if not result_engines and unresponsive_count:
-                failures.append(f"SEARCH_PROVIDER_DEGRADED:unresponsive_engines={unresponsive_count}")
+            if unresponsive_count:
+                reason = f"SEARCH_PROVIDER_DEGRADED:unresponsive_engines={unresponsive_count}"
+                failures.append(reason)
+                results.failure_reason = reason
+                if not explicit_query_mode:
+                    self._degraded_reason = reason
+                    self._degraded_until = time.monotonic() + self._degraded_backoff_seconds
                 logger.warning(
                     "search_query_degraded company=%s category=%s provider=%s query_id=%s unresponsive_engine_count=%s",
                     _profile_display_name(company), category, self.provider_name, query_id, unresponsive_count,
                 )
-                continue
+                break
             logger.info(
                 "search_query_complete company=%s category=%s provider=%s query_id=%s query=%s result_count=%s engines=%s unresponsive_engine_count=%s",
                 _profile_display_name(company), category, self.provider_name, query_id, query,
@@ -376,6 +412,11 @@ class OfficialFilingDiscovery:
             return await asyncio.shield(flight)
         flight = asyncio.get_running_loop().create_future()
         self._rows_flights[symbol] = flight
+        # Guardian Review Slice 6 (DISCOVERY): only the actual network
+        # attempt is timed here -- a cache hit or a joined single-flight
+        # caller (both handled above, before this point) correctly
+        # contribute nothing, since neither one performs new discovery work.
+        _discovery_started = time.monotonic()
         try:
             response = await self.client.get(self.announcements_url, params={"index": "equities", "symbol": symbol})
             response.raise_for_status()
@@ -395,6 +436,7 @@ class OfficialFilingDiscovery:
                     self._rows_cache.popitem(last=False)
             return rows
         finally:
+            cycle_timing.record_discovery_elapsed((time.monotonic() - _discovery_started) * 1000)
             self._rows_flights.pop(symbol, None)
 
     async def discover(self, profile: CompanyResearchProfile, categories: set[str], seen_urls: set[str]) -> list[DiscoveryResult]:
@@ -426,6 +468,18 @@ class OfficialFilingDiscovery:
             rows = await self._announcement_rows(symbol)
             candidates: list[tuple[int, datetime, DiscoveryResult]] = []
             candidate_urls = set(seen_urls)
+            # Guardian Review Slice 8: NSE announcement lists routinely carry
+            # dozens of category-matching rows with no attachment (the
+            # placeholder values in _NSE_NO_ATTACHMENT_PLACEHOLDERS). Logging
+            # one INFO line per such row -- repeated on every discover() call
+            # that shares this cached `rows` list (e.g. the FINANCIALS group
+            # and the SHAREHOLDING/ORDER_BOOK/GOVERNANCE group each run their
+            # own pass over it within one investigation) -- produced pure log
+            # volume with no new information per line. Counting here and
+            # emitting one aggregated line after the loop preserves the exact
+            # same rejection (still `continue`s, never accepted as a
+            # candidate) while cutting that volume to one line per call.
+            no_attachment_rejected = 0
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -488,8 +542,7 @@ class OfficialFilingDiscovery:
                 if not url or category is None:
                     continue
                 if url.strip() in _NSE_NO_ATTACHMENT_PLACEHOLDERS:
-                    logger.info("official_candidate_rejected provider=NSE globalInstrumentId=%s reason=NO_ATTACHMENT host=",
-                                profile.instrument_id)
+                    no_attachment_rejected += 1
                     continue
                 url = _resolve_nse_archive_path(url)
                 try:
@@ -522,6 +575,9 @@ class OfficialFilingDiscovery:
                 )
                 candidates.append((_nse_discovery_priority(subtype, category), published, DiscoveryResult(category=category, source=source)))
             accepted = [item for _, _, item in sorted(candidates, key=lambda value: (value[0], -value[1].timestamp()))]
+            if no_attachment_rejected:
+                logger.info("official_candidate_rejected provider=NSE globalInstrumentId=%s reason=NO_ATTACHMENT count=%s",
+                            profile.instrument_id, no_attachment_rejected)
             logger.info("official_filing_discovery provider=NSE globalInstrumentId=%s status=%s candidateCount=%s acceptedCount=%s reason=%s", profile.instrument_id, "SUCCESS" if accepted else "ZERO_CANDIDATES", len(rows), len(accepted), "NONE" if accepted else "NO_QUALIFYING_ATTACHMENT")
             return accepted
         except Exception as exc:
@@ -643,6 +699,11 @@ def _is_financial_result_announcement(value: str) -> bool:
     # 1. Exact phrase fast-path
     if any(term in lowered for term in ("financial results", "financial result", "unaudited financial", "audited financial", "results for the period ended")):
         return True
+    # "Annual General Meeting ... voting results" has both a cadence word
+    # and "results", but is an ownership/governance disclosure, not a financial
+    # statement. Explicit financial-result attachments above remain eligible.
+    if re.search(r"\bvoting\s+results?\b|\bscrutini[sz]er(?:['’]?s)?\b", lowered):
+        return False
     # 2. Semantic co-occurrence: period cadence + financial content
     has_period = any(term in lowered for term in _FINANCIAL_PERIOD_INDICATORS)
     if has_period:
@@ -913,6 +974,10 @@ class SearchDiscoveryService:
         per_category_limit = max(1, self.max_documents_per_refresh // max(len(missing_categories), 1))
         provider_errors: list[str] = []
         sorted_categories = sorted(missing_categories)
+        if budget is not None:
+            degraded = next((reason for reason in budget.failures if "SEARCH_PROVIDER_DEGRADED" in reason), None)
+            if degraded:
+                raise SearchProviderError(degraded)
         for index, category in enumerate(sorted_categories):
             if budget is not None:
                 if budget.stopped or await budget.sufficient():
@@ -945,7 +1010,16 @@ class SearchDiscoveryService:
                 provider_errors.append(str(exc))
                 logger.warning("search_category_failed company=%s category=%s provider=%s reason=%s",
                     _profile_display_name(profile), category, self.provider.provider_name, str(exc))
+                if "SEARCH_PROVIDER_DEGRADED" in str(exc):
+                    break
                 continue
+            partial_failure = getattr(candidates, "failure_reason", None)
+            if partial_failure:
+                stats.provider_failure_count += 1
+                stats.reject(partial_failure)
+                provider_errors.append(partial_failure)
+                if budget is not None:
+                    budget.failures.append(partial_failure)
             if not candidates:
                 stats.zero_result_query_count += 1
             # Search ranking is not filing selection.  Prefer an actual result
@@ -977,7 +1051,7 @@ class SearchDiscoveryService:
                     break
                 if accepted_for_category >= per_category_limit:
                     break
-            if len(accepted) >= self.max_documents_per_refresh:
+            if partial_failure or len(accepted) >= self.max_documents_per_refresh:
                 break
         accepted.sort(key=lambda result: _source_rank(result.source.source_classification))
         self.last_stats = stats
@@ -994,7 +1068,7 @@ class SearchDiscoveryService:
             stats.zero_result_query_count,
             stats.rejected_reasons,
         )
-        if not accepted and provider_errors and stats.provider_failure_count == stats.categories_attempted:
+        if not accepted and provider_errors:
             raise SearchProviderError(f"SEARCH_PROVIDER_UNAVAILABLE:{provider_errors[-1]}")
         return accepted
 

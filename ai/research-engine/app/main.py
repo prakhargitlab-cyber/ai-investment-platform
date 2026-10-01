@@ -105,6 +105,17 @@ async def research_lifespan(application):
         for task in flights:
             task.cancel()
         await asyncio.gather(*flights, return_exceptions=True)
+        # Bounded background work (currently: per-candidate optional
+        # CURRENT_NEWS acquisitions kicked off by Stage-2 -- see
+        # app/background_task_registry.py and
+        # app/global_opportunity_orchestration.py) is deliberately never
+        # cancelled here (unlike the readiness flights above): every entry
+        # is real, worth-persisting evidence, not a resumable single-flight
+        # computation. Give outstanding tasks a bounded window to finish and
+        # persist on their own; anything still running past it is logged
+        # (by drain() itself) rather than left to hang shutdown forever.
+        from app.background_task_registry import current_news_background_tasks
+        await current_news_background_tasks.drain(timeout=30)
 
 
 app = FastAPI(title="Research Engine", version="0.3.0", lifespan=research_lifespan)
@@ -171,6 +182,11 @@ async def opportunity_cycle(body: OpportunityCycleRequest, request: Request):
     from app.global_opportunity_cycle import run_global_opportunity_cycle
     if not hasattr(repository.persistence, 'publish_opportunity_cycle'):
         raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
+    # Operator-controlled recovery pause: refuse new cycle submissions while paused.
+    # The cancellation REQUEST/STATUS API and the fenced /finalize-cancel endpoint
+    # remain available. Both production and controlled submissions are blocked.
+    if settings.research_opportunity_recovery_paused:
+        raise HTTPException(503, 'RECOVERY_PAUSED')
     worker = _opportunity_worker()
     if body.candidate_ids is None:
         from fastapi.responses import JSONResponse
@@ -186,6 +202,92 @@ async def opportunity_cycle(body: OpportunityCycleRequest, request: Request):
         except PortfolioServiceUnavailableError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
                                 detail='PORTFOLIO_SERVICE_UNAVAILABLE') from exc
+
+
+@app.delete('/api/v1/research/opportunities/cycles/{cycle_id}/cancel')
+async def cancel_opportunity_cycle(
+    cycle_id: UUID,
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+    x_aip_user_roles: str | None = None,
+):
+    """ADMIN-gated durable cycle cancellation REQUEST (two-phase).
+
+    Phase 1 (request): sets status='CANCEL_REQUESTED' for the active cycle run
+    (if still ACCEPTED/RUNNING/PUBLISHED), PRESERVING ownership, lease, and the
+    active slot so the owning worker can drain in-flight work. Phase 2
+    (terminal): the owning worker (or a drain-takeover worker) coerces to
+    terminal 'CANCELLED' and releases ownership + the active slot.
+
+    Idempotent: a second request on an already-CANCEL_REQUESTED (or terminal)
+    cycle is a no-op and returns the current status. Does NOT restart, re-run,
+    or mutate any evidence rows.
+
+    NOTE: This endpoint can only affect a cycle handled by a *future* worker
+    image that reads the cancellation flag. It cannot cancel a cycle currently
+    executing under an already-running old worker image (see runbook step 2).
+    """
+    _require_market_data_admin(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject, x_aip_user_roles)
+    store = repository.persistence
+    if not hasattr(store, 'request_cycle_cancel'):
+        raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
+    with repository._persistence_worker_lock:
+        run = store.cycle_run(str(cycle_id))
+        if run is None:
+            raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
+        previous_status = run.get('status')
+        was_cancelled = store.cycle_cancel_status(str(cycle_id)) is not None
+        transitioned = store.request_cycle_cancel(str(cycle_id))
+        run = store.cycle_run(str(cycle_id)) or run
+    return {
+        'cycle_id': str(cycle_id),
+        'previous_status': previous_status,
+        'cancelled': was_cancelled or transitioned,
+        'status': (run or {}).get('status'),
+        'status_phase': 'CANCEL_REQUESTED' if (was_cancelled or transitioned) and run.get('status') == 'CANCEL_REQUESTED' else ('CANCELLED' if run.get('status') == 'CANCELLED' else None),
+    }
+
+
+@app.post('/api/v1/research/opportunities/cycles/{cycle_id}/finalize-cancel')
+async def finalize_cycle_cancel(
+    cycle_id: UUID,
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+    x_aip_user_roles: str | None = None,
+):
+    """ADMIN-gated fenced terminal transition for an unowned CANCEL_REQUESTED cycle.
+
+    Phase 2 finalization that does NOT invoke the research runner. Used when the
+    owning worker has terminated (old-worker transition) or while the recovery
+    pause is active. Transitions CANCEL_REQUESTED -> terminal CANCELLED, releasing
+    ownership/lease and removing the active slot. Only affects cycles currently in
+    CANCEL_REQUESTED — a terminal/PUBLISHED/COMPLETED/FAILED cycle is never touched.
+    Idempotent: already-CANCELLED returns 409 (already terminal).
+    """
+    _require_market_data_admin(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject, x_aip_user_roles)
+    store = repository.persistence
+    if not hasattr(store, 'cancel_cycle_run_unowned'):
+        raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
+    with repository._persistence_worker_lock:
+        run = store.cycle_run(str(cycle_id))
+        if run is None:
+            raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
+        status = run.get('status')
+        if status == 'CANCELLED':
+            raise HTTPException(409, 'ALREADY_CANCELLED')
+        if status != 'CANCEL_REQUESTED':
+            raise HTTPException(409, f'NOT_IN_CANCEL_REQUESTED: {status}')
+        # Fenced terminal transition: status='CANCEL_REQUESTED' -> 'CANCELLED'.
+        # Does NOT require owner_id (the cycle may be unowned).
+        transitioned = store.cancel_cycle_run_unowned(str(cycle_id))
+        run = store.cycle_run(str(cycle_id)) or run
+    return {
+        'cycle_id': str(cycle_id),
+        'transitioned': transitioned,
+        'status': run.get('status'),
+    }
 
 
 class BacktestRequest(BaseModel):

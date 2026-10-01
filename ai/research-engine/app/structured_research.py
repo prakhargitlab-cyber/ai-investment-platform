@@ -29,7 +29,13 @@ from app.models import (
     ValuationBenchmark,
     ValuationStateEvidence,
 )
-from app.fact_precedence import FinancialFact, FactSourceTier, SUPPORTED_FINANCIAL_SOURCE_TIERS, fact_source_authority
+from app.fact_precedence import (
+    FactSourceTier,
+    FinancialFact,
+    FinancialFactKey,
+    SUPPORTED_FINANCIAL_SOURCE_TIERS,
+    fact_source_authority,
+)
 from app.financial_structure_types import FinancialColumn
 
 
@@ -203,6 +209,88 @@ def latest_quarterly_result_from_facts(facts: list[FinancialFact]) -> QuarterlyR
     )
 
 
+#: Canonical financial-sector ratio metrics that the StockRuleEngine
+#: ``_balance_sheet`` financial branch queries via ``_latest_fact``.  Each maps
+#: a durable ``FinancialFact`` metric name to the text labels the official NSE
+#: result parser already uses.  Aliases the scorer also accepts
+#: (``capital_adequacy_ratio`` / ``gross_npa_ratio`` / ``net_npa_ratio``) are
+#: matched by the scorer's ``_metric_key`` normalizer (strip + casefold), so
+#: only the canonical primary name is persisted -- no duplicate rows and no
+#: parallel HFC-only persistence mechanism.
+_FINANCIAL_SECTOR_RATIO_METRICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("capital_adequacy", ("capital adequacy", "capital adequacy ratio", "crar")),
+    ("gross_npa", ("gross npa", "gnpa")),
+    ("net_npa", ("net npa", "nnpa")),
+)
+
+
+def official_financial_sector_ratio_facts(document: ResearchDocument) -> list[FinancialFact]:
+    """Persist the official-document text extraction of financial-sector ratios.
+
+    Housing-finance / NBFC / banking issuers publish regulatory ratios
+    (capital adequacy, gross NPA, net NPA) inside the same NSE result PDF that
+    yields ``revenue`` / ``pat`` / ``ebitda``.  The legacy text parser records
+    them on the in-memory ``QuarterlyResult`` but never writes them to the
+    ``FinancialFact`` table; ``StockRuleEngine._balance_sheet`` reads its
+    financial-branch metrics from that table via ``_latest_fact`` and so
+    observes nothing -> ``UNSCORABLE`` -> ``BALANCE_SHEET_FACTS`` blocking even
+    though readiness declared the sheet READY_FRESH (DEBT+EQUITY+CASH present).
+
+    This extraction surfaces those official text metrics as durable
+    ``FinancialFact`` rows on the *existing* official fact pipeline
+    (``repository._official_financial_fact_candidates``), reusing the same
+    regex labels the text parser already trusts.  Only values the parser
+    actually recovered are emitted -- missing evidence is never fabricated into
+    a zero, and a missing ratio simply stays absent (truthful UNSCORABLE).
+    """
+    if not document.instrument_id:
+        return []
+    text = document.normalized_text or document.raw_text or ""
+    if not text:
+        return []
+    period_end = _financial_result_period(text)
+    if not period_end:
+        # Stored NSE cover letters also anchor the quarter as "June 30, 2026".
+        # Keep this fallback local to regulatory ratios, not statement parsing.
+        heading = _NSE_QUARTER_HEADING.search(text)
+        match = _NSE_MONTH_DAY_DATE.match(text[heading.end():].lstrip()) if heading else None
+        if match and (parsed := _nse_date(match.group(2), match.group(1), match.group(3))):
+            period_end = parsed.isoformat()
+    if period_end:
+        period_end = _canonical_quarter_end(period_end)
+    if not period_end:
+        # No authoritative reporting-period anchor in the text; without a
+        # parseable period_end the scorer's _fact_series would silently drop
+        # the fact, so declining here is the honest, non-fabricating choice.
+        return []
+    reporting_basis = _reporting_basis(text)
+    source_identity = str(document.document_id)
+    document_id_uuid = document.instrument_id
+    facts: list[FinancialFact] = []
+    for metric, labels in _FINANCIAL_SECTOR_RATIO_METRICS:
+        provenanced = _percent_metric(text, labels, None, lambda value, unit: ProvenancedValue(
+            value=value, unit="PERCENT", as_of_date=document.published_at or document.retrieved_at,
+            period=None,
+            source_url=document.canonical_url, source_name=document.source_name,
+            source_type=str(document.source_type),
+            published_at=document.published_at, retrieved_at=document.retrieved_at,
+            confidence=0.82 if document.source_classification in {SourceClassification.EXCHANGE, SourceClassification.REGULATORY, SourceClassification.OFFICIAL_COMPANY} else 0.65,
+        ))
+        if provenanced is None or _missing_value(provenanced.value):
+            continue
+        facts.append(FinancialFact(
+            FinancialFactKey(document_id_uuid, metric, period_end, "QUARTERLY", reporting_basis),
+            provenanced,
+            FactSourceTier.OFFICIAL_NSE, "NSE",
+            source_identity, SourceMode.REAL,
+        ))
+    return facts
+
+
+def _missing_value(value) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def _semantic_period_key(period_end: str) -> str:
     """Return ``period_end``'s calendar-date identity for period grouping.
 
@@ -367,6 +455,16 @@ def _apply_normalized_official_facts(result: QuarterlyResult, facts: list[Financ
         if result.reporting_basis and fact.key.reporting_basis != result.reporting_basis:
             continue
         if fact.key.metric in {"revenue", "pat", "eps", "ebitda", "debt_or_borrowings"}:
+            if fact.source_tier == FactSourceTier.YAHOO and getattr(result, fact.key.metric) is not None:
+                continue
+            setattr(result, fact.key.metric, fact.value)
+        # Financial-sector regulatory ratios are also surfaced onto the
+        # official-facts-overlaid QuarterlyResult so display/analysis models
+        # see the same durable ratio the rule engine scores from the fact
+        # table.  Only authoritative (non-Yahoo-summary) facts override an
+        # already-text-derived value when both agree on the period; Yahoo
+        # summary ratios never overwrite an authoritative text extraction.
+        elif fact.key.metric in {"capital_adequacy", "gross_npa", "net_npa"}:
             if fact.source_tier == FactSourceTier.YAHOO and getattr(result, fact.key.metric) is not None:
                 continue
             setattr(result, fact.key.metric, fact.value)

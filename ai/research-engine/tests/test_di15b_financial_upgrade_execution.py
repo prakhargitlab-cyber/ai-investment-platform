@@ -117,10 +117,30 @@ def test_production_executor_attempts_nse_before_accepting_fresh_yahoo(mode):
     assert result.readiness.for_requirement("QUARTERLY_FINANCIALS").status == ResearchRequirementStatus.READY_FRESH
     assert result.readiness.for_requirement("QUARTERLY_FINANCIALS").source != "NSE"
     assert profile.instrument_id in repo._financial_authority_attempts
-    observations = [row for row in repo.acquisition_observations_for(profile.instrument_id) if row["provider"] == "NSE"]
+    # Guardian Review (Item 14, DI15B): a durable per-document
+    # FINANCIAL_PARSE:<document_id> receipt (provider="NSE") is also
+    # recorded whenever a financial document is parsed (Item 11's
+    # existing durable-parse-receipt mechanism, app.repository._record_
+    # financial_document_parse / _financial_document_parse_unchanged --
+    # pre-existing, not part of this pass's fix). It shares provider
+    # "NSE" but a distinct requirement_id, so isolate the top-level
+    # QUARTERLY_FINANCIALS acquisition observation explicitly rather
+    # than assuming every NSE-provider row belongs to it.
+    observations = [row for row in repo.acquisition_observations_for(profile.instrument_id)
+                    if row["provider"] == "NSE" and row["requirement_id"] == "QUARTERLY_FINANCIALS"]
     assert len(observations) == 1
-    assert observations[0]["outcome"] == ("FAILED" if mode == "unavailable" else "SUCCESS_EMPTY")
+    # "unparseable" downloads a real, usable document but extracts zero
+    # supported financial facts from it -- a genuine parser-capability gap,
+    # not an authoritative empty filing set. Pre-existing Item 11 semantics
+    # (app/repository.py's unparsed_results branch, ~line 2148) deliberately
+    # report this as FAILED with a PARSER_FAILED reason rather than folding
+    # it into SUCCESS_EMPTY, so a real parser defect is never hidden behind
+    # an authoritative-looking "nothing to find" outcome. Only "empty"
+    # (discovery genuinely found nothing) stays SUCCESS_EMPTY.
+    assert observations[0]["outcome"] == ("SUCCESS_EMPTY" if mode == "empty" else "FAILED")
     assert observations[0]["evidence_count"] == 0
+    if mode == "unparseable":
+        assert observations[0]["failure_reason"] == "PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS"
     _ensure(runtime, profile)
     assert order.count("NSE_DISCOVERY") == 1
 
@@ -138,7 +158,17 @@ def test_production_executor_discovers_parses_persists_and_reuses_authority():
     assert len(facts) == len({f.key for f in facts})
     assert result.readiness.for_requirement("QUARTERLY_FINANCIALS").source == "NSE"
     assert len(repo.documents_for(profile.instrument_id)) == 1
-    official = [row for row in repo.acquisition_observations_for(profile.instrument_id) if row["provider"] == "NSE"]
+    # Guardian Review (Item 14, DI15B): a durable per-document
+    # FINANCIAL_PARSE:<document_id> receipt (provider="NSE") is also
+    # recorded whenever a financial document is parsed (Item 11's
+    # existing durable-parse-receipt mechanism, app.repository._record_
+    # financial_document_parse / _financial_document_parse_unchanged --
+    # pre-existing, not part of this pass's fix). It shares provider
+    # "NSE" but a distinct requirement_id, so isolate the top-level
+    # QUARTERLY_FINANCIALS acquisition observation explicitly rather
+    # than assuming every NSE-provider row belongs to it.
+    official = [row for row in repo.acquisition_observations_for(profile.instrument_id)
+                if row["provider"] == "NSE" and row["requirement_id"] == "QUARTERLY_FINANCIALS"]
     assert official[0]["outcome"] == "SUCCESS" and official[0]["evidence_count"] == len(facts)
     repo._financial_authority_attempts.clear()  # Prove completeness, not throttle, prevents reacquisition.
     _ensure(runtime, profile)

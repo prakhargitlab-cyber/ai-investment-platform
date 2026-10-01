@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -650,6 +651,31 @@ class McpFirstResearchCapabilityExecutor:
         self.enabled = enabled
         self.priority = priority or McpFirstProviderPriority()
         self.persister = YahooMcpResultPersister(repository)
+        # Candidate/cycle-scoped reuse for Yahoo MCP acquisitions, keyed by
+        # the caller-supplied acquisition_context (asyncio.current_task(),
+        # exactly the same explicit-token pattern already used for direct
+        # yfinance reuse in app/structured_market.py -- never an implicit
+        # wall-clock cache). A hit replays either the prior success result
+        # (no second network round trip for an identical symbol+requirement
+        # already acquired in this exact candidate/cycle) or the prior
+        # failure's safe_code (bounded negative reuse -- no repeated
+        # immediate retry against a provider that already timed out/failed
+        # for this exact context). A different context (a different
+        # candidate, or a later legitimate refresh cycle, since
+        # asyncio.current_task() differs once this investigate() call has
+        # returned and a new one begins) always gets a fresh attempt.
+        self._context_results: "OrderedDict[object, dict[tuple[UUID, str], Any]]" = OrderedDict()
+        self._context_results_max = 64
+
+    def _context_result_slot(self, acquisition_context: object) -> dict[tuple[UUID, str], Any]:
+        slot = self._context_results.get(acquisition_context)
+        if slot is None:
+            slot = {}
+            self._context_results[acquisition_context] = slot
+        self._context_results.move_to_end(acquisition_context)
+        while len(self._context_results) > self._context_results_max:
+            self._context_results.popitem(last=False)
+        return slot
 
     async def execute_primary(
         self,
@@ -719,6 +745,19 @@ class McpFirstResearchCapabilityExecutor:
         # full, uncoordinated timeout regardless of how little shared budget
         # is actually left.
         normal_timeout_seconds = getattr(self.gateway, "timeout_seconds", 10.0)
+        # Scoped to the current task -- one candidate's one investigate()
+        # call runs its capability groups sequentially within a single
+        # asyncio task (see app/deep_investigation.py's investigate() loop),
+        # so this identifies exactly "this candidate's current cycle",
+        # mirroring the acquisition_context already used for direct
+        # yfinance reuse. A new task (a different candidate, or this same
+        # instrument's next refresh cycle) always gets a fresh, empty slot.
+        acquisition_context = asyncio.current_task()
+        reuse_slot = (
+            self._context_result_slot(acquisition_context)
+            if acquisition_context is not None
+            else None
+        )
         if self.enabled:
             for target in targets:
                 if target.requirement_id in completed:
@@ -764,30 +803,57 @@ class McpFirstResearchCapabilityExecutor:
                 executed.append(capability)
                 if progress is not None:
                     progress.executed(capability)
-                try:
-                    result = await self.gateway.acquire_requirement(
-                        profile,
-                        region=jurisdiction,
-                        requirement_id=target.requirement_id,
-                        authorization=authorization,
-                        request_id=request_id,
-                        timeout_seconds=call_timeout_seconds,
-                    )
-                    await self.persister.persist(result, profile)
-                except ExternalMcpAcquisitionError as exc:
-                    mcp_failures[target.requirement_id] = exc.safe_code
+                reuse_key = (global_instrument_id, target.requirement_id)
+                cached_outcome = reuse_slot.get(reuse_key) if reuse_slot is not None else None
+                if isinstance(cached_outcome, tuple) and cached_outcome[0] == "FAILED":
+                    # Same candidate/cycle, same symbol+requirement: a prior
+                    # attempt already failed/timed out. Reuse that bounded
+                    # negative outcome instead of making another immediate
+                    # call against a provider that just failed -- never a
+                    # permanent cache, since a new acquisition_context (a new
+                    # candidate, or this instrument's next refresh cycle)
+                    # always starts with an empty slot.
+                    mcp_failures[target.requirement_id] = cached_outcome[1]
                     if progress is not None:
-                        progress.failed(target.requirement_id, exc.safe_code)
+                        progress.failed(target.requirement_id, cached_outcome[1])
                     continue
-                except Exception:
-                    # Provider and persistence details never escape targeted ensure.
-                    # The unchanged regional provider receives the requirement.
-                    mcp_failures[target.requirement_id] = "EXTERNAL_PROVIDER_UNAVAILABLE"
-                    if progress is not None:
-                        progress.failed(
-                            target.requirement_id, "EXTERNAL_PROVIDER_UNAVAILABLE"
+                if cached_outcome is not None:
+                    # Same candidate/cycle already acquired this exact
+                    # symbol+requirement successfully -- reuse the result
+                    # rather than repeating an identical provider call.
+                    result = cached_outcome
+                else:
+                    try:
+                        result = await self.gateway.acquire_requirement(
+                            profile,
+                            region=jurisdiction,
+                            requirement_id=target.requirement_id,
+                            authorization=authorization,
+                            request_id=request_id,
+                            timeout_seconds=call_timeout_seconds,
                         )
-                    continue
+                        await self.persister.persist(result, profile)
+                    except ExternalMcpAcquisitionError as exc:
+                        if reuse_slot is not None:
+                            reuse_slot[reuse_key] = ("FAILED", exc.safe_code)
+                        mcp_failures[target.requirement_id] = exc.safe_code
+                        if progress is not None:
+                            progress.failed(target.requirement_id, exc.safe_code)
+                        continue
+                    except Exception:
+                        # Provider and persistence details never escape targeted ensure.
+                        # The unchanged regional provider receives the requirement.
+                        if reuse_slot is not None:
+                            reuse_slot[reuse_key] = ("FAILED", "EXTERNAL_PROVIDER_UNAVAILABLE")
+                        mcp_failures[target.requirement_id] = "EXTERNAL_PROVIDER_UNAVAILABLE"
+                        if progress is not None:
+                            progress.failed(
+                                target.requirement_id, "EXTERNAL_PROVIDER_UNAVAILABLE"
+                            )
+                        continue
+                    else:
+                        if reuse_slot is not None:
+                            reuse_slot[reuse_key] = result
                 if result.acquisition_outcome == "SUCCESS_EMPTY":
                     # Empty acquisition metadata is not event evidence. Try approved fallbacks.
                     continue

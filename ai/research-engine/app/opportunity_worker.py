@@ -38,6 +38,7 @@ class OpportunityCycleWorker:
         self.lease_seconds = float(lease_seconds or getattr(settings, 'research_opportunity_cycle_lease_seconds', DEFAULT_LEASE_SECONDS))
         self.poll_seconds = float(poll_seconds or min(60.0, max(0.05, self.lease_seconds / 4)))
         self._closing = False
+        self._in_flight_cycle_id = None
 
     # -- persistence helpers ---------------------------------------------------
     @property
@@ -46,6 +47,32 @@ class OpportunityCycleWorker:
 
     def _resumable_supported(self):
         return hasattr(self._store, 'create_cycle_run')
+
+    def _is_cycle_cancelled(self, cycle_id):
+        """Read-only durable check: has this cycle been cancelled (REQUESTED
+        or terminal CANCELLED)?"""
+        if not self._resumable_supported():
+            return False
+        return self._locked(self._store.cycle_cancellation_requested, cycle_id) if hasattr(self._store, 'cycle_cancellation_requested') else False
+
+    def _cancel_status(self, cycle_id):
+        """Return 'CANCEL_REQUESTED', 'CANCELLED', or None if not cancelled."""
+        if not self._resumable_supported():
+            return None
+        if not hasattr(self._store, 'cycle_cancel_status'):
+            # Backwards-compatible fallback: if no cancel_status method, use
+            # the cancellation-requested check as a boolean signal.
+            return 'CANCELLED' if self._is_cycle_cancelled(cycle_id) else None
+        return self._locked(self._store.cycle_cancel_status, cycle_id)
+
+    @property
+    def _recovery_paused(self):
+        """Operator-controlled recovery pause (default OFF). When True:
+        startup recovery, polling takeover, scheduler submission, and manual
+        research submission are all blocked. The cancellation REQUEST/STATUS API
+        and the fenced operator cancel-finalization endpoint remain available."""
+        settings = getattr(self.repository, 'settings', None)
+        return bool(getattr(settings, 'research_opportunity_recovery_paused', False))
 
     def _locked(self, operation, *args, **kwargs):
         with self.repository._persistence_worker_lock:
@@ -91,7 +118,53 @@ class OpportunityCycleWorker:
                              'updated_at': datetime.now(timezone.utc).isoformat()})
         self.task = asyncio.create_task(self._work(), name='global-opportunity-worker')
         if active_run is not None:
-            self._enqueue_resume(active_run)
+            if self._recovery_paused:
+                # Recovery pause is active: refuse to resume ANY active cycle
+                # at startup. This prevents a new worker image from auto-resuming
+                # a RUNNING cycle during the old-to-new transition or during an
+                # operator-controlled drain. The cancellation REQUEST/STATUS API
+                # and the fenced /finalize-cancel endpoint remain available.
+                logger.info("opportunity_cycle_recovery_paused_on_start cycleId=%s paused=%s",
+                            active_run['cycle_id'], self._recovery_paused)
+                self.record({**self._job_for_run(active_run), 'status': 'ACCEPTED',
+                             'error_code': 'RECOVERY_PAUSED',
+                             'updated_at': datetime.now(timezone.utc).isoformat()})
+                self.active = None
+                return
+            cancel_status = self._cancel_status(active_run['cycle_id'])
+            if cancel_status in ('CANCEL_REQUESTED', 'CANCELLED'):
+                # Startup/recovery barrier (old-to-new transition race): the
+                # new worker must NOT resume a cycle whose cancellation has
+                # been requested or is terminal -- UNLESS the original owner is
+                # dead (lease expired), in which case this worker must take
+                # over to drain in-flight work and coerce to terminal CANCELLED.
+                if cancel_status == 'CANCEL_REQUESTED':
+                    lease_expired = (not active_run.get('owner_id')
+                                     or active_run.get('lease_expires_at') is None
+                                     or active_run.get('lease_expires_at') < datetime.now(timezone.utc).isoformat(timespec='microseconds'))
+                    if lease_expired:
+                        logger.info("opportunity_cycle_cancel_drain_takeover cycleId=%s",
+                                    active_run['cycle_id'])
+                        self._enqueue_resume(active_run)
+                    else:
+                        logger.info("opportunity_cycle_cancel_owned_elsewhere cycleId=%s owner=%s",
+                                    active_run['cycle_id'], active_run.get('owner_id'))
+                else:  # CANCELLED (terminal) -- never resume
+                    logger.info("opportunity_cycle_cancel_terminal_on_start cycleId=%s",
+                                active_run['cycle_id'])
+                self.record({**self._job_for_run(active_run), 'status': cancel_status,
+                             'error_code': 'CYCLE_CANCELLED',
+                             'updated_at': datetime.now(timezone.utc).isoformat()})
+                if cancel_status != 'CANCEL_REQUESTED' or not self.active:
+                    self.active = None
+            elif (active_run.get('owner_id') == self.owner_id
+                    or not active_run.get('owner_id')
+                    or active_run.get('lease_expires_at') is None
+                    or active_run.get('lease_expires_at') < datetime.now(timezone.utc).isoformat(timespec='microseconds')):
+                self._enqueue_resume(active_run)
+            else:
+                logger.info("opportunity_cycle_owned_elsewhere cycleId=%s owner=%s",
+                            active_run['cycle_id'], active_run.get('owner_id'))
 
     def _enqueue_resume(self, run):
         if self.active is not None or self.queue.full():
@@ -106,8 +179,13 @@ class OpportunityCycleWorker:
         """Idle worker: resume an active cycle whose owner's lease expired."""
         if self.active is not None or not self._resumable_supported():
             return
+        if self._recovery_paused:
+            return
         run = self._locked(self._store.active_cycle_run)
         if run is None or run.get('owner_id') == self.owner_id:
+            return
+        if self._is_cycle_cancelled(run['cycle_id']):
+            # A cancelled cycle must not be resumed; stop admitting new work.
             return
         lease = run.get('lease_expires_at')
         now = datetime.now(timezone.utc).isoformat(timespec='microseconds')
@@ -116,8 +194,37 @@ class OpportunityCycleWorker:
 
     def submit(self, parameters):
         self.start()
+        if self._recovery_paused:
+            # Operator-controlled recovery pause: do not admit new candidates
+            # or start a new cycle. Return a coalesced rejection so the
+            # caller knows the cycle exists but is not being progressed.
+            if self._resumable_supported():
+                active_run = self._locked(self._store.active_cycle_run)
+                if active_run is not None:
+                    return {**self._job_for_run(active_run), 'coalesced': True,
+                            'paused': True, 'cancelled': self._is_cycle_cancelled(active_run['cycle_id'])}
+            return {'cycle_id': None, 'status': 'RECOVERY_PAUSED', 'paused': True,
+                    'error_code': 'RECOVERY_PAUSED'}
         if self.active is not None:
-            return {**self.active, 'coalesced': True}
+            cancel_status = self._cancel_status(self.active['cycle_id'])
+            if cancel_status == 'CANCELLED':
+                # Operator finalization may run in another process. Never let
+                # this worker's stale cache retain a released durable slot.
+                cancelled_id = self.active['cycle_id']
+                self.active = None
+                try:
+                    queued = self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                else:
+                    self.queue.task_done()
+                    if queued['cycle_id'] != cancelled_id:
+                        self.queue.put_nowait(queued)
+            else:
+                if cancel_status == 'CANCEL_REQUESTED':
+                    run = self._locked(self._store.cycle_run, self.active['cycle_id'])
+                    return {**self._job_for_run(run), 'coalesced': True, 'cancelled': True}
+                return {**self.active, 'coalesced': True}
         correlation_id = str(uuid4())
         parameters = {**parameters, 'correlation_id': correlation_id}
         cycle_id = str(uuid4())
@@ -126,6 +233,10 @@ class OpportunityCycleWorker:
             if not created:
                 # The single active production cycle already exists (this pod
                 # has not claimed it yet, or another replica owns it).
+                if self._is_cycle_cancelled(run['cycle_id']):
+                    # Stop admitting new candidates: the active cycle is
+                    # cancelled and must not be resumed or published.
+                    return {**self._job_for_run(run), 'coalesced': True, 'cancelled': True}
                 self._maybe_take_over()
                 return {**self._job_for_run(run), 'coalesced': True}
         value = dict(cycle_id=cycle_id, status='ACCEPTED',
@@ -166,11 +277,11 @@ class OpportunityCycleWorker:
                 return
 
     def _superseded_or_done(self, cycle_id):
-        """Another worker owns this still-active cycle, or it already COMPLETED."""
+        """Another worker owns this still-active cycle, or it already terminal."""
         run = self._locked(self._store.cycle_run, cycle_id)
         if run is None:
             return False
-        if run.get('status') == 'COMPLETED':
+        if run.get('status') in ('COMPLETED', 'CANCELLED', 'CANCEL_REQUESTED'):
             return True
         return (run.get('status') in ('ACCEPTED', 'RUNNING', 'PUBLISHED')
                 and run.get('owner_id') not in (None, self.owner_id))
@@ -181,6 +292,7 @@ class OpportunityCycleWorker:
 
     async def _run_one(self, value):
         cycle_id = value['cycle_id']
+        self._in_flight_cycle_id = cycle_id
         resumable = self._resumable_supported() and self._locked(self._store.cycle_run, cycle_id) is not None
         checkpoint = heartbeat = None
         if resumable:
@@ -192,6 +304,22 @@ class OpportunityCycleWorker:
             checkpoint = CycleCheckpoint(self._store, cycle_id, self.owner_id,
                                          run_blocking=getattr(self.repository, '_run_blocking_persistence', None))
             heartbeat = asyncio.create_task(self._heartbeat(cycle_id), name=f'opportunity-lease-{cycle_id}')
+            # Two-phase cancellation: if CANCEL_REQUESTED (not yet terminal),
+            # the owner KEEPS draining -- the orchestrator's admission loop
+            # checks cycle_cancellation_requested() and breaks out immediately
+            # (no new candidates), but in-flight acquisition/drain continues
+            # normally. Only a terminal CANCELLED run is coerced immediately.
+            if self._cancel_status(cycle_id) == 'CANCELLED':
+                logger.info("opportunity_cycle_cancel_terminal cycleId=%s owner=%s", cycle_id, self.owner_id)
+                # Already terminal (another worker or a prior pass coerced it).
+                self.active = None
+                return
+            # Record that cancellation is in effect so the job log reflects
+            # the drain. The status stays CANCEL_REQUESTED in the run table
+            # until the orchestrator finishes and we coerce in the post-runner
+            # block below (or in close()).
+            if self._is_cycle_cancelled(cycle_id):
+                logger.info("opportunity_cycle_cancel_drain cycleId=%s owner=%s", cycle_id, self.owner_id)
         try:
             value = {**value, 'status': 'RUNNING', 'updated_at': datetime.now(timezone.utc).isoformat()}
             value.pop('error_code', None)
@@ -199,6 +327,18 @@ class OpportunityCycleWorker:
             self.active = value
             extra = {'cycle_id': cycle_id, 'checkpoint': checkpoint} if resumable else {}
             result = await self.runner(**value['parameters'], **extra)
+            # Re-check cancellation after in-flight work completed: a cancel
+            # request may have arrived mid-flight. Coerce to terminal CANCELLED
+            # instead of publishing a successful snapshot.
+            if resumable and self._is_cycle_cancelled(cycle_id):
+                logger.info("opportunity_cycle_cancel_after_runner cycleId=%s owner=%s", cycle_id, self.owner_id)
+                with suppress(Exception):
+                    self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id)
+                value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
+                self.record(value)
+                if self.active is not None and self.active['cycle_id'] == cycle_id:
+                    self.active = None
+                return
             value = {**value, 'status': 'COMPLETED', 'result_cycle_id': result['cycle_id'],
                      'universe_count': result.get('universe_count')}
             if resumable:
@@ -212,10 +352,17 @@ class OpportunityCycleWorker:
             )
         except asyncio.CancelledError:
             if resumable and self._closing:
-                # Graceful shutdown: keep the SAME cycle resumable by the next worker.
-                value = {**value, 'status': 'RUNNING', 'error_code': 'WORKER_STOPPED_RESUMABLE'}
-                with suppress(Exception):
-                    self._locked(self._store.release_cycle_run, cycle_id, self.owner_id)
+                # Graceful shutdown: if the cycle has been cancel-requested,
+                # coerce it to terminal CANCELLED now (drain is done). Otherwise
+                # keep the SAME cycle resumable by the next worker.
+                if self._is_cycle_cancelled(cycle_id):
+                    with suppress(Exception):
+                        self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id)
+                    value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
+                else:
+                    value = {**value, 'status': 'RUNNING', 'error_code': 'WORKER_STOPPED_RESUMABLE'}
+                    with suppress(Exception):
+                        self._locked(self._store.release_cycle_run, cycle_id, self.owner_id)
             else:
                 value = {**value, 'status': 'FAILED', 'error_code': 'WORKER_STOPPED'}
                 if resumable:
@@ -264,7 +411,10 @@ class OpportunityCycleWorker:
                 else:
                     self.record(value)
             finally:
-                self.active = None
+                # Finalization can release this cycle while its old runner is
+                # draining. Do not erase a replacement already queued by submit.
+                if self.active is not None and self.active['cycle_id'] == cycle_id:
+                    self.active = None
 
     async def close(self):
         self._closing = True
@@ -274,13 +424,22 @@ class OpportunityCycleWorker:
                 with suppress(asyncio.CancelledError):
                     await self.task
                 self.task = None
-            if self.active is not None:
-                resumable = (self._resumable_supported()
-                             and self._locked(self._store.cycle_run, self.active['cycle_id']) is not None)
-                if not resumable:
-                    self.record({**self.active, 'status': 'FAILED', 'error_code': 'WORKER_STOPPED',
+            # If a resumable cycle was in-flight and not yet coerced to
+            # terminal (e.g. the task was cancelled outside _run_one), coerce
+            # CANCEL_REQUESTED -> terminal CANCELLED here so no resumable
+            # cancelled cycle is left for the next worker.
+            in_flight_cycle_id = getattr(self, '_in_flight_cycle_id', None)
+            if in_flight_cycle_id is not None and self._resumable_supported():
+                cycle_id = in_flight_cycle_id
+                if self._is_cycle_cancelled(cycle_id):
+                    with suppress(Exception):
+                        self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id)
+                    run = self._locked(self._store.cycle_run, cycle_id)
+                    job = self._job_for_run(run) if run else {}
+                    self.record({**job, 'cycle_id': cycle_id,
+                                 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED',
                                  'updated_at': datetime.now(timezone.utc).isoformat()})
-                # A queued resumable cycle stays ACCEPTED/RUNNING in the DB for the next worker.
-                self.active = None
+            self.active = None
+            self._in_flight_cycle_id = None
         finally:
             self._closing = False

@@ -18,8 +18,7 @@ from uuid import UUID
 
 import pytest
 
-from app.cycle_checkpoint import CandidateState, state_for_disposition
-from app.failure_taxonomy import EVIDENCE_UNAVAILABLE, TECHNICAL_RETRYABLE, classify_reason
+from app.failure_taxonomy import TECHNICAL_RETRYABLE, classify_reason
 from app.research_readiness import ResearchReadinessService, ResearchRequirementStatus as Status
 from app.research_readiness_runtime import RepositoryResearchReadinessAdapter, TargetedEnsureResult
 from app.stock_rule_engine import (AreaScoreStatus, RiskOverrideResult, RiskOverrideSeverity,
@@ -97,20 +96,20 @@ def _check(outcome, *, hours=1, reason=None):
 
 # --------------------------------------------------------------------------- 1
 @pytest.mark.asyncio
-async def test_1_unscorable_with_genuinely_unavailable_evidence_is_not_rank_filtered(monkeypatch):
+async def test_1_unscorable_without_authoritative_absence_is_retryable_not_rank_filtered(monkeypatch):
     result, deep_calls = await _run_stage2(monkeypatch, _unscorable_rule())
     diagnostic = result.diagnostics[0]
     assert diagnostic.disposition == "DEEP_READINESS_NOT_MET"
     assert diagnostic.disposition not in {"RANK_FILTERED", "ANALYZED"}
     assert not diagnostic.rank_eligible and diagnostic.status == "SUPPRESSED"
-    assert diagnostic.failure_class == EVIDENCE_UNAVAILABLE
+    assert diagnostic.failure_class == TECHNICAL_RETRYABLE
     assert diagnostic.acquisition_failures == {REQ: "RULE_AREA_UNSCORABLE"}
     assert diagnostic.suppression_reasons == [REQ]
     assert result.top_n == [] and result.rule_analyzed_count == 0 and result.evaluated_count == 0
-    assert result.deep_readiness_failed_count == 1 and result.deep_technical_failure_count == 0
+    assert result.deep_readiness_failed_count == 1 and result.deep_technical_failure_count == 1
     assert result.deep_ready_count == 0
-    assert state_for_disposition(diagnostic.disposition) == CandidateState.EVIDENCE_UNAVAILABLE
-    assert len(deep_calls) == 1  # genuine: no repair retry
+    assert result.deep_repair_attempted_count >= 1 and len(deep_calls) >= 2
+    assert len(result.diagnostics) == 1  # repair does not double-count the candidate
 
 
 # --------------------------------------------------------------------------- 2
@@ -179,7 +178,7 @@ def test_6_technical_catalyst_acquisition_failure_remains_retryable():
     item = _catalyst_item([_check("FAILED", reason="SOURCE_UNAVAILABLE:NSE:ConnectError")], events=[])
     assert item.status == Status.FAILED
     assert classify_reason(item.missing_reason) == TECHNICAL_RETRYABLE
-    assert classify_reason("RULE_AREA_UNSCORABLE") == EVIDENCE_UNAVAILABLE
+    assert classify_reason("RULE_AREA_UNSCORABLE") == TECHNICAL_RETRYABLE
 
 
 # --------------------------------------------------------------------------- 7

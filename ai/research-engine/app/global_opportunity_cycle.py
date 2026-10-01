@@ -198,6 +198,14 @@ async def _blocking(repository, operation, *args, **kwargs):
 async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4, shortlist_limit=25,
                                        candidate_ids=None, identity_headers=None, readiness_runtime=None,
                                        correlation_id=None, cycle_id=None, checkpoint=None):
+    # Production contract: candidate_ids=None means "process the complete
+    # applicable deep-research universe", so shortlist_limit (a bounded
+    # working-set size meant for controlled/manual validation runs only) must
+    # never truncate it -- regardless of what value the caller passed.
+    # Controlled cycles (an explicit candidate_ids list) keep their requested
+    # bound unchanged. GlobalOpportunityOrchestrator.run treats
+    # shortlist_limit=None as unbounded (see its docstring/validation).
+    effective_shortlist_limit = shortlist_limit if candidate_ids is not None else None
     # cycle_id/checkpoint: a resumable production cycle keeps ONE stable
     # cycle_id across worker restarts (app/cycle_checkpoint.py). Controlled
     # (candidate_ids) cycles never carry a checkpoint.
@@ -216,6 +224,11 @@ async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4,
         run = await checkpoint.run() or {}
         if run.get('status') == 'PUBLISHED':
             return await _complete_published_cycle(repository, checkpoint)
+        # A cancelled cycle must never resume or publish a successful snapshot.
+        # CANCEL_REQUESTED (drain in progress) and CANCELLED (terminal) both
+        # raise so the worker coerces to terminal CANCELLED via its drain path.
+        if run.get('status') in ('CANCEL_REQUESTED', 'CANCELLED'):
+            raise RuntimeError('CYCLE_CANCELLED')
         if run.get('as_of'):
             # A resumed cycle keeps its original evaluation instant.
             now = _parse_datetime(run['as_of'])
@@ -240,7 +253,7 @@ async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4,
     orchestrator = GlobalOpportunityOrchestrator(repository, repository.persistence,
         profile_hydrator=canonical_source.register_global_profile_metadata, readiness_runtime=readiness_runtime)
     ranking = await orchestrator.run(rows, as_of=now, sector_contexts=contexts,
-                                     shortlist_limit=shortlist_limit, top_n=None, review_ids=review_ids,
+                                     shortlist_limit=effective_shortlist_limit, top_n=None, review_ids=review_ids,
                                      identity_headers=identity_headers, correlation_id=correlation_id,
                                      discovery_v2=readiness_runtime is not None,
                                      rotation_after=(await orchestrator._run_blocking(repository.persistence.opportunity_rotation_after)

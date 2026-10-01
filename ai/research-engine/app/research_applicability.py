@@ -16,6 +16,30 @@ FINANCIAL_CLASSIFICATION_TERMS = (
     "finance company", "finance companies", "microfinance",
 )
 
+# Terms that identify regulated lenders / HFCs / banking / NBFCs which publish
+# regulatory ratios (capital adequacy, gross NPA, net NPA). Shared across
+# research_applicability, stock_rule_engine, and structured_research so all
+# components agree on what constitutes a "financial-sector" issuer.
+FINANCIAL_SECTOR_SUBTYPE_TERMS = (
+    "banks", "banking", "non-bank", "nbfc", "housing finance", "mortgage finance",
+    "microfinance", "credit service", "credit services", "lending", "finance company",
+    "micro finance", "nbf", "cooperative bank", "urban financial",
+)
+
+# Terms that identify asset management companies -- they are financial but
+# do NOT publish lender-style regulatory ratios.
+ASSET_MANAGEMENT_TERMS = ("asset management", "investment management")
+
+# Canonical financial-sector ratio metrics that the StockRuleEngine
+# `_balance_sheet` financial branch queries via `_latest_fact`. Each maps
+# a durable `FinancialFact` metric name to the text labels the official NSE
+# result parser already uses.
+FINANCIAL_SECTOR_RATIO_METRICS = (
+    ("capital_adequacy", ("capital adequacy", "capital adequacy ratio", "crar")),
+    ("gross_npa", ("gross npa", "gnpa")),
+    ("net_npa", ("net npa", "nnpa")),
+)
+
 CONCEPT_INPUTS = {
     "ORDER_BOOK": "ORDER_BOOK_OR_MAJOR_CONTRACT",
     "CAPEX": "CAPACITY_OR_CAPEX_OR_COMMISSIONING",
@@ -72,6 +96,7 @@ def classify_requirements(sector: str | None, industry: str | None, source: str 
         result["BUSINESS_QUALITY_FACTS"] = RequirementApplicability(
             "PARTIALLY_APPLICABLE", "INDUSTRIAL_ROCE_NOT_APPLICABLE", **common,
             excluded_inputs={"ROCE": "INDUSTRIAL_CAPITAL_EMPLOYED_NOT_APPLICABLE"})
+    result["BALANCE_SHEET_FACTS"] = balance_sheet_applicability(industry, sector)
     return result
 
 
@@ -83,3 +108,74 @@ def event_concept(event_type: str) -> str | None:
     if event_type.startswith("GUIDANCE_"):
         return "GUIDANCE"
     return None
+
+
+def classify_financial_subtype(industry: str | None, sector: str | None = None) -> str:
+    """Classify a financial issuer's subtype for balance-sheet scoring.
+
+    Returns one of:
+    - "FINANCIAL_SECTOR" for regulated lenders/HFCs/banks/NBFCs that publish
+      capital adequacy, gross NPA, net NPA ratios.
+    - "ASSET_MANAGEMENT" for investment/asset management companies that do not.
+    - "CORPORATE" for non-financial issuers.
+
+    This shared contract ensures consistency across research_applicability,
+    stock_rule_engine, and structured_research.
+    """
+    text = (sector or "").casefold() + " " + (industry or "")
+    # Normalize: keep only alphanumeric and spaces (remove hyphens, dashes, etc.)
+    text = re.sub(r"[^a-z0-9\s]+", " ", text.casefold()).strip()
+
+    # Check for asset management first (more specific)
+    if any(re.sub(r"[^a-z0-9\s]+", " ", term).strip() in text for term in ASSET_MANAGEMENT_TERMS):
+        return "ASSET_MANAGEMENT"
+
+    # Check for regulated lender/HFC/banking terms
+    # Normalize search terms the same way as text (remove hyphens, etc.)
+    if (any(re.sub(r"[^a-z0-9\s]+", " ", term).strip() in text for term in FINANCIAL_SECTOR_SUBTYPE_TERMS)
+            or re.search(r"\bhfc\b", text)):
+        return "FINANCIAL_SECTOR"
+
+    # Default to corporate for non-financial
+    return "CORPORATE"
+
+
+def is_regulated_lender_or_hfc(industry: str | None, sector: str | None = None) -> bool:
+    """Return True if the issuer is a regulated lender/HFC/banking/NBFC entity.
+
+    Combined with BALANCE_SHEET_FACTS readiness, this determines whether
+    capital_adequacy/gross_npa/net_npa ratios are applicable scoring metrics.
+    """
+    return classify_financial_subtype(industry, sector) == "FINANCIAL_SECTOR"
+
+
+LENDER_BALANCE_SHEET_INPUT = "FINANCIAL_SECTOR_CAPITAL_OR_ASSET_QUALITY"
+LENDER_BALANCE_SHEET_METRICS = {
+    "CAPITAL_ADEQUACY": ("capital_adequacy", "capital_adequacy_ratio"),
+    "GROSS_NPA": ("gross_npa", "gross_npa_ratio"),
+    "NET_NPA": ("net_npa", "net_npa_ratio"),
+}
+CORPORATE_BALANCE_SHEET_INPUTS = (
+    "DEBT", "EQUITY", "CASH", "INTEREST_COVERAGE_INPUTS", "LIQUIDITY_CURRENT_RATIO_INPUTS",
+)
+
+
+def balance_sheet_applicability(industry=None, sector=None):
+    lender = is_regulated_lender_or_hfc(industry, sector)
+    excluded = CORPORATE_BALANCE_SHEET_INPUTS if lender else (LENDER_BALANCE_SHEET_INPUT,)
+    return RequirementApplicability(
+        "PARTIALLY_APPLICABLE", "BALANCE_SHEET_SUBTYPE_INPUTS",
+        classification=classify_financial_subtype(industry, sector),
+        excluded_inputs={key: "NOT_APPLICABLE_BUSINESS_MODEL" for key in excluded},
+    )
+
+
+def shareholding_input_coverage(snapshot):
+    """Use the same mandatory ownership semantics for readiness and recovery."""
+    categories = {str(value.category) for value in snapshot.values}
+    covered = {"LATEST_VALID_SHAREHOLDING_PERIOD"}
+    if categories & {"PROMOTER", "FII_FPI", "DII", "PUBLIC_RETAIL"}:
+        covered.add("PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES")
+    if "PROMOTER_PLEDGE" in categories:
+        covered.add("PROMOTER_PLEDGE")
+    return covered

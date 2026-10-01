@@ -15,7 +15,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Protocol, Sequence
 from uuid import UUID
 
-from app.research_applicability import RequirementApplicability, CONCEPT_INPUTS
+from app.research_applicability import RequirementApplicability, CONCEPT_INPUTS, balance_sheet_applicability
 
 
 class RuleEngineArea(StrEnum):
@@ -279,6 +279,7 @@ class ResearchRequirementRegistry:
                     True,
                     "QUARTERLY_FINANCIALS",
                     inputs=(
+                        input_("FINANCIAL_SECTOR_CAPITAL_OR_ASSET_QUALITY", mandatory),
                         input_("DEBT", mandatory),
                         input_("EQUITY", mandatory),
                         input_("CASH", mandatory),
@@ -1130,7 +1131,8 @@ class ResearchReadinessService:
         now: datetime,
     ) -> ResearchRequirementReadiness:
         policy = self.freshness_registry.get(requirement.freshness_policy_id)
-        applicability = snapshot.applicability_by_requirement.get(requirement.requirement_id, RequirementApplicability())
+        applicability = snapshot.applicability_by_requirement.get(requirement.requirement_id,
+            balance_sheet_applicability() if requirement.requirement_id == "BALANCE_SHEET_FACTS" else RequirementApplicability())
         def with_applicability(value):
             states = {}
             for concept, decision in applicability.concepts.items():

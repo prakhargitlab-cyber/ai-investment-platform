@@ -225,7 +225,27 @@ async def test_10_success_empty_is_distinct_from_technical_failure(outcome, reas
     recorded = result.failures["GOVERNANCE_HISTORY"]
     assert classify_reason(recorded) == expected_class
     if outcome == "SUCCESS_EMPTY":
-        assert recorded == "ACQUISITION_NOT_DUE"  # checked & empty: not retried
+        # Guardian Review (Item 13/14): this must NOT be the bare literal
+        # "ACQUISITION_NOT_DUE" -- test_radar_final_audit.py::
+        # test_scheduler_or_scorer_gap_is_not_authoritative_absence and the
+        # whole of test_di_acquisition_not_due_fix.py establish, as a
+        # deliberate, load-bearing invariant, that bare ACQUISITION_NOT_DUE
+        # ("nothing was attempted this cycle") is NEVER an authoritative
+        # absence signal and always classifies TECHNICAL_RETRYABLE -- so the
+        # same literal string cannot simultaneously classify
+        # EVIDENCE_UNAVAILABLE here, for the same reason string, without
+        # contradicting that invariant. The correct, non-contradictory
+        # production fix (deep_investigation._prior_success_empty +
+        # failure_taxonomy.PERMANENT_REASONS) instead emits a distinct
+        # reason, PRIOR_ACQUISITION_EMPTY, precisely when the requirement's
+        # latest real (non-executor) observation already completed and
+        # found nothing -- matching how research_readiness_runtime.py
+        # already treats a completed SUCCESS_EMPTY NSE check elsewhere
+        # (AUTHORITATIVE_UNAVAILABLE / NO_USABLE_EVIDENCE /
+        # _completed_authoritative_check). This assertion was the stale
+        # half of the original contradiction; the fix above is the
+        # production-side half.
+        assert recorded == "PRIOR_ACQUISITION_EMPTY"  # checked & empty: not retried
     else:
         assert recorded == "ACQUISITION_BACKOFF|NETWORK_TIMEOUT"  # technical: exact reason retained
 

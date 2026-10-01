@@ -38,18 +38,25 @@ PERMANENT_REASONS = frozenset({
     "EVIDENCE_INSUFFICIENT_WITHIN_PLAN",
     "PRIMARY_FINANCIAL_PROVIDER_RETURNED_NO_FACTS",
     "NOT_APPLICABLE",
-    # Source checked successfully within its lightweight window: nothing new to
-    # acquire this cycle (a repair attempt would be a no-op).
-    "ACQUISITION_NOT_DUE",
-    # Readiness declared the durable evidence complete, yet the Rule Engine
-    # could not score an applicable required area from it and no technical
-    # failure was recorded: nothing further exists to acquire (terminal).
-    "RULE_AREA_UNSCORABLE",
+    # The requirement's most recent AUTHORITATIVE (NSE) acquisition attempt
+    # genuinely completed and found nothing (SUCCESS_EMPTY) -- not "a
+    # scheduling decision skipped this cycle" (that stays ACQUISITION_NOT_DUE
+    # / ACQUISITION_BACKOFF, which are deliberately technical: see below).
+    # research_readiness_runtime.py already treats a completed SUCCESS_EMPTY
+    # NSE check the same way (AUTHORITATIVE_UNAVAILABLE / NO_USABLE_EVIDENCE
+    # diagnostics, _completed_authoritative_check); deep_investigation's
+    # fallback classification was the one place still discarding that signal
+    # and reporting a bare ACQUISITION_NOT_DUE (technical/retryable) even when
+    # the last real check already ran to completion with nothing found.
+    "PRIOR_ACQUISITION_EMPTY",
 })
 
 # Positively technical (listed for documentation/review; anything not in
 # PERMANENT_REASONS is technical anyway).
 TECHNICAL_REASONS = frozenset({
+    # A refresh scheduling decision is not an authoritative absence check.
+    # Nor does readiness/scorer disagreement prove that evidence is absent.
+    "ACQUISITION_NOT_DUE", "RULE_AREA_UNSCORABLE",
     "NETWORK_TIMEOUT", "HTTP_FETCH_FAILED", "DOCUMENT_FETCH_FAILED",
     "PDF_EXTRACTION_TIMEOUT", "PDF_EXTRACTION_QUEUE_TIMEOUT", "PDF_TEXT_EXTRACTION_FAILED",
     "EXTRACTION_FAILED", "PARSER_FAILED", "RECONCILE_FAILED",

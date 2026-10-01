@@ -10,6 +10,7 @@ No live provider calls are made.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+from dataclasses import replace
 
 from app.market_sessions import (
     MarketCalendarException,
@@ -21,6 +22,7 @@ from uuid import UUID
 
 from app.fact_precedence import FactSourceTier, FinancialFact, FinancialFactKey
 from app.models import ProvenancedValue, SourceMode
+from app.research_applicability import balance_sheet_applicability, LENDER_BALANCE_SHEET_INPUT
 from app.research_readiness import (
     FreshnessMode,
     FreshnessPolicyRegistry,
@@ -319,9 +321,16 @@ def test_balance_sheet_quarterly_120_day_boundary_is_inclusive():
     assert QUARTERLY.is_fresh(ev, now + timedelta(seconds=1)) is False
 
 
+def _applicable_balance_sheet_requirement(industry, sector):
+    # Production filters these inputs before calling _required_inputs_are_fresh.
+    requirement = _REGISTRY.get("BALANCE_SHEET_FACTS")
+    excluded = balance_sheet_applicability(industry, sector).excluded_inputs
+    return replace(requirement, inputs=tuple(
+        item for item in requirement.inputs if item.input_id not in excluded))
+
+
 def test_balance_sheet_not_stale_through_required_inputs_when_fresh_quarterly():
-    """End-to-end: fresh quarterly debt + equity evidence (with period-aware
-    valid_until from _evidence_from_financial_fact) => _required_inputs_are_fresh True."""
+    """Fresh corporate debt/equity/cash satisfy the applicable freshness contract."""
     now = MON_DURING
     quarterly_as_of = now - timedelta(days=60)
     debt_ev = _evidence_from_financial_fact(
@@ -337,7 +346,7 @@ def test_balance_sheet_not_stale_through_required_inputs_when_fresh_quarterly():
         _financial_fact("cash_and_cash_equivalents", "2026-07-15", "QUARTERLY", quarterly_as_of),
         "BALANCE_SHEET_FACTS", ("CASH",),
     )
-    req = _REGISTRY.get("BALANCE_SHEET_FACTS")
+    req = _applicable_balance_sheet_requirement("Auto Components", "Industrials")
     policy = _POLICIES.get("QUARTERLY_FINANCIALS")
     authority = _AUTHORITY_REGISTRY.policy_for("BALANCE_SHEET_FACTS", "INDIA")
     assert ResearchReadinessService._required_inputs_are_fresh(
@@ -346,6 +355,37 @@ def test_balance_sheet_not_stale_through_required_inputs_when_fresh_quarterly():
     assert not ResearchReadinessService._required_inputs_are_fresh(
         req, [debt_ev, equity_ev], authority, policy, now
     )
+
+
+def test_lender_balance_sheet_still_requires_fresh_regulatory_evidence():
+    now = MON_DURING
+    requirement = _applicable_balance_sheet_requirement("Mortgage Finance", "Financial Services")
+    assert {item.input_id for item in requirement.inputs if item.importance == "MANDATORY"} == {
+        LENDER_BALANCE_SHEET_INPUT}
+    # Filtering creates a scoped copy; the shared requirement retains the lender input.
+    assert any(item.input_id == LENDER_BALANCE_SHEET_INPUT and item.importance == "MANDATORY"
+               for item in _REGISTRY.get("BALANCE_SHEET_FACTS").inputs)
+    policy = _POLICIES.get("QUARTERLY_FINANCIALS")
+    authority = _AUTHORITY_REGISTRY.policy_for("BALANCE_SHEET_FACTS", "INDIA")
+    corporate = [
+        _evidence_from_financial_fact(
+            _financial_fact(metric, "2026-07-15", "QUARTERLY", now - timedelta(days=60)),
+            "BALANCE_SHEET_FACTS", (coverage,))
+        for metric, coverage in (("total_debt", "DEBT"), ("total_equity", "EQUITY"),
+                                 ("cash_and_cash_equivalents", "CASH"))
+    ]
+    assert not ResearchReadinessService._required_inputs_are_fresh(
+        requirement, corporate, authority, policy, now)
+    regulatory = _evidence_from_financial_fact(
+        _financial_fact("capital_adequacy", "2026-07-15", "QUARTERLY", now - timedelta(days=60)),
+        "BALANCE_SHEET_FACTS", (LENDER_BALANCE_SHEET_INPUT,))
+    assert ResearchReadinessService._required_inputs_are_fresh(
+        requirement, [regulatory], authority, policy, now)
+    stale = _evidence_from_financial_fact(
+        _financial_fact("capital_adequacy", "2026-02-26", "QUARTERLY", now - timedelta(days=200)),
+        "BALANCE_SHEET_FACTS", (LENDER_BALANCE_SHEET_INPUT,))
+    assert not ResearchReadinessService._required_inputs_are_fresh(
+        requirement, [stale], authority, policy, now)
 
 
 # --- VALUATION evidence selection: any fresh candidate wins (Fix 2) ---

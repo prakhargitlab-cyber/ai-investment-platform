@@ -1,7 +1,7 @@
 """DI-18: Financial readiness hardening regressions.
 
-Covers four test-only corrections (reporting-basis separation, NSE SUCCESS_EMPTY
-must not claim readiness, bounded official-filing fetch timeout with Yahoo
+Covers four corrections (reporting-basis separation, an unparsed NSE result
+remains a technical failure, bounded official-filing fetch timeout with Yahoo
 fallback retained, ORDER_BOOK evidence retained while CAPEX/GUIDANCE stay missing)
 plus the OCF-summary-adapter fallthrough exercised against the Correction 5
 production fix in ``portfolio_orchestration._market_fundamentals_from_record``.
@@ -127,10 +127,10 @@ def test_reporting_basis_unknown_not_collapsed_to_consolidated() -> None:
 
 # --------------------------------------------------------------------------------------
 # Correction 2: an NSE discovery that fetches a filing but parses ZERO official facts
-# is SUCCESS_EMPTY -- it must not claim QUARTERLY_FINANCIALS readiness. The secondary
+# is a technical parser failure -- it must not claim QUARTERLY_FINANCIALS readiness. The secondary
 # Yahoo fallback remains untouched and authoritative NSE is never claimed.
 # --------------------------------------------------------------------------------------
-def test_di18_nse_success_empty_does_not_claim_nse_readiness() -> None:
+def test_di18_unparsed_nse_result_is_technical_and_does_not_claim_readiness() -> None:
     repo, profile = _repo()
 
     official_source = _trusted_source(profile)
@@ -163,7 +163,7 @@ def test_di18_nse_success_empty_does_not_claim_nse_readiness() -> None:
 
     asyncio.run(repo._refresh_live(profile.instrument_id, {"FINANCIAL_RESULTS"}))
 
-    # NSE found a filing but extracted zero OFFICIAL_NSE facts -> SUCCESS_EMPTY.
+    # A fetched result with no parseable table is not a verified empty result.
     observations = repo.acquisition_observations_for(profile.instrument_id)
     quarterly_obs = [
         obs
@@ -172,18 +172,18 @@ def test_di18_nse_success_empty_does_not_claim_nse_readiness() -> None:
     ]
     assert quarterly_obs, "expected a QUARTERLY_FINANCIALS acquisition observation"
     nse_obs = quarterly_obs[-1]
-    assert nse_obs["outcome"] == "SUCCESS_EMPTY"
+    assert nse_obs["outcome"] == "FAILED"
     assert nse_obs["evidence_count"] == 0
-    assert nse_obs["failure_reason"] is None
+    assert nse_obs["failure_reason"] == "PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS"
 
-    # No facts were persisted at all, so readiness must be MISSING with no source --
+    # No facts were persisted at all, so readiness must be FAILED with no source --
     # NSE NEVER claimed authoritative readiness on an empty parse.
     adapter = RepositoryResearchReadinessAdapter(repo)
     result = ResearchReadinessService(adapter).assess(
         profile.instrument_id, jurisdiction="INDIA"
     )
     readiness = result.for_requirement("QUARTERLY_FINANCIALS")
-    assert readiness.status == ResearchRequirementStatus.MISSING
+    assert readiness.status == ResearchRequirementStatus.FAILED
     assert readiness.source is None
 
     # The Yahoo fallback is independent: seeding it preserves its provenance and the

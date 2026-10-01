@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
+from app import cycle_timing
 from app.fact_precedence import FactSourceTier, FinancialFact, FinancialFactKey
 from app.models import (
     CompanyResearchProfile,
@@ -473,7 +474,7 @@ class RecordingOrchestrator:
         self.structured_calls: list[set[str]] = []
         self.international_calls = 0
 
-    async def ensure_structured_market(self, _instrument_id, classes):
+    async def ensure_structured_market(self, _instrument_id, classes, *, baseline_only=False):
         self.structured_calls.append(set(classes))
         return SimpleNamespace(error=None)
 
@@ -692,6 +693,57 @@ async def test_concurrent_same_instrument_ensure_reuses_single_flight() -> None:
     executor.release.set()
     first_result, second_result = await asyncio.gather(first, second)
 
+    assert executor.primary_calls == [{"CURRENT_NEWS"}]
+    assert first_result.reused_single_flight is False
+    assert second_result.reused_single_flight is True
+
+
+@pytest.mark.asyncio
+async def test_orchestration_wait_expiry_does_not_duplicate_scheduling() -> None:
+    """Stage2 Final Fix -- Item 5: correlate orchestration_wait_expired with
+    duplicate scheduling, without changing the 25s timeout itself.
+
+    A background-cycle ensure(wait_for_completion=True) call that outlasts
+    the observational wait budget only LOGS orchestration_wait_expired and
+    then keeps awaiting the SAME already-running task -- it never cancels or
+    reschedules it. A second, overlapping ensure() call for the same
+    instrument arriving while that wait is still pending (i.e. exactly the
+    window in which orchestration_wait_expired can fire) must still join the
+    existing single-flight task (ResearchReadinessRuntime._flights) rather
+    than triggering a second acquisition/provider pass. This is a focused
+    trace-by-test, per Item 5's "if they do not [cause duplication], make NO
+    production change and prove it" instruction -- no production code is
+    changed for this item.
+    """
+    source = StateDataSource({"CURRENT_NEWS"})
+    executor = UpdatingExecutor(source)
+    executor.release = asyncio.Event()
+    runtime = ResearchReadinessRuntime(
+        RuntimeRepository(),
+        source,  # type: ignore[arg-type]
+        executor,  # type: ignore[arg-type]
+        ensure_timeout_seconds=0.01,
+    )
+
+    first = asyncio.create_task(runtime.ensure(
+        INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["CURRENT_NEWS"],
+        wait_for_completion=True,
+    ))
+    await executor.started.wait()
+    # Let the tiny ensure_timeout_seconds elapse so orchestration_wait_expired
+    # fires for the still-in-flight first call, before issuing the second,
+    # overlapping ensure() call.
+    await asyncio.sleep(0.05)
+    second = asyncio.create_task(runtime.ensure(
+        INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["CURRENT_NEWS"],
+        wait_for_completion=True,
+    ))
+    await asyncio.sleep(0)
+    executor.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    # Exactly one underlying acquisition pass, despite the wait-expiry log
+    # having fired for the first call before the second one arrived.
     assert executor.primary_calls == [{"CURRENT_NEWS"}]
     assert first_result.reused_single_flight is False
     assert second_result.reused_single_flight is True
@@ -1095,3 +1147,576 @@ def test_jurisdiction_mapping_is_provider_neutral() -> None:
     american = _profile(uuid4()).model_copy(update={"country": "US", "exchange": "XNAS"})
     assert jurisdiction_for_profile(european) == "EUROPE"
     assert jurisdiction_for_profile(american) == "USA"
+
+
+def test_phase_timing_recorders_are_noops_without_active_recorder() -> None:
+    # Without a cycle_scope / span, the phase recorders must be safe no-ops.
+    cycle_timing.record_readiness_load_elapsed(1.0)
+    cycle_timing.record_planning_elapsed(1.0)
+    cycle_timing.record_single_flight_wait_elapsed(1.0)
+    cycle_timing.record_observation_recording_elapsed(1.0)
+    cycle_timing.record_final_readiness_reload_elapsed(1.0)
+
+
+@pytest.mark.asyncio
+async def test_ensure_emits_phase_timing_under_active_recorder() -> None:
+    from app.cycle_timing import (
+        CycleTimingRecorder,
+        cycle_scope,
+        track_requirement,
+    )
+
+    source = StateDataSource({"CURRENT_NEWS"})
+    executor = UpdatingExecutor(source)
+    runtime = _runtime(source, executor)
+    recorder = CycleTimingRecorder("phase-timing-cycle")
+
+    with cycle_scope(recorder):
+        with track_requirement("rt-1", "CURRENT_NEWS") as span:
+            await runtime.ensure(
+                INSTRUMENT_ID,
+                jurisdiction="INDIA",
+                requirement_ids=["CURRENT_NEWS"],
+            )
+
+    # Every phase that should have run must have recorded a non-negative ms.
+    assert span.readiness_load_elapsed_ms >= 0.0
+    assert span.planning_elapsed_ms >= 0.0
+    assert span.final_readiness_reload_elapsed_ms >= 0.0
+    # No single-flight target and no record_acquisition_observer on RuntimeRepository:
+    # both may legitimately be 0.0 (the recorder only fires when the phase runs).
+    assert span.single_flight_wait_elapsed_ms == 0.0
+    assert span.observation_recording_elapsed_ms == 0.0
+    # Cycle-level aggregates must mirror the span values.
+    assert recorder._cycle_readiness_load_ms == span.readiness_load_elapsed_ms
+    assert recorder._cycle_planning_ms == span.planning_elapsed_ms
+    assert recorder._cycle_final_readiness_reload_ms == span.final_readiness_reload_elapsed_ms
+
+
+@pytest.mark.asyncio
+async def test_single_flight_wait_recorded_for_follower() -> None:
+    from app.cycle_timing import (
+        CycleTimingRecorder,
+        cycle_scope,
+        track_requirement,
+    )
+
+    source = StateDataSource({"CURRENT_NEWS"})
+
+    class SlowExecutor(UpdatingExecutor):
+        async def execute_primary(self, instrument_id, targets, **_kwargs):
+            self.started.set()
+            await asyncio.sleep(0.05)  # blocks the owner's plan briefly so the
+            # follower's shielded wait is measurable in wall-clock time.
+            return await super().execute_primary(instrument_id, targets, **_kwargs)
+
+    executor = SlowExecutor(source)
+    runtime = _runtime(source, executor)
+    recorder = CycleTimingRecorder("sf-wait-cycle")
+
+    with cycle_scope(recorder):
+        with track_requirement("sf-owner", "CURRENT_NEWS") as owner_span:
+            first = asyncio.create_task(runtime.ensure(
+                INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["CURRENT_NEWS"]
+            ))
+            await executor.started.wait()
+            with track_requirement("sf-follower", "CURRENT_NEWS") as follower_span:
+                second = asyncio.create_task(runtime.ensure(
+                    INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["CURRENT_NEWS"]
+                ))
+                await asyncio.sleep(0)
+            first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.reused_single_flight is False
+    assert second_result.reused_single_flight is True
+    # The owner executed the plan; the follower waited on the shielded flight.
+    assert owner_span.single_flight_wait_elapsed_ms == 0.0
+    assert follower_span.single_flight_wait_elapsed_ms > 0.0
+    # The cycle aggregate captures the follower's wait.
+    assert recorder._cycle_single_flight_wait_ms == follower_span.single_flight_wait_elapsed_ms
+
+
+@pytest.mark.asyncio
+async def test_execute_plan_collapses_final_read_when_no_fallback() -> None:
+    # No-fallback path: after_primary fully satisfies the target, so the
+    # previously-redundant final_readiness read() is elided and reused.
+    # 4 reads would have occurred pre-optimization (initial + after_primary +
+    # final_readiness + ensure-final). With the collapse: 3 (initial +
+    # after_primary/reused + ensure-final).
+    source = StateDataSource({"CURRENT_NEWS"})
+    executor = UpdatingExecutor(source, update_primary=True)
+    runtime = _runtime(source, executor)
+
+    result = await runtime.ensure(
+        INSTRUMENT_ID,
+        jurisdiction="INDIA",
+        requirement_ids=["CURRENT_NEWS"],
+    )
+
+    assert executor.primary_calls == [{"CURRENT_NEWS"}]
+    assert executor.fallback_calls == []
+    assert result.readiness.for_requirement("CURRENT_NEWS").status == ResearchRequirementStatus.READY_FRESH
+    # initial read + after_primary read + ensure-final read == 3 (no collapsed 4th).
+    assert source.loads == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_plan_re_reads_final_readiness_when_fallback_runs() -> None:
+    # Fallback path: the fallback persists new evidence, so a separate final
+    # read() is REQUIRED to capture the persisted change. The optimization
+    # must NOT elide this read.
+    source = StateDataSource({"QUARTERLY_FINANCIALS"})
+    executor = UpdatingExecutor(source, update_primary=False)
+    runtime = _runtime(source, executor)
+
+    result = await runtime.ensure(
+        INSTRUMENT_ID,
+        jurisdiction="INDIA",
+        requirement_ids=["QUARTERLY_FINANCIALS"],
+    )
+
+    assert executor.primary_calls == [{"QUARTERLY_FINANCIALS"}]
+    assert executor.fallback_calls == [{"QUARTERLY_FINANCIALS"}]
+    assert result.readiness.for_requirement("QUARTERLY_FINANCIALS").status == ResearchRequirementStatus.READY_FRESH
+    # initial + after_primary + final_readiness-after-fallback + ensure-final == 4.
+    assert source.loads == 4
+
+
+# ---------------------------------------------------------------------------
+# Context-span propagation for grouped (multi-member) acquisition.
+#
+# Root cause being guarded: deep_investigation._acquire_group calls ONE shared
+# runtime.ensure() on behalf of N requirement members but (pre-fix) did NOT
+# bind any RequirementTimingRecord as _current_span while that ensure() ran.
+# Every descendant recorder (_record -> span._add) therefore hit span=None and
+# silently dropped per-requirement attribution, even though the cycle-level
+# recorder (_current_recorder, set once by the outer cycle_scope) kept the
+# cycle aggregates non-zero. The fix: bind the FIRST member's record as the
+# active span around the shared ensure(), so granular descendant sub-timing
+# (provider/network/discovery/PDF/persistence) attributes to a representative
+# member exactly as deep_investigation's own comment intends, while group
+# totals still flow to EVERY member via record_elapsed_on().
+# ---------------------------------------------------------------------------
+
+
+def test_group_span_bind_routes_descendant_timing_to_first_member() -> None:
+    # Reproduces the _acquire_group shape at the cycle_timing layer:
+    # start N member records, bind_span the first, record descendant timing
+    # (provider_elapsed == the kind of leaf metric emitted inside ensure()),
+    # then unbind and write totals to all members.
+    from app.cycle_timing import (
+        CycleTimingRecorder,
+        cycle_scope,
+        bind_span,
+        unbind_span,
+        record_elapsed_on,
+    )
+
+    recorder = CycleTimingRecorder("group-span-cycle")
+    with cycle_scope(recorder):
+        first = recorder.start_requirement(INSTRUMENT_ID, "GROWTH_FACTS")
+        second = recorder.start_requirement(INSTRUMENT_ID, "BALANCE_SHEET_FACTS")
+        # Pre-fix behaviour: no span bound -> provider timing is dropped from
+        # BOTH member records (span is None) but still reaches the cycle total.
+        # Post-fix: bind the first member so descendant attribution lands.
+        token = bind_span(first)
+        try:
+            cycle_timing.record_provider_elapsed(1234.5)  # leaf inside ensure()
+        finally:
+            unbind_span(token)
+        # The group's own elapsed totals are written to EVERY member afterwards.
+        record_elapsed_on(first, "runtime_ensure_elapsed_ms", 999.0)
+        record_elapsed_on(second, "runtime_ensure_elapsed_ms", 999.0)
+
+    # The first member (the active span) captures the descendant leaf timing:
+    assert first.provider_elapsed_ms == 1234.5
+    # Second member never held the span -> no leaf sub-timing of its own:
+    assert second.provider_elapsed_ms == 0.0
+    # Both members received the group total via record_elapsed_on:
+    assert first.runtime_ensure_elapsed_ms == 999.0
+    assert second.runtime_ensure_elapsed_ms == 999.0
+    # Cycle aggregate still captured the provider work once:
+    assert recorder.report()["aggregate_provider_wait_ms"] == 1234.5
+
+
+def test_group_span_bind_does_not_cross_contaminate_concurrent_requirements() -> None:
+    # Two DIFFERENT requirement spans active in sequence must not bleed timing
+    # into each other -- the bind/unbind boundary is strict.
+    from app.cycle_timing import (
+        CycleTimingRecorder,
+        cycle_scope,
+        bind_span,
+        unbind_span,
+        record_provider_elapsed,
+    )
+
+    recorder = CycleTimingRecorder("no-cross-cycle")
+    with cycle_scope(recorder):
+        growth = recorder.start_requirement(INSTRUMENT_ID, "GROWTH_FACTS")
+        token = bind_span(growth)
+        try:
+            record_provider_elapsed(500.0)
+        finally:
+            unbind_span(token)
+        # After unbind, no span is active; a late recorder call must not land
+        # on growth (proving the span is truly unbound, not still live).
+        record_provider_elapsed(1.0)
+
+        balance = recorder.start_requirement(INSTRUMENT_ID, "BALANCE_SHEET_FACTS")
+        token = bind_span(balance)
+        try:
+            record_provider_elapsed(7.0)
+        finally:
+            unbind_span(token)
+
+    assert growth.provider_elapsed_ms == 500.0
+    assert balance.provider_elapsed_ms == 7.0
+    # The cycle aggregate captures ALL provider work -- including the 1.0
+    # emitted after the span was unbound (cycle totals are independent of any
+    # single-requirement span, by design), plus both members' attribution.
+    assert recorder.report()["aggregate_provider_wait_ms"] == 500.0 + 7.0 + 1.0
+
+
+@pytest.mark.asyncio
+async def test_ensure_under_bound_group_span_attributes_descendant_timing() -> None:
+    # End-to-end through the REAL ResearchReadinessRuntime.ensure() path:
+    # bind_span(first_member) around ensure(), with a capability executor that
+    # emits record_provider_elapsed inside execute_primary (as production does
+    # via research_fetching). Assert the first member's record captures the
+    # provider timing and the cycle aggregate survives -- reproducing the
+    # INFY/KPIGREEN zero-attribution symptom and its fix.
+    from app.cycle_timing import CycleTimingRecorder, cycle_scope, bind_span, unbind_span
+
+    source = StateDataSource({"GROWTH_FACTS", "BALANCE_SHEET_FACTS"})
+    recorder = CycleTimingRecorder("ensure-bound-cycle")
+
+    captured: dict[str, object] = {}
+
+    class RecordingProviderExecutor:
+        def __init__(self, src):
+            self._src = src
+            self.primary_calls: list[set[str]] = []
+
+        async def execute_primary(self, _instrument_id, targets, **_kwargs):
+            ids = {t.requirement_id for t in targets}
+            self.primary_calls.append(ids)
+            self._src.missing.difference_update(ids)
+            # Emit the kind of descendant leaf timing production emits inside
+            # the provider/discovery/PDF/persistence layer:
+            cycle_timing.record_provider_elapsed(250.0)
+            return CapabilityExecutionResult(("RECORDED_PRIMARY",), {})
+
+        async def execute_approved_fallbacks(self, _instrument_id, targets):
+            return CapabilityExecutionResult((), {})
+
+    executor = RecordingProviderExecutor(source)
+    runtime = ResearchReadinessRuntime(RuntimeRepository(), source, executor)
+
+    with cycle_scope(recorder):
+        first_member = recorder.start_requirement(INSTRUMENT_ID, "GROWTH_FACTS")
+        second_member = recorder.start_requirement(INSTRUMENT_ID, "BALANCE_SHEET_FACTS")
+        try:
+            token = bind_span(first_member)
+            try:
+                result = await runtime.ensure(
+                    INSTRUMENT_ID,
+                    jurisdiction="INDIA",
+                    requirement_ids=["GROWTH_FACTS", "BALANCE_SHEET_FACTS"],
+                    wait_for_completion=True,
+                )
+            finally:
+                unbind_span(token)
+        finally:
+            recorder.complete_requirement(first_member)
+            recorder.complete_requirement(second_member)
+        captured["result"] = result
+        captured["first"] = first_member
+        captured["second"] = second_member
+        captured["report"] = recorder.report()
+
+    # Both members served by the single shared primary call:
+    assert executor.primary_calls == [{"GROWTH_FACTS", "BALANCE_SHEET_FACTS"}]
+    # The first group member (the active span during ensure()) now captures the
+    # descendant provider timing -- this is the field that was 0.0 pre-fix:
+    first_member = captured["first"]
+    second_member = captured["second"]
+    assert first_member.planning_elapsed_ms >= 0.0
+    assert first_member.readiness_load_elapsed_ms >= 0.0
+    assert first_member.final_readiness_reload_elapsed_ms >= 0.0
+    assert first_member.provider_elapsed_ms == 250.0
+    # Second member never held the span, so it carries no leaf sub-timing
+    # (only the group totals written via record_elapsed_on in production):
+    assert second_member.provider_elapsed_ms == 0.0
+    # Cycle aggregate survived even though it's set independently of the span:
+    assert captured["report"]["aggregate_provider_wait_ms"] == 250.0
+    # And the readiness result itself is unchanged (semantics preserved):
+    result = captured["result"]
+    assert result.failures == {}
+    assert result.readiness.for_requirement("GROWTH_FACTS").status != ResearchRequirementStatus.MISSING
+
+
+# ---------------------------------------------------------------------------
+# Redundancy-elimination tests for ResearchReadinessRuntime.read().
+#
+# Root-cause attribution (controlled INFY + KPIGREEN cycle, stage2WallClockMs
+# = 62508): ResearchReadinessService.assess was invoked 65 times for 2
+# investigations because every runtime.read() re-ran both
+#   (a) repository.market_session_data() -> 2 locked persistence loads
+#       (load_market_schedules + load_market_calendar_exceptions), and
+#   (b) RepositoryResearchReadinessAdapter.load_by_global_instrument_id() ->
+#       8 synchronous repository reads,
+#   under a single _persistence_worker_lock hold. So assess_count == read_count
+#   == 65 and market_session_data ran 130 locked sub-calls.
+#
+# Two provably-safe optimizations were applied:
+#   (1) Bounded market-session cache on ResearchRepository (invalidated on any
+#       persistence write) collapses the repeated locked schedule loads.
+#   (2) evidence_only=True reads reuse the in-flight ResearchReadinessResult
+#       when no persistence mutation occurred since the snapshot was taken,
+#       and durable reads (evidence_only=False) clear the cache so the final
+#       verification and post-mutation re-reads remain authoritative.
+#
+# These tests are provider-free: they count assess invocations (via
+# StateDataSource.loads) and market_session_data invocations without touching
+# any network/provider code.
+# ---------------------------------------------------------------------------
+
+
+class MutationTrackingRepository:
+    """RuntimeRepository stub whose _run_blocking_persistence mirrors
+    ResearchRepository's write-prefix classification and bumps a readiness-
+    mutation generation counter on persistence writes, so evidence-only reuse
+    invalidation can be exercised without a real database."""
+
+    def __init__(self) -> None:
+        self._readiness_mutation_generation = 0
+        self.write_calls: list[str] = []
+
+    async def _run_blocking_persistence(self, operation, *args, **kwargs):
+        qn = getattr(operation, "__qualname__", "") or ""
+        name = getattr(operation, "__name__", "") or ""
+        label = name or qn
+        if any(label.startswith(p) for p in ResearchRepository._PERSISTENCE_WRITE_PREFIXES):
+            self.write_calls.append(label)
+            self._readiness_mutation_generation += 1
+        return operation(*args, **kwargs)
+
+
+class _NoopExecutor:
+    async def execute_primary(self, *_a, **_k):
+        return CapabilityExecutionResult((), {})
+
+    async def execute_approved_fallbacks(self, *_a, **_k):
+        return CapabilityExecutionResult((), {})
+
+
+def _run_sync(coro):
+    """Run a coroutine to completion on a fresh loop (test helper)."""
+    import asyncio as _asyncio
+    loop = _asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _run_market_session_sync(repository, markets):
+    """Invoke repository.market_session_data synchronously (test helper)."""
+    return _run_sync(repository.market_session_data(markets))
+
+
+@pytest.mark.asyncio
+async def test_evidence_only_read_reuses_unmutated_snapshot() -> None:
+    """Multiple evidence_only=True reads with no intervening persistence
+    mutation must reuse the cached ResearchReadinessResult instead of invoking
+    assess a second time. A durable (evidence_only=False) read precedes them,
+    so the cache is primed; the first evidence_only read misses (loads go 1->2)
+    and caches, subsequent evidence_only reads hit (loads unchanged)."""
+    source = StateDataSource(set())
+    runtime = _runtime(source, UpdatingExecutor(source))  # uses RuntimeRepository stub
+
+    await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA")  # durable: loads=1, cache cleared
+    assert source.loads == 1
+    assert INSTRUMENT_ID not in runtime._evidence_readiness_cache
+
+    first = await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA", evidence_only=True)
+    assert source.loads == 2  # cache miss -> assess ran
+    assert INSTRUMENT_ID in runtime._evidence_readiness_cache
+
+    second = await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA", evidence_only=True)
+    third = await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA", evidence_only=True)
+    assert source.loads == 2  # both cache hits -> no new assess
+    assert second is first
+    assert third is first
+
+
+@pytest.mark.asyncio
+async def test_persistence_mutation_invalidates_reused_readiness() -> None:
+    """A persistence write between an evidence_only read and the next must bump
+    the repository mutation generation so the reused snapshot is discarded and
+    the subsequent evidence_only read re-assesses (durable reload)."""
+    source = StateDataSource(set())
+    repo = MutationTrackingRepository()
+    runtime = ResearchReadinessRuntime(repo, source, _NoopExecutor())  # type: ignore[arg-type]
+
+    await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA")  # durable: loads=1
+    assert source.loads == 1
+
+    evidence = await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA", evidence_only=True)
+    assert source.loads == 2  # cache miss -> assess ran
+    assert INSTRUMENT_ID in runtime._evidence_readiness_cache
+    cached_gen = runtime._evidence_readiness_cache[INSTRUMENT_ID][1]
+    assert cached_gen == 0
+
+    # Simulate a persistence write (e.g. record_acquisition_observation in
+    # ensure post-execution recording) -- the generation must bump.
+    repo._readiness_mutation_generation += 1
+
+    again = await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA", evidence_only=True)
+    assert source.loads == 3  # mutation invalidated cache -> re-assessed
+    assert again is not evidence  # not the stale cached object
+    assert runtime._evidence_readiness_cache[INSTRUMENT_ID][1] == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_read_still_reloads_after_mutation() -> None:
+    """A durable (evidence_only=False) read after a mutation must always hit the
+    backend -- it is the authoritative verification path and must never serve
+    the evidence-only cache. This preserves the post-mutation final durable
+    verification at deep_investigation.investigate L589."""
+    source = StateDataSource(set())
+    runtime = _runtime(source, UpdatingExecutor(source))
+
+    await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA")  # loads=1
+    before = await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA", evidence_only=True)
+    assert source.loads == 2
+
+    # Force a mutation generation bump (simulates an upsert/record during exec).
+    # RuntimeRepository (the _runtime stub) does not carry the attribute, so
+    # attach it as a plain attribute mirroring ResearchRepository.
+    setattr(runtime.repository, "_readiness_mutation_generation",
+            getattr(runtime.repository, "_readiness_mutation_generation", 0) + 1)
+    after = await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA")  # durable reload
+    assert source.loads == 3
+    assert after is not before
+
+
+@pytest.mark.asyncio
+async def test_final_durable_verification_is_never_cached() -> None:
+    """The final authoritative readiness verification (investigate L589, a
+    durable read) must not leave an evidence-only cache entry behind. A final
+    durable read must always perform the backend load."""
+    source = StateDataSource({"CURRENT_NEWS"})
+    executor = UpdatingExecutor(source, update_primary=True)
+    runtime = _runtime(source, executor)
+
+    result = await runtime.ensure(
+        INSTRUMENT_ID,
+        jurisdiction="INDIA",
+        requirement_ids=["CURRENT_NEWS"],
+    )
+    # The final read inside ensure() is durable (evidence_only=False) and is
+    # never cached -- assert no evidence-only entry survived the ensure() flow.
+    assert INSTRUMENT_ID not in runtime._evidence_readiness_cache
+    assert result.readiness.for_requirement("CURRENT_NEWS").status == ResearchRequirementStatus.READY_FRESH
+
+
+@pytest.mark.asyncio
+async def test_assess_call_reduction_under_evidence_only_spike() -> None:
+    """Simulate the deep_investigation evidence_only sufficiency pre-checks
+    (multiple evidence_only reads in a row with no mutation) and assert the
+    assess invocation count is materially reduced: 1 durable read + 1
+    evidence_only miss + 4 cache hits = 2 assess calls instead of 6."""
+    source = StateDataSource(set())
+    runtime = _runtime(source, UpdatingExecutor(source))
+
+    await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA")  # durable -> assess #1
+    for _ in range(5):
+        await runtime.read(INSTRUMENT_ID, jurisdiction="INDIA", evidence_only=True)  # 1 miss + 4 hits
+    assert source.loads == 2  # 6 reads, but only 2 assess invocations
+
+
+def test_market_session_data_reuse_within_cycle(tmp_path) -> None:
+    """Within one investigate flow, market_session_data for the same market set
+    must be served from the repository bounded cache instead of re-running the
+    two locked loads on every read. No persistence write occurs, so the cache
+    is not invalidated."""
+    persistence = SqliteResearchPersistence(tmp_path / "sched.sqlite")
+    repository = ResearchRepository(
+        settings=Settings(research_demo_enabled=False), persistence=persistence
+    )
+    repository._market_session_cache.clear()
+
+    first_markets, first_exceptions = _run_market_session_sync(repository, {"XNSE"})
+    second_markets, second_exceptions = _run_market_session_sync(repository, {"XNSE"})
+
+    assert first_markets is second_markets
+    assert first_exceptions is second_exceptions
+    assert len(repository._market_session_cache) == 1
+    assert frozenset({"XNSE"}) in repository._market_session_cache
+
+
+def test_market_session_data_cache_cleared_on_write(tmp_path) -> None:
+    """A persistence write (e.g. record_acquisition_observation) must invalidate
+    the market-session cache so schedule data is never served stale across a
+    mutation boundary. The cache must be empty after the write, forcing a
+    reload on the next market_session_data call."""
+    persistence = SqliteResearchPersistence(tmp_path / "sched-write.sqlite")
+    repository = ResearchRepository(
+        settings=Settings(research_demo_enabled=False), persistence=persistence
+    )
+    repository._market_session_cache.clear()
+    profile = _profile(uuid4())
+    repository.profiles.append(profile)
+
+    _run_market_session_sync(repository, {"XNSE"})  # populates cache
+    assert len(repository._market_session_cache) == 1
+
+    _run_sync(
+        repository.record_acquisition_observation(
+            profile.instrument_id,
+            "CURRENT_NEWS",
+            "READINESS_EXECUTOR",
+            "COMPLETED",
+            NOW,
+        )
+    )
+    assert len(repository._market_session_cache) == 0  # invalidated by the write
+    assert repository._readiness_mutation_generation == 1
+
+
+def test_market_session_data_does_not_leak_across_instruments(tmp_path) -> None:
+    """A persistence write for instrument A must invalidate the global
+    market-session cache so instrument B cannot observe schedule data cached
+    before the mutation boundary. This proves the cache cannot leak a stale
+    schedule snapshot across an unsafe (write) boundary."""
+    persistence = SqliteResearchPersistence(tmp_path / "sched-leak.sqlite")
+    repository = ResearchRepository(
+        settings=Settings(research_demo_enabled=False), persistence=persistence
+    )
+    repository._market_session_cache.clear()
+    profile_a = _profile(uuid4())
+    profile_b = _profile(uuid4())
+    repository.profiles.append(profile_a)
+    repository.profiles.append(profile_b)
+
+    cached_before = _run_market_session_sync(repository, {"XNSE"})
+    assert len(repository._market_session_cache) == 1
+
+    # A write for instrument A invalidates the global schedule cache.
+    _run_sync(
+        repository.record_acquisition_observation(
+            profile_a.instrument_id,
+            "CURRENT_NEWS",
+            "READINESS_EXECUTOR",
+            "COMPLETED",
+            NOW,
+        )
+    )
+    assert len(repository._market_session_cache) == 0
+
+    # The next load for B is fresh (re-queried from storage), not the pre-write
+    # cached tuple object.
+    fresh_markets, fresh_exceptions = _run_market_session_sync(repository, {"XNSE"})
+    assert fresh_markets is not None
+    assert fresh_exceptions is not None

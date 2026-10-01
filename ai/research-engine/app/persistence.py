@@ -642,7 +642,10 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         return [_document_from_row(row) for row in self._filtered_rows(
             "research_documents", set(document_ids), column="document_id")]
 
-    def load_document_identities(self) -> list[tuple[UUID, UUID | None, str, str, str, datetime | None]]:
+    def load_document_identities_for_instrument(self, instrument_id: UUID):
+        return self.load_document_identities(instrument_id=instrument_id)
+
+    def load_document_identities(self, *, instrument_id: UUID | None = None) -> list[tuple[UUID, UUID | None, str, str, str, datetime | None]]:
         """Cheap startup/dedup-seeding read: compact identity columns only,
         never the (potentially large) normalized_text body -- rehydration
         cost is independent of historical document size.
@@ -650,7 +653,10 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         with self._connection:
             rows = self._connection.execute(
                 "SELECT document_id, instrument_id, canonical_url, content_hash, source_mode, published_at, retrieved_at "
-                "FROM research_documents ORDER BY retrieved_at"
+                "FROM research_documents "
+                + ("WHERE instrument_id = ? " if instrument_id is not None else "")
+                + "ORDER BY retrieved_at",
+                (str(instrument_id),) if instrument_id is not None else (),
             ).fetchall()
         return [(_parse_uuid(row["document_id"]), _parse_uuid(row["instrument_id"]), row["canonical_url"], row["content_hash"],
                  SourceMode(row["source_mode"]), _parse_dt(row["published_at"]) or _parse_dt(row["retrieved_at"]))
@@ -742,6 +748,49 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                     (str(value.id), str(snapshot.id), str(value.category), _decimal(value.percentage), value.metric_basis,
                      value.raw_source_label, value.source_locator, value.evidence_text, _dt(value.created_at)),
                 )
+        return True
+
+    def repair_official_document(self, document: ResearchDocument) -> bool:
+        """Repair a failed/legacy NSE row or a republished locator in place.
+
+        Retain its durable id and fact provenance. Ordinary duplicate filings
+        and documents for a different issuer cannot overwrite an existing row.
+        """
+        from app.financial_projection import nse_authority_rejection
+        if nse_authority_rejection(document) or not (document.normalized_text or "").strip():
+            return False
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM research_documents WHERE canonical_url=?", (document.canonical_url,),
+            ).fetchone()
+            if row is None:
+                return False
+            prior = _document_from_row(row)
+            if prior.instrument_id != document.instrument_id or prior.company_id != document.company_id:
+                return False
+            revised = bool(document.published_at and prior.published_at and document.published_at > prior.published_at)
+            changed = document.content_hash != prior.content_hash and document.retrieved_at >= prior.retrieved_at
+            if nse_authority_rejection(prior) is None and prior.normalized_text and not revised and not changed:
+                return False
+            document.published_at = document.published_at or prior.published_at
+            document.document_subtype = document.document_subtype or prior.document_subtype
+            self._connection.execute(
+                """UPDATE research_documents SET normalized_text=?, content_hash=?, status=?,
+                   title=?, published_at=?, retrieved_at=?, content_type=?, source_type=?, source_classification=?,
+                   discovery_provider=?, reliability_level=?, entity_resolution_confidence=?, original_url=?,
+                   source_url=?, source_name=?, document_type=?, document_subtype=?, source_independence_key=?,
+                   updated_at=? WHERE document_id=?""",
+                (document.normalized_text, document.content_hash, str(DocumentStatus.PROCESSED),
+                 _bounded(document.title, RESEARCH_DOCUMENT_COLUMN_LIMITS["title"]), _dt(document.published_at),
+                 _dt(document.retrieved_at), document.content_type, str(document.source_type), str(document.source_classification),
+                 document.discovery_provider, str(document.reliability_level), document.entity_resolution_confidence,
+                 document.original_url, document.original_url, _bounded(document.source_name, RESEARCH_DOCUMENT_COLUMN_LIMITS["source_name"]),
+                 str(document.document_type), document.document_subtype, document.source_independence_key,
+                 _dt(datetime.now(timezone.utc)), str(prior.document_id)),
+            )
+        document.document_id = prior.document_id
+        document.status = DocumentStatus.PROCESSED
+        document.duplicate_of_document_id = None
         return True
 
     def upsert_document(self, document: ResearchDocument) -> bool:

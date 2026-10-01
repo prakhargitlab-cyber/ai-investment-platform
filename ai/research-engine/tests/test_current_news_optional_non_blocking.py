@@ -13,10 +13,24 @@ end to end: eligibility policy -> Rule Engine evaluation -> orchestration
 completeness gate -> ranker rank_eligible -- while confirming mandatory
 fundamental requirements are completely unaffected (test F) and CURRENT_NEWS
 diagnostics remain visible (test G).
+
+Tests H-K extend this to app.deep_investigation.investigate() itself: proving
+CURRENT_NEWS's *acquisition* -- not just its already-proven eligibility
+exemption -- does not sit on the mandatory wall-clock critical path when a
+caller opts in via investigate()'s `background_tasks` parameter, using the
+same lifecycle-safe drain (asyncio.gather(*pending, return_exceptions=True))
+that GlobalOpportunityOrchestrator._acquire_deep's finally: block performs on
+its own `pending_news_tasks`.
 """
+import asyncio
+import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
+
+from app.deep_investigation import investigate
+from app.research_readiness_runtime import TargetedEnsureResult
 
 from app.global_opportunity_orchestration import GlobalOpportunityOrchestrator
 from app.global_opportunity_ranker import GlobalOpportunityRanker
@@ -25,6 +39,209 @@ from app.research_readiness import ResearchRequirementStatus
 from app.stock_rule_engine import AreaScoreStatus, DecisionSignal, StockRuleEngineEligibilityPolicy, StockRuleEngineV1
 
 from test_stock_rule_engine import NOW, INSTRUMENT_ID, _inputs, _readiness
+
+
+class _FakeInvestigateRuntime:
+    """A controllable runtime for investigate(): each requirement's ensure()
+    call can be given an artificial delay and/or made to raise, so a test can
+    prove exactly which calls investigate() waited on and which it did not.
+    Mirrors the SimpleNamespace(read=..., ensure=..., repository=...) pattern
+    already used by tests/test_di20h_discovery_investigation.py, just made
+    parameterizable for timing/failure control."""
+
+    def __init__(self, readiness, *, delays=None, fail=None):
+        self.readiness = readiness
+        self.delays = dict(delays or {})
+        self.fail = dict(fail or {})
+        self.fail_full_read_from_now = False
+        self.observations = []
+        self.repository = SimpleNamespace(record_acquisition_observation=self._record_observation)
+
+    async def _record_observation(self, *args, **kwargs):
+        self.observations.append((args, kwargs))
+
+    async def read(self, instrument_id, *, jurisdiction, evidence_only=False):
+        # fail_full_read_from_now is only ever flipped on by a test *after*
+        # investigate() has already returned, so it can only affect reads
+        # issued by a still-running background task -- never investigate()'s
+        # own synchronous-path reads.
+        if self.fail_full_read_from_now and not evidence_only:
+            raise RuntimeError("SIMULATED_POST_RETURN_READ_FAILURE")
+        return self.readiness
+
+    async def ensure(self, instrument_id, *, jurisdiction, requirement_ids, identity_headers=None,
+                     correlation_id=None, wait_for_completion=True):
+        requirement_id = requirement_ids[0]
+        delay = self.delays.get(requirement_id, 0)
+        if delay:
+            await asyncio.sleep(delay)
+        if requirement_id in self.fail:
+            raise self.fail[requirement_id]
+        self.readiness = replace(self.readiness, requirements=tuple(
+            replace(row, status=ResearchRequirementStatus.READY_FRESH, missing_input_ids=())
+            if row.requirement_id == requirement_id else row for row in self.readiness.requirements))
+        return TargetedEnsureResult(self.readiness, (requirement_id,), (f"NSE:{requirement_id}",))
+
+
+async def _drain(background_tasks, **gather_kwargs):
+    if not background_tasks:
+        return []
+    outcomes = await asyncio.gather(*background_tasks, **gather_kwargs)
+    background_tasks.clear()
+    return outcomes
+
+
+# H -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_h_slow_current_news_does_not_delay_mandatory_candidate_completion():
+    # A deliberately slow CURRENT_NEWS acquisition (far past what a mandatory
+    # requirement should ever take) must not add to investigate()'s own
+    # wall-clock time once a caller opts in via background_tasks.
+    readiness = _readiness({"QUARTERLY_FINANCIALS": ResearchRequirementStatus.MISSING,
+                            "CURRENT_NEWS": ResearchRequirementStatus.MISSING})
+    slow_news_seconds = 0.35
+    runtime = _FakeInvestigateRuntime(readiness, delays={"CURRENT_NEWS": slow_news_seconds})
+    background_tasks = set()
+    started = time.monotonic()
+    result, plan, matrix = await investigate(runtime, INSTRUMENT_ID, jurisdiction="INDIA",
+                                              background_tasks=background_tasks)
+    returned_after = time.monotonic() - started
+    assert returned_after < slow_news_seconds / 2  # measured timing: see report section 7
+
+    # The mandatory requirement was fully awaited and genuinely completed.
+    assert result.readiness.for_requirement("QUARTERLY_FINANCIALS").status == ResearchRequirementStatus.READY_FRESH
+    assert "QUARTERLY_FINANCIALS" not in result.failures
+    eligibility = StockRuleEngineEligibilityPolicy().evaluate(result.readiness)
+    assert eligibility.full_analysis_allowed
+    assert eligibility.blocking_requirements == []
+
+    # CURRENT_NEWS is genuinely still in flight the moment investigate()
+    # returned -- not a case that merely happened to finish fast.
+    assert len(background_tasks) == 1
+    assert matrix["CURRENT_NEWS"]["state"] == "MISSING"
+
+    drain_started = time.monotonic()
+    await _drain(background_tasks, return_exceptions=True)
+    drained_after = time.monotonic() - drain_started
+    assert drained_after >= slow_news_seconds * 0.8  # the background task genuinely ran the full delay
+
+    # Once drained, CURRENT_NEWS's true, truthful outcome is reflected --
+    # acquisition was preserved, never skipped or faked.
+    assert runtime.readiness.for_requirement("CURRENT_NEWS").status == ResearchRequirementStatus.READY_FRESH
+    assert matrix["CURRENT_NEWS"]["state"] == "READY_FRESH"
+    assert matrix["CURRENT_NEWS"]["failure"] is None
+
+
+# I -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_i_current_news_technical_failure_stays_visible_and_non_blocking():
+    readiness = _readiness({"QUARTERLY_FINANCIALS": ResearchRequirementStatus.MISSING,
+                            "CURRENT_NEWS": ResearchRequirementStatus.MISSING})
+    runtime = _FakeInvestigateRuntime(readiness, fail={"CURRENT_NEWS": RuntimeError("PROVIDER_TIMEOUT")})
+    background_tasks = set()
+    result, plan, matrix = await investigate(runtime, INSTRUMENT_ID, jurisdiction="INDIA",
+                                              background_tasks=background_tasks)
+    # Mandatory completion and eligibility are already fully unaffected the
+    # instant investigate() returns -- before CURRENT_NEWS's own failure is
+    # even observed.
+    assert result.readiness.for_requirement("QUARTERLY_FINANCIALS").status == ResearchRequirementStatus.READY_FRESH
+    eligibility = StockRuleEngineEligibilityPolicy().evaluate(result.readiness)
+    assert eligibility.full_analysis_allowed
+    assert eligibility.blocking_requirements == []
+
+    outcomes = await _drain(background_tasks, return_exceptions=True)
+    # The background wrapper itself completes normally: _acquire() catches
+    # CURRENT_NEWS's technical failure internally, exactly as the pre-existing
+    # inline path always has -- this is not a new/different failure path.
+    assert outcomes == [None]
+
+    # The technical failure remains visible/retryable, never silently dropped.
+    assert matrix["CURRENT_NEWS"]["failure"] is not None
+    assert runtime.observations, "record_acquisition_observation was never called for the failure"
+    obs_args = runtime.observations[-1][0]
+    assert obs_args[1] == "CURRENT_NEWS" and obs_args[3] == "FAILED"
+
+    # It does not add DEEP_READINESS_NOT_MET by itself, does not make full
+    # analysis ineligible, and does not suppress Rule Engine/ranking.
+    rule_result = StockRuleEngineV1().evaluate(_inputs(readiness=result.readiness), allow_partial=False)
+    incomplete = GlobalOpportunityOrchestrator._incomplete_analysis(rule_result, result.readiness)
+    assert incomplete is None
+    assert rule_result.eligibility.full_analysis_allowed
+    assert not rule_result.partial
+    assert "CURRENT_NEWS" not in rule_result.eligibility.blocking_requirements
+    assert _ranked(rule_result).rank_eligible
+
+
+# J -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_j_mandatory_requirement_delay_and_failure_still_fully_block():
+    # A slow mandatory requirement is still fully awaited: investigate() does
+    # not return until it resolves, background_tasks notwithstanding.
+    readiness = _readiness({"QUARTERLY_FINANCIALS": ResearchRequirementStatus.MISSING})
+    slow_mandatory_seconds = 0.2
+    runtime = _FakeInvestigateRuntime(readiness, delays={"QUARTERLY_FINANCIALS": slow_mandatory_seconds})
+    background_tasks = set()
+    started = time.monotonic()
+    result, plan, matrix = await investigate(runtime, INSTRUMENT_ID, jurisdiction="INDIA",
+                                              background_tasks=background_tasks)
+    assert time.monotonic() - started >= slow_mandatory_seconds * 0.8
+    assert result.readiness.for_requirement("QUARTERLY_FINANCIALS").status == ResearchRequirementStatus.READY_FRESH
+    await _drain(background_tasks, return_exceptions=True)
+
+    # A failing mandatory requirement still blocks eligibility outright --
+    # background_tasks changes nothing about mandatory semantics.
+    readiness = _readiness({"QUARTERLY_FINANCIALS": ResearchRequirementStatus.MISSING})
+    runtime = _FakeInvestigateRuntime(readiness, fail={"QUARTERLY_FINANCIALS": RuntimeError("PROVIDER_DOWN")})
+    background_tasks = set()
+    result, plan, matrix = await investigate(runtime, INSTRUMENT_ID, jurisdiction="INDIA",
+                                              background_tasks=background_tasks)
+    assert result.failures.get("QUARTERLY_FINANCIALS") == "RuntimeError"
+    eligibility = StockRuleEngineEligibilityPolicy().evaluate(result.readiness)
+    assert not eligibility.full_analysis_allowed
+    assert "QUARTERLY_FINANCIALS" in eligibility.blocking_requirements
+    await _drain(background_tasks, return_exceptions=True)
+
+
+# K -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_k_no_unhandled_task_exception_or_leaked_task_after_drain():
+    # Even when CURRENT_NEWS's background wrapper itself fails (not merely the
+    # ensure() call inside it, which _acquire() already catches), draining
+    # background_tasks the way GlobalOpportunityOrchestrator._acquire_deep's
+    # finally: block does -- asyncio.gather(*pending_news_tasks,
+    # return_exceptions=True) -- retrieves the exception, so Python's default
+    # "Task exception was never retrieved" handler is never invoked and no
+    # task is left dangling for the garbage collector to warn about.
+    readiness = _readiness({"CURRENT_NEWS": ResearchRequirementStatus.MISSING})
+    runtime = _FakeInvestigateRuntime(readiness)
+    background_tasks = set()
+    result, plan, matrix = await investigate(runtime, INSTRUMENT_ID, jurisdiction="INDIA",
+                                              background_tasks=background_tasks)
+    assert len(background_tasks) == 1
+    task = next(iter(background_tasks))
+    # Only now -- after investigate() itself has already returned, so every
+    # read() call on investigate()'s own synchronous path is long done --
+    # make the background wrapper's own post-acquisition read() raise.
+    runtime.fail_full_read_from_now = True
+
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda l, ctx: unhandled.append(ctx))
+    try:
+        outcomes = await asyncio.gather(*background_tasks, return_exceptions=True)
+        background_tasks.clear()
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], RuntimeError)
+        assert str(outcomes[0]) == "SIMULATED_POST_RETURN_READ_FAILURE"
+        assert task.done() and isinstance(task.exception(), RuntimeError)
+        del outcomes
+        import gc
+        gc.collect()
+        await asyncio.sleep(0)  # let any pending "exception never retrieved" callback fire, if one exists
+    finally:
+        loop.set_exception_handler(previous_handler)
+    assert unhandled == []
 from test_global_opportunity_ranker import inputs as ranker_inputs
 
 POLICY = StockRuleEngineEligibilityPolicy()

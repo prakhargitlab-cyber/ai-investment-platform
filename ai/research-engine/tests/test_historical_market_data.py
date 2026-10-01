@@ -31,6 +31,8 @@ async def test_yahoo_adapter_uses_verified_ticker_date_bounds_and_converts_close
             return [(Timestamp(), {"Close": "123.45"})]
 
     class Ticker:
+        info = {"longName": "Infosys Limited", "exchange": "NSI", "currency": "INR"}
+
         def history(self, **kwargs):
             observed["history"] = kwargs
             return History()
@@ -49,6 +51,7 @@ async def test_yahoo_adapter_uses_verified_ticker_date_bounds_and_converts_close
             "ticker": "UNVERIFIED",
             "structuredProviderTicker": "INFY.NS",
             "currency": "INR",
+            "companyName": "Infosys Limited",
         },
         start=start,
         end=end,
@@ -89,6 +92,8 @@ async def test_yahoo_adapter_skips_non_finite_close_rows_without_discarding_vali
             ]
 
     class Ticker:
+        info = {"longName": "KEC International Limited", "exchange": "NSI", "currency": "INR"}
+
         def history(self, **_kwargs):
             return History()
 
@@ -97,6 +102,7 @@ async def test_yahoo_adapter_skips_non_finite_close_rows_without_discarding_vali
             "globalInstrumentId": str(instrument_id),
             "structuredProviderTicker": "KEC.NS",
             "currency": "INR",
+            "companyName": "KEC International Limited",
         },
         start=first,
         end=first + timedelta(days=4),

@@ -78,7 +78,23 @@ def _make_reusable_nse_document(
     normalized_text: str = "Quarterly revenue is 100 crore INR",
     status: DocumentStatus = DocumentStatus.PROCESSED,
 ) -> ResearchDocument:
-    """Build a ResearchDocument that _is_usable_durable_document considers reusable."""
+    """Build a ResearchDocument that _is_usable_durable_document considers
+    reusable AND that nse_authority_rejection() (financial_projection.py)
+    accepts as an official NSE source.
+
+    Guardian Review (Item 14): nse_authority_rejection requires
+    entity_resolution_confidence >= .95 for a document to qualify as an
+    authoritative NSE source -- a requirement added to production code
+    after this fixture was first written, which is why it must be set
+    explicitly here (0.99, matching the same confidence used for a
+    trusted-NSE-profile-identity binding elsewhere in repository.py) rather
+    than relying on the model's default of 0.0. Without this, every reusable
+    NSE document this fixture builds was silently rejected as
+    'UNQUALIFIED_NSE_SOURCE' by _reusable_official_document's financial-scope
+    branch, so callers fell through to a real (mocked-away) network fetch
+    instead of reusing the already-persisted document -- a stale-fixture
+    defect, not a production one; production's own stricter check is
+    intentional and is left untouched."""
     return ResearchDocument(
         canonical_url=url,
         original_url=url,
@@ -96,6 +112,7 @@ def _make_reusable_nse_document(
         source_mode=SourceMode.REAL,
         status=status,
         discovery_provider="NSE_OFFICIAL_API",
+        entity_resolution_confidence=0.99,
         retrieved_at=NOW,
         published_at=NOW,
     )

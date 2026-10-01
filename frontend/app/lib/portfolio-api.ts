@@ -1004,7 +1004,20 @@ export const brokerApi = {
 };
 
 export const researchApi = {
-  listCompanies: () => request<ResearchProfile[]>("/api/v1/research/companies"),
+  listCompanies: (page?: number, pageSize?: number) => {
+    const params = new URLSearchParams();
+    if (page !== undefined) params.set("page", String(page));
+    if (pageSize !== undefined) params.set("page_size", String(pageSize));
+    // Note: the query parameter is snake_case ("page_size") to match the
+    // backend's FastAPI Query() binding, which has no camelCase alias --
+    // this is distinct from the response envelope's "pageSize" field below.
+    const query = params.toString();
+    const url = query ? `/api/v1/research/companies?${query}` : "/api/v1/research/companies";
+    // The backend now returns a paginated envelope { items, page, pageSize,
+    // total, hasMore }. When called without page/pageSize, the backend defaults
+    // to page 1 / pageSize 50 for backward compatibility.
+    return request<{ items: ResearchProfile[]; page: number; pageSize: number; total: number; hasMore: boolean }>(url);
+  },
   getSummary: (instrumentId: string) =>
     request<ResearchSummary>(`/api/v1/research/companies/${instrumentId}/summary`)
       .then(normalizeResearchSummary),

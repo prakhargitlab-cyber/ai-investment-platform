@@ -30,8 +30,8 @@ def test_research_company_summary_api_returns_demo_evidence_without_raw_bodies()
     client = TestClient(app)
 
     companies = client.get("/api/v1/research/companies").json()
-    assert companies
-    instrument_id = companies[0]["instrumentId"]
+    assert companies["items"]
+    instrument_id = companies["items"][0]["instrumentId"]
 
     summary = client.get(f"/api/v1/research/companies/{instrument_id}/summary")
 
@@ -46,7 +46,7 @@ def test_research_company_summary_api_returns_demo_evidence_without_raw_bodies()
 
 def test_research_company_summary_api_is_object_and_normalizes_casefolded_bucket_aliases() -> None:
     client = TestClient(app)
-    instrument_id = client.get("/api/v1/research/companies").json()[0]["instrumentId"]
+    instrument_id = client.get("/api/v1/research/companies").json()["items"][0]["instrumentId"]
     expected = main.repository.summary(UUID(instrument_id), allow_demo=True)
 
     response = client.get(f"/api/v1/research/companies/{instrument_id}/summary")

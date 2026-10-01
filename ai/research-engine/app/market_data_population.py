@@ -215,9 +215,19 @@ class IndiaMarketDataPopulationJobs:
             job["universeSize"],
         )
         batch_size = self.settings.market_data_population_batch_size
-        for offset in range(0, len(universe), batch_size):
-            batch = universe[offset:offset + batch_size]
-            for instrument in batch:
+        # Bounded-parallel acquisition: never gather across the whole 2585-
+        # instrument universe at once. Concurrency is capped per batch by a
+        # dedicated, configurable semaphore (default 1 == byte-identical to
+        # the prior strictly-sequential behavior); each worker slot still
+        # paces itself with the existing per-instrument request interval, so
+        # raising concurrency scales throughput without abandoning rate-limit
+        # awareness. One instrument's failure is isolated to that instrument
+        # and never cancels or strands the rest of the batch.
+        concurrency = max(1, min(8, int(self.settings.market_data_population_concurrency or 1)))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _populate_one_bounded(instrument: MarketUniverseInstrument) -> None:
+            async with semaphore:
                 try:
                     await self._populate_one(job, instrument, identity_headers, correlation_id)
                 except Exception:
@@ -230,6 +240,10 @@ class IndiaMarketDataPopulationJobs:
                     delay = self.settings.market_data_population_request_interval_seconds
                     if instrument.canonical_sector and delay:
                         await self._sleep(delay)
+
+        for offset in range(0, len(universe), batch_size):
+            batch = universe[offset:offset + batch_size]
+            await asyncio.gather(*(_populate_one_bounded(instrument) for instrument in batch))
 
         job.update(
             status="COMPLETED" if job["failed"] == 0 else "COMPLETED_WITH_ERRORS",

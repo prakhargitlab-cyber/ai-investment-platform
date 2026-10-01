@@ -240,9 +240,10 @@ from app.opportunity_persistence import OpportunityPersistenceMixin, SCHEMA as O
 from app.cycle_checkpoint import CycleRunPersistenceMixin, SQLITE_SCHEMA as CYCLE_RUN_SCHEMA
 from app.macro_persistence import MacroPersistenceMixin, SQLITE_SCHEMA as MACRO_SCHEMA
 from app.macro_event_persistence import MacroEventPersistenceMixin, SQLITE_SCHEMA as MACRO_EVENT_SCHEMA
+from app.etf_persistence import EtfPersistenceMixin, SQLITE_SCHEMA as ETF_SQLITE_SCHEMA
 
 
-class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixin, CycleRunPersistenceMixin, MacroPersistenceMixin, MacroEventPersistenceMixin):
+class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixin, CycleRunPersistenceMixin, MacroPersistenceMixin, MacroEventPersistenceMixin, EtfPersistenceMixin):
     def __init__(self, database_path: str | Path = ":memory:") -> None:
         self.database_path = str(database_path)
         self._connection = sqlite3.connect(self.database_path)
@@ -263,6 +264,8 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         self._connection.executescript(MACRO_SCHEMA)
         self._connection.commit()
         self._connection.executescript(MACRO_EVENT_SCHEMA)
+        self._connection.commit()
+        self._connection.executescript(ETF_SQLITE_SCHEMA)
         self._connection.commit()
 
     def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None:

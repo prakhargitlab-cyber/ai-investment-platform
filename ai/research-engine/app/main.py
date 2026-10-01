@@ -366,8 +366,28 @@ def schedule():
 
 
 @app.get("/api/v1/research/companies")
-def companies():
-    return repository.list_profiles()
+def companies(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+):
+    """Paginated list of all profiles with deterministic ordering.
+
+    Backward-compatible: callers that omit page/page_size receive the first
+    50 profiles. The old no-argument form /api/v1/research/companies still
+    works — it just gets page 1 with the default page size.
+    """
+    profiles = repository.list_profiles()
+    total = len(profiles)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = profiles[start:end]
+    return {
+        "items": page_items,
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "hasMore": end < total,
+    }
 
 
 @app.get("/api/v1/research/readiness/{global_instrument_id}")

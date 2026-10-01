@@ -136,6 +136,60 @@ function ExpandableSection({ title, items, horizon, heldIds, watchlistedIds }: {
   );
 }
 
+/**
+ * Paginated list of previous recommendations.
+ *
+ * Renders at most PAGE_SIZE items at a time with deterministic ordering
+ * (by global_instrument_id), previous/next controls, and disabled boundary
+ * states. The page is reset to 1 whenever the underlying item list changes
+ * identity (same-length different-content or different length).
+ */
+const RECOMMENDATIONS_PAGE_SIZE = 10;
+
+export function PreviousRecommendationsList({ items }: { items: Opportunity[] }) {
+  const [page, setPage] = useState(1);
+  const total = items.length;
+  // Deterministic ordering: sort by global_instrument_id so page boundaries
+  // are stable across re-renders and refreshes.
+  const sorted = [...items].sort((a, b) =>
+    a.global_instrument_id.localeCompare(b.global_instrument_id)
+  );
+  const start = (page - 1) * RECOMMENDATIONS_PAGE_SIZE;
+  const end = start + RECOMMENDATIONS_PAGE_SIZE;
+  const visible = sorted.slice(start, end);
+  const hasNext = end < total;
+  const hasPrev = page > 1;
+
+  // Reset to page 1 when the list identity (length or content) changes.
+  const listKey = `${total}:${items.map(i => i.global_instrument_id).join(",")}`;
+  useEffect(() => {
+    if (page !== 1) setPage(1);
+  }, [listKey]);
+
+  return (
+    <>
+      <ul>{visible.map(item =>
+        <li key={item.global_instrument_id}>{item.company_name ?? item.symbol} · Short: {label(item.current_short_action)} ({label(item.short_term_state)}) · Long: {label(item.current_long_action)} ({label(item.long_term_state)})
+          <p>{item.lifecycle_reasons?.map(label).join(" · ")}{item.evaluation_status ? ` · ${label(item.evaluation_status)}` : ""}</p>
+        </li>
+      )}</ul>
+      <div className="pagination-controls" role="navigation" aria-label="Previous recommendations pages">
+        <button type="button" className="pagination-prev"
+          disabled={!hasPrev}
+          onClick={() => setPage(p => Math.max(1, p - 1))}>
+          Previous
+        </button>
+        <span aria-live="polite">Page {page} of {Math.ceil(total / RECOMMENDATIONS_PAGE_SIZE)}</span>
+        <button type="button" className="pagination-next"
+          disabled={!hasNext}
+          onClick={() => setPage(p => p + 1)}>
+          Next
+        </button>
+      </div>
+    </>
+  );
+}
+
 export function RadarContent({ data, heldIds = [], watchlistedIds = [] }: { data: Radar; heldIds?: string[]; watchlistedIds?: string[] }) {
   return <>
     <p>{data.generated_at ? `Last cycle: ${new Date(data.generated_at).toLocaleString()}` : "No persisted opportunity cycle yet."}</p>
@@ -148,10 +202,8 @@ export function RadarContent({ data, heldIds = [], watchlistedIds = [] }: { data
       title="TOP LONG-TERM OPPORTUNITIES" items={data.top_long_term} horizon="long"
       heldIds={heldIds} watchlistedIds={watchlistedIds} />
     <h3>PREVIOUS RECOMMENDATIONS</h3>
-    {!data.previous_recommendations || !data.previous_recommendations.length ? <p>No previous recommendations.</p> : <ul>{data.previous_recommendations.map(item =>
-      <li key={item.global_instrument_id}>{item.company_name ?? item.symbol} · Short: {label(item.current_short_action)} ({label(item.short_term_state)}) · Long: {label(item.current_long_action)} ({label(item.long_term_state)})
-        <p>{item.lifecycle_reasons?.map(label).join(" · ")}{item.evaluation_status ? ` · ${label(item.evaluation_status)}` : ""}</p>
-      </li>)}</ul>}
+    {!data.previous_recommendations || !data.previous_recommendations.length ? <p>No previous recommendations.</p> :
+      <PreviousRecommendationsList items={data.previous_recommendations} />}
   </>;
 }
 

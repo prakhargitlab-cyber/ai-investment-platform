@@ -559,6 +559,44 @@ class SourceDiversity(ResearchBaseModel):
     secondary_sources: int = 0
 
 
+class EtfSubtype(StrEnum):
+    EQUITY_INDEX = "EQUITY_INDEX"
+    EQUITY_SECTOR_THEMATIC = "EQUITY_SECTOR_THEMATIC"
+    EQUITY_SMART_BETA = "EQUITY_SMART_BETA"
+    GOLD = "GOLD"
+    SILVER = "SILVER"
+    DEBT = "DEBT"
+    MONEY_MARKET = "MONEY_MARKET"
+    INTERNATIONAL_EQUITY = "INTERNATIONAL_EQUITY"
+    INTERNATIONAL_DEBT = "INTERNATIONAL_DEBT"
+    HYBRID = "HYBRID"
+    OTHER = "OTHER"
+
+
+class EtfHolding(ResearchBaseModel):
+    """An underlying portfolio position, never ownership of the fund itself.
+
+    Optional amounts remain absent unless supplied by the source. This model
+    does not infer weights from quantities or fill unknown identifiers.
+    """
+
+    etf_instrument_id: UUID
+    constituent_identifier: str | None = None
+    constituent_symbol: str | None = None
+    constituent_isin: str | None = None
+    constituent_name: str | None = None
+    weight_percentage: Decimal | None = Field(default=None, ge=0, le=100)
+    quantity: Decimal | None = None
+    value: Decimal | None = None
+    value_currency: str | None = None
+    as_of_date: date
+    source_provider: str
+    source_locator: str | None = None
+    evidence_reference: str | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    reliability_level: ReliabilityLevel | None = None
+
+
 class EtfResearchProfile(ResearchBaseModel):
     instrument_id: UUID
     fund_id: UUID
@@ -572,6 +610,10 @@ class EtfResearchProfile(ResearchBaseModel):
     currency: str | None = None
     fund_provider: str | None = None
     underlying_index: str | None = None
+    subtype: EtfSubtype = EtfSubtype.OTHER
+    asset_class: str | None = None
+    inception_date: date | None = None
+    is_benchmark_based: bool | None = None
     known_domains: list[str] = Field(default_factory=list)
     facts: dict[str, ProvenancedValue] = Field(default_factory=dict)
 

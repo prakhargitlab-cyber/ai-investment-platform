@@ -14,7 +14,7 @@ function component(name) {
   new Function('require', 'module', 'exports', output)(path => path.includes('portfolio-api') ? {} : require(path), module, module.exports);
   return module.exports;
 }
-const { RadarContent, normalizeRadar, price, INITIAL_DISPLAY } = component('opportunity-radar');
+const { RadarContent, normalizeRadar, price, INITIAL_DISPLAY, PreviousRecommendationsList } = component('opportunity-radar');
 const { Backtesting, BacktestResults } = component('backtesting');
 const item = i => ({ global_instrument_id: `${i}`, company_name: `Company ${i}`, symbol: `C${i}`, current_price: 100,
   opportunity_score: 80, opportunity_confidence: 85, score_coverage: 90, new_investor_action: 'BUY_CANDIDATE',
@@ -134,4 +134,54 @@ test('backtesting page and all horizon results render', () => {
   const html = renderToStaticMarkup(React.createElement(BacktestResults, { run }));
   for (const h of ['1W', '1M', '3M', '6M', '1Y']) assert.ok(html.includes(h));
   assert.match(html, /100.00%/);
+});
+
+test('previous recommendations paginate: first page shows 10, More shows next', () => {
+  const picks = Array.from({ length: 25 }, (_, i) => ({ ...item(i), current_short_action: 'BUY', short_term_state: 'BUY' }));
+  const html = renderToStaticMarkup(React.createElement(RadarContent, {
+    data: { ...empty, previous_recommendations: picks }
+  }));
+  // Page 1 of 3, first 10 shown.
+  assert.match(html, /Page 1 of 3/);
+  assert.equal((html.match(/class="recommendation-item"/g) ?? []).length, 0); // list items don't have that class
+  // Previous button disabled on first page: the pagination-prev button
+  // has the disabled attribute (and no onClick).
+  assert.match(html, /pagination-prev[^>]*disabled/);
+  // Next button enabled: the pagination-next button has no disabled attribute.
+  assert.doesNotMatch(html, /pagination-next[^>]*disabled/);
+  // Pagination controls present.
+  assert.match(html, /pagination-controls/);
+  assert.match(html, /pagination-next/);
+  assert.match(html, /pagination-prev/);
+});
+
+test('previous recommendations empty shows no pagination', () => {
+  const html = renderToStaticMarkup(React.createElement(RadarContent, {
+    data: { ...empty, previous_recommendations: [] }
+  }));
+  assert.match(html, /No previous recommendations/);
+  assert.doesNotMatch(html, /pagination-controls/);
+});
+
+test('previous recommendations single page: no next, previous disabled', () => {
+  const picks = Array.from({ length: 5 }, (_, i) => ({ ...item(i), current_short_action: 'BUY', short_term_state: 'BUY' }));
+  const html = renderToStaticMarkup(React.createElement(RadarContent, {
+    data: { ...empty, previous_recommendations: picks }
+  }));
+  assert.match(html, /Page 1 of 1/);
+  // Both buttons disabled on single page (no more, no prev).
+  assert.match(html, /pagination-prev[^>]*disabled/);
+  assert.match(html, /pagination-next[^>]*disabled/);
+});
+
+test('previous recommendations render all when under page size', () => {
+  const picks = Array.from({ length: 10 }, (_, i) => ({ ...item(i), current_short_action: 'BUY', short_term_state: 'BUY' }));
+  const html = renderToStaticMarkup(React.createElement(RadarContent, {
+    data: { ...empty, previous_recommendations: picks }
+  }));
+  // All 10 visible, page 1 of 1
+  assert.match(html, /Page 1 of 1/);
+  for (let i = 0; i < 10; i++) {
+    assert.match(html, new RegExp(`Company ${i}`));
+  }
 });

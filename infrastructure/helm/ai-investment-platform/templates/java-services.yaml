@@ -161,7 +161,7 @@ spec:
             - name: DB_POOL_IDLE_TIMEOUT_MS
               value: {{ $.Values.database.pool.idleTimeoutMs | quote }}
             - name: DB_POOL_MAX_LIFETIME_MS
-              value: {{ $.Values.database.pool.maxLifetimeMs | quote }}
+              value: {{ printf "%.0f" $.Values.database.pool.maxLifetimeMs | quote }}
             - name: SPRING_DATASOURCE_URL
               value: {{ printf "jdbc:postgresql://%s:%v/%s?sslmode=%s&connectTimeout=%v&socketTimeout=%v" $.Values.database.host $.Values.database.port $.Values.database.name $.Values.database.sslMode $.Values.database.connectTimeoutSeconds $.Values.database.socketTimeoutSeconds | quote }}
             - name: SPRING_DATASOURCE_USERNAME

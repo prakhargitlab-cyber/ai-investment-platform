@@ -416,6 +416,14 @@ javaServices:
     tag: latest
     port: 8080
     scalingClass: HORIZONTALLY_SCALABLE
+    # DEV startup allowance. portfolio-service has legitimately taken >2 min
+    # for Spring/JPA boot and was being killed (exit 137) by the inherited
+    # javaServiceDefaults startup failureThreshold: 36 (180s). Override ONLY
+    # the startup failureThreshold here (60 * 5s ~= 5 min); readiness and
+    # liveness thresholds are inherited unchanged (failureThreshold: 3).
+    probes:
+      startup:
+        failureThreshold: 60
   - name: broker-service
     image: ai-investment/broker-service
     tag: latest

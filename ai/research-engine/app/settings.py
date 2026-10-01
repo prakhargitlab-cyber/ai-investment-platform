@@ -222,6 +222,14 @@ class Settings(BaseSettings):
     nse_historical_max_retries: int = Field(default=2, ge=0, le=3)
     market_data_population_request_interval_seconds: float = 0.20
     market_data_population_initial_lookback_days: int = 400
+    # Bounded within-batch concurrency for India market-data population jobs
+    # (app/market_data_population.py). Default 1 == byte-identical to the prior
+    # strictly-sequential per-batch behavior. Each worker slot still paces itself
+    # with the existing per-instrument request interval, so raising concurrency
+    # scales throughput without abandoning rate-limit awareness. One instrument's
+    # failure is isolated to that instrument and never cancels the rest of the
+    # batch. Never tied to Stage2 concurrency.
+    market_data_population_concurrency: int = 1
     market_data_nifty_freshness_hours: int = 12
     market_data_historical_freshness_hours: int = 72
     market_data_ensure_retry_cooldown_minutes: int = 15
@@ -242,6 +250,13 @@ class Settings(BaseSettings):
     def validate_market_data_population_batch_size(cls, value: int) -> int:
         if not 1 <= value <= 100:
             raise ValueError("market_data_population_batch_size must be between 1 and 100")
+        return value
+
+    @field_validator("market_data_population_concurrency")
+    @classmethod
+    def validate_market_data_population_concurrency(cls, value: int) -> int:
+        if not 1 <= value <= 8:
+            raise ValueError("market_data_population_concurrency must be between 1 and 8")
         return value
 
     @field_validator("market_data_nifty_refresh_timeout_seconds")

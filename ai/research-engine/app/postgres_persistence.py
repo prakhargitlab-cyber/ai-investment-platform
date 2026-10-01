@@ -61,6 +61,12 @@ class PostgresResearchPersistence(SqliteResearchPersistence):
             self._connection.execute("SELECT 1 FROM global_opportunity_cycle_active LIMIT 0")
             self._connection.execute("SELECT 1 FROM macro_observations LIMIT 0")
             self._connection.execute("SELECT 1 FROM macro_events LIMIT 0")
+            self._connection.execute("SELECT 1 FROM etf_fact_observations LIMIT 0")
+            self._connection.execute("SELECT 1 FROM etf_nav_observations LIMIT 0")
+            self._connection.execute("SELECT 1 FROM etf_holdings_snapshots LIMIT 0")
+            self._connection.execute("SELECT 1 FROM etf_holdings_positions LIMIT 0")
+            self._connection.execute("SELECT 1 FROM etf_listing_observations LIMIT 0")
+            self._connection.execute("SELECT 1 FROM etf_acquisition_attempts LIMIT 0")
             self._connection.commit()
         except Exception as exc:
             self._connection.connection.rollback()

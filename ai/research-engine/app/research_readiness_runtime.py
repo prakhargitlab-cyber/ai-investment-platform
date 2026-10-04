@@ -920,18 +920,46 @@ class ExistingResearchCapabilityExecutor:
                     **upgrade_options,
                 )
             except Exception as exc:
-                for requirement_id in requirement_ids & (
-                    _FINANCIAL_REQUIREMENTS
-                    | {
-                        "SHAREHOLDING",
-                        "ORDER_BOOK_CAPEX_GUIDANCE",
-                        "CURRENT_NEWS",
-                        "GOVERNANCE_HISTORY",
-                    }
-                ):
-                    failures[requirement_id] = type(exc).__name__
-                    if progress is not None:
-                        progress.failed(requirement_id, type(exc).__name__)
+                # A shared executor exception (from ONE
+                # repository.refresh_targeted_categories call spanning several
+                # requirement categories) must NOT be copied blindly to every
+                # requirement that happened to be in the intersected set -- that
+                # call returns a single ResearchSummary and raises a single
+                # exception with NO per-requirement ownership. Assigning
+                # `type(exc).__name__` to (e.g.) SHAREHOLDING just because
+                # SHAREHOLDING_PATTERN was part of the fused category set would
+                # misattribute an unrelated search/discovery outage
+                # (SEARCH_PROVIDER_DEGRADED from a catalyst/governance NEWS_SEARCH)
+                # to a requirement whose own channel (NSE structured/XBRL feed)
+                # never ran.
+                #
+                # Per the UNKNOWN-OWNERSHIP invariant:
+                #   UNKNOWN OWNERSHIP OF FAILURE != FAILURE OF EVERY REQUIREMENT
+                #
+                # We therefore do NOT distribute this exception to any
+                # requirement id in `failures`. The genuinely-failed requirement
+                # is still marked failed by its OWN dedicated acquisition
+                # observation (RepositoryResearchReadinessAdapter records a per-
+                # requirement persisted observation, and deep_investigation._finalize
+                # records requirement_failures on that requirement's own budget
+                # before/after this shared call). This shared exception has no
+                # such per-requirement owner, so it is logged here -- in full,
+                # with traceback -- as an explicit unattributed shared-execution
+                # failure, and is NOT suppressed (the traceback is preserved for
+                # diagnosis). It is recorded only on the request-local progress
+                # object under a sentinel key that never flows into any
+                # requirement's final classification (the sentinel contains no
+                # requirement id, so it cannot contaminate SHAREHOLDING or any
+                # other participant).
+                exc_name = type(exc).__name__
+                logger.warning(
+                    "execute_primary_shared_refresh_failed reason=%s detail=%s "
+                    "categories=%s requirements=%s",
+                    exc_name, str(exc)[:200], sorted(repository_categories),
+                    sorted(requirement_ids), exc_info=True,
+                )
+                if progress is not None:
+                    progress.failed("UNATTRIBUTED_SHARED_EXECUTION_FAILURE", exc_name)
 
         if "HISTORICAL_PRICE_SERIES" in requirement_ids:
             executed.append("HISTORICAL_MARKET_DATA")

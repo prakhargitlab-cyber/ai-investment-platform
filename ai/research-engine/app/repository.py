@@ -4063,6 +4063,16 @@ def _fetch_rejection_reason(exc: FetchError) -> str:
         "NETWORK_TIMEOUT",
         "PDF_EXTRACTION_TIMEOUT",
         "PDF_EXTRACTION_QUEUE_TIMEOUT",
+        # Forensic cycle 89fd630e, Issue 6: DOCUMENT_SIZE_LIMIT_EXCEEDED is
+        # already a recognized PERMANENT_REASONS entry (see
+        # failure_taxonomy.py) -- a document's byte count is a deterministic
+        # property of that exact document, never resolved by a bare retry
+        # against the same URL, and maximum content size is never raised to
+        # "fix" this. It was missing from THIS passthrough set, so it fell
+        # through to the generic "PARSER_FAILED" default below (TECHNICAL_
+        # RETRYABLE) -- indistinguishable from an actual corrupt-PDF parser
+        # exception, and wrongly eligible for an identical, pointless retry.
+        "DOCUMENT_SIZE_LIMIT_EXCEEDED",
         "CONTENT_EMPTY",
         "CONTENT_TOO_SHORT",
         "COMPANY_RELEVANCE_FAILED",
@@ -4071,6 +4081,15 @@ def _fetch_rejection_reason(exc: FetchError) -> str:
         "SOURCE_QUALITY_REJECTED",
     }:
         return message
+    if message == "Maximum content size exceeded":
+        # The post-buffer backstop check in
+        # HttpResearchFetcher.process_network_response (for a response with
+        # no/unreliable Content-Length header) raises plain FetchError with
+        # this literal text, rather than the typed DocumentSizeLimitExceeded
+        # the early streaming-time check above already raises for the same
+        # semantic condition. Map it to the SAME existing canonical reason
+        # instead of inventing a second name for one condition.
+        return "DOCUMENT_SIZE_LIMIT_EXCEEDED"
     if "Unsupported content type" in message:
         return "PARSER_FAILED"
     if "not approved" in message or "not permitted" in message:

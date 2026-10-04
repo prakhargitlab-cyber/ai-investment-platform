@@ -260,6 +260,30 @@ class CycleTimingRecorder:
                 record = RequirementTimingRecord(candidate_id=str(candidate_id), requirement_id=requirement_id,
                                                   queued_at=datetime.now(timezone.utc))
                 self._records[key] = record
+            else:
+                # Root-cause fix (forensic cycle 89fd630e, Issue 3 --
+                # impossible queued_at/started_at/completed_at ordering):
+                # one RequirementTimingRecord is reused (by design, see the
+                # class docstring's accumulator-field rationale) across every
+                # attempt at this exact (candidate, requirement) within the
+                # SAME cycle recorder -- a first attempt followed later by a
+                # repair-pass retry hits this `record is not None` branch and
+                # previously fell straight through to unconditionally
+                # overwriting `started_at` below, while `completed_at` was
+                # left holding the FIRST attempt's finish time. A report
+                # produced between that overwrite and the retry's own
+                # completion therefore showed `started_at` (the retry,
+                # later) AFTER `completed_at` (the first attempt, earlier) --
+                # an impossible ordering for what reads as a single
+                # queued->started->completed span, even though both
+                # timestamps were individually correct for their OWN attempt.
+                # A fresh attempt starting means the operation is back "in
+                # flight", not finished, so the stale completion from the
+                # previous attempt must be cleared here, before `started_at`
+                # is updated -- never leaving a non-None completed_at that
+                # predates the current started_at.
+                record.completed_at = None
+                record.elapsed_ms = None
         record.started_at = datetime.now(timezone.utc)
         record._start_monotonic_ms = _now_ms()
         return record

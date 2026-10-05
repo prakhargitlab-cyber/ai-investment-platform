@@ -198,7 +198,7 @@ async def test_real_structured_commit_boundary_wakes_readiness_or_preserves_fail
     async def ensure(instrument_id, requested_classes, **kwargs):
         return await orchestrator._reconcile_structured_market(
             instrument_id, {"assetType": "EQUITY", "mic": "XNSE"},
-            records=[], market_data=({}, {}), requested_classes=requested_classes, force_requested=True,
+            records=[], market_data=({}, {}), requested_classes=requested_classes,
         )
     orchestrator.ensure_structured_market = ensure
     executor = ExistingResearchCapabilityExecutor(repository, orchestrator, SimpleNamespace())

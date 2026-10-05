@@ -44,6 +44,7 @@ from app.models import (
     DailyMarketBar,
 )
 from app.normalization import canonicalize_url, content_hash, detect_document_type, extract_published_at, extract_text, normalize_text
+from app.readiness_signals import evidence_committed
 from app import cycle_timing
 from app.research_fetching import FetchError, HttpResearchFetcher, PdfExtractionTimeoutError, RestrictedFetchError, TransportFetchError
 from app.scoring import CatalystScorer, canonical_read_model_score
@@ -389,12 +390,40 @@ class ResearchRepository:
         # used WITHIN one batch (unchanged); this map is the ACROSS-batches
         # memory that counter never had.
         self._official_host_cooldowns: dict[tuple[UUID, str], float] = {}
+        # Guardian Review companion to the cross-batch cooldown above: per
+        # (instrument_id, host), the set of source URLs that have already been
+        # attempted-and-failed with a TransportFetchError in a prior batch.
+        # The cross-batch cooldown blocks only NEW (unseen) filings on a failed
+        # host -- it does NOT block a legitimate retry of a source that already
+        # burned its transport-failure budget on the exact same URL (those
+        # retries are governed by research_official_document_max_attempts_per_refresh
+        # within the current batch), which is exactly the contract the Issue 3
+        # cross-batch test (test_nse_host_failure_budget_cross_batch.py)
+        # distinguishes from the same-URL retry path covered by the single-flight
+        # and host-failure-budget reuse tests in test_research_engine.py.
+        self._official_host_failed_urls: dict[tuple[UUID, str], set[str]] = {}
         self._instrument_refresh_flights: dict[UUID, asyncio.Task[ResearchSummary]] = {}
         # The production persistence adapter owns one synchronous database
         # connection.  Worker operations are serialized per repository so two
         # refreshes do not interleave transactions on that connection.
         self._persistence_worker_lock = threading.RLock()
-        self._news_worker_lock = asyncio.Lock()
+        # Per-instrument keyed locks (not one process-wide lock): two
+        # DIFFERENT instruments must be able to run CURRENT_NEWS refreshes
+        # concurrently -- a global lock here was proven in production to
+        # serialize every candidate in a cycle behind one another
+        # (aggregateNewsWorkerLockWaitMs ~388s across one cycle, 27-54s per
+        # slow operation), while two refreshes for the SAME instrument must
+        # still serialize. Keyed by instrument_id; each entry is created on
+        # first use and reference-counted so it is removed again once no
+        # caller is waiting on or holding it -- the map never grows with
+        # the number of instruments ever refreshed, only with the number
+        # currently in flight. See _acquire_news_worker_lock/
+        # _release_news_worker_lock below. Lock/refcount bookkeeping relies
+        # on asyncio's single-threaded cooperative scheduling: no `await`
+        # occurs between a bookkeeping check and its matching mutation, so
+        # no separate mutex is needed around these two dicts.
+        self._news_worker_locks: dict[UUID, asyncio.Lock] = {}
+        self._news_worker_lock_refcounts: dict[UUID, int] = {}
         # Bounded per-repository cache of market-session metadata (trading
         # schedules + calendar exceptions) keyed by the market set. Schedules
         # are refreshed by a separate, dedicated schedule-refresh flow (never by
@@ -426,12 +455,47 @@ class ResearchRepository:
     async def append_news_record(self, record):
         return await self._run_blocking_persistence(self._persistence.append_news_record, record)
 
+    def _acquire_news_worker_lock(self, instrument_id) -> asyncio.Lock:
+        # Synchronous bookkeeping only (no `await` below) -- see the
+        # __init__ comment on why this needs no separate mutex. Returns
+        # the SAME Lock object to every concurrent caller for this
+        # instrument_id (preserving same-instrument serialization) while a
+        # different instrument_id gets its own, independent Lock.
+        lock = self._news_worker_locks.get(instrument_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._news_worker_locks[instrument_id] = lock
+        self._news_worker_lock_refcounts[instrument_id] = self._news_worker_lock_refcounts.get(instrument_id, 0) + 1
+        return lock
+
+    def _release_news_worker_lock(self, instrument_id) -> None:
+        # Mirrors _acquire_news_worker_lock: drops the refcount, and once
+        # no caller is holding or waiting on this instrument's lock,
+        # removes both map entries so they do not accumulate for every
+        # instrument ever refreshed over the process lifetime.
+        remaining = self._news_worker_lock_refcounts.get(instrument_id, 0) - 1
+        if remaining <= 0:
+            self._news_worker_lock_refcounts.pop(instrument_id, None)
+            self._news_worker_locks.pop(instrument_id, None)
+        else:
+            self._news_worker_lock_refcounts[instrument_id] = remaining
+
     async def refresh_news_intelligence(self, instrument_id, *, industry=None):
         from app.news_acquisition import acquire_news
-        async with self._news_worker_lock:
-            return await acquire_news(self,self.profile(instrument_id),providers=[self._search_discovery.provider],industry=industry,
-                max_queries=min(20,max(1,self.settings.research_search_max_queries_per_category)),
-                max_documents=min(20,max(1,self.settings.research_search_max_documents_per_refresh)))
+        # Diagnostic timing only (lock scope unchanged in kind, only in
+        # keying -- see __init__ comment above): measures the await on
+        # __aenter__ (not the time held), isolating this instrument's
+        # same-instrument queueing cost from other_unattributed_ms.
+        lock = self._acquire_news_worker_lock(instrument_id)
+        try:
+            _lock_wait_started = time.monotonic()
+            async with lock:
+                cycle_timing.record_news_worker_lock_wait_elapsed((time.monotonic() - _lock_wait_started) * 1000)
+                return await acquire_news(self,self.profile(instrument_id),providers=[self._search_discovery.provider],industry=industry,
+                    max_queries=min(20,max(1,self.settings.research_search_max_queries_per_category)),
+                    max_documents=min(20,max(1,self.settings.research_search_max_documents_per_refresh)))
+        finally:
+            self._release_news_worker_lock(instrument_id)
 
     def list_profiles(self) -> list[CompanyResearchProfile]:
         return self.profiles
@@ -559,11 +623,27 @@ class ResearchRepository:
     async def record_structured_market_failure_async(self, instrument_id: UUID, provider: str, code: str, message: str) -> None:
         await self._run_blocking_persistence(self._persistence.record_structured_market_failure, instrument_id, provider, datetime.now(timezone.utc), code, message)
 
+    # Lifecycle note (narrowed-invalidation follow-up): this cache is no
+    # longer cleared by unrelated writes (see _is_market_session_cache_
+    # invalidating_write), and ResearchRepository is process-lifetime --
+    # longer than one Radar cycle -- with nothing in this codebase that
+    # writes to market_schedules/market_trading_calendar_exceptions to ever
+    # trigger the schedule-relevant invalidation path either. Without a
+    # bound, a real future schedule/calendar edit made out-of-band (e.g. a
+    # DB migration or an admin tool, not this process) could be served as
+    # stale indefinitely. A short TTL re-reads reference data periodically
+    # without reintroducing the broad per-write invalidation this fix
+    # removed, and is far longer than one Radar cycle (~minutes) so it still
+    # collapses the within-cycle amplification this cache exists for.
+    _MARKET_SESSION_CACHE_TTL_SECONDS = 3600.0
+
     async def market_session_data(self, markets: set[str]):
         key = frozenset(markets)
         cached = self._market_session_cache.get(key)
         if cached is not None:
-            return cached
+            result, cached_at = cached
+            if time.monotonic() - cached_at <= self._MARKET_SESSION_CACHE_TTL_SECONDS:
+                return result
         schedules, exceptions = await asyncio.gather(
             self._run_blocking_persistence(self._persistence.load_market_schedules, markets),
             self._run_blocking_persistence(self._persistence.load_market_calendar_exceptions, markets),
@@ -572,17 +652,23 @@ class ResearchRepository:
         # Only cache complete (non-empty) schedule data; an empty/partial load
         # is still authoritative for "no schedules persisted yet", so we cache
         # it too to avoid re-running the locked loads within the same flow.
-        self._market_session_cache[key] = result
+        self._market_session_cache[key] = (result, time.monotonic())
         return result
 
     def _invalidate_market_session_cache(self) -> None:
         """Clear the market-session metadata cache.
 
-        Called from the persistence chokepoint on any write operation so stale
-        schedule data is never served across a mutation boundary. Safe to call
-        when the cache is empty (no-op).
+        Called from the persistence chokepoint on a write that could plausibly
+        touch the market_schedules/market_calendar_exceptions tables (see
+        ``_is_market_session_cache_invalidating_write``) so stale schedule data
+        is never served across a mutation boundary. Safe to call when the
+        cache is empty (no-op) and when the instance was constructed without
+        __init__ (e.g. boundary tests / partial recovery) -- in which case
+        there is simply no process-local cache to invalidate.
         """
-        self._market_session_cache.clear()
+        cache = getattr(self, "_market_session_cache", None)
+        if cache is not None:
+            cache.clear()
 
     _PERSISTENCE_WRITE_PREFIXES = (
         "upsert_",
@@ -597,19 +683,53 @@ class ResearchRepository:
         "_store",
     )
 
+    # Root Cause (Area 3 / persistence-readiness amplification): the
+    # market-session cache (self._market_session_cache, populated by
+    # market_session_data()) was previously cleared on EVERY persistence
+    # write matched by _PERSISTENCE_WRITE_PREFIXES above -- including
+    # upsert_market_price_observation, which alone runs ~3944 times in a
+    # single Radar cycle. Nothing in this codebase ever writes to the
+    # market_schedules / market_trading_calendar_exceptions tables at
+    # runtime (grep of app/persistence.py confirms only load_market_schedules
+    # / load_market_calendar_exceptions exist -- no upsert/insert/delete
+    # counterpart), so clearing the cache on an unrelated write such as a
+    # price-observation upsert can never avoid serving genuinely stale
+    # schedule/exception data; it only forces the next market_session_data()
+    # call back into a full DB reload, every single time, for reference data
+    # that is effectively immutable for the lifetime of a Radar cycle. This
+    # is exactly why load_market_schedules/load_market_calendar_exceptions
+    # were each observed ~598 times per cycle despite the cache already
+    # existing. Fix: invalidate the market-session cache only for a write
+    # that could plausibly touch those two tables (today, none do -- the set
+    # below is a no-op safety net for if/when such a write is ever added, per
+    # the original docstring's "never clearing on a schedule-relevant write
+    # would be the unsafe case" guarantee). The readiness mutation-generation
+    # bump (and therefore ResearchReadinessRuntime's separate evidence-only
+    # readiness cache) is completely unaffected by this change -- it still
+    # increments on every write exactly as before.
+    _MARKET_SESSION_CACHE_INVALIDATING_WRITE_PREFIXES = (
+        "upsert_market_schedule",
+        "insert_market_schedule",
+        "delete_market_schedule",
+        "upsert_market_calendar_exception",
+        "insert_market_calendar_exception",
+        "delete_market_calendar_exception",
+    )
+
     def _is_persistence_write(self, operation) -> bool:
         """Return True if ``operation`` is a persistence write that may mutate
-        durable state and therefore must invalidate derived caches.
+        durable state and therefore must bump the readiness mutation
+        generation (and, when relevant, invalidate derived caches).
 
         Uses the operation's method ``__name__`` (e.g. ``upsert_acquisition_observation``)
         or, for repository-level wrapper methods, ``__qualname__`` to classify.
         Read-only loads (``load_*``, ``profile``, ``summary``, ``financial_facts_for``,
         ``acquisition_observations_for``, ``news_records_for``,
         ``market_session_data``, ``assess`` and similar) are not writes, so they
-        never clear the market-session cache. This is a conservative classification:
-        clearing on a write that does not touch schedule tables is safe (just a
-        cache miss on the next read); never clearing on a schedule-relevant write
-        would be the unsafe case, which this guard prevents.
+        never bump the generation or clear any cache. This is a conservative
+        classification: treating a read as a write would be safe but wasteful;
+        treating a write as a read would be the unsafe case, which this guard
+        prevents.
         """
         qn = getattr(operation, "__qualname__", None) or ""
         name = getattr(operation, "__name__", "") or ""
@@ -619,6 +739,16 @@ class ResearchRepository:
         # Check the bare method name first (most precise), then the qualname.
         label = name or qn
         return any(label.startswith(prefix) for prefix in self._PERSISTENCE_WRITE_PREFIXES)
+
+    def _is_market_session_cache_invalidating_write(self, operation) -> bool:
+        """Return True only for a write that could plausibly mutate the
+        market_schedules / market_trading_calendar_exceptions tables -- see
+        the Area 3 root-cause comment above _MARKET_SESSION_CACHE_INVALIDATING_WRITE_PREFIXES.
+        """
+        qn = getattr(operation, "__qualname__", None) or ""
+        name = getattr(operation, "__name__", "") or ""
+        label = name or qn
+        return any(label.startswith(prefix) for prefix in self._MARKET_SESSION_CACHE_INVALIDATING_WRITE_PREFIXES)
 
     async def _run_blocking_persistence(self, operation, *args, **kwargs):
         """Keep production database work out of the request event loop.
@@ -634,8 +764,13 @@ class ResearchRepository:
         operations are unaffected.
         """
         if self._is_persistence_write(operation):
-            self._invalidate_market_session_cache()
-            self._readiness_mutation_generation += 1
+            if self._is_market_session_cache_invalidating_write(operation):
+                self._invalidate_market_session_cache()
+            # Bump the durability staleness sentinel. Defensive getattr: a
+            # boundary test (or any partial construction) may not have run
+            # __init__, in which case there is no generation counter to bump.
+            if hasattr(self, "_readiness_mutation_generation"):
+                self._readiness_mutation_generation += 1
         if isinstance(self._persistence, SqliteResearchPersistence) and self._persistence.__class__.__module__ != "app.postgres_persistence":
             return operation(*args, **kwargs)
         dispatched_at = time.monotonic()
@@ -843,6 +978,31 @@ class ResearchRepository:
         return sorted(values, key=lambda event: event.event_date or event.detected_at, reverse=True)
 
     def shareholding_for(self, instrument_id: UUID, *, limit: int = 4) -> list[ShareholdingSnapshot]:
+        # Unchanged public contract: the single best (highest-authority)
+        # snapshot per distinct period, newest period first. Implemented as
+        # the head of each shareholding_period_groups() group below, so this
+        # method's own output stays bit-for-bit identical to before --
+        # field-level/multi-source merging lives only in the new grouped
+        # accessor, consumed by the readiness layer. Never relabel or merge
+        # another filing's values (including pledge) under a different
+        # snapshot's provenance.
+        return [group[0] for group in self.shareholding_period_groups(instrument_id, limit=limit)]
+
+    def shareholding_period_groups(
+        self, instrument_id: UUID, *, limit: int = 4
+    ) -> list[list[ShareholdingSnapshot]]:
+        """All qualifying real quarter-end snapshots, grouped by exact
+        period_end (up to `limit` distinct periods, newest first); each
+        group is ordered best-authority-first by the same selection_key
+        shareholding_for() has always used.
+
+        This exists so a caller that needs authority-aware FIELD-level
+        coverage (a different source may hold a field -- e.g. promoter
+        pledge -- that the single best-ranked snapshot for that period
+        lacks) can see every real snapshot for a period, not just the one
+        shareholding_for() would pick. It never merges/relabels values
+        itself -- each snapshot in a group keeps its own provenance.
+        """
         from app.research_applicability import shareholding_input_coverage
 
         def selection_key(snapshot):
@@ -868,16 +1028,18 @@ class ResearchRepository:
              and _is_quarter_end(snapshot.period_end)],
             key=selection_key, reverse=True,
         )
-        latest_by_period: list[ShareholdingSnapshot] = []
-        periods: set[datetime] = set()
+        groups: list[list[ShareholdingSnapshot]] = []
+        index: dict[datetime, int] = {}
         for snapshot in ordered:
-            if snapshot.period_end in periods:
-                continue
-            periods.add(snapshot.period_end)
-            latest_by_period.append(snapshot)
-            if len(latest_by_period) == limit:
-                break
-        return latest_by_period
+            position = index.get(snapshot.period_end)
+            if position is None:
+                if len(groups) == limit:
+                    continue
+                position = len(groups)
+                index[snapshot.period_end] = position
+                groups.append([])
+            groups[position].append(snapshot)
+        return groups
 
     def persist_shareholding_snapshot(self, snapshot: ShareholdingSnapshot) -> bool:
         if not snapshot.values or snapshot.source_mode != SourceMode.REAL:
@@ -1438,7 +1600,18 @@ class ResearchRepository:
         owned = [fact for fact in self._persistence.load_financial_facts({document.instrument_id})
                  if fact.source_identity == str(document.document_id)
                  or (fact.key.metric, fact.key.period_end, fact.key.period_type, fact.key.reporting_basis) in expected]
+        # ResearchDocument.normalized_text is model-serialized with
+        # ``exclude=True``, so it is absent from model_dump() and would
+        # silently NOT participate in the digest. A textual change (OCR
+        # correction, a revised filing that adds a ratio like CRAR, an
+        # amended statement) must invalidate the unchanged-receipt, or
+        # the reconcile path never re-parses and silently hides
+        # newly-discoverable facts. Fold the explicit text + content_hash
+        # into the payload so the receipt tracks document body changes
+        # regardless of field-level serialization policy.
         payload = [document.model_dump(mode="json", exclude={"raw_text", "pdf_structure", "publisher", "language", "country", "exchange", "duplicate_of_document_id"}),
+                   (document.normalized_text or document.content_hash),
+                   document.content_hash,
                    sorted([[str(fact.key), int(fact.source_tier), fact.source_provider, fact.source_identity, str(fact.source_mode),
                             fact.value.model_dump(mode="json")] for fact in owned], key=str)]
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -1555,6 +1728,7 @@ class ResearchRepository:
         correlation_id: str | None = None,
         allow_demo: bool = True,
         authority_upgrade_categories: set[str] | None = None,
+        shareholding_phase: str | None = None,
     ) -> ResearchSummary:
         """Run only planner-selected legacy capabilities under the existing flight.
 
@@ -1562,6 +1736,17 @@ class ResearchRepository:
         This boundary deliberately canonicalizes and filters categories before
         reaching discovery so a readiness ensure cannot widen into an ALL
         refresh.
+
+        shareholding_phase (Slice 2 follow-up: exact NSE/Yahoo/PDF order):
+        narrowly scoped to SHAREHOLDING_PATTERN only, default None preserves
+        every existing caller's fused behavior byte-for-byte.
+          - "STRUCTURED_ONLY": run the dedicated NSE shareholding master/XBRL
+            feed; never invoke official filing/PDF discovery for
+            SHAREHOLDING_PATTERN this call.
+          - "DOCUMENT_ONLY": never invoke the dedicated NSE shareholding
+            feed; still run the existing official filing/PDF discovery for
+            SHAREHOLDING_PATTERN.
+          - None (default): today's fused behavior, unchanged.
         """
         selected = {_canonical_refresh_category(value) for value in categories if str(value).strip()}
         if not selected:
@@ -1581,6 +1766,7 @@ class ResearchRepository:
                 correlation_id=correlation_id,
                 allow_demo=allow_demo,
                 authority_upgrade_categories=authority_upgrade_categories,
+                shareholding_phase=shareholding_phase,
             )
         )
         self._instrument_refresh_flights[instrument_id] = task
@@ -1604,6 +1790,7 @@ class ResearchRepository:
         correlation_id: str | None,
         allow_demo: bool,
         authority_upgrade_categories: set[str] | None = None,
+        shareholding_phase: str | None = None,
     ) -> ResearchSummary:
         profile = self.profile(instrument_id)
         run = await self._run_blocking_persistence(
@@ -1636,6 +1823,8 @@ class ResearchRepository:
                     _live_kwargs["targeted_repair"] = True
                 if authority_upgrade_categories:
                     _live_kwargs["authority_upgrade_categories"] = authority_upgrade_categories
+                if shareholding_phase is not None:
+                    _live_kwargs["shareholding_phase"] = shareholding_phase
                 await self._refresh_live(instrument_id, set(), **_live_kwargs)
         except asyncio.CancelledError:
             await self._run_blocking_persistence(
@@ -1798,6 +1987,7 @@ class ResearchRepository:
         targeted_repair: bool = False,
         requested_categories: set[str] | None = None,
         authority_upgrade_categories: set[str] | None = None,
+        shareholding_phase: str | None = None,
     ) -> None:
         from app.deep_investigation import acquisition_budget
         budget = acquisition_budget(instrument_id)
@@ -1866,6 +2056,7 @@ class ResearchRepository:
             targeted_repair=targeted_repair,
             requested_categories=requested_categories,
             authority_upgrade_categories=authority_upgrade_categories,
+            shareholding_phase=shareholding_phase,
         )
 
     def _instrument_refresh_gate(
@@ -1975,6 +2166,7 @@ class ResearchRepository:
         targeted_repair: bool = False,
         requested_categories: set[str] | None = None,
         authority_upgrade_categories: set[str] | None = None,
+        shareholding_phase: str | None = None,
     ) -> None:
         from app.deep_investigation import acquisition_budget
         budget = acquisition_budget(profile.instrument_id)
@@ -2009,6 +2201,7 @@ class ResearchRepository:
         )
         valid_shareholding_periods = len(self.shareholding_for(profile.instrument_id, limit=4))
         shareholding_check_succeeded = False
+        shareholding_persisted_this_call = 0
         successful_check_categories: set[str] = set()
         logger.info(
             "research_refresh_gate globalInstrumentId=%s outcome=DUE_CATEGORIES dueCategories=%s",
@@ -2032,11 +2225,15 @@ class ResearchRepository:
             return
         # The dedicated ownership feed must get its bounded opportunity before
         # generic announcement PDFs can exhaust the shared capability budget.
+        # Slice 2 follow-up: shareholding_phase == "DOCUMENT_ONLY" means the
+        # caller (the India SHAREHOLDING pre-pass in yahoo_mcp_acquisition.py)
+        # already ran this dedicated feed in an earlier STRUCTURED_ONLY call
+        # this same cycle -- never re-invoke it here.
         if (
             "SHAREHOLDING_PATTERN" in due_categories
             or shareholding_backfill_needed
             or shareholding_category_enrichment_needed
-        ) and _eligible_for_nse_shareholding_reconciliation(profile):
+        ) and _eligible_for_nse_shareholding_reconciliation(profile) and shareholding_phase != "DOCUMENT_ONLY":
             shareholding_failure = None
             try:
                 # NSE publishes quarterly Regulation 31 data through its
@@ -2063,6 +2260,7 @@ class ResearchRepository:
                         break
                     enriched_snapshot = await self._enrich_nse_shareholding_snapshot(snapshot)
                     persisted += int(await self._persist_shareholding_snapshot_async(enriched_snapshot))
+                shareholding_persisted_this_call = persisted
                 shareholding_check_succeeded = True
                 successful_check_categories.add("SHAREHOLDING_PATTERN")
                 if shareholding_backfill_needed or shareholding_category_enrichment_needed:
@@ -2093,6 +2291,33 @@ class ResearchRepository:
         official_due_categories = {"FINANCIAL_RESULTS", "SHAREHOLDING_PATTERN", "CAPEX", "NEW_FACILITIES", "ORDERS_BACKLOG", "CONTRACTS", "GUIDANCE", "RISKS", "REGULATORY", "MANAGEMENT"} & due_categories
         if authority_upgrade:
             official_due_categories.add("FINANCIAL_RESULTS")
+        if shareholding_phase == "STRUCTURED_ONLY":
+            # Slice 2 follow-up: this call is scoped to the dedicated NSE
+            # feed only -- the caller will decide, from freshly reassessed
+            # persisted evidence, whether Yahoo and/or a later
+            # shareholding_phase="DOCUMENT_ONLY" call are even needed. Never
+            # spend an official-document fetch for SHAREHOLDING_PATTERN here.
+            official_due_categories.discard("SHAREHOLDING_PATTERN")
+        if shareholding_persisted_this_call and "SHAREHOLDING_PATTERN" in official_due_categories:
+            # The dedicated NSE shareholding feed just persisted real
+            # evidence THIS call. Recompute field-level coverage from what
+            # was actually persisted (authority-aware union across every
+            # real snapshot for the target period, never a single
+            # best-snapshot check) before letting the generic official
+            # announcement/PDF path spend a document fetch on a field NSE's
+            # own structured feed already supplied moments ago. A dedicated
+            # feed call that found nothing (ZERO_RESULTS) leaves
+            # shareholding_persisted_this_call at 0 and this block is
+            # skipped entirely -- the existing PDF fallback behavior for a
+            # genuine NSE gap is completely unchanged.
+            from app.research_applicability import shareholding_field_merge
+            top_groups = self.shareholding_period_groups(profile.instrument_id, limit=1)
+            covered_union: set[str] = set()
+            if top_groups:
+                for _snapshot, _covered in shareholding_field_merge(top_groups[0]):
+                    covered_union.update(_covered)
+            if "PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES" in covered_union:
+                official_due_categories.discard("SHAREHOLDING_PATTERN")
         eligible_official = (
             profile.country.upper() in {"IN", "IND", "INDIA"}
             and profile.exchange.upper() in {"NSE", "XNSE"}
@@ -2114,6 +2339,7 @@ class ResearchRepository:
                 # loop can then explicitly reuse a durable global document, while
                 # failed/scanned historical attempts remain eligible for retry.
                 official_filings = await self._official_filing_discovery.discover(profile, official_due_categories, set())
+                logger.info("radar_acquisition_count operation=official_documents_discovered provider=NSE count=%d", len(official_filings))
                 if budget is not None:
                     # DI-20H.4 accounting: the default is an empty dict, so the
                     # previous `is None` guard never populated it and every
@@ -2719,6 +2945,7 @@ class ResearchRepository:
 
                 if budget is not None:
                     if budget.stopped or await budget.sufficient():
+                        logger.info("radar_acquisition_count operation=pdf_fallback_avoided reason=EVIDENCE_SUFFICIENT count=1")
                         budget.stopped = True
                         state.stop = True
                         return None
@@ -2795,9 +3022,24 @@ class ResearchRepository:
                 cross_batch_cooldown_active = (
                     host_cooldown_until is not None and time.monotonic() < host_cooldown_until
                 )
+                # A cross-batch cooldown blocks NEW filings on a host that just
+                # tripped its transport-failure budget (Issue 3: don't hammer a
+                # failed host with fresh filings in the next capability group's
+                # batch). It does NOT, however, block a legitimate retry of a
+                # source URL that already failed transport in a prior batch --
+                # those retries are bounded by the per-refresh attempt budget
+                # below (state.attempted) and governed by the single-flight /
+                # late-result reconciliation paths, not by the host circuit.
+                # Distinguishing same-URL retry from new-URL retry is what lets
+                # the host-failure-budget cross-batch contract coexist with the
+                # single-flight reuse contract in test_research_engine.py.
+                same_url_already_failed = (
+                    source.url
+                    in self._official_host_failed_urls.get((profile.instrument_id, host), set())
+                )
                 if (
                     state.host_transport_failures.get(host, 0) >= self.settings.research_official_document_max_transport_failures_per_host
-                    or cross_batch_cooldown_active
+                    or (cross_batch_cooldown_active and not same_url_already_failed)
                 ):
                     # Guardian Review (Issue 3): state.host_transport_failures
                     # alone only remembers failures within THIS batch call.
@@ -2835,6 +3077,59 @@ class ResearchRepository:
                 state.attempted += 1
                 return source
 
+        async def _fetch_with_bounded_queue_timeout_retry(
+            source: RegisteredResearchSource,
+        ) -> tuple[ResearchDocument, bool]:
+            """PDF_EXTRACTION_QUEUE_TIMEOUT means a worker for THIS document
+            was never started (Part C already guarantees its single-flight
+            key is released, not stranded, so a fresh attempt is legitimate
+            here) -- it only means the bounded admission wait for the sole
+            PDF extraction slot expired while another, unrelated document
+            legitimately held it. That is a transient condition of this
+            candidate's own acquisition batch, not evidence the document is
+            unusable, so give it exactly ONE bounded retry within this same
+            batch -- reusing the existing admission-wait semaphore inside
+            process_network_response_async (research_pdf_extraction_queue_timeout_seconds,
+            already 12s, unchanged) as the coordination mechanism: the retry
+            simply waits on the real extraction slot again, so it only
+            succeeds once the slot has genuinely freed up, with no new
+            timeout constant and no arbitrary sleep. A genuine execution-wait
+            PDF_EXTRACTION_TIMEOUT (a worker IS alive, shielded, pursuing the
+            Part D late-result/evidence_committed path) is a different reason
+            string and is never retried here -- retrying it would start a
+            second, duplicate worker for the same document while the first
+            is still running. Any other FetchError/RestrictedFetchError/
+            ValueError is also never retried by this mechanism; it is left
+            for _worker()'s existing except clauses exactly as before.
+            A second PDF_EXTRACTION_QUEUE_TIMEOUT on the retry itself is a
+            genuine, bounded, truthful technical failure -- there is no
+            third attempt.
+            """
+            try:
+                return await self._single_flight_official_filing(profile, source)
+            except PdfExtractionTimeoutError as exc:
+                if str(exc) != "PDF_EXTRACTION_QUEUE_TIMEOUT":
+                    raise
+                logger.info(
+                    "official_document_fetch provider=NSE globalInstrumentId=%s path=%s "
+                    "outcome=QUEUE_TIMEOUT_RETRY reason=PDF_EXTRACTION_QUEUE_TIMEOUT",
+                    profile.instrument_id, _safe_url_path(source.url),
+                )
+                # Guard the single retry against the per-refresh attempt
+                # budget: a QUEUE_TIMEOUT retry is still a network fetch for
+                # THIS document, and the attempt budget (max_attempts_per_refresh)
+                # is the authority on how many fetches a candidate may consume
+                # in one batch. Without this guard, queue-saturation retries
+                # under a low PDF-extraction concurrency can push a single
+                # document past the configured attempt ceiling (an attempt
+                # budget that is silently exceeded is a correctness violation,
+                # not a transient retry). Re-raise so _worker() records the
+                # failure against the host budget exactly as a first attempt
+                # would have.
+                if state.attempted >= self.settings.research_official_document_max_attempts_per_refresh:
+                    raise
+                return await self._single_flight_official_filing(profile, source)
+
         async def _worker() -> None:
             while True:
                 async with dispatch_lock:
@@ -2844,7 +3139,7 @@ class ResearchRepository:
                 host = (urlparse(source.url).hostname or "").lower()
                 started = time.monotonic()
                 try:
-                    document, joined_in_flight = await self._single_flight_official_filing(profile, source)
+                    document, joined_in_flight = await _fetch_with_bounded_queue_timeout_retry(source)
                     async with dispatch_lock:
                         if document.status != DocumentStatus.DUPLICATE:
                             seen_urls.add(document.canonical_url)
@@ -2883,6 +3178,7 @@ class ResearchRepository:
                         self._official_host_cooldowns[(profile.instrument_id, host)] = (
                             time.monotonic() + self.settings.research_official_document_host_cooldown_seconds
                         )
+                        self._official_host_failed_urls.setdefault((profile.instrument_id, host), set()).add(source.url)
                         self.last_live_error[profile.instrument_id] = "OFFICIAL_FILING_FETCH_FAILED:NETWORK_TIMEOUT"
                         logger.warning(
                             "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
@@ -2897,6 +3193,7 @@ class ResearchRepository:
                         self._official_host_cooldowns[(profile.instrument_id, host)] = (
                             time.monotonic() + self.settings.research_official_document_host_cooldown_seconds
                         )
+                        self._official_host_failed_urls.setdefault((profile.instrument_id, host), set()).add(source.url)
                         self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{_fetch_rejection_reason(exc)}"
                         logger.warning(
                             "official_document_fetch provider=NSE globalInstrumentId=%s host=%s path=%s outcome=FAILED reason=%s elapsedMs=%s httpStatus=%s",
@@ -2912,6 +3209,7 @@ class ResearchRepository:
                             self._official_host_cooldowns[(profile.instrument_id, host)] = (
                                 time.monotonic() + self.settings.research_official_document_host_cooldown_seconds
                             )
+                            self._official_host_failed_urls.setdefault((profile.instrument_id, host), set()).add(source.url)
                         reason = _fetch_rejection_reason(exc) if isinstance(exc, FetchError) else "PARSER_FAILED"
                         self.last_live_error[profile.instrument_id] = f"OFFICIAL_FILING_FETCH_FAILED:{reason}"
                         logger.warning(
@@ -3039,6 +3337,18 @@ class ResearchRepository:
                 await self._ingest_registered_fetch_result_async(
                     profile, source, outcome, expected_profile=profile,
                 )
+                # Mirrors the structured/Yahoo snapshot path
+                # (PortfolioOrchestrationService._reconcile_structured_market,
+                # which calls evidence_committed() right after persisting).
+                # Without this, a still-running background acquisition for
+                # the SAME candidate (ResearchReadinessRuntime._execute_plan_until_ready,
+                # which already wakes on evidence_committed() and re-reads
+                # readiness) has no way to learn that this late PDF success
+                # landed, and a late success that is durably persisted can
+                # still be missed by the same attempt that gave up on it.
+                # This adds no new timeout and no new wait for anyone -- it
+                # only sets an asyncio.Event a caller may already be awaiting.
+                evidence_committed(profile.instrument_id)
                 logger.info(
                     "official_document_late_result provider=NSE globalInstrumentId=%s host=%s path=%s "
                     "outcome=LATE_SUCCESS_PERSISTED",
@@ -3077,8 +3387,41 @@ class ResearchRepository:
                         extraction_timeout_seconds=self.settings.research_official_document_extraction_timeout_seconds,
                         on_late_result=_on_late_result,
                     )
-                except PdfExtractionTimeoutError:
-                    defer_key_cleanup = True
+                except PdfExtractionTimeoutError as exc:
+                    # A genuine execution-wait timeout ("PDF_EXTRACTION_TIMEOUT")
+                    # means a worker was actually admitted into the executor and
+                    # is still running (shielded) -- process_network_response_async
+                    # registers on_late_result as a done-callback on THAT worker's
+                    # task in this case, so deferring key cleanup until it fires is
+                    # safe (and necessary: a follower must join the live worker, not
+                    # start a duplicate). A queue-ADMISSION timeout
+                    # ("PDF_EXTRACTION_QUEUE_TIMEOUT") means this call never got a
+                    # worker at all -- no task exists, so on_late_result will never
+                    # fire for it. Deferring cleanup for that case would strand the
+                    # single-flight key permanently: every subsequent request for
+                    # this exact document would replay this same stale exception
+                    # forever, because nothing would ever pop the key.
+                    if str(exc) != "PDF_EXTRACTION_QUEUE_TIMEOUT":
+                        defer_key_cleanup = True
+                    raise
+                except asyncio.CancelledError as exc:
+                    # Same contract as PdfExtractionTimeoutError above: the caller
+                    # was cancelled, but the shielded worker thread may still
+                    # be running (it is shielded inside process_network_response_async).
+                    # Defer key cleanup so a follower does not start a duplicate
+                    # download+extraction while the first worker is still alive.
+                    # process_network_response_async now registers on_late_result
+                    # as a done-callback on its CancelledError branch too, so
+                    # _on_late_result will fire once the worker actually
+                    # finishes -- either persisting a late success or popping
+                    # the key on failure. BUT: if cancellation happened while still
+                    # waiting for the extraction semaphore (queue admission), no
+                    # worker task was ever created and nothing will ever call
+                    # on_late_result -- process_network_response_async tags that
+                    # specific case on the exception so we never defer for it
+                    # (same stranded-key risk as the queue-timeout case above).
+                    if not getattr(exc, "_pdf_extraction_worker_never_started", False):
+                        defer_key_cleanup = True
                     raise
                 finally:
                     # Release the large raw PDF bytes regardless of whether
@@ -3179,7 +3522,19 @@ class ResearchRepository:
         if _CATEGORY_STRATEGIES.get(category) is not _QUARTERLY_WINDOW:
             return False
         _evidence_at, period_end = self._category_evidence_timing(instrument_id, category)
-        return period_end is not None and now >= _next_quarter_window(period_end)
+        if period_end is None or now < _next_quarter_window(period_end):
+            return False
+        # The new quarter has begun, so a newer quarter's results may now
+        # exist. But only force a re-check if the existing evidence was
+        # retrieved BEFORE the new quarter opened: evidence retrieved in or
+        # after the new quarter has already had the chance to discover the
+        # new filing, so a stale quarterly-window-open signal must not
+        # re-open acquisition for a category whose evidence is genuinely
+        # fresh. Absence of evidence (_evidence_at is None) always opens the
+        # window so a missing quarter is backfilled.
+        if _evidence_at is None:
+            return True
+        return _evidence_at.replace(tzinfo=timezone.utc) < _next_quarter_window(period_end)
 
     def _category_is_eligible_to_check(
         self,
@@ -3275,6 +3630,26 @@ class ResearchRepository:
                            # an older retrieval (e.g. a malformed OCR year).
                            and _canonical_financial_period_end(fact.key.period_end) <= fact.value.retrieved_at.date().isoformat()]
                 return latest.retrieved_at, max(periods) if periods else _explicit_quarter_end(latest.normalized_text or latest.raw_text or "")
+            # No qualifying NSE document present, but a directly-persisted
+            # OFFICIAL_NSE QUARTERLY fact still establishes durable evidence
+            # freshness and a reporting-period window. The document-backed
+            # branch above is the strong case; this fallback keeps the
+            # quarterly freshness window honest when facts were persisted
+            # without a qualifying NSE-authority document in the in-memory
+            # cache (e.g. a fact ingested via an alternate official seam).
+            # Bounded to the single instrument on the persistence boundary.
+            facts = [fact for fact in self._persistence.load_financial_facts({instrument_id})
+                     if fact.source_tier == FactSourceTier.OFFICIAL_NSE and fact.key.period_type == "QUARTERLY"
+                     and _canonical_financial_period_end(fact.key.period_end)
+                     and (fact.value.retrieved_at is not None)
+                     and _canonical_financial_period_end(fact.key.period_end) <= fact.value.retrieved_at.date().isoformat()]
+            if facts:
+                latest_fact = max(facts, key=lambda fact: fact.value.retrieved_at or datetime.min.replace(tzinfo=timezone.utc))
+                latest_period = max(
+                    datetime.fromisoformat(_canonical_financial_period_end(fact.key.period_end)).replace(tzinfo=timezone.utc)
+                    for fact in facts if _canonical_financial_period_end(fact.key.period_end)
+                )
+                return latest_fact.value.retrieved_at, latest_period
         evidence = self._qualifying_category_evidence(instrument_id, category)
         if evidence and isinstance(evidence.get("evidence_at"), str):
             return _parse_iso_datetime(evidence["evidence_at"]), None
@@ -3379,8 +3754,27 @@ class ResearchRepository:
                 "document_id": document.document_id,
                 "evidence_at": document.retrieved_at.isoformat(),
             }
+        # No qualifying NSE document in the in-memory cache, but a
+        # directly-persisted OFFICIAL_NSE QUARTERLY fact still
+        # establishes durable evidence that the FINANCIAL_RESULTS
+        # category is covered (the fact carries its own retrieval
+        # timestamp and source authority). This preserves the DI-7C
+        # Step-4 invariant -- a document whose parse produced zero
+        # facts never counts as evidence -- because this branch only
+        # fires when at least one genuine FinancialFact row exists.
+        # Bounded to the single instrument on the persistence boundary.
+        facts = [fact for fact in self._persistence.load_financial_facts({instrument_id})
+                 if fact.source_tier == FactSourceTier.OFFICIAL_NSE and fact.key.period_type == "QUARTERLY"
+                 and _canonical_financial_period_end(fact.key.period_end)
+                 and (fact.value.retrieved_at is not None)]
+        if facts:
+            latest = max(facts, key=lambda fact: fact.value.retrieved_at or datetime.min.replace(tzinfo=timezone.utc))
+            return {
+                "reason": "DURABLE_OFFICIAL_FINANCIAL_FACT",
+                "document_id": latest.source_identity,
+                "evidence_at": latest.value.retrieved_at.isoformat(),
+            }
         return None
-
     def _category_is_fresh(self, instrument_id: UUID, category: str, now: datetime) -> bool:
         category = _canonical_refresh_category(category)
         refreshed_at = self._category_refresh.get((instrument_id, category))
@@ -4079,6 +4473,8 @@ def _fetch_rejection_reason(exc: FetchError) -> str:
         "DOCUMENT_PERSIST_FAILED",
         "DOMAIN_VALIDATION_FAILED",
         "SOURCE_QUALITY_REJECTED",
+        "PDF_PARSE_ERROR",
+        "PDF_TEXT_EXTRACTION_FAILED",
     }:
         return message
     if message == "Maximum content size exceeded":

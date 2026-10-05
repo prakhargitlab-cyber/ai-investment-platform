@@ -49,7 +49,9 @@ class IndiaMarketDataPopulationJobs:
         self.universe_provider = universe_provider
         self.orchestrator = orchestrator
         self.settings = settings
-        self.historical_provider = historical_provider or YahooHistoricalPriceProvider(yf.Ticker)
+        structured = getattr(orchestrator, "structured_provider", None)
+        self.historical_provider = historical_provider or YahooHistoricalPriceProvider(
+            yf.Ticker, ticker_contexts=getattr(structured, "ticker_contexts", None))
         self.population = HistoricalPricePopulationService(repository, self.historical_provider)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep

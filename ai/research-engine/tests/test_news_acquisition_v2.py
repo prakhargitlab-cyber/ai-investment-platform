@@ -67,7 +67,10 @@ async def test_worker_exposure_queries_persist_features_and_bounded_spacing():
     assert run.outcome=='SEARCH_COMPLETE_WITH_EVENTS'
     assert features and features[0].relevance_type=='SECTOR_EXPOSURE'
     assert any('copper' in q[0].lower() for q in provider.calls)
-    assert len(provider.calls)==6 and spacing==[1.25]*6
+    # Issue 2 fix: no sleep follows the FINAL query -- there is no next
+    # query left to pace, so that trailing sleep was pure waste. 6
+    # queries therefore pace 5 gaps, not 6.
+    assert len(provider.calls)==6 and spacing==[1.25]*5
     assert len(repo.fetches)==1
     assert len(repo._persistence.load_news_records(EventImpactFeature,KEY,as_of=NOW))==1
     again,second=await acquire_news(repo,company(),providers=[provider],industry='Wires and cables',now=NOW,sleep=no_sleep,max_queries=6)

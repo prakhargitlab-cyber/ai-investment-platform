@@ -1,14 +1,16 @@
-"""Yahoo MCP-first acquisition behind the 5A ExternalResearchToolGateway seam.
+"""Targeted Yahoo acquisition behind the ExternalResearchToolGateway seam.
 
 The read-side readiness and rule-engine paths never import or call this module.
 Only the targeted readiness executor uses it, after DB-first planning has found
-a stale or missing requirement. Yahoo acquisition priority is kept separate
+a stale or missing requirement. NSE financial inputs use official-first gap fill.
+Acquisition priority is kept separate
 from the existing durable fact authority/merge rules.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,6 +22,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.fact_precedence import FactSourceTier, FinancialFact, FinancialFactKey
+from app.financial_gap_fill import FINANCIAL_GAP_REQUIREMENTS, load_financial_gap_state
 from app.normalization import content_hash
 from app.models import (
     CompanyResearchProfile,
@@ -46,13 +49,14 @@ from app.models import (
 )
 from app.deep_investigation import acquisition_budget
 from app.research_readiness import (
-    ExternalResearchToolAuthorization, ResearchRefreshTarget,
+    ExternalResearchToolAuthorization, ResearchRefreshTarget, ResearchRequirementStatus,
     REQUIREMENT_STATUSES_NEEDING_ACQUISITION, ResearchReadinessService,
 )
 from app.research_readiness_runtime import (
     CapabilityExecutionProgress, CapabilityExecutionResult, RepositoryResearchReadinessAdapter,
 )
 
+logger = logging.getLogger(__name__)
 
 YAHOO_FINANCE_MCP = "YAHOO_FINANCE_MCP"
 _SUPPORTED_REGIONS = frozenset({"INDIA", "USA", "EUROPE"})
@@ -71,6 +75,51 @@ _MCP_FIRST_REQUIREMENTS = frozenset(
         "SECTOR_MACRO",
     }
 )
+
+# Structural fact requirements whose provider contract is NSE-authoritative and
+# whose absence after a *completed* Yahoo acquisition (gateway returned a
+# well-formed, schema-valid result that yielded zero persistable facts) is a
+# deterministic evidence gap -- not a transient empty response that a same-cycle
+# repair retry could ever fill. This covers the gap-fill financial requirements
+# (NSE is the authoritative source and already attempted via the official-first
+# financial path / legacy fallback) plus VALUATION_INPUTS (MCP-first, also
+# NSE-authoritative via the NSE_OR_APPROVED_STRUCTURED regional fallback above).
+#
+# When the provider call itself fails transiently it raises a distinct, retryable
+# code (DOWNSTREAM_TIMEOUT / EXTERNAL_PROVIDER_UNAVAILABLE / EXTERNAL_SCHEMA_INVALID
+# / EXTERNAL_IDENTITY_CONFLICT) -- those are NOT qualified here and stay
+# TECHNICAL_RETRYABLE. Only the "provider responded successfully but facts are
+# absent" outcome is rewritten to the permanent canonical reason
+# PRIMARY_FINANCIAL_PROVIDER_RETURNED_NO_FACTS (see failure_taxonomy.PERMANENT_REASONS
+# and research_readiness_runtime's matching treatment of an authoritatively-empty
+# primary provider result).
+_DETERMINISTIC_FINANCIAL_REQUIREMENTS = frozenset(
+    (*FINANCIAL_GAP_REQUIREMENTS, "VALUATION_INPUTS")
+)
+
+
+def _qualify_empty_financial_result(requirement_id: str, safe_code: str) -> str:
+    """Disambiguate an empty-but-completed provider result from a transient one.
+
+    bare ``EXTERNAL_RESULT_INCOMPLETE`` is produced exclusively after a completed,
+    schema-valid provider call that persisted zero facts (see YahooMcpResultPersister.
+    persist()'s ``written < 1`` raise and the post-success recheck). For the
+    structural financial requirements the gateway already exhausts its own
+    transient retries internally (``_call`` retries DOWNSTREAM_TIMEOUT /
+    EXTERNAL_PROVIDER_UNAVAILABLE / rate-limits up to max_retries before surfacing
+    those distinct codes), so a successful ``acquire_requirement`` return with zero
+    facts is a deterministic absence -- rewrite it to the permanent canonical
+    reason so the aggregate does not mislabel it as a retryable technical failure.
+    Every other producer of bare EXTERNAL_RESULT_INCOMPLETE (e.g. a HISTORICAL_PRICE
+    _SERIES zero-facts response, whose gap could be transient by nature) is left
+    TECHNICAL_RETRYABLE unchanged. Genuine technical codes never pass through here.
+    """
+    if (
+        safe_code == "EXTERNAL_RESULT_INCOMPLETE"
+        and requirement_id.strip().upper() in _DETERMINISTIC_FINANCIAL_REQUIREMENTS
+    ):
+        return "PRIMARY_FINANCIAL_PROVIDER_RETURNED_NO_FACTS"
+    return safe_code
 
 
 class ExternalMcpAcquisitionError(Exception):
@@ -252,6 +301,7 @@ class ExternalResearchToolGatewayClient(Protocol):
         authorization: ExternalResearchToolAuthorization,
         request_id: str,
         timeout_seconds: float | None = None,
+        financial_gap_fill: bool = False,
     ) -> YahooMcpNormalizedResult: ...
 
 
@@ -272,6 +322,7 @@ class HttpExternalResearchToolGateway:
         authorization: ExternalResearchToolAuthorization,
         request_id: str,
         timeout_seconds: float | None = None,
+        financial_gap_fill: bool = False,
     ) -> YahooMcpNormalizedResult:
         symbol = profile.provider_instrument_ids.get("YAHOO_FINANCE")
         if not symbol:
@@ -286,6 +337,8 @@ class HttpExternalResearchToolGateway:
             "expectedCurrency": profile.currency,
             "authorization": authorization.as_gateway_payload(),
         }
+        if financial_gap_fill:
+            payload["financialGapFill"] = True
         headers = {
             "X-Request-ID": request_id,
             "X-Correlation-ID": request_id,
@@ -332,7 +385,7 @@ class YahooMcpResultPersister:
         self.repository = repository
 
     async def persist(
-        self, result: YahooMcpNormalizedResult, profile: CompanyResearchProfile
+        self, result: YahooMcpNormalizedResult, profile: CompanyResearchProfile, *, financial_gaps=None
     ) -> int:
         if result.global_instrument_id != profile.instrument_id:
             raise ExternalMcpAcquisitionError("EXTERNAL_IDENTITY_CONFLICT")
@@ -340,6 +393,22 @@ class YahooMcpResultPersister:
             "YAHOO_FINANCE", ""
         ).upper():
             raise ExternalMcpAcquisitionError("EXTERNAL_IDENTITY_CONFLICT")
+        if financial_gaps is not None:
+            # The tool has capability-level granularity. Do not persist its
+            # quote/summary/other-category payload alongside requested facts.
+            selected, ambiguous = {}, set()
+            for item in result.financial_facts:
+                fact = self._financial_fact(item, result, profile)
+                if not financial_gaps.accepts(result.requirement_id, fact, profile.currency):
+                    continue
+                previous = selected.get(fact.key)
+                if previous is not None and (Decimal(str(previous.value)), previous.unit) != (fact.value.value, fact.value.unit):
+                    ambiguous.add(fact.key)
+                selected[fact.key] = item
+            selected = tuple(item for key, item in selected.items() if key not in ambiguous)
+            result = result.model_copy(update={"financial_facts": selected,
+                "structured_facts": (), "market_observations": (), "news": (),
+                "events": (), "shareholding": None, "company_profile": None})
         written = 0
         if result.structured_facts:
             await self._persist_structured(result, profile)
@@ -634,7 +703,7 @@ _RESPONSE_PROCESSING_SAFETY_MARGIN_SECONDS = 0.5
 
 
 class McpFirstResearchCapabilityExecutor:
-    """Try configured Yahoo MCP capabilities, then call the unchanged executor."""
+    """Use NSE-first financial gaps; retain MCP-first routing for other targets."""
 
     def __init__(
         self,
@@ -664,10 +733,10 @@ class McpFirstResearchCapabilityExecutor:
         # candidate, or a later legitimate refresh cycle, since
         # asyncio.current_task() differs once this investigate() call has
         # returned and a new one begins) always gets a fresh attempt.
-        self._context_results: "OrderedDict[object, dict[tuple[UUID, str], Any]]" = OrderedDict()
+        self._context_results: "OrderedDict[object, dict[tuple, Any]]" = OrderedDict()
         self._context_results_max = 64
 
-    def _context_result_slot(self, acquisition_context: object) -> dict[tuple[UUID, str], Any]:
+    def _context_result_slot(self, acquisition_context: object) -> dict[tuple, Any]:
         slot = self._context_results.get(acquisition_context)
         if slot is None:
             slot = {}
@@ -676,6 +745,154 @@ class McpFirstResearchCapabilityExecutor:
         while len(self._context_results) > self._context_results_max:
             self._context_results.popitem(last=False)
         return slot
+
+    async def _financial_state(self, instrument_id):
+        return await self.repository._run_blocking_persistence(
+            load_financial_gap_state, self.repository, instrument_id)
+
+    def _uses_nse_financial_gaps(self, profile):
+        return (self.enabled and profile.country.upper() in {"IN", "IND", "INDIA"}
+                and profile.exchange.upper() in {"NSE", "XNSE"} and bool(profile.provider_instrument_ids.get("NSE"))
+                and getattr(self.legacy_executor, "official_financial_provider", None) is not None
+                and callable(getattr(self.legacy_executor, "acquire_official_financials", None)))
+
+    async def _observe_failure(self, instrument_id, requirement_id, provider, reason):
+        recorder = getattr(self.repository, "record_acquisition_observation", None)
+        if callable(recorder):
+            await recorder(instrument_id, requirement_id, provider, "FAILED",
+                           datetime.now(timezone.utc), failure_reason=reason)
+
+    async def _execute_financial_gaps(self, instrument_id, targets, *, correlation_id,
+                                     identity_headers, progress, deadline):
+        """NSE structured -> durable gaps -> filtered Yahoo -> existing fallback."""
+        state = await self._financial_state(instrument_id)
+        satisfied = {"READY_FRESH", "NOT_APPLICABLE"}
+        profile = self.repository.profile(instrument_id)
+        upgrade_due = getattr(self.repository, "financial_authority_upgrade_due", None)
+        authority_upgrade = (any(target.requirement_id == "QUARTERLY_FINANCIALS"
+                                 and target.reason == ResearchRequirementStatus.READY_FRESH for target in targets)
+                             and callable(upgrade_due)
+                             and await self.repository._run_blocking_persistence(
+                                 upgrade_due, profile, datetime.now(timezone.utc)))
+        due = [target for target in targets if
+               state.readiness.for_requirement(target.requirement_id).status not in satisfied
+               or (target.requirement_id == "QUARTERLY_FINANCIALS" and authority_upgrade)]
+        executed, failures = [], {}
+        if due:
+            capability = "NSE:STRUCTURED_FINANCIALS"
+            executed.append(capability)
+            if progress is not None:
+                progress.executed(capability)
+            try:
+                await self.legacy_executor.acquire_official_financials(instrument_id)
+            except Exception as exc:
+                for target in due:
+                    reason = type(exc).__name__
+                    failures[target.requirement_id] = reason
+                    await self._observe_failure(instrument_id, target.requirement_id, "NSE", reason)
+                    if progress is not None:
+                        progress.failed(target.requirement_id, reason)
+            if progress is not None:
+                progress.completed(capability)
+            state = await self._financial_state(instrument_id)
+
+        context = asyncio.current_task()
+        slot = self._context_result_slot(context) if context is not None else {}
+        for target in targets:
+            requirement_id = target.requirement_id
+            row = state.readiness.for_requirement(requirement_id)
+            if row.status in satisfied or not state.supported_inputs(requirement_id):
+                continue
+            capability = f"{YAHOO_FINANCE_MCP}:{requirement_id}"
+            authorization = target.authority_policy.fallback_policy.authorize_external_tool(
+                global_instrument_id=instrument_id, requirement_id=requirement_id,
+                status=row.status, confidence=0.0, permitted_provider_ids=(YAHOO_FINANCE_MCP,))
+            call_timeout = None
+            if deadline is not None:
+                call_timeout = min(getattr(self.gateway, "timeout_seconds", 10.0),
+                    deadline - asyncio.get_running_loop().time() - _RESPONSE_PROCESSING_SAFETY_MARGIN_SECONDS)
+            try:
+                if authorization is None:
+                    raise ExternalMcpAcquisitionError("EXTERNAL_FALLBACK_NOT_AUTHORIZED")
+                if call_timeout is not None and call_timeout <= _RESPONSE_PROCESSING_SAFETY_MARGIN_SECONDS:
+                    raise ExternalMcpAcquisitionError("BUDGET_EXHAUSTED")
+                executed.append(capability)
+                if progress is not None:
+                    progress.executed(capability)
+                key = (instrument_id, requirement_id, "FINANCIAL_GAPS")
+                result = slot.get(key)
+                if isinstance(result, tuple):
+                    raise ExternalMcpAcquisitionError(result[1])
+                if result is None:
+                    try:
+                        result = await self.gateway.acquire_requirement(profile, region="INDIA",
+                            requirement_id=requirement_id, authorization=authorization,
+                            request_id=correlation_id or str(instrument_id), timeout_seconds=call_timeout,
+                            financial_gap_fill=True)
+                    except ExternalMcpAcquisitionError as exc:
+                        slot[key] = ("FAILED", exc.safe_code)
+                        raise
+                    slot[key] = result
+                if result.requirement_id != requirement_id or result.region != "INDIA":
+                    raise ExternalMcpAcquisitionError("EXTERNAL_IDENTITY_CONFLICT")
+                await self.persister.persist(result, profile, financial_gaps=state)
+            except Exception as exc:
+                reason = exc.safe_code if isinstance(exc, ExternalMcpAcquisitionError) else "EXTERNAL_PROVIDER_UNAVAILABLE"
+                # Producer-site qualification (Root Cause A, extended to this
+                # SECOND bare-EXTERNAL_RESULT_INCOMPLETE producer). This
+                # function (_execute_financial_gaps) is the PRIMARY acquisition
+                # path for QUARTERLY_FINANCIALS/GROWTH_FACTS/BUSINESS_QUALITY_FACTS
+                # /BALANCE_SHEET_FACTS -- every `requirement_id` reached here is
+                # already one of FINANCIAL_GAP_REQUIREMENTS (the caller filters
+                # to that set before invoking this loop). execute_primary's two
+                # producer sites already apply this same qualifier for
+                # VALUATION_INPUTS and the generic post-repair-budget recheck;
+                # without it here too, a completed-but-empty Yahoo financial-gap
+                # call stayed bare EXTERNAL_RESULT_INCOMPLETE -> TECHNICAL_RETRYABLE
+                # even though the provider genuinely returned zero facts -- the
+                # exact deterministic-absence case this qualifier exists to
+                # recognize. Left unqualified, repair kept re-attempting a
+                # provider that had already proven (this same cycle) it has no
+                # facts to give, which is a plausible contributor to
+                # repair_attempted>0/repair_recovered=0 for these candidates.
+                # _qualify_empty_financial_result is a no-op for every other
+                # reason (genuine technical codes, EXTERNAL_PROVIDER_UNAVAILABLE,
+                # composite reasons, etc.) -- see its docstring.
+                # The audit observation (_observe_failure) and progress
+                # reporting intentionally keep the RAW provider-reported
+                # reason -- that is what actually happened and audit
+                # observations must not be rewritten (see NO REGRESSION
+                # RULES). Only the `failures` entry that feeds
+                # classify_requirement_failures/repair-retryability is
+                # qualified, matching how execute_primary's own producer
+                # site treats this same distinction.
+                qualified_reason = _qualify_empty_financial_result(requirement_id, reason)
+                failures[requirement_id] = "|".join(filter(None, (failures.get(requirement_id), qualified_reason)))
+                await self._observe_failure(instrument_id, requirement_id, YAHOO_FINANCE_MCP, reason)
+                if progress is not None:
+                    progress.failed(requirement_id, reason)
+            if progress is not None:
+                progress.completed(capability)
+            # Provider SUCCESS is never a claim of requirement completeness.
+            state = await self._financial_state(instrument_id)
+
+        remaining = tuple(target for target in targets
+                          if state.readiness.for_requirement(target.requirement_id).status not in satisfied)
+        if remaining:
+            legacy = await self.legacy_executor.execute_primary(instrument_id, remaining,
+                jurisdiction="INDIA", correlation_id=correlation_id, identity_headers=identity_headers,
+                progress=progress, deadline=deadline, official_financials_attempted=True)
+            executed.extend(legacy.executed_capabilities)
+            for key, reason in legacy.failures.items():
+                failures[key] = "|".join(filter(None, (failures.get(key), reason)))
+            state = await self._financial_state(instrument_id)
+        completed = tuple(target.requirement_id for target in targets
+                          if state.readiness.for_requirement(target.requirement_id).status in satisfied)
+        for key in completed:
+            failures.pop(key, None)
+            if progress is not None:
+                progress.satisfied(key)
+        return CapabilityExecutionResult(tuple(dict.fromkeys(executed)), failures, completed)
 
     async def execute_primary(
         self,
@@ -689,10 +906,35 @@ class McpFirstResearchCapabilityExecutor:
         deadline: float | None = None,
     ) -> CapabilityExecutionResult:
         completed: set[str] = set()
+        # Root-cause fix (Stage-2 final closure, Root Cause A): a requirement
+        # whose own dedicated/authorized acquisition plan has fully run its
+        # course this cycle (every legitimate source tried, genuine
+        # evidence-absence verdict reached) must never be re-dispatched into
+        # the legacy/capability-grouped executor "just in case" -- that
+        # grouped path shares ONE RequirementAcquisitionBudget across
+        # unrelated capabilities (e.g. SHAREHOLDING batched with
+        # ORDER_BOOK_CAPEX_GUIDANCE/GOVERNANCE_HISTORY, which genuinely do
+        # use generic search/document discovery). Re-dispatching a
+        # plan-exhausted requirement there both wastes a full redundant
+        # acquisition pass (the long SHAREHOLDING single-flight wait) and
+        # risks deep_investigation._finalize()'s budget.failures fallback
+        # borrowing an unrelated group member's SEARCH_PROVIDER_* failure as
+        # this requirement's own final reason. Unlike `completed`, this set
+        # does NOT feed satisfied_requirement_ids -- a plan-exhausted
+        # requirement is excluded from further acquisition this cycle, not
+        # claimed as satisfied.
+        plan_exhausted: set[str] = set()
         executed: list[str] = []
         mcp_failures: dict[str, str] = {}
         profile = self.repository.profile(global_instrument_id)
         request_id = correlation_id or str(global_instrument_id)
+        financial_result = CapabilityExecutionResult()
+        if jurisdiction == "INDIA" and self._uses_nse_financial_gaps(profile):
+            financial_targets = tuple(target for target in targets if target.requirement_id in FINANCIAL_GAP_REQUIREMENTS)
+            if financial_targets:
+                financial_result = await self._execute_financial_gaps(global_instrument_id, financial_targets,
+                    correlation_id=correlation_id, identity_headers=identity_headers, progress=progress, deadline=deadline)
+                targets = tuple(target for target in targets if target.requirement_id not in FINANCIAL_GAP_REQUIREMENTS)
         authority_checked: set[str] = set()
         upgrade_due = getattr(self.repository, "financial_authority_upgrade_due", None)
         if (self.enabled and jurisdiction == "INDIA"
@@ -752,6 +994,104 @@ class McpFirstResearchCapabilityExecutor:
         # mirroring the acquisition_context already used for direct
         # yfinance reuse. A new task (a different candidate, or this same
         # instrument's next refresh cycle) always gets a fresh, empty slot.
+        shareholding_targets: tuple = ()
+        # Issue 1 diagnostic (0dfbe654 SHAREHOLDING=EXTERNAL_CAPABILITY_UNSUPPORTED):
+        # fires immediately before the ONE branch below that decides whether
+        # SHAREHOLDING is routed through the dedicated NSE-first path (never
+        # reaches the external Yahoo gateway for SHAREHOLDING at all) or falls
+        # into the generic per-target loop further down (where Yahoo is
+        # attempted and the downstream gateway service's own capability
+        # decision -- see HttpExternalResearchToolGateway.acquire_requirement,
+        # not anything decided in this repository -- can come back as
+        # EXTERNAL_CAPABILITY_UNSUPPORTED). profile.provider_instrument_ids
+        # only ever holds a symbol for a provider that already passed this
+        # function's VERIFIED/RESOLVED trust gate at hydration time (the raw
+        # per-mapping status strings are not retained past hydration), so its
+        # keys are exactly "the verified provider mappings" at this point.
+        # Purely additive observability -- no behavior change.
+        if any(target.requirement_id == "SHAREHOLDING" for target in targets):
+            logger.info(
+                "shareholding_routing_decision instrument_id=%s country=%s exchange=%s "
+                "ticker=%s jurisdiction=%s nseSymbol=%s bseSymbol=%s verifiedProviderMappings=%s "
+                "route=%s",
+                global_instrument_id, profile.country, profile.exchange, profile.ticker, jurisdiction,
+                profile.provider_instrument_ids.get("NSE"), profile.provider_instrument_ids.get("BSE"),
+                dict(profile.provider_instrument_ids),
+                "NSE_FIRST" if jurisdiction == "INDIA" else "GENERIC_PROVIDER_LOOP",
+            )
+        if jurisdiction == "INDIA":
+            shareholding_targets = tuple(
+                target for target in targets if target.requirement_id == "SHAREHOLDING"
+            )
+            if shareholding_targets:
+                # SHAREHOLDING exact source order (Slice 2 follow-up):
+                # NSE structured/XBRL ONLY -> reassess -> Yahoo MCP ONLY if
+                # a genuine gap remains -> reassess -> NSE official
+                # document/PDF ONLY if a genuine gap still remains ->
+                # reassess. SHAREHOLDING is pulled out of `targets` here so
+                # the Yahoo-first loop below can never reach it ahead of
+                # NSE; this call goes directly to the repository (not the
+                # fused legacy/CapabilityExecutor) so the dedicated NSE feed
+                # and the official document fallback can be invoked as two
+                # separate, narrowly-scoped phases instead of one fused
+                # pass. Yahoo is NOT removed as a fallback, only
+                # re-sequenced strictly between the two NSE phases.
+                targets = tuple(
+                    target for target in targets if target.requirement_id != "SHAREHOLDING"
+                )
+                # This requirement's authoritative (NSE) source gets its
+                # turn(s) this cycle regardless of outcome -- never let the
+                # final catch-all legacy fallback further below invoke any
+                # shareholding acquisition a second time in the same refresh.
+                authority_checked.add("SHAREHOLDING")
+                structured_capability = "NSE:SHAREHOLDING_STRUCTURED"
+                executed.append(structured_capability)
+                if progress is not None:
+                    progress.executed(structured_capability)
+                try:
+                    await self.repository.refresh_targeted_categories(
+                        global_instrument_id, {"SHAREHOLDING_PATTERN"},
+                        correlation_id=correlation_id, allow_demo=False,
+                        shareholding_phase="STRUCTURED_ONLY",
+                    )
+                except Exception as exc:
+                    mcp_failures["SHAREHOLDING"] = "|".join(
+                        filter(None, (mcp_failures.get("SHAREHOLDING"), type(exc).__name__)))
+                if progress is not None:
+                    progress.completed(structured_capability)
+                # Reassess actual persisted evidence (field-level, via
+                # shareholding_period_groups()/shareholding_field_merge())
+                # before deciding whether Yahoo is even needed. Never infer
+                # completion from document/transport success.
+                readiness = await self.repository._run_blocking_persistence(
+                    ResearchReadinessService(RepositoryResearchReadinessAdapter(self.repository)).assess,
+                    global_instrument_id, jurisdiction=jurisdiction,
+                )
+                if readiness.for_requirement("SHAREHOLDING").status not in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
+                    completed.add("SHAREHOLDING")
+                else:
+                    # A genuine gap remains after NSE structured. Yahoo MCP is
+                    # NOT a registered, supported capability for SHAREHOLDING
+                    # (the YahooFinanceCapabilityRegistry from_json hardcodes
+                    # SHAREHOLDING state = UNSUPPORTED across every region, and
+                    # YahooMcpGateway.invoke() consequently raises
+                    # EXTERNAL_CAPABILITY_UNSUPPORTED for it) -- see
+                    # failure_taxonomy.PERMANENT_REASONS. Routing SHAREHOLDING
+                    # through the generic Yahoo-first loop would therefore
+                    # always fail with that bare provider error and leak it as
+                    # the final SHAREHOLDING outcome (wrong aggregate
+                    # semantics: an intermediate provider outcome, not a
+                    # genuine evidence-absence verdict). Do NOT re-append
+                    # shareholding_targets here; fall through to the dedicated
+                    # NSE DOCUMENT_ONLY phase below, which is the only source
+                    # with authority remaining after NSE structured. A genuine
+                    # gap that survives that phase is reported as the aggregate
+                    # EVIDENCE_INSUFFICIENT_WITHIN_PLAN (permanent, not retried),
+                    # not as a Yahoo provider error.
+                    pass
+                    # shareholding_targets is deliberately NOT re-appended to
+                    # `targets`: the generic per-target loop below must never
+                    # reach SHAREHOLDING.
         acquisition_context = asyncio.current_task()
         reuse_slot = (
             self._context_result_slot(acquisition_context)
@@ -832,13 +1172,72 @@ class McpFirstResearchCapabilityExecutor:
                             request_id=request_id,
                             timeout_seconds=call_timeout_seconds,
                         )
-                        await self.persister.persist(result, profile)
+                        # Stage-2 follow-up (Objective B): FinancialGapState.
+                        # accepts() is the metric+period+period_type+
+                        # reporting_basis+unit-aware filter already proven in
+                        # the narrow NSE-financial-gap-fill path
+                        # (_execute_financial_gaps). That path pulls its own
+                        # financial targets out of `targets` before this
+                        # generic loop ever runs (see the INDIA +
+                        # _uses_nse_financial_gaps() branch above), so this
+                        # only fires when that narrow path's own
+                        # preconditions were NOT met (e.g. no NSE official
+                        # financial provider configured, or a non-INDIA
+                        # instrument) -- the exact "generic financial
+                        # fallback" the task says must not bypass this
+                        # filtering. A single whole-requirement Yahoo call is
+                        # still made (the provider contract cannot request
+                        # one metric at a time), but the returned payload is
+                        # filtered to only the FinancialFactKeys genuinely
+                        # still missing before anything is persisted -- an
+                        # already-authoritative NSE fact is never replaced,
+                        # and unrelated metrics the requirement did not
+                        # actually need are discarded, not written.
+                        if target.requirement_id in FINANCIAL_GAP_REQUIREMENTS:
+                            gap_state = await self._financial_state(global_instrument_id)
+                            await self.persister.persist(result, profile, financial_gaps=gap_state)
+                        else:
+                            await self.persister.persist(result, profile)
                     except ExternalMcpAcquisitionError as exc:
+                        # A completed provider call that still produced zero usable
+                        # facts is a deterministic evidence gap for the structural
+                        # financial requirements (NSE-authoritative, gap-fill done),
+                        # not a transient failure to retry. Rewrite it to the
+                        # permanent canonical reason BEFORE recording, so the
+                        # aggregate does not misclassify it as TECHNICAL_RETRYABLE.
+                        # Genuine transient codes (DOWNSTREAM_TIMEOUT /
+                        # EXTERNAL_PROVIDER_UNAVAILABLE / EXTERNAL_SCHEMA_INVALID /
+                        # EXTERNAL_IDENTITY_CONFLICT / BUDGET_EXHAUSTED / etc.) are
+                        # returned unchanged by the qualifier and stay retryable.
+                        safe_code = _qualify_empty_financial_result(target.requirement_id, exc.safe_code)
+                        if target.requirement_id == "SHAREHOLDING":
+                            # Issue 1 diagnostic: the TRUE emission site for a
+                            # SHAREHOLDING EXTERNAL_CAPABILITY_UNSUPPORTED (or
+                            # any other) final reason. exc.safe_code is read
+                            # verbatim from HttpExternalResearchToolGateway.
+                            # acquire_requirement()'s HTTP response envelope --
+                            # this repository never constructs that string
+                            # itself. Reaching this except block at all already
+                            # proves jurisdiction != "INDIA" here (the INDIA
+                            # pre-pass above pulls SHAREHOLDING out of `targets`
+                            # before this generic loop ever runs), and that
+                            # route.providers[0] == YAHOO_FINANCE_MCP was
+                            # selected for it (checked just above this try/except).
+                            logger.info(
+                                "shareholding_final_reason_emitted instrument_id=%s requirement_id=%s "
+                                "country=%s exchange=%s ticker=%s jurisdiction=%s nseSymbol=%s bseSymbol=%s "
+                                "verifiedProviderMappings=%s selectedProvider=%s finalReason=%s",
+                                global_instrument_id, target.requirement_id,
+                                profile.country, profile.exchange, profile.ticker, jurisdiction,
+                                profile.provider_instrument_ids.get("NSE"),
+                                profile.provider_instrument_ids.get("BSE"),
+                                dict(profile.provider_instrument_ids), route.providers[0], safe_code,
+                            )
                         if reuse_slot is not None:
-                            reuse_slot[reuse_key] = ("FAILED", exc.safe_code)
-                        mcp_failures[target.requirement_id] = exc.safe_code
+                            reuse_slot[reuse_key] = ("FAILED", safe_code)
+                        mcp_failures[target.requirement_id] = safe_code
                         if progress is not None:
-                            progress.failed(target.requirement_id, exc.safe_code)
+                            progress.failed(target.requirement_id, safe_code)
                         continue
                     except Exception:
                         # Provider and persistence details never escape targeted ensure.
@@ -875,16 +1274,104 @@ class McpFirstResearchCapabilityExecutor:
                         global_instrument_id, jurisdiction=jurisdiction,
                     )
                     if readiness.for_requirement(target.requirement_id).status in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
-                        mcp_failures[target.requirement_id] = "EXTERNAL_RESULT_INCOMPLETE"
+                        # Stage-2 follow-up (Objective C): a bare
+                        # EXTERNAL_RESULT_INCOMPLETE here is ambiguous across
+                        # every requirement that reaches this generic
+                        # post-success recheck, so it must stay
+                        # TECHNICAL_RETRYABLE for all of them (no blanket
+                        # reclassification). HISTORICAL_PRICE_SERIES is the
+                        # one case this block can make a deterministic call
+                        # about: the provider call already succeeded
+                        # (written >= 1 was persisted above) and durable
+                        # evidence -- re-read fresh, right here -- still does
+                        # not cover the required window. An identical retry
+                        # against the exact same persisted gap cannot
+                        # discover history that was already proven not to
+                        # exist in that successful response, so this is
+                        # evidence-unavailable for *this* acquisition, not a
+                        # transient failure to keep retrying. See
+                        # failure_taxonomy.PERMANENT_REASONS for the matching
+                        # entry; a genuine network/provider error for this
+                        # requirement is caught separately above (the
+                        # ExternalMcpAcquisitionError / bare Exception
+                        # branches) and keeps its own retryable reason.
+                        reason = "EXTERNAL_RESULT_INCOMPLETE"
+                        if target.requirement_id == "HISTORICAL_PRICE_SERIES":
+                            reason = "EXTERNAL_RESULT_INCOMPLETE:HISTORICAL_COVERAGE_INSUFFICIENT"
+                        elif target.requirement_id.strip().upper() in _DETERMINISTIC_FINANCIAL_REQUIREMENTS:
+                            # Producer-side qualification (not a global taxonomy
+                            # reclassification): the provider call completed and the
+                            # NSE-authoritative financial path + legacy fallback
+                            # already ran (this generic post-success recheck only
+                            # fires under an active repair budget, see the
+                            # acquisition_budget guard above), so a still-unsatisfied
+                            # structural-financial requirement is a deterministic
+                            # absence rather than a retryable transient gap.
+                            # Genuine technical codes are caught on the branches
+                            # above and never reach here.
+                            reason = "PRIMARY_FINANCIAL_PROVIDER_RETURNED_NO_FACTS"
+                        mcp_failures[target.requirement_id] = reason
                         if progress is not None:
-                            progress.failed(target.requirement_id, "EXTERNAL_RESULT_INCOMPLETE")
+                            progress.failed(target.requirement_id, reason)
                         continue
                 completed.add(target.requirement_id)
                 if progress is not None:
                     progress.satisfied(target.requirement_id)
 
+        if jurisdiction == "INDIA" and shareholding_targets and "SHAREHOLDING" not in completed:
+            # Yahoo was attempted (or skipped as unauthorized/budget-
+            # exhausted) above. Reassess persisted evidence once more before
+            # ever touching the official NSE document/PDF path -- the last
+            # resort, only for fields genuinely still missing after both
+            # NSE structured and Yahoo.
+            readiness = await self.repository._run_blocking_persistence(
+                ResearchReadinessService(RepositoryResearchReadinessAdapter(self.repository)).assess,
+                global_instrument_id, jurisdiction=jurisdiction,
+            )
+            if readiness.for_requirement("SHAREHOLDING").status not in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
+                completed.add("SHAREHOLDING")
+            else:
+                document_capability = "NSE:SHAREHOLDING_DOCUMENT"
+                executed.append(document_capability)
+                if progress is not None:
+                    progress.executed(document_capability)
+                try:
+                    await self.repository.refresh_targeted_categories(
+                        global_instrument_id, {"SHAREHOLDING_PATTERN"},
+                        correlation_id=correlation_id, allow_demo=False,
+                        shareholding_phase="DOCUMENT_ONLY",
+                    )
+                except Exception as exc:
+                    mcp_failures["SHAREHOLDING"] = "|".join(
+                        filter(None, (mcp_failures.get("SHAREHOLDING"), type(exc).__name__)))
+                if progress is not None:
+                    progress.completed(document_capability)
+                readiness = await self.repository._run_blocking_persistence(
+                    ResearchReadinessService(RepositoryResearchReadinessAdapter(self.repository)).assess,
+                    global_instrument_id, jurisdiction=jurisdiction,
+                )
+                if readiness.for_requirement("SHAREHOLDING").status not in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
+                    completed.add("SHAREHOLDING")
+                else:
+                    # Every legitimate source with authority to resolve
+                    # SHAREHOLDING -- NSE structured/XBRL, NSE official
+                    # document/PDF -- has now genuinely been tried this cycle
+                    # and the gap remains. This is a genuine evidence-absence
+                    # verdict, NOT an intermediate provider outcome: do not
+                    # leak any stale Yahoo provider error (e.g.
+                    # EXTERNAL_CAPABILITY_UNSUPPORTED, which can only ever
+                    # appear here if a prior code path or observation
+                    # recorded it) as the final SHAREHOLDING reason. Report
+                    # the aggregate, plan-grounded classification instead. Both
+                    # are PERMANENT_REASONS (EVIDENCE_UNAVAILABLE, not retried),
+                    # but the aggregate reason truthfully describes the
+                    # candidate-level state rather than a single provider's
+                    # self-reported unsupported state.
+                    mcp_failures["SHAREHOLDING"] = "EVIDENCE_INSUFFICIENT_WITHIN_PLAN"
+                    plan_exhausted.add("SHAREHOLDING")
+
         remaining = tuple(target for target in targets
-                          if target.requirement_id not in completed | authority_checked)
+                          if target.requirement_id not in completed | authority_checked | plan_exhausted)
         legacy = (
             await self.legacy_executor.execute_primary(
                 global_instrument_id,
@@ -908,15 +1395,33 @@ class McpFirstResearchCapabilityExecutor:
                 # re-reads durable evidence and can prove the requirement was
                 # satisfied by that fallback.
                 failures[requirement_id] = safe_code
+        # Final blocking state comes from committed evidence. Keep attempt
+        # failures in observations/progress even when the regional path wins.
+        if mcp_failures and callable(getattr(self.repository, "_run_blocking_persistence", None)):
+            for key, reason in mcp_failures.items():
+                provider = "NSE" if reason == "NSE_FINANCIAL_UPGRADE_UNAVAILABLE" else YAHOO_FINANCE_MCP
+                await self._observe_failure(global_instrument_id, key, provider, reason)
+            current = await self.repository._run_blocking_persistence(
+                ResearchReadinessService(RepositoryResearchReadinessAdapter(self.repository)).assess,
+                global_instrument_id, jurisdiction=jurisdiction, evidence_only=True)
+            failures = {key: value for key, value in failures.items()
+                        if current.for_requirement(key).status not in {
+                            ResearchRequirementStatus.READY_FRESH, ResearchRequirementStatus.NOT_APPLICABLE}}
         return CapabilityExecutionResult(
-            (*executed, *legacy.executed_capabilities),
-            failures,
-            tuple(sorted(completed | set(legacy.satisfied_requirement_ids))),
+            (*financial_result.executed_capabilities, *executed, *legacy.executed_capabilities),
+            {**financial_result.failures, **failures},
+            tuple(sorted(completed | set(legacy.satisfied_requirement_ids) | set(financial_result.satisfied_requirement_ids))),
         )
 
     async def execute_approved_fallbacks(
         self, global_instrument_id: UUID, targets: Sequence[ResearchRefreshTarget]
     ) -> CapabilityExecutionResult:
+        if self._uses_nse_financial_gaps(self.repository.profile(global_instrument_id)):
+            # These requirements already attempted the scoped Yahoo fallback.
+            # Do not follow it with a whole-category direct-Yahoo acquisition.
+            targets = tuple(target for target in targets if target.requirement_id not in FINANCIAL_GAP_REQUIREMENTS)
+            if not targets:
+                return CapabilityExecutionResult()
         return await self.legacy_executor.execute_approved_fallbacks(global_instrument_id, targets)
 
 

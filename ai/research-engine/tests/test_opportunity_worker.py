@@ -190,14 +190,21 @@ async def test_prior_active_stock_reviewed_outside_discovery_without_extra_ensur
     for row in rows: persisted(store, row)
     service.rule_engine.analyze.side_effect = lambda profile, *a, **k: inputs(profile.instrument_id.int)[1]
     result = await service.run(rows, as_of=NOW, shortlist_limit=1, review_ids=[UUID(int=2), UUID(int=3)])
-    # Baseline-first design: every eligible stock receives a baseline ensure
-    # (cache-hit for the 3 pre-persisted / deep-ready "prior active" stocks).
-    # Only the single shortlisted candidate (1) additionally receives a deep
-    # acquisition ensure; the two reviewed stocks (2, 3) receive NO deep ensure,
-    # so "without extra ensure" still holds. Total: 3 baseline + 1 deep = 4.
-    assert runtime.ensure.await_count == 4
-    assert service.rule_engine.analyze.await_count == 3
-    assert {r.global_instrument_id.int for r in result.evaluated_entries} == {1, 2, 3}
+    # Bounded-admission design: live baseline ensure is now bounded to the
+    # admitted shortlist too (not the full eligible universe), so only the
+    # single shortlisted candidate (1) receives baseline + deep ensure.
+    # Reviewed stocks (2, 3) share that same admission boundary and are
+    # excluded from it on purpose: being outside the shortlist, they get
+    # only a persisted-only, price-lifecycle review (DEFERRED) -- no ensure()
+    # of any kind ("without extra ensure"), and no rule_engine.analyze() call
+    # either, so they never enter evaluated_entries. Total: 1 baseline + 1 deep
+    # ensure, and exactly 1 analyze() call (the admitted candidate only).
+    assert runtime.ensure.await_count == 2
+    assert service.rule_engine.analyze.await_count == 1
+    assert {r.global_instrument_id.int for r in result.evaluated_entries} == {1}
+    deferred = {d.global_instrument_id.int for d in result.diagnostics if d.disposition == "DEFERRED"}
+    assert deferred == {2, 3}
+    assert {str(UUID(int=2)), str(UUID(int=3))} <= set(result.review_evidence)
     assert result.shortlist_count == 1
 
 

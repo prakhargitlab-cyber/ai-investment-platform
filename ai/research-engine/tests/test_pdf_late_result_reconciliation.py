@@ -51,7 +51,7 @@ async def test_on_late_result_delivers_eventual_success_after_caller_timeout(mon
     worker_started = threading.Event()
     release_worker = threading.Event()
 
-    def blocking_extract(_response, *, max_bytes=None):
+    def blocking_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         worker_started.set()
         assert release_worker.wait(timeout=3)
         return FetchResult("https://nsearchives.nseindia.com/corporate/fixture.pdf", 200, "application/pdf", "late-text", 10)
@@ -87,7 +87,7 @@ async def test_on_late_result_delivers_eventual_failure_after_caller_timeout(mon
     worker_started = threading.Event()
     release_worker = threading.Event()
 
-    def blocking_extract(_response, *, max_bytes=None):
+    def blocking_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         worker_started.set()
         assert release_worker.wait(timeout=3)
         raise ValueError("late worker failure")
@@ -117,7 +117,7 @@ async def test_on_late_result_not_invoked_on_ordinary_success(monkeypatch):
     the caller already has the outcome directly via the normal return value."""
     fetcher = HttpResearchFetcher(Settings(research_pdf_extraction_concurrency=1))
 
-    def fast_extract(_response, *, max_bytes=None):
+    def fast_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         return FetchResult("https://nsearchives.nseindia.com/corporate/fixture.pdf", 200, "application/pdf", "text", 10)
 
     monkeypatch.setattr(fetcher, "process_network_response", fast_extract)
@@ -142,7 +142,7 @@ async def test_on_late_result_not_invoked_on_ordinary_non_timeout_failure(monkey
     (as today) without ever touching on_late_result."""
     fetcher = HttpResearchFetcher(Settings(research_pdf_extraction_concurrency=1))
 
-    def fast_failure(_response, *, max_bytes=None):
+    def fast_failure(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         raise ValueError("immediate failure")
 
     monkeypatch.setattr(fetcher, "process_network_response", fast_failure)
@@ -170,7 +170,7 @@ async def test_on_late_result_handler_exception_is_isolated(monkeypatch):
     worker_started = threading.Event()
     release_worker = threading.Event()
 
-    def blocking_extract(_response, *, max_bytes=None):
+    def blocking_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         worker_started.set()
         assert release_worker.wait(timeout=3)
         return FetchResult("https://nsearchives.nseindia.com/corporate/fixture.pdf", 200, "application/pdf", "text", 10)

@@ -37,6 +37,11 @@ PERMANENT_REASONS = frozenset({
     "DISCOVERY_ALL_CANDIDATES_REUSED_OR_UNSUPPORTED",
     "EVIDENCE_INSUFFICIENT_WITHIN_PLAN",
     "PRIMARY_FINANCIAL_PROVIDER_RETURNED_NO_FACTS",
+    # Exact, deterministic parser outcomes for the same source/content and
+    # parser version. Bare PARSER_FAILED, unknown subtypes and network failures
+    # remain technical; a composite containing any of them remains retryable.
+    "PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS",
+    "PARSER_FAILED:NSE_SHAREHOLDING_XBRL_NO_SUPPORTED_VALUES",
     "NOT_APPLICABLE",
     # The requirement's most recent AUTHORITATIVE (NSE) acquisition attempt
     # genuinely completed and found nothing (SUCCESS_EMPTY) -- not "a
@@ -49,6 +54,31 @@ PERMANENT_REASONS = frozenset({
     # and reporting a bare ACQUISITION_NOT_DUE (technical/retryable) even when
     # the last real check already ran to completion with nothing found.
     "PRIOR_ACQUISITION_EMPTY",
+    # The external MCP gateway's own capability registry has no provider
+    # tool registered for this requirement in this region at all (verified:
+    # SHAREHOLDING is hard-defaulted UNSUPPORTED in the Yahoo MCP capability
+    # registry -- no tool, no underlying provider call exists). This is not
+    # a transient provider outage and there is no alternative provider to
+    # retry against within the existing acquisition order (NSE structured ->
+    # Yahoo -> NSE document); repeating the identical request only wastes
+    # the bounded repair budget. A capability that genuinely becomes
+    # supported later is a deployment/config change, not something a
+    # same-cycle repair retry could ever observe anyway.
+    "EXTERNAL_CAPABILITY_UNSUPPORTED",
+    # HISTORICAL_PRICE_SERIES only (see yahoo_mcp_acquisition.py's
+    # McpFirstResearchCapabilityExecutor.execute_primary, the active-repair-
+    # budget post-success readiness recheck): the provider call already
+    # succeeded and something was durably persisted, yet re-read durable
+    # evidence still lacks the required history coverage/range. An
+    # identical retry against the same persisted gap cannot find history
+    # that a successful response already proved does not exist for this
+    # acquisition. Deliberately a distinct, qualified string from the bare
+    # EXTERNAL_RESULT_INCOMPLETE (which remains TECHNICAL_RETRYABLE for
+    # every other requirement sharing that same generic recheck, and for a
+    # HISTORICAL_PRICE_SERIES response that returned nothing persistable at
+    # all -- see persist()'s own `written < 1` raise -- since that case
+    # cannot yet be told apart from a transient empty response).
+    "EXTERNAL_RESULT_INCOMPLETE:HISTORICAL_COVERAGE_INSUFFICIENT",
 })
 
 # Positively technical (listed for documentation/review; anything not in

@@ -208,3 +208,96 @@ async def test_bounded_top_n_truncates_rank_eligible_tail_but_keeps_evaluated(mo
     assert bounded.top_n == unbounded.top_n[:min(2, len(eligible))]
     # evaluated_entries remain complete in BOTH modes (no truncation).
     assert len(bounded.evaluated_entries) == len(unbounded.evaluated_entries)
+
+
+# --- DI-OBS-2 regression: review-path technical evidence must stay JSON-safe ---
+
+def test_technical_evidence_isoformats_history_end_for_json_safe_persistence():
+    """DI-OBS-2 root cause (Issue B): TechnicalFeatureSnapshot.history_end is a
+    raw datetime. _technical_evidence() used to forward it verbatim. Every
+    NORMAL snapshot reaches persistence via OpportunityRankingEntry.model_dump
+    (mode='json'), which happens to convert nested raw datetimes to ISO
+    strings -- masking the defect. But global_opportunity_cycle.py's
+    "previous_states review" / price-lifecycle path reads
+    OpportunityRanking.review_evidence by plain attribute access (never
+    model_dump) and assigns history_end straight into a card's top-level
+    price_as_of field. Reproduced (before this fix): building that exact card
+    shape and calling json.dumps(card, sort_keys=True, allow_nan=False) --
+    the same call opportunity_persistence.py's _insert_opportunity makes --
+    raised "TypeError: Object of type datetime is not JSON serializable".
+    """
+    import json
+    from datetime import datetime, timezone
+    from uuid import UUID
+    from app.technical_features import TechnicalFeatureSnapshot
+
+    snapshot = TechnicalFeatureSnapshot(
+        global_instrument_id=UUID(int=1), as_of=datetime(2026, 9, 13, tzinfo=timezone.utc),
+        configuration={}, observation_count=250, history_readiness='FULL_HISTORY',
+        history_end=datetime(2026, 9, 12, 15, 30, tzinfo=timezone.utc), latest_price=1234.5)
+
+    technical = GlobalOpportunityOrchestrator._technical_evidence(GlobalOpportunityOrchestrator, snapshot)
+    assert technical['history_end'] == '2026-09-12T15:30:00+00:00'
+
+    # The exact review-path card shape from global_opportunity_cycle.py
+    # (snapshot_from_entry / previous_states review block): price_as_of is
+    # set directly from technical.get('history_end').
+    card = dict(snapshot_id='s1', cycle_id='c1', global_instrument_id=str(UUID(int=1)), market='NSE',
+                generated_at='2026-09-13T00:00:00+00:00', current_price=technical.get('latest_price'),
+                price_as_of=technical.get('history_end'), rank_eligible=False, opportunity_score=None)
+    # Must not raise -- this is the identical call opportunity_persistence.py's
+    # _insert_opportunity makes for the payload column.
+    round_tripped = json.loads(json.dumps(card, sort_keys=True, allow_nan=False))
+    assert round_tripped['price_as_of'] == '2026-09-12T15:30:00+00:00'
+
+
+def test_technical_evidence_history_end_none_stays_none():
+    """No history (INSUFFICIENT_HISTORY) must keep history_end as None, not a
+    stringified 'None' or any other sentinel -- matching existing contract for
+    a value already absent on the snapshot."""
+    from datetime import datetime, timezone
+    from uuid import UUID
+    from app.technical_features import TechnicalFeatureSnapshot
+
+    snapshot = TechnicalFeatureSnapshot(
+        global_instrument_id=UUID(int=1), as_of=datetime(2026, 9, 13, tzinfo=timezone.utc),
+        configuration={}, observation_count=0, history_readiness='INSUFFICIENT_HISTORY')
+    technical = GlobalOpportunityOrchestrator._technical_evidence(GlobalOpportunityOrchestrator, snapshot)
+    assert technical['history_end'] is None
+
+
+def test_publish_opportunity_cycle_round_trips_review_path_price_as_of():
+    """DI-OBS-2 regression (B): a full publish_opportunity_cycle round trip
+    with the exact review-path card shape (price_as_of/evidence_state built
+    from _technical_evidence's output, a raw TechnicalFeatureSnapshot.history_end
+    underneath) must persist without raising, and the canonical ISO-8601
+    string representation must load back unchanged -- never a Python
+    datetime, never a different string shape."""
+    from datetime import datetime, timezone
+    from uuid import uuid4, UUID
+    from app.persistence import SqliteResearchPersistence
+    from app.technical_features import TechnicalFeatureSnapshot
+
+    store = SqliteResearchPersistence()
+    snapshot = TechnicalFeatureSnapshot(
+        global_instrument_id=UUID(int=7), as_of=datetime(2026, 9, 13, tzinfo=timezone.utc),
+        configuration={}, observation_count=250, history_readiness='FULL_HISTORY',
+        history_end=datetime(2026, 9, 12, 15, 30, tzinfo=timezone.utc), latest_price=777.0)
+    technical = GlobalOpportunityOrchestrator._technical_evidence(GlobalOpportunityOrchestrator, snapshot)
+
+    cycle_id = str(uuid4())
+    card = dict(snapshot_id=str(uuid4()), cycle_id=cycle_id, global_instrument_id=str(UUID(int=7)),
+                market='NSE', generated_at='2026-09-13T00:00:00+00:00',
+                current_price=technical['latest_price'], price_as_of=technical['history_end'],
+                rank_eligible=False, opportunity_score=None,
+                evidence_state={'technical': technical, 'as_of': '2026-09-13T00:00:00+00:00'})
+    selection = dict(cycle_id=cycle_id, generated_at='2026-09-13T00:00:00+00:00', market='NSE', top_n=4,
+                     best_buy_today=None, top_short_term=[], top_long_term=[], top_exit=[],
+                     previous_recommendations=[card], diagnostics=[], correlation_id=None)
+
+    # Must not raise "TypeError: Object of type datetime is not JSON serializable".
+    store.publish_opportunity_cycle([card], [], [], selection)
+
+    [persisted] = store.opportunity_snapshots(cycle_id)
+    assert persisted['price_as_of'] == '2026-09-12T15:30:00+00:00'
+    assert persisted['evidence_state']['technical']['history_end'] == '2026-09-12T15:30:00+00:00'

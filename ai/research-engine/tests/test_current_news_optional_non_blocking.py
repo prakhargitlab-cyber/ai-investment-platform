@@ -377,3 +377,88 @@ def test_g_current_news_diagnostics_remain_visible_despite_non_blocking_eligibil
         eligibility = POLICY.evaluate(readiness)
         assert eligibility.full_analysis_allowed
         assert "CURRENT_NEWS" not in eligibility.blocking_requirements
+
+
+# L -----------------------------------------------------------------------------
+# Orchestration-level, end-to-end proof (not just the unit-level gates proven
+# above): a Stage2 candidate with every mandatory requirement READY_FRESH but
+# CURRENT_NEWS FAILED must come out of GlobalOpportunityOrchestrator.run()
+# itself as deep-ready / rank-eligible, WITHOUT triggering a repair pass --
+# this is the "REPAIR INTERACTION" contract: CURRENT_NEWS failing alone must
+# never cost a repair attempt, since repair can never recover it (see Issue
+# B's earlier repair-effectiveness diagnosis: repair is a blind retry of the
+# identical acquisition call).
+
+import httpx as _httpx
+from unittest.mock import AsyncMock as _AsyncMock
+from app.deep_investigation import build_plan as _build_plan
+from app.global_scanner import GlobalScanner as _GlobalScanner
+from test_global_opportunity_baseline import setup_acquisition as _setup_acquisition
+from test_global_opportunity_ranker import inputs as _ranker_inputs_full
+
+
+@pytest.mark.asyncio
+async def test_l_current_news_failure_alone_is_deep_ready_and_never_repaired(monkeypatch):
+    service, rows, pairs, store, tracker = _setup_acquisition(monkeypatch, count=1)
+    candidate_id = next(iter(pairs))
+    pairs[candidate_id] = _ranker_inputs_full(1, core=90, confidence=90)
+
+    readiness = replace(_readiness({"CURRENT_NEWS": ResearchRequirementStatus.FAILED}),
+                        global_instrument_id=candidate_id)
+
+    async def investigate_stub(runtime, key, **kwargs):
+        assert key == candidate_id
+        result = TargetedEnsureResult(readiness, (), (), failures={"CURRENT_NEWS": "PROVIDER_TIMEOUT"})
+        return result, _build_plan(readiness), {"CURRENT_NEWS": {"state": "FAILED", "failure": "PROVIDER_TIMEOUT"}}
+
+    monkeypatch.setattr("app.deep_investigation.investigate", investigate_stub)
+    # Any direct runtime.ensure() for this key (outside investigate()) would
+    # be a sign CURRENT_NEWS's own acquisition reached a code path this test
+    # does not intend to exercise.
+    forbidden = _AsyncMock(side_effect=AssertionError("Unexpected direct ensure() call"))
+    monkeypatch.setattr(_httpx.AsyncClient, "send", forbidden)
+
+    result = await service.run(rows, as_of=NOW, shortlist_limit=25, discovery_v2=True)
+
+    diagnostic = next(d for d in result.diagnostics if d.global_instrument_id == candidate_id)
+    # Deep-ready / rank-eligible despite CURRENT_NEWS's own technical failure.
+    assert diagnostic.disposition == "ANALYZED"
+    assert diagnostic.rank_eligible is True
+    assert diagnostic.status == "RANK_ELIGIBLE"
+    assert result.deep_ready_count == 1
+    assert result.rank_eligible_count == 1
+    # Never classified as a readiness/technical failure, and never repaired,
+    # because of CURRENT_NEWS alone.
+    assert result.deep_readiness_failed_count == 0
+    assert result.deep_technical_failure_count == 0
+    assert result.deep_repair_attempted_count == 0
+    # CURRENT_NEWS's own failure remains visible in the investigation matrix
+    # (observability preserved -- never hidden).
+    assert result.investigation_matrix[str(candidate_id)]["requirements"]["CURRENT_NEWS"]["failure"] == "PROVIDER_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_m_genuinely_mandatory_failure_still_triggers_repair_unaffected(monkeypatch):
+    # Control: a candidate failing a genuinely mandatory requirement (not
+    # CURRENT_NEWS) still goes through DEEP_READINESS_NOT_MET / repair exactly
+    # as before -- this change must not touch that existing behavior.
+    service, rows, pairs, store, tracker = _setup_acquisition(monkeypatch, count=1)
+    candidate_id = next(iter(pairs))
+    pairs[candidate_id] = _ranker_inputs_full(1, core=90, confidence=90)
+
+    attempts = {"n": 0}
+    readiness = replace(_readiness({"QUARTERLY_FINANCIALS": ResearchRequirementStatus.MISSING}),
+                        global_instrument_id=candidate_id)
+
+    async def investigate_stub(runtime, key, **kwargs):
+        attempts["n"] += 1
+        result = TargetedEnsureResult(readiness, (), (), failures={"QUARTERLY_FINANCIALS": "TimeoutError"})
+        return result, _build_plan(readiness), {}
+
+    monkeypatch.setattr("app.deep_investigation.investigate", investigate_stub)
+    result = await service.run(rows, as_of=NOW, shortlist_limit=25, discovery_v2=True)
+
+    assert result.deep_ready_count == 0
+    assert result.deep_readiness_failed_count == 1
+    assert result.deep_repair_attempted_count == 1  # unchanged existing repair behavior
+    assert attempts["n"] == 2  # original attempt + one repair pass

@@ -19,7 +19,7 @@ from uuid import UUID
 logger = logging.getLogger(__name__)
 
 from app import cycle_timing
-from app.readiness_signals import evidence_notifications
+from app.readiness_signals import evidence_notifications, evidence_committed
 
 from app.research_applicability import classify_requirements, CONCEPT_INPUTS, CONCEPT_CATEGORIES
 from app.market_sessions import price_session_valid_until
@@ -28,6 +28,7 @@ from app.normalization import content_hash
 from app.fact_precedence import FactSourceTier, FinancialFact
 from app.historical_market_data import HistoricalPriceIdentityConflict, HistoricalPriceProviderError, HistoricalPricePersistenceError, has_year_historical_coverage
 from app.structured_market import derive_and_verify_nse_yahoo_mapping, _exchange_family
+from app.structured_financial import OfficialFinancialProvider
 from app.models import (
     CompanyResearchProfile,
     DocumentStatus,
@@ -69,18 +70,12 @@ _FINANCIAL_REQUIREMENTS = frozenset(
         "QUARTERLY_FINANCIALS",
     }
 )
-# STAGE-1 (cheap baseline) data contract: every eligible NSE equity must have
-# only low-cost, structured read-only facts acquired before any pre-ranking or
-# deep-enrichment decision. These gate exclusively on structured market-data
-# reads (ensured cheaply via ensure_structured_market + historical price series),
-# NOT on per-instrument financial-document discovery, NSE result reconciliation,
-# governance/RISKS/REGULATORY/MANAGEMENT search, or PDF fetching -- those
-# expensive steps are deferred to STAGE-2 deep enrichment (shortlist only,
-# ensure(requirement_ids=None) for <= shortlist_limit candidates). Financial
-# facts themselves are READ by the scanner from persistence (persisted by the
-# NSE/GHCL refresh); any candidate whose financials are not yet persisted simply
-# does not enter the deep pool and is deep-acquired by the Stage-2 shortlist
-# instead of the full 2578-universe baseline pass.
+# Structured/history acquisition contract for admitted candidates only. The
+# full-universe scanner reads persistence without ensuring these requirements.
+# Deterministic discovery (including sparse-candidate rotation) admits at most
+# shortlist_limit identities before this provider-capable contract is executed.
+# Official document discovery, governance and PDF fallback remain deep work;
+# final recommendation readiness still uses the full existing requirement set.
 BASELINE_REQUIREMENT_IDS = frozenset(
     {
         "LATEST_PRICE",
@@ -200,6 +195,26 @@ class RepositoryResearchReadinessAdapter:
             global_instrument_id, source_mode=SourceMode.REAL
         )
         shareholding = self.repository.shareholding_for(global_instrument_id, limit=4)
+        # Field-level (not whole-snapshot) coverage: the same period may
+        # have more than one real snapshot (NSE structured, Yahoo MCP,
+        # official NSE PDF) each holding different fields -- e.g. NSE has
+        # promoter/institutional categories but not pledge, while Yahoo or
+        # an NSE PDF supplies pledge. shareholding_for() above still returns
+        # only the single best snapshot per period (unchanged, still used
+        # by every other existing caller); this grouped accessor exposes
+        # every real snapshot for the most recent qualifying period so
+        # _append_shareholding can union their coverage without discarding
+        # any of them.
+        shareholding_period_groups_fn = getattr(self.repository, "shareholding_period_groups", None)
+        if callable(shareholding_period_groups_fn):
+            shareholding_groups = shareholding_period_groups_fn(global_instrument_id, limit=4)
+        else:
+            # A lightweight test/fixture repository that predates this
+            # accessor: fall back to one single-snapshot group per
+            # shareholding_for() result, which is exactly the old
+            # behavior (no cross-source field merge, but no regression
+            # either).
+            shareholding_groups = [[snapshot] for snapshot in shareholding]
 
         evidence: dict[str, list[ResearchEvidence]] = {
             requirement.requirement_id: [] for requirement in requirements
@@ -216,7 +231,11 @@ class RepositoryResearchReadinessAdapter:
                 source_url=value.source_url,covered_input_ids=('PE' if name=='trailingPE' else 'PB',)))
         self._append_documents(evidence, documents)
         self._append_events(evidence, events)
-        self._append_shareholding(evidence, shareholding)
+        from app.research_applicability import shareholding_scorable_ownership_coverage
+        self._append_shareholding(
+            evidence, shareholding_groups[0] if shareholding_groups else (),
+            scorable=shareholding_scorable_ownership_coverage(shareholding),
+        )
         self._append_canonical_sector(evidence, global_instrument_id, profile, structured)
 
         metadata = self.canonical_metadata_for(global_instrument_id)
@@ -629,39 +648,67 @@ class RepositoryResearchReadinessAdapter:
 
     @staticmethod
     def _append_shareholding(
-        evidence: dict[str, list[ResearchEvidence]], snapshots: Sequence[Any]
+        evidence: dict[str, list[ResearchEvidence]], period_group: Sequence[Any],
+        *, scorable: bool = True,
     ) -> None:
-        if not snapshots:
+        if not period_group:
             return
-        snapshot = snapshots[0]
-        from app.research_applicability import shareholding_input_coverage
-        covered = shareholding_input_coverage(snapshot)
-        evidence["SHAREHOLDING"].append(
-            ResearchEvidence(
-                evidence_id=f"shareholding:{snapshot.id}",
-                requirement_id="SHAREHOLDING",
-                source=(
-                    "NSE"
-                    if snapshot.source_provider.upper() == "NSE"
-                    else "APPROVED_EXTERNAL_TOOL"
-                    if snapshot.source_provider.upper() == "YAHOO_FINANCE_MCP"
-                    else snapshot.source_provider
-                ),
-                source_tier=(
-                    ResearchSourceTier.OFFICIAL
-                    if snapshot.source_provider.upper() == "NSE"
-                    else ResearchSourceTier.APPROVED_EXTERNAL_TOOL
-                    if snapshot.source_provider.upper() == "YAHOO_FINANCE_MCP"
-                    else ResearchSourceTier.LICENSED_STRUCTURED
-                ),
-                retrieved_at=snapshot.retrieved_at,
-                as_of=snapshot.period_end,
-                published_at=snapshot.published_at,
-                source_url=snapshot.source_url,
-                confidence=float(snapshot.confidence),
-                covered_input_ids=tuple(sorted(covered)),
+        from app.research_applicability import shareholding_field_merge
+        # Authority-aware, field-level union across every real snapshot for
+        # this one period (NSE structured/XBRL > Yahoo MCP > official NSE
+        # PDF -- see shareholding_source_authority_rank()). Each
+        # contributing snapshot gets its own ResearchEvidence row, scoped to
+        # only the fields it is the highest-authority source for, so a
+        # lower-priority source can never be read as overwriting a
+        # higher-priority one for the same field+period, and no synthetic
+        # merged snapshot/provenance is ever manufactured. The existing
+        # coverage aggregation (ShareholdingCoverageService.covered_input_ids)
+        # already unions covered_input_ids across every evidence row for a
+        # requirement, so emitting more than one row here is sufficient --
+        # no change needed there.
+        #
+        # `scorable` (Stage-2 follow-up: readiness/scoring reconciliation):
+        # shareholding_field_merge()/shareholding_input_coverage() answer
+        # "is this category present in this one period" -- a per-field
+        # bookkeeping question, unrelated to whether the rule engine's
+        # StockRuleEngine._shareholding() scorer can actually turn that
+        # evidence into a metric (which may additionally require a second,
+        # trend-compatible period -- see
+        # shareholding_scorable_ownership_coverage()). Only the mandatory
+        # PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES input is gated by that
+        # broader, multi-period check: LATEST_VALID_SHAREHOLDING_PERIOD and
+        # the (supporting, optional) PROMOTER_PLEDGE input are untouched,
+        # so a genuinely present pledge value is never hidden by this gate.
+        for snapshot, covered in shareholding_field_merge(period_group):
+            covered = set(covered)
+            if not scorable:
+                covered.discard("PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES")
+            evidence["SHAREHOLDING"].append(
+                ResearchEvidence(
+                    evidence_id=f"shareholding:{snapshot.id}",
+                    requirement_id="SHAREHOLDING",
+                    source=(
+                        "NSE"
+                        if snapshot.source_provider.upper() == "NSE"
+                        else "APPROVED_EXTERNAL_TOOL"
+                        if snapshot.source_provider.upper() == "YAHOO_FINANCE_MCP"
+                        else snapshot.source_provider
+                    ),
+                    source_tier=(
+                        ResearchSourceTier.OFFICIAL
+                        if snapshot.source_provider.upper() == "NSE"
+                        else ResearchSourceTier.APPROVED_EXTERNAL_TOOL
+                        if snapshot.source_provider.upper() == "YAHOO_FINANCE_MCP"
+                        else ResearchSourceTier.LICENSED_STRUCTURED
+                    ),
+                    retrieved_at=snapshot.retrieved_at,
+                    as_of=snapshot.period_end,
+                    published_at=snapshot.published_at,
+                    source_url=snapshot.source_url,
+                    confidence=float(snapshot.confidence),
+                    covered_input_ids=tuple(sorted(covered)),
+                )
             )
-        )
 
     def _append_canonical_sector(
         self,
@@ -769,13 +816,94 @@ class CapabilityExecutionProgress:
         self.satisfied_requirement_ids.add(requirement_id)
 
 
+async def memoized_assess(
+    repository,
+    memo: dict,
+    global_instrument_id: UUID,
+    *,
+    jurisdiction: str,
+    evidence_only: bool = False,
+    now: datetime | None = None,
+):
+    """Collapse within-call duplicate `ResearchReadinessService.assess` reads.
+
+    Root-cause fix (forensic cycle 89fd630e / Stage-2 amplification): one
+    Stage-2 candidate was observed making ~46 ResearchReadinessService.assess
+    calls on average (1147 calls / 25 candidates), each one re-running
+    RepositoryResearchReadinessAdapter.load_by_global_instrument_id -- eight
+    separate repository reads (profile, financial facts, structured market,
+    price observations, documents, events, shareholding, shareholding period
+    groups) -- through `_run_blocking_persistence`'s thread-dispatch path.
+
+    ``ResearchReadinessRuntime.read()`` already memoizes evidence_only reads
+    using ``repository._readiness_mutation_generation`` (bumped on every
+    persistence *write*) as the staleness sentinel, but every direct-call
+    site inside McpFirstResearchCapabilityExecutor.execute_primary and
+    ExistingResearchCapabilityExecutor.execute_primary constructs its own
+    throwaway ``ResearchReadinessService(...)`` and calls ``.assess``
+    directly, bypassing that cache entirely -- so two assess() calls with
+    *no durable write in between* (e.g. an optional provider attempt that
+    raised before persisting anything, or two branches of the same
+    single acquisition pass both re-checking the same candidate) each pay
+    the full reload cost again.
+
+    This helper applies the exact same, already-trusted invalidation rule
+    -- not a new caching policy -- scoped to a `memo` dict the caller
+    creates fresh at the top of ITS OWN single execute_primary invocation
+    (never shared across candidates, never module/global state, never
+    outliving one call). A cached result is only ever returned when the
+    mutation generation has not advanced since it was captured, so any
+    committed write (acquisition, observation, document fetch, ...)
+    immediately invalidates it and the next call reloads from current
+    durable evidence -- final readiness still always comes from current
+    durable evidence (Invariant 1); this only removes work that was
+    PROVABLY redundant (identical state, nothing wrote in between).
+    """
+    key = (global_instrument_id, jurisdiction, bool(evidence_only))
+    generation = getattr(repository, "_readiness_mutation_generation", None)
+    cached = memo.get(key)
+    if cached is not None and generation is not None:
+        cached_result, cached_generation = cached
+        if cached_generation == generation and now is None:
+            return cached_result
+    result = await repository._run_blocking_persistence(
+        ResearchReadinessService(RepositoryResearchReadinessAdapter(repository)).assess,
+        global_instrument_id,
+        jurisdiction=jurisdiction,
+        evidence_only=evidence_only,
+        now=now,
+    )
+    if generation is not None and now is None:
+        memo[key] = (result, generation)
+    return result
+
+
 class ExistingResearchCapabilityExecutor:
     """Map planner targets to the narrow provider capabilities already present."""
 
-    def __init__(self, repository, orchestrator, market_data_population_jobs) -> None:
+    def __init__(self, repository, orchestrator, market_data_population_jobs, *,
+                 official_financial_provider: OfficialFinancialProvider | None = None) -> None:
         self.repository = repository
         self.orchestrator = orchestrator
         self.market_data_population_jobs = market_data_population_jobs
+        self.official_financial_provider = official_financial_provider
+
+    async def acquire_official_financials(self, global_instrument_id: UUID) -> None:
+        """Structured NSE acquisition only; document fallback belongs to execute_primary."""
+        if self.official_financial_provider is None:
+            return
+        facts = await self.official_financial_provider.collect(self.repository.profile(global_instrument_id))
+        if any(fact.key.instrument_id != global_instrument_id
+               or fact.source_provider != "NSE" or fact.source_tier != FactSourceTier.OFFICIAL_NSE
+               or fact.source_mode != SourceMode.REAL or not fact.source_identity
+               or urlparse(fact.value.source_url).scheme != "https"
+               or not ((urlparse(fact.value.source_url).hostname or "") == "nseindia.com"
+                       or (urlparse(fact.value.source_url).hostname or "").endswith(".nseindia.com"))
+               for fact in facts):
+            raise ValueError("OFFICIAL_STRUCTURED_PROVENANCE_INVALID")
+        await self.repository.persist_international_financial_facts_async(facts)
+        if facts:
+            evidence_committed(global_instrument_id)
 
     async def execute_primary(
         self,
@@ -787,6 +915,7 @@ class ExistingResearchCapabilityExecutor:
         identity_headers: Mapping[str, str | None] | None,
         progress: CapabilityExecutionProgress | None = None,
         deadline: float | None = None,
+        official_financials_attempted: bool = False,
     ) -> CapabilityExecutionResult:
         requirement_ids = {target.requirement_id for target in targets}
         unknown = requirement_ids - _KNOWN_REQUIREMENTS
@@ -794,6 +923,10 @@ class ExistingResearchCapabilityExecutor:
             raise KeyError(f"No targeted capability mapping for {sorted(unknown)}")
         executed: list[str] = []
         failures: dict[str, str] = {}
+        # Scoped to this single execute_primary call only -- see
+        # memoized_assess's docstring (forensic cycle 89fd630e readiness-
+        # amplification fix). Never shared across candidates or calls.
+        _assess_memo: dict = {}
 
         structured_classes: set[str] = set()
         if "VALUATION_INPUTS" in requirement_ids:
@@ -838,13 +971,38 @@ class ExistingResearchCapabilityExecutor:
                 progress.completed("STRUCTURED_MARKET")
 
         financial = requirement_ids & _FINANCIAL_REQUIREMENTS
+        official_structured_failure = None
         repository_categories: set[str] = set()
         if financial:
             executed.append("FINANCIALS")
             if progress is not None:
                 progress.executed("FINANCIALS")
             if jurisdiction == "INDIA":
-                repository_categories.add("FINANCIAL_RESULTS")
+                remaining = financial
+                if self.official_financial_provider is not None or official_financials_attempted:
+                    try:
+                        if not official_financials_attempted:
+                            await self.acquire_official_financials(global_instrument_id)
+                        current = await memoized_assess(
+                            self.repository, _assess_memo, global_instrument_id, jurisdiction=jurisdiction)
+                        remaining = {key for key in financial if
+                            current.for_requirement(key).status != ResearchRequirementStatus.READY_FRESH
+                            or current.for_requirement(key).source != "NSE"}
+                        logger.info("radar_acquisition_count operation=pdf_fallback_avoided reason=OFFICIAL_STRUCTURED count=%d",
+                                    len(financial - remaining))
+                    except Exception as exc:
+                        # An optional provider failure never suppresses the
+                        # existing official-document path or certifies evidence.
+                        official_structured_failure = type(exc).__name__
+                        # Preserve the exception message (bounded, no PII --
+                        # our own code only raises short internal taxonomy
+                        # codes or stdlib TypeError/ValueError text here) and
+                        # the traceback, so a deterministic defect is
+                        # diagnosable from logs instead of a bare class name.
+                        logger.warning("official_structured_financial_failed reason=%s detail=%s",
+                                        type(exc).__name__, str(exc)[:200], exc_info=True)
+                if remaining:
+                    repository_categories.add("FINANCIAL_RESULTS")
             else:
                 try:
                     profile = self.repository.profile(global_instrument_id)
@@ -960,6 +1118,26 @@ class ExistingResearchCapabilityExecutor:
                 )
                 if progress is not None:
                     progress.failed("UNATTRIBUTED_SHARED_EXECUTION_FAILURE", exc_name)
+
+        if official_structured_failure is not None:
+            # A failed structured attempt must not disappear behind a PDF path
+            # that completed with no supported facts. Clear it only when the
+            # fallback actually satisfied that requirement with official facts.
+            current = await memoized_assess(
+                self.repository, _assess_memo, global_instrument_id, jurisdiction=jurisdiction)
+            from app.deep_investigation import acquisition_budget
+            budget = acquisition_budget(global_instrument_id)
+            for requirement_id in financial:
+                row = current.for_requirement(requirement_id)
+                if row.status == ResearchRequirementStatus.READY_FRESH and row.source == "NSE":
+                    continue
+                reason = "|".join(dict.fromkeys(filter(None, (
+                    failures.get(requirement_id), official_structured_failure))))
+                failures[requirement_id] = reason
+                if budget is not None:
+                    budget.requirement_failures[requirement_id] = reason
+                if progress is not None:
+                    progress.failed(requirement_id, reason)
 
         if "HISTORICAL_PRICE_SERIES" in requirement_ids:
             executed.append("HISTORICAL_MARKET_DATA")
@@ -1175,7 +1353,12 @@ class ResearchReadinessRuntime:
         self.planner = ResearchRefreshPlanner(self.authority_registry)
         self.executor = executor
         self.ensure_timeout_seconds = ensure_timeout_seconds
-        self._flights: dict[UUID, _EnsureFlight] = {}
+        # Keyed by instrument, holding every CONCURRENTLY running ensure()
+        # flight for that instrument (not just one) -- see the Root Cause
+        # comment on the join logic in ensure() below for why a single slot
+        # per instrument was a correctness/performance bug, not just an
+        # implementation detail.
+        self._flights: dict[UUID, list[_EnsureFlight]] = {}
         # Bounded per-instrument cache of the most recent durability-check
         # ResearchReadinessResult, reused only for evidence_only=True reads.
         # This collapses the repeated sufficiency pre-checks in deep_investigation
@@ -1314,12 +1497,37 @@ class ResearchReadinessRuntime:
         if not plan.targets:
             return TargetedEnsureResult(readiness, (), ())
 
-        existing = self._flights.get(global_instrument_id)
-        if existing is not None:
+        # Root Cause (Area 2 / runtime_ensure bottleneck): this single-flight
+        # join used to key on the instrument alone, so ANY concurrently
+        # running ensure() for this instrument -- regardless of which
+        # requirement_ids it was servicing -- was joined and shielded-waited
+        # on in full before this call's own (entirely disjoint) plan could
+        # even start. CURRENT_NEWS is deliberately run concurrently with the
+        # sequential mandatory-group loop in deep_investigation.investigate
+        # (see _acquire_news_in_background) specifically so it is NOT stuck
+        # behind BUSINESS_QUALITY_FACTS/SHAREHOLDING/etc acquisition -- but
+        # because every one of those groups shares the SAME instrument,
+        # CURRENT_NEWS's runtime_ensure kept finding an unrelated flight
+        # already registered and blocking on it anyway, which is exactly why
+        # its own runtime_ensure_elapsed_ms tracked almost the entire
+        # investigation wall time instead of just its own acquisition cost.
+        # Fix: only join (shield-wait on, and subtract attempted ids from) a
+        # prior flight whose OWN requirement_ids actually intersect this
+        # call's planned targets. A flight for disjoint requirement_ids is
+        # left running untouched and this call proceeds concurrently with
+        # it, exactly as the grouping/backgrounding design already intends.
+        planned_target_ids = frozenset(target.requirement_id for target in plan.targets)
+        existing_flights = self._flights.get(global_instrument_id, [])
+        overlapping = [flight for flight in existing_flights if flight.requirement_ids & planned_target_ids]
+        if overlapping:
             _single_flight_started = _time.monotonic()
-            shared_execution = await asyncio.shield(existing.task)
+            shared_executions = await asyncio.gather(*(asyncio.shield(flight.task) for flight in overlapping))
             cycle_timing.record_single_flight_wait_elapsed((_time.monotonic() - _single_flight_started) * 1000)
-            attempted = existing.requirement_ids
+            attempted: set[str] = set()
+            shared_failures: dict[str, str] = {}
+            for flight, shared_execution in zip(overlapping, shared_executions):
+                attempted |= flight.requirement_ids
+                shared_failures.update(shared_execution.failures)
             readiness = await self.read(global_instrument_id, jurisdiction=jurisdiction)
             remaining = self.planner.plan(
                 readiness,
@@ -1332,11 +1540,11 @@ class ResearchReadinessRuntime:
                 for target in remaining.targets
                 if target.requirement_id not in attempted
                 or (wait_for_completion and "ACQUISITION_TIMEOUT" in
-                    shared_execution.failures.get(target.requirement_id, ""))
+                    shared_failures.get(target.requirement_id, ""))
             )
             if not remaining_targets:
                 return TargetedEnsureResult(
-                    readiness, planned_ids, (), True, shared_execution.failures
+                    readiness, planned_ids, (), True, shared_failures
                 )
             plan = ResearchRefreshPlan(
                 global_instrument_id, remaining_targets, remaining.created_at
@@ -1353,10 +1561,17 @@ class ResearchReadinessRuntime:
             )
         )
         flight = _EnsureFlight(task, target_ids)
-        self._flights[global_instrument_id] = flight
+        self._flights.setdefault(global_instrument_id, []).append(flight)
 
         def cleanup(completed: asyncio.Task[_PlanExecutionResult]) -> None:
-            if self._flights.get(global_instrument_id) is flight:
+            flights = self._flights.get(global_instrument_id)
+            if flights is None:
+                return
+            try:
+                flights.remove(flight)
+            except ValueError:
+                return
+            if not flights:
                 self._flights.pop(global_instrument_id, None)
 
         task.add_done_callback(cleanup)

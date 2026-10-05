@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import traceback
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from uuid import UUID
@@ -83,6 +84,16 @@ class Settings(BaseSettings):
     # comparable evidence for queue admission itself.
     research_pdf_extraction_queue_timeout_seconds: float = 12.0
     research_pdf_extraction_concurrency: int = 1
+    # Track A — OOM mitigation: gc.collect() is invoked every Nth PDF
+    # extraction (in the worker thread's finally block after del reader) to
+    # break pypdf's cyclic PdfReader<->PageObject references that CPython's
+    # refcounting cannot reclaim immediately. Unconditional gc.collect() after
+    # every extraction costs ~42–260ms (depending on process size) per PDF;
+    # periodic collection (every 4th by default) amortizes this while still
+    # bounding cyclic-garbage accumulation. Set to 0 or 1 to collect after
+    # every extraction (maximum memory reclamation, highest overhead); set
+    # higher to reduce overhead at the cost of slightly delayed reclamation.
+    research_pdf_extraction_gc_interval: int = 4
     research_official_document_max_transport_failures_per_host: int = 1
     # Guardian Review (Issue 3, STAGE2_LIVE_RUN_DEFECTS_20260930.md): the
     # per-host transport-failure count above is tracked in
@@ -314,6 +325,13 @@ class Settings(BaseSettings):
             raise ValueError("research_pdf_extraction_concurrency must be between 1 and 4")
         return value
 
+    @field_validator("research_pdf_extraction_gc_interval")
+    @classmethod
+    def validate_research_pdf_extraction_gc_interval(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("research_pdf_extraction_gc_interval must be >= 1")
+        return value
+
     @field_validator("research_log_level")
     @classmethod
     def validate_research_log_level(cls, value: str) -> str:
@@ -454,4 +472,18 @@ class _StructuredLogFormatter(logging.Formatter):
             "requestId": _REQUEST_ID.get(),
             "message": message,
         }
+        # DI-OBS-1: logger.exception()/exc_info=True set record.exc_info, but
+        # this formatter previously never read it -- the exception class,
+        # message, and traceback were silently dropped from every structured
+        # log line, including opportunity_cycle_failed. Preserve a bounded,
+        # redacted summary so a future controlled run keeps real diagnostics
+        # even when the raw pod log buffer has since rotated past the event.
+        if record.exc_info:
+            exc_type, exc_value, _ = record.exc_info
+            exc_text = "".join(traceback.format_exception(*record.exc_info))
+            exc_text = _SENSITIVE_LOG_VALUE.sub(r"\1=<redacted>", exc_text).replace("\r", " ")
+            payload["exceptionType"] = exc_type.__name__ if exc_type is not None else None
+            payload["exceptionMessage"] = _SENSITIVE_LOG_VALUE.sub(
+                r"\1=<redacted>", str(exc_value))[:500].replace("\r", " ").replace("\n", " ")
+            payload["traceback"] = exc_text[-4000:]
         return json.dumps(payload, separators=(",", ":"), default=str)

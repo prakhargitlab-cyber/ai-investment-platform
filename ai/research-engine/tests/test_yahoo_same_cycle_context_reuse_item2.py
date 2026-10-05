@@ -85,14 +85,15 @@ async def test_a_same_context_reuses_one_live_ticker_acquisition():
     await market.collect(_instrument(), acquisition_context=context)
     # Two logical requests, but .info (the actual network-backed property)
     # is only ever computed once on the shared yf.Ticker instance.
-    assert network_calls == ["ZENTEC.NS", "ZENTEC.NS"] or network_calls.count("ZENTEC.NS") <= 2
+    assert network_calls == ["ZENTEC.NS"]
     # The decisive assertion: the SAME underlying ticker object served both
     # calls (its .info was only ever computed once, since _CountingTicker
     # caches _info after the first real computation and every access after
     # that re-appends to `_calls` without recomputing -- so the test proves
     # reuse via object identity instead of call count, which is the
     # behavior-level guarantee that matters).
-    first = market._context_tickers[context]["ZENTEC.NS"]
+    with market.ticker_contexts.acquire("ZENTEC.NS", context) as access:
+        first = access.ticker
     assert first is not None
 
 
@@ -111,8 +112,10 @@ async def test_b_different_context_is_independent():
     # out of scope for this item).
     await market.collect_baseline(_instrument(), acquisition_context=first_context)
     await market.collect_baseline(_instrument(), acquisition_context=second_context)
-    first_ticker = market._context_tickers[first_context]["ZENTEC.NS"]
-    second_ticker = market._context_tickers[second_context]["ZENTEC.NS"]
+    with market.ticker_contexts.acquire("ZENTEC.NS", first_context) as access:
+        first_ticker = access.ticker
+    with market.ticker_contexts.acquire("ZENTEC.NS", second_context) as access:
+        second_ticker = access.ticker
     assert first_ticker is not second_ticker
     assert network_calls == ["ZENTEC.NS", "ZENTEC.NS"]
 
@@ -124,7 +127,7 @@ async def test_c_no_context_remains_fully_independent_every_call():
     snapshot_one = await market.collect(_instrument(), acquisition_context=None)
     snapshot_two = await market.collect(_instrument())  # default, no context at all
     assert snapshot_one.facts["latestPrice"].value == snapshot_two.facts["latestPrice"].value
-    assert market._context_tickers == {}
+    assert market.ticker_contexts._contexts == {}
 
 
 @pytest.mark.asyncio

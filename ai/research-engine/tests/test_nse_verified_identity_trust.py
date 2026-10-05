@@ -32,6 +32,8 @@ from app.portfolio_orchestration import (
     _trusted_provider_mapping,
 )
 from app.repository import ResearchRepository
+from app.research_readiness_runtime import jurisdiction_for_profile
+from app.global_opportunity_orchestration import _baseline_jurisdiction
 from app.settings import Settings
 from app.source_discovery import OfficialFilingDiscovery, OfficialNseShareholdingDiscovery
 
@@ -390,3 +392,136 @@ async def test_J_plausible_matching_ticker_and_name_do_not_rescue_a_resolved_nse
         await client.aclose()
     assert filings == []
     assert snapshots == []
+
+
+
+# --------------------------------------------------------------------------
+# K: identity-hydration -> jurisdiction boundary fix. A profile reused via
+# _resolve_profile() only ever goes through _hydrate_verified_exchange_
+# mappings() (never _refresh_profile_from_global_instrument()), which used
+# to update provider_instrument_ids["NSE"] without ever touching
+# profile.country/profile.exchange -- the exact fields
+# jurisdiction_for_profile() reads. A profile whose country/exchange were
+# ever wrong/stale (e.g. created before a verified NSE mapping existed)
+# therefore stayed permanently misrouted to a non-INDIA jurisdiction even
+# after a fresh cycle proved a VERIFIED NSE identity, leaking INDIA-only
+# capabilities like SHAREHOLDING's NSE_XBRL-first routing into the generic
+# Yahoo-first path (where SHAREHOLDING is hard-unsupported) as
+# EXTERNAL_CAPABILITY_UNSUPPORTED.
+# --------------------------------------------------------------------------
+
+def test_K_verified_nse_mapping_corrects_a_stale_non_india_profile_jurisdiction() -> None:
+    profile = CompanyResearchProfile(
+        instrument_id=uuid4(), company_id=uuid4(), company_name="KMC Speciality Hospitals India Limited",
+        isin="INE1234K01015", ticker="KMCSHIL", exchange="UNKNOWN", mic="UNKNOWN", country="",
+        currency="INR", provider_instrument_ids={"YAHOO_FINANCE": "KMCSHIL.NS"},
+    )
+    assert jurisdiction_for_profile(profile) != "INDIA"
+    fresh = {
+        "nseSymbol": "KMCSHIL",
+        "providerMappings": [{"provider": "NSE", "providerSymbol": "KMCSHIL", "status": "VERIFIED"}],
+    }
+    result = _hydrate_verified_exchange_mappings(profile, fresh)
+    assert result.provider_instrument_ids.get("NSE") == "KMCSHIL"
+    assert result.exchange == "NSE"
+    assert result.country == "IN"
+    assert jurisdiction_for_profile(result) == "INDIA"
+
+
+def test_K_profile_without_a_verified_nse_mapping_keeps_its_existing_jurisdiction() -> None:
+    profile = CompanyResearchProfile(
+        instrument_id=uuid4(), company_id=uuid4(), company_name="Example US Corp",
+        isin="US0000000000", ticker="EXUS", exchange="NASDAQ", mic="XNAS", country="US",
+        currency="USD", provider_instrument_ids={"YAHOO_FINANCE": "EXUS"},
+    )
+    assert jurisdiction_for_profile(profile) == "USA"
+    # No nseSymbol at all -- an unrelated, genuinely RESOLVED (not VERIFIED)
+    # mapping for a different provider must not touch exchange/country.
+    fresh = {"providerMappings": [{"provider": "YAHOO_FINANCE", "providerSymbol": "EXUS", "status": "RESOLVED"}]}
+    result = _hydrate_verified_exchange_mappings(profile, fresh)
+    assert result.exchange == "NASDAQ"
+    assert result.country == "US"
+    assert jurisdiction_for_profile(result) == "USA"
+# --------------------------------------------------------------------------
+# L: full production lifecycle through register_global_profile_metadata --
+# the ACTUAL Stage2/global-opportunity profile_hydrator (see
+# GlobalOpportunityOrchestration.__init__'s profile_hydrator param and
+# app.main's wiring of PortfolioResearchOrchestrator.register_global_profile_metadata
+# into it). This is deliberately NOT a direct call to
+# _hydrate_verified_exchange_mappings (that function is only reached via
+# PortfolioResearchOrchestrator._resolve_profile(), the portfolio-POSITION
+# path -- register_global_profile_metadata's existing-profile branch calls
+# _refresh_profile_from_global_instrument() instead, and its new-profile
+# branch calls _register_equity_profile_from_instrument(); neither reaches
+# _hydrate_verified_exchange_mappings at all). Both of those consume the
+# SAME dict built by _global_master_instrument(), which is where the real
+# defect was: instrument["ticker"]/instrument["exchange"] both fell back to
+# the verified nseSymbol when the upstream field was missing, but
+# instrument["country"] had no such fallback -- so a VERIFIED NSE mapping
+# with no (or blank) "country" on the portfolio-service payload left
+# profile.country wrong forever, independent of the
+# _hydrate_verified_exchange_mappings fix.
+# --------------------------------------------------------------------------
+
+def test_L_verified_nse_mapping_with_missing_payload_country_still_routes_india() -> None:
+    orchestrator, repo = _orchestrator()
+    global_id = uuid4()
+    payload = {
+        "globalInstrumentId": str(global_id),
+        "canonicalName": "KMC Speciality Hospitals India Limited",
+        "isin": "INE1234K01015",
+        "assetType": "EQUITY",
+        # The actual production defect: portfolio-service's global-instrument
+        # payload has no "country" field at all (or it is blank) even though
+        # a VERIFIED NSE mapping is present -- this is the exact shape that
+        # left instrument["country"] (and therefore profile.country) wrong.
+        "primaryExchange": None,
+        "primarySymbol": "KMCSHIL",
+        "providerMappings": [
+            {"provider": "NSE", "providerSymbol": "KMCSHIL", "status": "VERIFIED", "exchange": "NSE"},
+        ],
+    }
+    assert orchestrator.register_global_profile_metadata(global_id, payload) is True
+    profile = repo.profile(global_id)
+    assert profile.provider_instrument_ids.get("NSE") == "KMCSHIL"
+    assert profile.country == "IN"
+    assert profile.exchange == "NSE"
+    # The ACTUAL Stage2 jurisdiction call (global_opportunity_orchestration.py
+    # passes _baseline_jurisdiction(profile) to readiness/execute_primary) on
+    # the SAME profile object the hydrator mutated -- not a fresh/hand-built
+    # one -- must resolve INDIA.
+    assert _baseline_jurisdiction(profile) == "INDIA"
+    assert jurisdiction_for_profile(profile) == "INDIA"
+    # This is exactly the precondition yahoo_mcp_acquisition.py's
+    # execute_primary() checks (jurisdiction == "INDIA" and
+    # profile.provider_instrument_ids.get("NSE")) before pulling SHAREHOLDING
+    # out of the generic Yahoo-first loop and into the dedicated NSE-first
+    # route -- proving the fix actually flips SHAREHOLDING's routing
+    # decision for this exact production shape, not just a helper's output.
+    assert jurisdiction_for_profile(profile) == "INDIA" and profile.provider_instrument_ids.get("NSE")
+
+
+def test_L_registration_without_any_verified_nse_mapping_does_not_fabricate_india() -> None:
+    orchestrator, repo = _orchestrator()
+    global_id = uuid4()
+    payload = {
+        "globalInstrumentId": str(global_id),
+        "canonicalName": "Example US Corp",
+        "isin": "US0000000000",
+        "assetType": "EQUITY",
+        "primaryExchange": "NASDAQ",
+        "primarySymbol": "EXUS",
+        # No "country" field supplied, and no NSE/BSE mapping at all -- only
+        # an unrelated, non-NSE provider mapping. The missing-country
+        # fallback must stay scoped to the existing verified NSE/BSE trust
+        # boundary and never default an unrelated instrument to INDIA.
+        "providerMappings": [
+            {"provider": "YAHOO_FINANCE", "providerSymbol": "EXUS", "status": "VERIFIED", "exchange": "NASDAQ"},
+        ],
+    }
+    assert orchestrator.register_global_profile_metadata(global_id, payload) is True
+    profile = repo.profile(global_id)
+    assert "NSE" not in profile.provider_instrument_ids
+    assert profile.country != "IN"
+    assert _baseline_jurisdiction(profile) != "INDIA"
+    assert jurisdiction_for_profile(profile) != "INDIA"

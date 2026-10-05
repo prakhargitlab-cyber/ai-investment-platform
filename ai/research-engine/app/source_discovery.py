@@ -1495,12 +1495,24 @@ async def _safe_search_get(
     params: dict[str, str | int],
     headers: dict[str, str] | None = None,
 ) -> httpx.Response:
+    # Shared chokepoint for every CURRENT_NEWS search provider (Brave-
+    # compatible, Google-compatible, Searxng-compatible -- all three call
+    # only this function for their network request). None of the three
+    # call sites wired any cycle_timing recorder in, so this time was
+    # previously invisible, folding into other_unattributed_ms for the
+    # enclosing runtime_ensure span. Timed around the actual network call
+    # only (mirrors OfficialFilingDiscovery.discover's record_discovery_elapsed
+    # placement) -- a timeout or HTTP error still consumes real wall time,
+    # so the timing is recorded in a finally, before the error is raised.
+    _search_started = time.monotonic()
     try:
         response = await client.get(endpoint, params=params, headers=headers)
     except httpx.TimeoutException as exc:
         raise SearchProviderError("SEARCH_PROVIDER_TIMEOUT") from exc
     except httpx.HTTPError as exc:
         raise SearchProviderError("SEARCH_PROVIDER_UNAVAILABLE:http_error") from exc
+    finally:
+        cycle_timing.record_search_provider_elapsed((time.monotonic() - _search_started) * 1000)
     if response.status_code in {401, 403}:
         raise SearchProviderError("SEARCH_PROVIDER_FORBIDDEN")
     if response.status_code == 429:

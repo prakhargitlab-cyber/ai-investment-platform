@@ -45,7 +45,13 @@ async def test_warm_db_reuses_durable_evidence_documents_and_rule_results(univer
     assert sum(delta["ingested"].values()) == 0
     assert u.store._connection.execute("SELECT COUNT(*) FROM research_documents").fetchone()[0] == documents_before
     # Unchanged evidence -> durable rule-engine cache, no re-evaluation.
-    assert sum(delta["evaluated"].values()) == 0 and sum(delta["cache_hits"].values()) == reviewed
+    # Reviewed instruments now take the persisted-only, price-lifecycle review
+    # path (never calling rule_engine.analyze -- see
+    # global_opportunity_orchestration.py's "Reviews share the same admission
+    # boundary as discovery" comment), and the reinvestigated ones reuse their
+    # durable rule result upstream of rule_engine.analyze entirely, so neither
+    # group calls it in a warm cycle: cache_hits, like evaluated, is zero.
+    assert sum(delta["evaluated"].values()) == 0 and sum(delta["cache_hits"].values()) == 0
     # Stage-1 baseline is re-evaluated (cheap readiness read) but acquires nothing.
     assert sum(delta["provider"].values()) == 0
     with capsys.disabled():

@@ -1,21 +1,4 @@
-"""Regression tests: the production (candidate_ids=None) opportunity-cycle path
-must process the COMPLETE applicable deep-research universe -- never truncated
-to shortlist_limit (previously a fixed cap, e.g. 100) -- while controlled/manual
-cycles (an explicit candidate_ids list) may still request a bounded working set,
-and bounded worker concurrency + durable per-candidate checkpointing are
-preserved unchanged.
-
-Fix sites covered here:
-  - app/global_opportunity_cycle.py: run_global_opportunity_cycle now forces
-    shortlist_limit=None (unbounded) into GlobalOpportunityOrchestrator.run
-    whenever candidate_ids is None, regardless of the caller-supplied value.
-  - app/global_opportunity_orchestration.py: GlobalOpportunityOrchestrator.run
-    accepts shortlist_limit=None as "no cap" (both the plain pool slice and the
-    discovery_v2/discover() branch).
-  - app/global_opportunity_scheduler.py: both production submission sites pass
-    shortlist_limit=None explicitly, so they cannot reintroduce a finite cap on
-    their own even if run_global_opportunity_cycle's override were ever removed.
-"""
+"""Production preserves the requested deep cap; explicit diagnostic None stays supported."""
 from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -35,7 +18,7 @@ from test_global_scanner import NOW
 
 @pytest.mark.asyncio
 async def test_shortlist_limit_none_does_not_truncate_a_pool_larger_than_the_old_cap(monkeypatch):
-    """With shortlist_limit=None (the production value), a pool larger than the
+    """With shortlist_limit=None (an explicit diagnostic value), a pool larger than the
     old fixed 100-candidate cap must be processed in full: every eligible
     candidate reaches baseline AND deep evaluation, with no silent truncation
     anywhere in the pipeline."""
@@ -116,10 +99,9 @@ class _CapturingOrchestrator:
 
 
 @pytest.mark.asyncio
-async def test_production_candidate_ids_none_forces_unbounded_regardless_of_caller_value(monkeypatch):
-    """candidate_ids=None (production) must reach the orchestrator with
-    shortlist_limit=None even if a caller passed a numeric value in -- the
-    production contract is unconditional, not merely a default."""
+@pytest.mark.parametrize("limit,expected", [(7, 7), (25, 25), (100, 100), (None, 25)])
+async def test_production_preserves_requested_bound_and_defaults_legacy_none(monkeypatch, limit, expected):
+    """The production boundary must not nullify the requested deep budget."""
     from app import global_opportunity_cycle as cycle
     monkeypatch.setattr(cycle, "datetime", _Clock)
     monkeypatch.setattr(cycle, "GlobalOpportunityOrchestrator", _CapturingOrchestrator)
@@ -127,9 +109,9 @@ async def test_production_candidate_ids_none_forces_unbounded_regardless_of_call
     repo = SimpleNamespace(persistence=store, _persistence_worker_lock=RLock())
 
     await cycle.run_global_opportunity_cycle(
-        repo, _FakeSource(), candidate_ids=None, shortlist_limit=25, top_n=2)
+        repo, _FakeSource(), candidate_ids=None, shortlist_limit=limit, top_n=2)
 
-    assert _CapturingOrchestrator.last_shortlist_limit is None
+    assert _CapturingOrchestrator.last_shortlist_limit == expected
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from uuid import UUID
 
 from app.models import MarketPriceObservation
 from app.structured_market import verify_historical_price_identity
+from app.yahoo_ticker_context import YahooTickerContexts
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +57,28 @@ class YahooHistoricalPriceProvider:
     """
     provider_name = "YAHOO_FINANCE"
 
-    def __init__(self, ticker_factory: Any) -> None:
+    def __init__(self, ticker_factory: Any, *, ticker_contexts: YahooTickerContexts | None = None) -> None:
         self.ticker_factory = ticker_factory
+        self.ticker_contexts = ticker_contexts or YahooTickerContexts(ticker_factory)
+        self._shared_context = ticker_contexts is not None
 
-    async def closes(self, instrument: dict[str, Any], *, start: datetime, end: datetime) -> list[MarketPriceObservation]:
-        return await asyncio.to_thread(self._closes, instrument, start, end)
+    async def closes(self, instrument: dict[str, Any], *, start: datetime, end: datetime,
+                     acquisition_context: object | None = None) -> list[MarketPriceObservation]:
+        context = acquisition_context or (asyncio.current_task() if self._shared_context else None)
+        return await asyncio.to_thread(self._closes, instrument, start, end, context)
 
-    def _closes(self, instrument: dict[str, Any], start: datetime, end: datetime) -> list[MarketPriceObservation]:
+    def _closes(self, instrument: dict[str, Any], start: datetime, end: datetime, context=None) -> list[MarketPriceObservation]:
         ticker = str(instrument.get("structuredProviderTicker") or instrument.get("ticker") or "").strip()
         if not ticker:
             return []
-        yf_ticker = self.ticker_factory(ticker)
-        history = yf_ticker.history(start=start.date(), end=end.date(), auto_adjust=False)
-        rows = list(history.iterrows()) if history is not None else []
-        if rows:
-            self._verify_identity_or_raise(instrument, ticker, yf_ticker)
+        with self.ticker_contexts.acquire(ticker, context) as access:
+            logger.info("radar_acquisition_count operation=historical_series_live_acquisition provider=YAHOO_FINANCE count=1")
+            history = access.ticker.history(start=start.date(), end=end.date(), auto_adjust=False)
+            rows = list(history.iterrows()) if history is not None else []
+            if rows:
+                # Recheck canonical identity against the same returned info;
+                # sharing a ticker never substitutes for verification.
+                self._verify_identity_or_raise(instrument, ticker, access)
         out: list[MarketPriceObservation] = []
         for observed_at, row in rows:
             try:

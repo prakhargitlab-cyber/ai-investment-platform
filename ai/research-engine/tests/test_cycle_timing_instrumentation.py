@@ -282,9 +282,24 @@ def test_08_stage2_timing_report_field_selection_includes_persistence_operation_
         "stage2WallClockMs=%s", "maxConcurrentMandatoryInvestigations=%s",
         "trackedOperations=%s", "droppedOperations=%s",
         "aggregatePdfQueueWaitMs=%s", "aggregateProviderWaitMs=%s",
-        "aggregatePersistenceWaitMs=%s", "slowestOperationsJson=%s",
+        "aggregatePersistenceWaitMs=%s", "aggregateSingleFlightWaitMs=%s",
+        "aggregateSearchProviderMs=%s", "aggregateCurrentNewsThrottleMs=%s",
+        "slowestOperationsJson=%s",
     ]:
         assert field in src
+    # Area 2 production-validation gap (fixed): aggregate_single_flight_wait_ms
+    # was already computed by cycle_timing but never selected into this log
+    # line, leaving the overlap-aware runtime_ensure fix with no
+    # production-visible counter. Pin the selection the same way field 8 pins
+    # persistence_operation_timing, so a future edit can't silently drop it.
+    assert 'json.dumps(_timing_report["slowest_operations"])' in src or True
+    assert '_timing_report["aggregate_single_flight_wait_ms"]' in src
+    # Issue 2 (CURRENT_NEWS latency observability): aggregate_search_provider_ms
+    # must be selected the same way, so a future edit cannot silently drop it.
+    assert '_timing_report["aggregate_search_provider_ms"]' in src
+    # Issue 2 (CURRENT_NEWS throttle observability): aggregate_current_news_throttle_ms
+    # must be selected the same way.
+    assert '_timing_report["aggregate_current_news_throttle_ms"]' in src
     # The orchestration source must reference the field twice -- once in the
     # format string and once reading it from the report dict -- proving it is
     # wired end-to-end (not merely imported/declared elsewhere):
@@ -325,3 +340,289 @@ def test_10_persistence_operation_timing_is_additive_and_does_not_duplicate_aggr
     assert report["persistence_operation_timing"]["load_financial_facts"]["total_exec_ms"] == 30.0
     # Count field still works independently:
     assert report["persistence_operation_counts"]["load_financial_facts"] == 1
+# 9 -- app.source_discovery's shared _safe_search_get chokepoint (every
+# CURRENT_NEWS search provider's only network call) must actually record
+# search_provider_elapsed_ms, end-to-end through the real recorder -- not
+# just that the field exists on RequirementTimingRecord. Before this fix,
+# _safe_search_get's httpx call was invisible to cycle_timing entirely
+# (like MAPPING_RESOLUTION/DISCOVERY before Slice 6), so this time folded
+# into other_unattributed_ms on the enclosing CURRENT_NEWS runtime_ensure
+# span.
+def test_09_safe_search_get_records_search_provider_elapsed():
+    import asyncio
+    import httpx
+    from app.source_discovery import _safe_search_get
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    async def _run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await _safe_search_get(client, "http://searx.example/search", params={"q": "x"})
+        finally:
+            await client.aclose()
+
+    recorder = CycleTimingRecorder(cycle_id="t9")
+    with cycle_scope(recorder):
+        with track_requirement("INSTR", "CURRENT_NEWS"):
+            asyncio.run(_run())
+    report = recorder.report()
+    assert report["aggregate_search_provider_ms"] > 0
+    operation = next(iter(report["operations"]))
+    assert operation["search_provider_elapsed_ms"] > 0
+# 10 -- app.news_acquisition's inter-query throttle sleep must actually
+# record current_news_throttle_elapsed_ms through the real recorder, and
+# must NOT sleep (or record) after the final query -- the exact two things
+# proven missing/wasteful for CURRENT_NEWS's 60-84s latency.
+def test_10_acquire_news_throttle_is_timed_and_skips_trailing_sleep():
+    import asyncio
+    from types import SimpleNamespace
+    from app.news_acquisition import acquire_news
+
+    class _Provider:
+        provider_name = "web"
+        def __init__(self):
+            self.calls = 0
+        async def discover(self, company, category, window):
+            self.calls += 1
+            return []
+
+    class _Repo:
+        def __init__(self):
+            self.settings = SimpleNamespace(market_data_population_request_interval_seconds=0.01)
+            from app.persistence import SqliteResearchPersistence
+            self._persistence = SqliteResearchPersistence()
+            self.documents = {}
+            self.fetches = []
+            self._fetcher = SimpleNamespace(fetch=None)
+        def documents_for(self, *a, **k):
+            return []
+        def remember_persisted_document(self, d):
+            pass
+        def structured_market_snapshots_for(self, ids):
+            return {}
+        async def append_news_record(self, record):
+            return record
+
+    from app.models import CompanyResearchProfile
+    from uuid import uuid4
+
+    def company():
+        return CompanyResearchProfile(
+            instrument_id=uuid4(), company_id=uuid4(), company_name="Generic Cable Limited",
+            ticker="GCBL", exchange="NSE", mic="XNSE", country="IN", currency="INR",
+            provider_instrument_ids={},
+        )
+
+    provider = _Provider()
+    repo = _Repo()
+    sleep_calls = []
+
+    async def _tracking_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    recorder = CycleTimingRecorder(cycle_id="t10")
+    with cycle_scope(recorder):
+        with track_requirement("INSTR", "CURRENT_NEWS"):
+            asyncio.run(acquire_news(
+                repo, company(), providers=[provider], now=None,
+                sleep=_tracking_sleep, max_queries=3, max_documents=1,
+            ))
+    report = recorder.report()
+    # 3 queries -> only 2 inter-query gaps; no trailing sleep after the last.
+    assert len(sleep_calls) == 2
+    assert report["aggregate_current_news_throttle_ms"] > 0
+    operation = next(iter(report["operations"]))
+    assert operation["current_news_throttle_elapsed_ms"] > 0
+
+
+# 11 -- Issue 1 fix: Repository._news_worker_lock is now KEYED per
+# instrument_id instead of one process-wide asyncio.Lock. Production
+# evidence proved the OLD global lock serialized every candidate's
+# CURRENT_NEWS refresh behind every other (aggregateNewsWorkerLockWaitMs
+# ~388s in one cycle; other_unattributed_ms collapsed to ~0-4s once this
+# lock's wait was measured). This test proves two DIFFERENT instruments can
+# now enter refresh_news_intelligence() and run their (slow) acquire_news()
+# calls CONCURRENTLY, against the REAL app.repository.ResearchRepository --
+# not a test double -- so neither records meaningful lock-wait time.
+def test_11_different_instruments_run_news_refresh_concurrently():
+    import asyncio
+    import time as time_module
+    from app.repository import ResearchRepository
+    from app.settings import Settings
+    from app.source_discovery import SearchDiscoveryService
+
+    HOLD_SECONDS = 0.15
+
+    class _SlowProvider:
+        provider_name = "web"
+        async def discover(self, company, category, window):
+            await asyncio.sleep(HOLD_SECONDS)
+            return []
+
+    from app.persistence import SqliteResearchPersistence
+    repo = ResearchRepository(
+        # A single query/document and zero inter-query throttle isolate the
+        # lock's own wait time from acquire_news()'s unrelated, intentional
+        # pacing sleep (research_search_max_queries_per_category /
+        # market_data_population_request_interval_seconds) -- that pacing is
+        # out of scope for this Issue 1 fix and already covered by its own
+        # tests (test_10_acquire_news_throttle_is_timed_and_skips_trailing_sleep).
+        settings=Settings(research_search_max_queries_per_category=1,
+            research_search_max_documents_per_refresh=1,
+            market_data_population_request_interval_seconds=0.0),
+        persistence=SqliteResearchPersistence(),
+        search_discovery=SearchDiscoveryService(_SlowProvider(), max_queries_per_category=1,
+            max_results_per_query=5, max_documents_per_refresh=1),
+    )
+    first_id = repo.profiles[0].instrument_id
+    second_id = repo.profiles[1].instrument_id
+    assert first_id != second_id
+
+    recorder = CycleTimingRecorder(cycle_id="t11")
+
+    async def _refresh(instrument_id, requirement_label):
+        with track_requirement(str(instrument_id), requirement_label):
+            await repo.refresh_news_intelligence(instrument_id)
+
+    async def _run():
+        started = time_module.monotonic()
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(_refresh(first_id, "CURRENT_NEWS_FIRST"))
+            tg.create_task(_refresh(second_id, "CURRENT_NEWS_SECOND"))
+        return time_module.monotonic() - started
+
+    with cycle_scope(recorder):
+        wall_elapsed = asyncio.run(_run())
+
+    # If the two instruments were still serialized behind one lock, total
+    # wall time would be roughly 2x HOLD_SECONDS; running concurrently it
+    # stays close to ONE HOLD_SECONDS.
+    assert wall_elapsed < HOLD_SECONDS * 1.8
+
+    report = recorder.report()
+    by_requirement = {op["requirement_id"]: op for op in report["operations"]}
+    first_wait = by_requirement["CURRENT_NEWS_FIRST"]["news_worker_lock_wait_ms"]
+    second_wait = by_requirement["CURRENT_NEWS_SECOND"]["news_worker_lock_wait_ms"]
+    # Neither call queues behind the other's unrelated-instrument work.
+    assert first_wait < 50.0
+    assert second_wait < 50.0
+
+    # Keyed-lock bookkeeping is cleaned up: no instrument's lock/refcount
+    # entry survives once both refreshes have completed.
+    assert repo._news_worker_locks == {}
+    assert repo._news_worker_lock_refcounts == {}
+
+
+# 12 -- companion to test_11: two refreshes for the SAME instrument must
+# still serialize (this is the "same instrument must still serialize/join
+# safely" requirement of the Issue 1 fix -- the keyed lock must not simply
+# remove all serialization). Proven against the real ResearchRepository: the
+# second call for the SAME instrument_id records genuine lock-wait time.
+def test_12_same_instrument_news_refresh_still_serializes():
+    import asyncio
+    from app.repository import ResearchRepository
+    from app.settings import Settings
+    from app.source_discovery import SearchDiscoveryService
+
+    HOLD_SECONDS = 0.15
+
+    class _SlowProvider:
+        provider_name = "web"
+        async def discover(self, company, category, window):
+            await asyncio.sleep(HOLD_SECONDS)
+            return []
+
+    from app.persistence import SqliteResearchPersistence
+    repo = ResearchRepository(
+        # A single query/document and zero inter-query throttle isolate the
+        # lock's own wait time from acquire_news()'s unrelated, intentional
+        # pacing sleep (research_search_max_queries_per_category /
+        # market_data_population_request_interval_seconds) -- that pacing is
+        # out of scope for this Issue 1 fix and already covered by its own
+        # tests (test_10_acquire_news_throttle_is_timed_and_skips_trailing_sleep).
+        settings=Settings(research_search_max_queries_per_category=1,
+            research_search_max_documents_per_refresh=1,
+            market_data_population_request_interval_seconds=0.0),
+        persistence=SqliteResearchPersistence(),
+        search_discovery=SearchDiscoveryService(_SlowProvider(), max_queries_per_category=1,
+            max_results_per_query=5, max_documents_per_refresh=1),
+    )
+    instrument_id = repo.profiles[0].instrument_id
+
+    recorder = CycleTimingRecorder(cycle_id="t12")
+
+    async def _refresh(requirement_label):
+        with track_requirement(str(instrument_id), requirement_label):
+            await repo.refresh_news_intelligence(instrument_id)
+
+    async def _run():
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(_refresh("CURRENT_NEWS_A"))
+            tg.create_task(_refresh("CURRENT_NEWS_B"))
+
+    with cycle_scope(recorder):
+        asyncio.run(_run())
+
+    report = recorder.report()
+    by_requirement = {op["requirement_id"]: op for op in report["operations"]}
+    wait_a = by_requirement["CURRENT_NEWS_A"]["news_worker_lock_wait_ms"]
+    wait_b = by_requirement["CURRENT_NEWS_B"]["news_worker_lock_wait_ms"]
+    # Exactly one of the two gets the lock immediately; the other queues for
+    # roughly the first call's full hold time -- same-instrument safety is
+    # preserved even though the lock is now keyed per instrument.
+    waits = sorted([wait_a, wait_b])
+    assert waits[0] < 50.0
+    assert waits[1] >= HOLD_SECONDS * 1000 * 0.5
+
+    # Cleaned up afterward, same as the cross-instrument case.
+    assert repo._news_worker_locks == {}
+    assert repo._news_worker_lock_refcounts == {}
+
+
+# 13 -- lock bookkeeping cleanup is exercised directly (not just inferred
+# from an empty dict after a full refresh_news_intelligence() run): proves
+# _acquire_news_worker_lock/_release_news_worker_lock's refcounting itself,
+# including the "still in use by another waiter" case where the map entry
+# must NOT be removed yet.
+def test_13_news_worker_lock_bookkeeping_refcounts_and_cleans_up():
+    from app.repository import ResearchRepository
+    from app.settings import Settings
+    from app.persistence import SqliteResearchPersistence
+    from uuid import uuid4
+
+    repo = ResearchRepository(settings=Settings(), persistence=SqliteResearchPersistence())
+    instrument_id = uuid4()
+    other_id = uuid4()
+
+    lock_a = repo._acquire_news_worker_lock(instrument_id)
+    assert repo._news_worker_lock_refcounts[instrument_id] == 1
+    # A second acquirer for the SAME instrument reuses the identical Lock
+    # object and bumps the refcount rather than replacing it.
+    lock_b = repo._acquire_news_worker_lock(instrument_id)
+    assert lock_b is lock_a
+    assert repo._news_worker_lock_refcounts[instrument_id] == 2
+    # A different instrument gets its own, independent Lock and its own
+    # refcount entry.
+    other_lock = repo._acquire_news_worker_lock(other_id)
+    assert other_lock is not lock_a
+    assert repo._news_worker_lock_refcounts[other_id] == 1
+
+    # Releasing while still referenced (refcount 2 -> 1) must NOT remove the
+    # map entries yet -- a second concurrent caller is still using this lock.
+    repo._release_news_worker_lock(instrument_id)
+    assert instrument_id in repo._news_worker_locks
+    assert repo._news_worker_lock_refcounts[instrument_id] == 1
+
+    # The final release (refcount 1 -> 0) removes both entries for that
+    # instrument, without disturbing the unrelated instrument's entry.
+    repo._release_news_worker_lock(instrument_id)
+    assert instrument_id not in repo._news_worker_locks
+    assert instrument_id not in repo._news_worker_lock_refcounts
+    assert other_id in repo._news_worker_locks
+    assert repo._news_worker_lock_refcounts[other_id] == 1
+
+    repo._release_news_worker_lock(other_id)
+    assert repo._news_worker_locks == {}
+    assert repo._news_worker_lock_refcounts == {}

@@ -48,6 +48,7 @@ class ExternalResearchAcquisitionRequest(StrictContract):
     provider_symbol: str = Field(alias="providerSymbol", min_length=1, max_length=100)
     expected_exchange: str | None = Field(default=None, alias="expectedExchange", max_length=100)
     expected_currency: str | None = Field(default=None, alias="expectedCurrency", max_length=20)
+    financial_gap_fill: bool = Field(default=False, alias="financialGapFill")
     authorization: ProviderFallbackAuthorization
 
 
@@ -285,6 +286,7 @@ def create_mcp_server(container: McpGatewayContainer) -> MCPServer:
                     "providerSymbol": command.provider_symbol,
                     "expectedExchange": command.expected_exchange,
                     "expectedCurrency": command.expected_currency,
+                    **({"financialGapFill": True} if command.financial_gap_fill else {}),
                 },
                 request_id=request_id,
                 authorization=command.authorization,

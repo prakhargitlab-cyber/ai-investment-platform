@@ -1,14 +1,7 @@
-"""Regression tests: REMOVE the fixed pre-deep 25-stock bias from global discovery.
+"""All eligible equities are evaluated; only admitted candidates acquire evidence.
 
-These tests verify the baseline-first architecture where ALL eligible NSE equities
-receive the same minimum baseline data contract before any shortlist or deep-
-enrichment decision.  The fixed shortlist_limit=25 may only remain as an optional
-safety maximum AFTER whole-universe baseline comparison — never as a gate on
-which stocks receive mandatory baseline acquisition/evaluation.
-
-Manual research history (cached evidence) may save provider calls (cache hit)
-but must NOT change eligibility, add ranking bonuses, alter weights, bypass
-baseline acquisition, force deep-pool entry, or alter global rank.
+Fairness is deterministic persisted evaluation plus bounded exploration, never
+mandatory full-universe live acquisition. Cached research grants no rank bonus.
 """
 from datetime import timedelta
 from types import SimpleNamespace
@@ -124,17 +117,13 @@ def _baseline_ready_count(tracker):
 
 @pytest.mark.asyncio
 async def test_A_all_eligible_receive_baseline_readiness(monkeypatch):
-    """All eligible universe candidates receive baseline readiness evaluation.
-
-    No fixed 25-stock gate may prevent baseline acquisition for any eligible
-    stock.  shortlist_limit=25 must NOT restrict baseline evaluation.
-    """
+    """All 30 are evaluated, while only 25 receive live-capable baseline ensure."""
     service, rows, pairs, store, tracker = setup_acquisition(monkeypatch, count=30)
     result = await service.run(rows, as_of=NOW, shortlist_limit=25)
 
-    # Every one of the 30 eligible candidates received baseline ensure().
-    assert _baseline_ready_count(tracker) == 30
-    assert result.baseline_ready_count == 30
+    assert _baseline_ready_count(tracker) == 25
+    assert result.baseline_evaluated_count == 30
+    assert result.baseline_ready_count == 25
     assert result.universe_count == 30
     assert result.preliminary_eligible_count == 30
 
@@ -143,18 +132,13 @@ async def test_A_all_eligible_receive_baseline_readiness(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_B_shortlist_limit_does_not_restrict_baseline(monkeypatch):
-    """shortlist_limit=25 must NOT restrict baseline evaluation to 25.
-
-    In the old code, `[:shortlist_limit]` cut the universe before ensure().
-    Now ALL eligible stocks get baseline ensure() regardless of shortlist_limit.
-    """
+    """The cap limits acquisition without restricting provider-free evaluation."""
     service, rows, pairs, store, tracker = setup_acquisition(monkeypatch, count=30)
     result = await service.run(rows, as_of=NOW, shortlist_limit=25, top_n=4)
 
-    # All 30 got baseline acquisition — not just 25.
-    assert _baseline_ready_count(tracker) == 30
-    assert result.baseline_ready_count == 30
-    # shortlist_limit=25 only capped the final deep pool, not baseline.
+    assert _baseline_ready_count(tracker) == 25
+    assert result.baseline_evaluated_count == 30
+    assert result.baseline_ready_count == 25
     assert result.shortlist_count <= 25
     # deep_pool_eligible_count is the pool BEFORE safety cap
     assert result.deep_pool_eligible_count == 30
@@ -234,8 +218,8 @@ async def test_E_dynamic_deep_pool_deterministic(monkeypatch):
     assert first.deep_candidate_count == second.deep_candidate_count
     assert first.shortlist_count == second.shortlist_count
     assert first.preliminary_eligible_count == second.preliminary_eligible_count
-    # Baseline acquisition called for all eligible in both runs.
-    assert _baseline_ready_count(tracker2) == 100
+    assert _baseline_ready_count(tracker2) == 25
+    assert second.baseline_evaluated_count == 100
     # Top-N is deterministic.
     first_ids = [e.global_instrument_id.int for e in first.top_n]
     second_ids = [e.global_instrument_id.int for e in second.top_n]
@@ -246,28 +230,16 @@ async def test_E_dynamic_deep_pool_deterministic(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_F_rank26_not_discarded_by_fixed_cutoff(monkeypatch):
-    """Rank-26 under the old fixed cutoff is NOT automatically discarded.
-
-    With 30 eligible candidates and shortlist_limit=25, the old code would
-    cut rank-26 via [:25] BEFORE baseline acquisition — stock 26 would never
-    get baseline ensure() at all.  Now ALL 30 get baseline acquisition AND the
-    dynamic deep pool considers all 30.  We verify both:
-
-    (a) With shortlist_limit=25 the safety cap may truncate the shortlist to 25,
-        but stock 26 STILL received baseline acquisition (the old [:25] gate
-        is gone).
-    (b) With shortlist_limit=30 (no truncation) stock 26, holding the highest
-        V1 score, reaches the top-N — proving it was never discarded merely
-        for being rank-26.
-    """
-    # --- (a) shortlist_limit=25: stock 26 gets baseline acquisition ---
+    """Candidate 26 is evaluated and deferred at budget 25; a larger admission can rank it. Rotation coverage is tested separately."""
     service, rows, pairs, store, tracker = setup_acquisition(monkeypatch, count=30)
     pairs[UUID(int=26)] = inputs(26, core=95, confidence=95)
     result = await service.run(rows, as_of=NOW, shortlist_limit=25, top_n=4)
 
     baseline_ids = set(c[0] for c in tracker.baseline_calls)
-    assert UUID(int=26) in baseline_ids  # NOT cut by old [:25] gate
-    assert _baseline_ready_count(tracker) == 30
+    assert UUID(int=26) not in baseline_ids
+    assert result.baseline_evaluated_count == 30
+    assert any(d.global_instrument_id == UUID(int=26) and d.disposition == "DEFERRED" for d in result.diagnostics)
+    assert _baseline_ready_count(tracker) == 25
     # deep_pool_eligible_count is the pool BEFORE safety cap
     assert result.deep_pool_eligible_count == 30
     # deep_candidate_count is AFTER safety cap
@@ -312,9 +284,9 @@ async def test_G_only_missing_stale_acquired(monkeypatch):
                               if requirement_ids is not None else None))
         if global_instrument_id in stale_ids and requirement_ids is not None:
             # Return non-empty planned_requirement_ids to indicate acquisition needed.
-            return TargetedEnsureResult(None, tuple(sorted(BASELINE_REQUIREMENT_IDS)), ())
+            return TargetedEnsureResult(_readiness(), tuple(sorted(BASELINE_REQUIREMENT_IDS)), ("STRUCTURED_MARKET",))
         # Otherwise: cache hit (all fresh, no targets).
-        return TargetedEnsureResult(None, (), ())
+        return TargetedEnsureResult(_readiness(), (), ())
 
     service.readiness.ensure = selective_ensure
 
@@ -355,19 +327,23 @@ async def test_H_news_absence_does_not_block(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_I_historical_suggestions_reviewed_independently(monkeypatch):
-    """Historical active suggestions (review_ids) are reviewed independently
-    of the deep pool.  A review candidate that is NOT in the shortlist still
-    gets read-only evaluation.  A candidate that IS in both gets full eval.
-
-    The review does NOT bypass the final ranker gate — a partial/suppressed
-    review candidate never overrides the shortlist.
+    """Historical active suggestions (review_ids) share the same admission
+    boundary as discovery and are excluded from it on purpose (see
+    global_opportunity_orchestration.py's "Reviews share the same admission
+    boundary as discovery" comment): a review candidate is never promoted
+    into the shortlist just for being a prior recommendation, and -- being
+    outside the shortlist -- gets only a persisted-only, price-lifecycle
+    review (DEFERRED), never a fresh rule-engine evaluation. A candidate
+    that the shortlist independently admits on its own merit still gets a
+    full evaluation.
     """
     service, rows, pairs, store, tracker = setup_acquisition(monkeypatch, count=3)
 
     # Stock 3 is strong (core=95) — in deep pool.
     pairs[UUID(int=3)] = inputs(3, core=95, confidence=95)
-    # Stock 1 is a review candidate (prior recommendation) but weak (core=10).
-    # partial=True makes the ranker add V1_ANALYSIS_NOT_ELIGIBLE gate → SUPPRESSED.
+    # Stock 1 is a review candidate (prior recommendation). Its score is
+    # irrelevant here: being a review_id excludes it from admission
+    # regardless of merit, so it is never run through the ranker at all.
     pairs[UUID(int=1)] = inputs(1, core=10, confidence=10)
     pairs[UUID(int=1)][1].partial = True
 
@@ -381,11 +357,13 @@ async def test_I_historical_suggestions_reviewed_independently(monkeypatch):
     assert UUID(int=3) in diagnostic_ids  # deep-evaluated
 
     # The review candidate (stock 1) was NOT promoted just because it's a
-    # prior recommendation — it was suppressed due to weak score.
+    # prior recommendation -- it was excluded from admission and deferred,
+    # getting only a price-lifecycle (read-only) review, never ranked.
     suppressed = [d for d in result.diagnostics
                   if d.global_instrument_id == UUID(int=1)]
     assert len(suppressed) == 1
-    assert suppressed[0].status == 'SUPPRESSED'
+    assert suppressed[0].status == 'DEFERRED'
+    assert str(UUID(int=1)) in result.review_evidence
 
     # Stock 3 (strong) is rank-eligible.
     eligible = [d for d in result.diagnostics
@@ -545,15 +523,7 @@ async def test_K_http_get_opportunities_current_is_dashboard_only():
 
 @pytest.mark.asyncio
 async def test_L_baseline_fairness_large_universe_all_eligible_get_baseline():
-    """Large universe (>25): ALL eligible candidates receive baseline evaluation.
-
-    Baseline evaluation must NOT be capped by shortlist_limit.  The dynamic deep
-    pool is formed AFTER baseline comparison; shortlist_limit applies only to the
-    deep pool size, not to baseline acquisition.
-
-    Fresh cached evidence (prior manual research) must not trigger unnecessary
-    provider acquisition and must not alter rank or eligibility.
-    """
+    """All 50 are evaluated while only two are admitted to acquisition."""
     # Create a 50-candidate universe
     store = SqliteResearchPersistence()
     repo = ResearchRepository(persistence=store)
@@ -581,16 +551,15 @@ async def test_L_baseline_fairness_large_universe_all_eligible_get_baseline():
         return await original_analyze(profile, *args, **kwargs)  # Properly await!
     service.rule_engine.analyze = AsyncMock(side_effect=count_analyze)
 
-    # Run with shortlist_limit=2 to verify baseline is not capped
+    # Run with shortlist_limit=2 to verify persisted evaluation is not capped.
     result = await service.run(rows, as_of=NOW, shortlist_limit=2)
 
     # Verify baseline fairness counters
     assert result.baseline_ready_count > 0, "No candidates received baseline"
-    assert result.baseline_ready_count + result.baseline_incomplete_count > 25, \
-        f"Baseline evaluation count ({result.baseline_ready_count + result.baseline_incomplete_count}) not >25"
+    assert result.baseline_evaluated_count > 25, \
+        f"Baseline evaluation count ({result.baseline_evaluated_count}) not >25"
 
-    # ALL eligible candidates must receive baseline (not capped by shortlist_limit=2)
-    baseline_eval_total = result.baseline_ready_count + result.baseline_incomplete_count
+    baseline_eval_total = result.baseline_evaluated_count
     assert baseline_eval_total == result.universe_count, \
         f"Only {baseline_eval_total}/{result.universe_count} got baseline evaluation (capped incorrectly)"
 
@@ -607,12 +576,14 @@ async def test_L_baseline_fairness_large_universe_all_eligible_get_baseline():
     assert result.shortlist_count <= 2, f"Shortlist ({result.shortlist_count}) exceeds limit (2)"
 
     # Verify baseline calls were made (use tracker.baseline_calls property)
-    assert len(tracker.baseline_calls) > 25, \
-        f"Baseline calls ({len(tracker.baseline_calls)}) not >25"
+    assert len(tracker.baseline_calls) == 2, \
+        f"Expected two admitted baseline calls, got {len(tracker.baseline_calls)}"
 
-    # Deep calls (if any) should be <= deep_candidate_count (which is the capped value)
-    assert len(tracker.deep_calls) <= result.deep_candidate_count, \
-        f"Deep calls ({len(tracker.deep_calls)}) exceed deep pool ({result.deep_candidate_count})"
+    # Existing bounded repair can recheck the same candidate; it must never
+    # introduce another identity outside the admitted population.
+    deep_ids = {key for key, _ in tracker.deep_calls}
+    assert len(deep_ids) <= result.deep_candidate_count
+    assert deep_ids <= {key for key, _ in tracker.baseline_calls}
 
 
 # --- Test M: Production diagnostics expose baseline/deep counts ---
@@ -633,7 +604,10 @@ async def test_M_diagnostics_expose_baseline_deep_counts(monkeypatch):
     result = await service.run(rows, as_of=NOW, shortlist_limit=2, top_n=4)
 
     # All new diagnostics fields present and correct.
-    assert result.baseline_ready_count == 50
+    assert result.baseline_evaluated_count == 50
+    assert result.acquisition_admitted_count == 2
+    assert result.acquisition_deferred_count == 48
+    assert result.baseline_ready_count == 2
     assert result.baseline_acquisition_needed_count == 0  # all cache hits (mocked)
     assert result.baseline_incomplete_count == 0
     assert result.preliminary_eligible_count == 50
@@ -652,7 +626,7 @@ async def test_M_diagnostics_expose_baseline_deep_counts(monkeypatch):
 
     assert len(result.diagnostics) > 0
     # Each diagnostic has a status.
-    assert all(d.status in ('RANK_ELIGIBLE', 'SUPPRESSED', 'FAILED')
+    assert all(d.status in ('RANK_ELIGIBLE', 'SUPPRESSED', 'FAILED', 'DEFERRED')
                for d in result.diagnostics)
 
 
@@ -673,7 +647,7 @@ class _JurisdictionTracker:
         self.calls.append((global_instrument_id, jurisdiction,
                            tuple(sorted(requirement_ids))
                            if requirement_ids is not None else None))
-        return TargetedEnsureResult(None, (), ())
+        return TargetedEnsureResult(_readiness(), (), ())
 
     @property
     def baseline_calls(self):
@@ -781,19 +755,17 @@ async def test_Q_deep_ready_cache_hit_still_receives_baseline_ensure(monkeypatch
 
 @pytest.mark.asyncio
 async def test_R_all_eligible_enter_baseline_before_shortlist_cap(monkeypatch):
-    """shortlist_limit caps the deep pool ONLY, never baseline acquisition.
-    With count=30 and shortlist_limit=10, all 30 eligible receive the Phase-1
-    baseline ensure; only <=10 reach deep enrichment."""
+    """All 30 receive persisted evaluation before the ten-candidate acquisition boundary."""
     service, rows, pairs, store, tracker = setup_acquisition(monkeypatch, count=30)
 
     result = await service.run(rows, as_of=NOW, shortlist_limit=10, top_n=4)
 
-    assert _baseline_ready_count(tracker) == 30
-    assert result.baseline_ready_count == 30
+    assert _baseline_ready_count(tracker) == 10
+    assert result.baseline_evaluated_count == 30
+    assert result.baseline_ready_count == 10
     assert result.baseline_incomplete_count == 0
     # Pool BEFORE safety cap still contains every eligible candidate.
     assert result.deep_pool_eligible_count == 30
-    # shortlist_limit=10 only caps the deep pool, not baseline.
     assert result.shortlist_count <= 10
     assert result.deep_candidate_count <= 10
 

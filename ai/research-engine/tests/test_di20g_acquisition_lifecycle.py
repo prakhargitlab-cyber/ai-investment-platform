@@ -214,9 +214,24 @@ async def test_25_deep_candidates_use_completion_not_request_budget_and_account_
     assert result.rule_analyzed_count == (0 if incomplete else 25)
     assert result.deep_ready_count == (0 if incomplete else 25)
     assert result.deep_readiness_failed_count == (25 if incomplete else 0)
-    assert result.suppressed_count == (26 if incomplete else 1)
-    assert result.baseline_incomplete_count == 1
-    assert sum(d.failure_reason == "BASELINE_ACQUISITION_FAILED" for d in result.diagnostics) == 1
+    assert result.suppressed_count == (25 if incomplete else 0)
+    assert result.baseline_incomplete_count == 0
+    # Candidate #26 is baseline-eligible but outside the 25-candidate
+    # admission boundary (live baseline acquisition is now bounded to
+    # admitted candidates only, same as deep investigation). It must be
+    # explicitly DEFERRED before any live baseline acquisition is attempted
+    # for it -- never counted as a live acquisition failure -- so its
+    # injected RuntimeError("isolated baseline failure") must never fire.
+    deferred = [d for d in result.diagnostics if d.status == "DEFERRED"]
+    assert len(deferred) == 1
+    assert deferred[0].global_instrument_id == UUID(int=26)
+    assert sum(d.failure_reason == "BASELINE_ACQUISITION_FAILED" for d in result.diagnostics) == 0
+    # Every non-deferred diagnostic (baseline- and deep-acquired) is one of
+    # the 25 admitted identities; #26 never enters rule analysis, deep
+    # research, or ranked output under any other disposition either.
+    acquired_ids = {d.global_instrument_id for d in result.diagnostics if d.status != "DEFERRED"}
+    assert acquired_ids <= {UUID(int=n) for n in range(1, 26)}
+    assert UUID(int=26) not in acquired_ids
     assert caplog.text.count("orchestration_wait_expired") == 25
     assert not runtime._flights
     if incomplete:

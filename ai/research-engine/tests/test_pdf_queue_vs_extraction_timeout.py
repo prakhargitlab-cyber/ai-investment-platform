@@ -50,7 +50,7 @@ async def test_short_queue_timeout_independent_of_generous_extraction_timeout(mo
     worker_started = threading.Event()
     release_worker = threading.Event()
 
-    def blocking_extract(_response, *, max_bytes=None):
+    def blocking_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         worker_started.set()
         assert release_worker.wait(timeout=3)
         return FetchResult("https://nsearchives.nseindia.com/corporate/fixture.pdf", 200, "application/pdf", "text", 10)
@@ -93,7 +93,7 @@ async def test_explicit_override_still_bounds_queue_admission_too(monkeypatch):
     worker_started = threading.Event()
     release_worker = threading.Event()
 
-    def blocking_extract(_response, *, max_bytes=None):
+    def blocking_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         worker_started.set()
         assert release_worker.wait(timeout=3)
         return FetchResult("https://nsearchives.nseindia.com/corporate/fixture.pdf", 200, "application/pdf", "text", 10)

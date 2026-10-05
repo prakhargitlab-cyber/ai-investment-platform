@@ -325,13 +325,14 @@ async def test_v2_full_universe_retains_only_one_event_payload_and_gates_rules(m
     assert result.universe_count == 2578
     assert result.shortlist_count == 25
     assert result.stage2_internal_error_count == 0
-    assert result.deep_candidate_count == result.deep_attempted_count == 2578
-    assert len(result.candidate_nominations) == len(result.investigation_matrix) == 2578
-    assert len(event_reads) == 2578 * 2
+    assert result.deep_candidate_count == result.deep_attempted_count == 25
+    assert len(result.candidate_nominations) == 25
+    assert len(result.investigation_matrix) == 2578
+    assert len(event_reads) == 2578 + 25
     assert not live and not deep_live
-    assert result.rule_analyzed_count == (2578 if ready else 0)
-    assert service.rule_engine.analyze.await_count == (2578 if ready else 0)
-    assert result.deep_readiness_failed_count == (0 if ready else 2578)
+    assert result.rule_analyzed_count == (25 if ready else 0)
+    assert service.rule_engine.analyze.await_count == (25 if ready else 0)
+    assert result.deep_readiness_failed_count == (0 if ready else 25)
     assert result.deep_acquisition_timeout_count == 0
     if not ready:
         assert result.top_n == []
@@ -365,9 +366,11 @@ async def test_production_cycle_enables_v2_and_publishes_cursor_with_explanation
     selection = await cycle.run_global_opportunity_cycle(service.repository, source,
         readiness_runtime=service.readiness, shortlist_limit=2, top_n=2)
     assert selection['status'] == 'COMPLETED'
-    assert len(selection['candidate_nominations']) == len(selection['investigation_matrix']) == 4
+    assert len(selection['candidate_nominations']) == 2
+    assert len(selection['investigation_matrix']) == 4
     assert selection['rotation_after'] == store.opportunity_rotation_after()
-    assert all(matrix['rule_evaluated'] for matrix in selection['investigation_matrix'].values())
+    assert sum(matrix['rule_evaluated'] for matrix in selection['investigation_matrix'].values()) == 2
+    assert sum(matrix['disposition'] == 'DEFERRED' for matrix in selection['investigation_matrix'].values()) == 2
 
 
 @pytest.mark.parametrize('reason', ['NETWORK_TIMEOUT', 'PDF_EXTRACTION_TIMEOUT', 'PDF_EXTRACTION_QUEUE_TIMEOUT'])
@@ -544,7 +547,7 @@ async def test_di20h4_reusable_document_skips_budget_before_allow_document() -> 
         fetch_calls.append(source.url)
         return _document("fetched"), False
 
-    def fake_reusable(instrument_id, url):
+    def fake_reusable(instrument_id, url, *, source=None):
         if "reused" in url:
             return _document("reused")
         return None

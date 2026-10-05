@@ -9,15 +9,26 @@ import pytest
 
 from app.global_scanner import GlobalScanner, GlobalPreScore
 from app.global_opportunity_orchestration import GlobalOpportunityOrchestrator
+from app.research_readiness import ResearchRequirementStatus
 from test_global_opportunity_baseline import setup_acquisition
 from test_global_opportunity_ranker import inputs
 from test_global_scanner import instrument, NOW
+from test_stock_rule_engine import _readiness
 
 
 class Payload:
     def __init__(self, live):
         self.data = bytearray(64 * 1024)
         live.add(self)
+
+    def for_requirement(self, requirement_id):
+        # Duck-types a real ResearchReadinessResult for the baseline payload:
+        # _BaselineOutcome.from_result() now inspects actual per-requirement
+        # status (READY_FRESH/NOT_APPLICABLE) to compute true readiness, not
+        # merely whether ensure() returned without raising. This keeps the
+        # same tracked Payload instance (identical weakref/memory semantics)
+        # while making it satisfy that contract.
+        return SimpleNamespace(status="READY_FRESH")
 
 
 @pytest.mark.asyncio
@@ -49,8 +60,20 @@ async def test_full_universe_streams_evidence_and_releases_baseline(monkeypatch,
             assert not deep_live  # no previous deep payload, including failed gates
             payload = Payload(deep_live)
             await asyncio.sleep(0)
-            result = await tracker(key, **kwargs)
-            return SimpleNamespace(readiness=result.readiness, failures=result.failures, payload=payload)
+            if survivors:
+                result = await tracker(key, **kwargs)
+                readiness, failures = result.readiness, result.failures
+            else:
+                # eligibility_policy.evaluate(readiness) -- not the
+                # eligible_for_deep_analysis flag -- is the sole authoritative
+                # deep-analysis gate now (that flag only still shapes Stage-B
+                # enrichment inclusion, mocked above via setup_acquisition's
+                # enrich_candidates patch). A "survivor=False" candidate must
+                # therefore genuinely fail that gate via its readiness, not just
+                # its pre-score flag, or it would reach ranker.score() unenriched.
+                readiness = _readiness({"LATEST_PRICE": ResearchRequirementStatus.MISSING})
+                failures = {}
+            return SimpleNamespace(readiness=readiness, failures=failures, payload=payload)
         payload = Payload(baseline_live)
         peaks["baseline"] = max(peaks["baseline"], len(baseline_live))
         peaks["tasks"] = max(peaks["tasks"], len(asyncio.all_tasks()) - starting_tasks)
@@ -63,7 +86,12 @@ async def test_full_universe_streams_evidence_and_releases_baseline(monkeypatch,
         assert len(ids) == 1  # before materializing any heavyweight evidence
         assert len(scan_live) == 0  # previous instrument's evidence is collectible
         if baseline_done:
-            assert baseline_done == 2578
+            # Baseline live acquisition is admission-bounded: only the
+            # shortlist_limit=7 admitted candidates ever reach readiness.ensure
+            # with requirement_ids set, so the transition to the second
+            # (admitted-only) rescan happens after exactly 7, not the full
+            # 2578-row universe.
+            assert baseline_done == 7
             assert len(baseline_live) == 0  # nothing retained across the transition
             assert len(asyncio.all_tasks()) == starting_tasks
         scan_calls += 1
@@ -92,19 +120,38 @@ async def test_full_universe_streams_evidence_and_releases_baseline(monkeypatch,
     monkeypatch.setattr(GlobalPreScore, "score", score)
     with caplog.at_level(logging.INFO, logger="app.global_scanner"):
         result = await service.run(rows, as_of=NOW, shortlist_limit=7, top_n=3)
-    assert baseline_done == 2578
-    assert scan_calls == 2 * 2578  # all instruments, both scans, no sampling
+    # Live baseline acquisition only ever runs for the 7 admitted candidates.
+    assert baseline_done == 7
+    # First scan: provider-free discovery over the full 2578-row universe.
+    # Second scan: the admitted-only rescan, bounded to the same 7 admitted
+    # candidates baseline acquisition just ran for -- not a second full-universe
+    # pass. No candidate outside admission is ever rescanned.
+    assert scan_calls == 2578 + 7
     assert peaks["baseline"] <= service._BASELINE_CONCURRENCY
     assert peaks["tasks"] <= service._BASELINE_CONCURRENCY
     assert peaks["scan"] == 1
     assert not baseline_live and not scan_live and not deep_live
     assert result.universe_count == 2578
-    assert result.baseline_ready_count == 2578
-    assert result.shortlist_count == (7 if survivors else 0)
-    assert peaks["deep"] == (7 if survivors else 0)
+    # Baseline readiness is only ever computed for the 7 admitted candidates
+    # (baseline_ready_count is accumulated over the admission-bounded outcome
+    # set in _acquire_baseline_requirements, never the full universe).
+    assert result.baseline_ready_count == 7
+    # Admission into the shortlist (deterministic bounded admission / sparse
+    # rotation) is governed by eligible_for_acquisition (always True here) and
+    # the shortlist_limit budget -- never by eligible_for_deep_analysis. All 7
+    # admitted candidates reach the deep ensure() call regardless of survivors;
+    # survivors only decides whether their readiness clears the deep-analysis
+    # eligibility gate afterward (DEEP_READINESS_NOT_MET below when it does not).
+    assert result.shortlist_count == 7
+    assert peaks["deep"] == 7
     assert [entry.global_instrument_id for entry in result.top_n] == (
         [UUID(int=n) for n in (7, 6, 5)] if survivors else [])
-    assert "stage2_progress: completed=2578/2578 failed=0 active=0/1" in caplog.text
+    if not survivors:
+        assert sum(d.disposition == "DEEP_READINESS_NOT_MET" for d in result.diagnostics) == 7
+    # The admitted-only rescan (labeled "admitted", not "stage2") completes
+    # over exactly the 7 admitted candidates, proving it never re-scans the
+    # full universe.
+    assert "admitted_progress: completed=7/7 failed=0 active=0/1" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -180,4 +227,8 @@ async def test_scan_failure_propagates_to_existing_cycle_failure_boundary(monkey
     monkeypatch.setattr(store, "load_financial_facts", broken)
     with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="synthetic storage failure"):
         await service.run(rows, as_of=NOW)
-    assert "stage2_failed: completed=0/2 failed=1" in caplog.text
+    # The failure occurs during the admitted-only rescan phase (triggered
+    # only once tracker.baseline_calls is non-empty, i.e. after baseline
+    # acquisition has started), which this architecture labels "admitted"
+    # (not "stage2" -- that label is not used anywhere in production code).
+    assert "admitted_failed: completed=0/2 failed=1" in caplog.text

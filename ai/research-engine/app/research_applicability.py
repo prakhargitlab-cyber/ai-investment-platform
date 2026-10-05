@@ -179,3 +179,129 @@ def shareholding_input_coverage(snapshot):
     if "PROMOTER_PLEDGE" in categories:
         covered.add("PROMOTER_PLEDGE")
     return covered
+
+
+# Mirrors stock_rule_engine.StockRuleEngine._shareholding()'s own two
+# scoring paths exactly, so readiness can never report SHAREHOLDING's
+# mandatory PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES input as covered for
+# ownership evidence the rule engine cannot actually turn into a metric
+# (the generic root cause behind a candidate going
+# "deep_requirement_satisfied SHAREHOLDING state=READY" and then
+# "RULE_AREA_UNSCORABLE blocking=['SHAREHOLDING']" for the exact same
+# evidence -- not specific to any one instrument).
+#
+# Deliberately NOT the same question as shareholding_input_coverage()
+# above, which stays single-snapshot and is still the correct, unchanged
+# contract for: (a) per-snapshot field-level coverage inside
+# shareholding_field_merge() (pledge/period bookkeeping, authority
+# claiming), and (b) shareholding_period_groups()'s own
+# qualifying_official/official_xbrl snapshot *selection* ranking. Neither
+# of those is "can the rule engine score this" -- conflating them would
+# either lose per-field provenance in (a) or change which snapshot is
+# picked as authoritative in (b). This function answers only the
+# multi-period scorability question, and only the SHAREHOLDING mandatory
+# input is gated by it (see app/research_readiness_runtime.py's
+# _append_shareholding).
+SHAREHOLDING_TREND_SCORABLE_CATEGORIES = ("PROMOTER", "FII_FPI", "DII")
+
+
+def shareholding_scorable_ownership_coverage(snapshots) -> bool:
+    """True iff stock_rule_engine._shareholding() can produce at least one
+    ownership metric from `snapshots` -- the exact one-best-snapshot-per-
+    period, newest-last sequence it actually consumes (i.e.
+    repository.shareholding_for(instrument_id, limit=N), the same shape
+    StockRuleEngineInput.shareholding carries).
+
+    Two paths, mirrored verbatim from _shareholding():
+      1. Single-period: the latest (newest) period has a PROMOTER category
+         value. ZERO IS VALID -- only the category's presence is checked,
+         never its percentage, exactly like shareholding_input_coverage()
+         above; a legitimate 0% promoter holding is never "missing".
+      2. Trend: the two most recent DISTINCT periods both carry a value
+         for the SAME trend-supported category (PROMOTER, FII_FPI or
+         DII) -- matching _shareholding()'s own
+         (PROMOTER, FII_FPI, DII) trend-metric loop exactly. A single
+         period containing only FII_FPI/DII/PUBLIC_RETAIL (no PROMOTER,
+         no second compatible period) satisfies neither path and is
+         correctly reported NOT scorable, never silently treated as
+         ready-but-unscorable.
+
+    No synthetic snapshot is created or inspected; this only reads the
+    category sets already present on real, persisted snapshots, and never
+    weakens period/date/quarter validation (that filtering already
+    happened upstream in shareholding_period_groups()/shareholding_for()
+    before this function ever sees a snapshot).
+    """
+    if not snapshots:
+        return False
+    ordered = sorted(snapshots, key=lambda item: item.period_end)
+    latest_categories = {str(value.category) for value in ordered[-1].values}
+    if "PROMOTER" in latest_categories:
+        return True
+    if len(ordered) < 2:
+        return False
+    previous_categories = {str(value.category) for value in ordered[-2].values}
+    return bool(
+        latest_categories & previous_categories
+        & set(SHAREHOLDING_TREND_SCORABLE_CATEGORIES)
+    )
+
+
+def shareholding_source_authority_rank(snapshot) -> int:
+    """Slice 2 source authority contract, lower rank = higher authority:
+
+    0. NSE structured / XBRL feed -- PRIMARY SOURCE OF TRUTH.
+    2. Yahoo MCP (approved external tool) -- only for fields NSE is missing.
+    3. Official NSE shareholding/result/announcement PDF -- last resort.
+    4. Anything else (never expected for a real snapshot here).
+
+    Mirrors the qualifying_official/official_xbrl checks shareholding_for()
+    already uses, so ranking here can never disagree with the single-best
+    selection that function performs.
+    """
+    provider = snapshot.source_provider.upper()
+    is_nse = provider == "NSE"
+    is_official_xbrl = is_nse and (
+        snapshot.source_type == "NSE_SHAREHOLDING_XBRL"
+        or any((value.source_locator or "").startswith("nse-xbrl:") for value in snapshot.values)
+    )
+    if is_official_xbrl:
+        return 0
+    if provider == "YAHOO_FINANCE_MCP":
+        return 2
+    if is_nse:
+        # Official NSE PDF/announcement fallback: authoritative issuer, but
+        # not the structured feed -- the contract places it below Yahoo.
+        return 3
+    return 4
+
+
+def shareholding_field_merge(snapshots):
+    """Authority-aware, field-level union of shareholding coverage across
+    every real snapshot sharing one period.
+
+    Each returned (snapshot, covered_input_ids) pair keeps that snapshot's
+    own identity/provenance untouched -- no synthetic merged snapshot is
+    ever manufactured. A lower-authority snapshot's covered_input_ids never
+    includes a field a higher-authority snapshot already claimed for this
+    same period, so lower-priority evidence can enrich a genuine gap but
+    can never be read as overwriting/competing with higher-priority
+    evidence for the same logical field. A snapshot that contributes
+    nothing new (every one of its fields is already covered by a
+    higher-authority source) is omitted entirely.
+
+    ZERO IS VALID: shareholding_input_coverage() only checks for the
+    presence of a category's ShareholdingSnapshotValue, never its
+    percentage, so a legitimate 0% value (e.g. promoter_pledge_percent=0)
+    is treated as present/covered here exactly like any other value.
+    """
+    ranked = sorted(snapshots, key=shareholding_source_authority_rank)
+    claimed: set[str] = set()
+    contributions = []
+    for snapshot in ranked:
+        covered = shareholding_input_coverage(snapshot) - claimed
+        if not covered:
+            continue
+        claimed.update(covered)
+        contributions.append((snapshot, covered))
+    return contributions

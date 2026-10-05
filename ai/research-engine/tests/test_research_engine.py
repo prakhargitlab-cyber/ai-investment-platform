@@ -3049,7 +3049,7 @@ async def test_official_restricted_document_failure_does_not_trip_host_transport
 @pytest.mark.asyncio
 async def test_pdf_extraction_timeout_does_not_trip_official_host_transport_budget() -> None:
     class SlowPdfFetcher(HttpResearchFetcher):
-        def process_network_response(self, response, *, max_bytes=None):
+        def process_network_response(self, response, *, max_bytes=None, extraction_deadline_monotonic=None):
             time.sleep(0.05)
             return FetchResult(response.final_url, 200, "text/html", "<html>unused</html>", len(response.content))
 
@@ -3091,7 +3091,7 @@ async def test_official_filing_single_flight_shares_network_extraction_and_persi
             await self.release_network.wait()
             return type("Network", (), {"final_url": url, "status_code": 200, "content": b"body"})()
 
-        def process_network_response(self, response, *, max_bytes=None):
+        def process_network_response(self, response, *, max_bytes=None, extraction_deadline_monotonic=None):
             self.extraction_calls += 1
             return FetchResult(
                 response.final_url, 200, "text/html",
@@ -3334,7 +3334,7 @@ async def test_late_extraction_completion_after_timeout_cannot_persist_or_retain
         async def fetch_network(self, url, **_kwargs):
             return type("Network", (), {"final_url": url, "status_code": 200, "content": b"body"})()
 
-        def process_network_response(self, response, *, max_bytes=None):
+        def process_network_response(self, response, *, max_bytes=None, extraction_deadline_monotonic=None):
             self.extractions += 1
             time.sleep(0.05)
             return FetchResult(response.final_url, 200, "text/html", "<main>late</main>", len(response.content))
@@ -3376,9 +3376,21 @@ async def test_official_filing_single_flight_cancellation_cleans_up_and_urls_rem
     first_task = asyncio.create_task(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", first)], set()))
     await fetcher.started.wait()
     second_task = asyncio.create_task(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", second)], set()))
-    for _ in range(10):
-        if len(fetcher.calls) == 2:
-            break
+    # Reaching the second URL's fetch_network call now crosses a real
+    # asyncio.to_thread() round trip first (_sync_persisted_document_
+    # identities, dispatched via _run_blocking_persistence at the top of
+    # _fetch_official_filings), plus the per-filing reuse/content-type/
+    # attempt-budget checks under dispatch_lock -- all genuine, correct
+    # awaited steps added by the bounded-concurrency official-filing
+    # fetch redesign, not a defect. A fixed `range(10)` bare-yield budget
+    # (measured: needs ~17 in this environment, and a to_thread() round
+    # trip's completion timing is not guaranteed by yield count alone)
+    # is an assumption about scheduling latency, not about the behavior
+    # under test -- bound this on wall-clock time instead so the test
+    # verifies the actual invariant (two independent URLs each get
+    # their own fetch) rather than a stale timing guess.
+    deadline = asyncio.get_event_loop().time() + 5.0
+    while len(fetcher.calls) < 2 and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0)
     assert set(fetcher.calls) == {first.url, second.url}
 
@@ -4932,7 +4944,7 @@ async def test_pdf_extraction_runs_off_event_loop_and_allows_event_loop_progress
     release_worker = threading.Event()
     worker_thread_ids: list[int] = []
 
-    def blocking_extract(_response, *, max_bytes=None):
+    def blocking_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         worker_thread_ids.append(threading.get_ident())
         worker_started.set()
         release_worker.wait(timeout=2)
@@ -4962,7 +4974,7 @@ async def test_timed_out_pdf_thread_retains_extraction_permit_until_actual_compl
     peak = 0
     lock = threading.Lock()
 
-    def blocking_first_then_fast(_response, *, max_bytes=None):
+    def blocking_first_then_fast(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         nonlocal calls, active, peak
         with lock:
             calls += 1
@@ -5003,7 +5015,7 @@ async def test_pdf_extraction_concurrency_two_never_runs_more_than_two_workers(m
     active = 0
     peak = 0
 
-    def blocking_extract(_response, *, max_bytes=None):
+    def blocking_extract(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         nonlocal active, peak
         with lock:
             active += 1
@@ -5033,7 +5045,7 @@ async def test_cancelled_pdf_caller_keeps_permit_until_worker_exits(monkeypatch)
     release = threading.Event()
     calls = 0
 
-    def blocking_first_then_fast(_response, *, max_bytes=None):
+    def blocking_first_then_fast(_response, *, max_bytes=None, extraction_deadline_monotonic=None):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -5071,7 +5083,7 @@ async def test_pdf_network_download_is_not_serialized_by_extraction_admission(mo
         return _pdf_network_fixture()
 
     monkeypatch.setattr(fetcher, "fetch_network", concurrent_network)
-    monkeypatch.setattr(fetcher, "process_network_response", lambda response, *, max_bytes=None: FetchResult(response.final_url, 200, "application/pdf", "text", 10))
+    monkeypatch.setattr(fetcher, "process_network_response", lambda response, *, max_bytes=None, extraction_deadline_monotonic=None: FetchResult(response.final_url, 200, "application/pdf", "text", 10))
     await asyncio.gather(fetcher.fetch("https://example.test/one.pdf"), fetcher.fetch("https://example.test/two.pdf"))
     assert download_peak == 2
 

@@ -180,10 +180,12 @@ def test_targeted_repair_preserves_genuinely_fresh_evidence() -> None:
     of the cooldown-bypass flag."""
     repository = ResearchRepository(settings=Settings(), persistence=SqliteResearchPersistence())
     instrument_id = repository.profiles[0].instrument_id
+    company_id = repository.profiles[0].company_id
     document = _document(
         "Quarterly financial results for the quarter ended June 30, 2026 revenue 100 profit after tax 10",
     ).model_copy(update={
         "instrument_id": instrument_id,
+        "company_id": company_id,
         "source_mode": SourceMode.REAL,
         "status": DocumentStatus.PROCESSED,
         "title": "Quarterly Financial Results",

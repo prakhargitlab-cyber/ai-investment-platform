@@ -26,6 +26,7 @@ import logging
 from datetime import datetime, time, timezone, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
+from app.global_opportunity_orchestration import DEFAULT_DEEP_LIMIT
 
 from app.market_sessions import (
     MarketTradingSchedule,
@@ -64,6 +65,7 @@ class GlobalOpportunityScheduler:
         hourly_interval: timedelta = _HOURLY_INTERVAL,
         post_close_window: timedelta = _POST_CLOSE_WINDOW,
         market_code: str = "NSE",
+        shortlist_limit: int = DEFAULT_DEEP_LIMIT,
     ):
         self.worker = worker
         self.persistence = persistence
@@ -72,6 +74,9 @@ class GlobalOpportunityScheduler:
         self.hourly_interval = hourly_interval
         self.post_close_window = post_close_window
         self.market_code = market_code
+        if type(shortlist_limit) is not int or not 1 <= shortlist_limit <= 100:
+            raise ValueError("INVALID_OPPORTUNITY_LIMIT")
+        self.shortlist_limit = shortlist_limit
         self.task: asyncio.Task | None = None
         self._stopped = False
         # Timestamps of last submission per phase — prevents duplicate hourly
@@ -196,13 +201,7 @@ class GlobalOpportunityScheduler:
             return False
         if self._has_valid_production_snapshot():
             return False
-        # Production submission: candidate_ids=None means the complete
-        # applicable deep-research universe, never a bounded shortlist.
-        # run_global_opportunity_cycle already forces this unbounded whenever
-        # candidate_ids is None regardless of what's passed here; None is
-        # passed explicitly too so this call site cannot silently reintroduce
-        # a finite cap on its own.
-        parameters = dict(top_n=4, shortlist_limit=None, candidate_ids=None)
+        parameters = dict(top_n=4, shortlist_limit=self.shortlist_limit, candidate_ids=None)
         try:
             result = self.worker.submit(parameters)
             now = self.clock()
@@ -260,13 +259,7 @@ class GlobalOpportunityScheduler:
         if phase is None:
             return False
         # Submit a production (non-controlled) cycle.
-        # Production submission: candidate_ids=None means the complete
-        # applicable deep-research universe, never a bounded shortlist.
-        # run_global_opportunity_cycle already forces this unbounded whenever
-        # candidate_ids is None regardless of what's passed here; None is
-        # passed explicitly too so this call site cannot silently reintroduce
-        # a finite cap on its own.
-        parameters = dict(top_n=4, shortlist_limit=None, candidate_ids=None)
+        parameters = dict(top_n=4, shortlist_limit=self.shortlist_limit, candidate_ids=None)
         try:
             result = self.worker.submit(parameters)
             if phase == "MARKET_HOURS":

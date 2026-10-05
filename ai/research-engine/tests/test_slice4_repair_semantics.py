@@ -23,7 +23,9 @@ TECHNICAL = ["NETWORK_TIMEOUT", "PDF_EXTRACTION_TIMEOUT", "PDF_EXTRACTION_QUEUE_
              "SEARCH_PROVIDER_RATE_LIMITED", "DOCUMENT_BUDGET_EXHAUSTED", "RuntimeError", "TimeoutError"]
 PERMANENT = ["ROBOTS_OR_ACCESS_BLOCKED", "DOMAIN_BLOCKED", "DISCOVERY_NO_FINANCIAL_RESULTS_CANDIDATES",
              "DISCOVERY_ALL_CANDIDATES_REUSED_OR_UNSUPPORTED", "EVIDENCE_INSUFFICIENT_WITHIN_PLAN",
-             "DOCUMENT_SIZE_LIMIT_EXCEEDED", "COMPANY_RELEVANCE_FAILED"]
+             "DOCUMENT_SIZE_LIMIT_EXCEEDED", "COMPANY_RELEVANCE_FAILED",
+             "PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS",
+             "PARSER_FAILED:NSE_SHAREHOLDING_XBRL_NO_SUPPORTED_VALUES"]
 
 
 def test_taxonomy_is_explicit_and_conservative():
@@ -33,6 +35,9 @@ def test_taxonomy_is_explicit_and_conservative():
         assert classify_reason(reason) == EVIDENCE_UNAVAILABLE, reason
     # Composite DI-20H.4 reasons: any technical component keeps it retryable.
     assert classify_reason("ROBOTS_OR_ACCESS_BLOCKED|NETWORK_TIMEOUT") == TECHNICAL_RETRYABLE
+    assert classify_reason("PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS|NETWORK_TIMEOUT") == TECHNICAL_RETRYABLE
+    assert classify_reason("PARSER_FAILED:NSE_SHAREHOLDING_XBRL_NO_SUPPORTED_VALUES|TimeoutError") == TECHNICAL_RETRYABLE
+    assert classify_reason("PARSER_FAILED:UNRECOGNIZED_FAILURE") == TECHNICAL_RETRYABLE
     assert classify_requirement_failures({"A": "DISCOVERY_NO_CANDIDATES", "B": "NETWORK_TIMEOUT"}, ["A"]) == EVIDENCE_UNAVAILABLE
     assert classify_requirement_failures({"A": "DISCOVERY_NO_CANDIDATES", "B": "NETWORK_TIMEOUT"}, ["B"]) == TECHNICAL_RETRYABLE
     assert classify_requirement_failures({}, ["A"]) is None

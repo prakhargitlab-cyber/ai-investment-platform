@@ -39,8 +39,8 @@ async def test_late_unready_nominee_reaches_rules_and_wins_despite_earlier_failu
         return replace(_readiness(), global_instrument_id=key)
 
     service.readiness.read = read
-    result = await service.run(rows, as_of=NOW, shortlist_limit=25, top_n=1, discovery_v2=True)
-    assert result.shortlist_count == 25
+    result = await service.run(rows, as_of=NOW, shortlist_limit=None, top_n=1, discovery_v2=True)
+    assert result.shortlist_count == 40
     assert result.deep_attempted_count == 40
     assert set(considered) == {UUID(int=n) for n in range(1, 41)}
     assert considered.index(late) >= 25

@@ -17,6 +17,7 @@ from app.portfolio_orchestration import (
     WatchlistRegionMismatchError,
 )
 from app.structured_market import StructuredProviderError
+from app.structured_financial import NseOfficialFinancialProvider
 from app.repository import ResearchRepository
 from app.scoring import canonical_read_model_score
 from app.sector_leaderboard import build_sector_leaderboard
@@ -60,7 +61,9 @@ market_data_ensure_service = IndiaMarketDataEnsureService(
 )
 research_readiness_adapter = RepositoryResearchReadinessAdapter(repository)
 existing_research_capability_executor = ExistingResearchCapabilityExecutor(
-    repository, portfolio_orchestrator, market_data_population_jobs
+    repository, portfolio_orchestrator, market_data_population_jobs,
+    official_financial_provider=NseOfficialFinancialProvider(
+        repository._official_filing_discovery.client, repository._fetcher),
 )
 research_readiness_runtime = ResearchReadinessRuntime(
     repository,
@@ -101,7 +104,10 @@ async def research_lifespan(application):
             await scheduler.close()
             del application.state.opportunity_scheduler
         # Readiness uses shielded single-flight tasks: explicitly drain them on shutdown.
-        flights = [flight.task for flight in research_readiness_runtime._flights.values()]
+        # Each instrument may now hold several concurrently running flights
+        # (see ResearchReadinessRuntime.ensure's overlap-scoped join), so this
+        # flattens every per-instrument list rather than assuming one task.
+        flights = [flight.task for flight_list in research_readiness_runtime._flights.values() for flight in flight_list]
         for task in flights:
             task.cancel()
         await asyncio.gather(*flights, return_exceptions=True)
@@ -210,7 +216,7 @@ async def cancel_opportunity_cycle(
     x_aip_user_id: str | None = Header(default=None),
     x_aip_user_issuer: str | None = Header(default=None),
     x_aip_user_subject: str | None = Header(default=None),
-    x_aip_user_roles: str | None = None,
+    x_aip_user_roles: str | None = Header(default=None),
 ):
     """ADMIN-gated durable cycle cancellation REQUEST (two-phase).
 
@@ -255,7 +261,7 @@ async def finalize_cycle_cancel(
     x_aip_user_id: str | None = Header(default=None),
     x_aip_user_issuer: str | None = Header(default=None),
     x_aip_user_subject: str | None = Header(default=None),
-    x_aip_user_roles: str | None = None,
+    x_aip_user_roles: str | None = Header(default=None),
 ):
     """ADMIN-gated fenced terminal transition for an unowned CANCEL_REQUESTED cycle.
 

@@ -14,8 +14,19 @@ from uuid import UUID
 
 from app.research_readiness import ResearchRequirementStatus as Status
 from app import cycle_timing
+from app.failure_taxonomy import EVIDENCE_UNAVAILABLE, classify_reason
 
 logger = logging.getLogger(__name__)
+
+
+def deferred_investigation():
+    """Scheduling state only: never a provider observation or evidence of absence."""
+    from app.research_readiness import ResearchRequirementRegistry
+    return {
+        "rule_evaluated": False, "disposition": "DEFERRED",
+        "requirements": {row.requirement_id: {"acquisition_state": "DEFERRED", "attempted": False}
+                         for row in ResearchRequirementRegistry.default().requirements},
+    }
 
 
 @dataclass(frozen=True)
@@ -29,9 +40,10 @@ class DeepInvestigationPlan:
     not_applicable_evidence: tuple[str, ...]
     already_satisfied: tuple[str, ...]
     acquisition_needed: tuple[str, ...]
+    deferred_evidence: tuple[str, ...] = ()
 
 
-def build_plan(readiness, paths=(), company_context=None):
+def build_plan(readiness, paths=(), company_context=None, *, deep_selected=True):
     """V1 has one shared rule family; optional concepts do not block its gate."""
     required = tuple(row.requirement_id for row in readiness.requirements if row.mandatory)
     optional = tuple(row.requirement_id for row in readiness.requirements if not row.mandatory)
@@ -39,11 +51,17 @@ def build_plan(readiness, paths=(), company_context=None):
     excluded_concepts = tuple(f'{row.requirement_id}/{key}' for row in readiness.requirements
                               for key in sorted(row.not_applicable_input_reasons))
     satisfied = tuple(row.requirement_id for row in readiness.requirements if row.status == Status.READY_FRESH)
-    # Catalyst research is relevant to an observed catalyst nomination, rather
-    # than a compulsory sweep for every stock. Other optional evidence is reused.
-    selected = set(required)
-    if "EVENT_CATALYST" in paths:
-        selected.add("ORDER_BOOK_CAPEX_GUIDANCE")
+    # The rule engine requires applicable catalyst coverage even without an
+    # event nomination. A genuine completed empty check is valid; an unattempted
+    # check is not. Before selection these costs are explicitly deferred.
+    selected = set(required) | {"ORDER_BOOK_CAPEX_GUIDANCE"}
+    deferred = ()
+    if not deep_selected:
+        from app.research_readiness_runtime import BASELINE_REQUIREMENT_IDS
+        deferred = tuple(row.requirement_id for row in readiness.requirements
+                         if row.requirement_id not in BASELINE_REQUIREMENT_IDS
+                         and row.requirement_id not in (*na, *satisfied))
+        selected &= set(BASELINE_REQUIREMENT_IDS)
     needed = tuple(row.requirement_id for row in readiness.requirements
                    if row.requirement_id in selected and row.requirement_id not in (*na, *satisfied))
     context = {str(k): str(v) for k, v in (company_context or {}).items() if v is not None}
@@ -52,7 +70,7 @@ def build_plan(readiness, paths=(), company_context=None):
             context.setdefault('classification', row.classification)
             context.setdefault('classification_source', row.classification_source or 'UNKNOWN')
     return DeepInvestigationPlan(readiness.global_instrument_id, tuple(sorted(paths)), tuple(sorted(context.items())),
-        ("STOCK_RULE_ENGINE_V1",), required, optional, (*na, *excluded_concepts), satisfied, needed)
+        ("STOCK_RULE_ENGINE_V1",), required, optional, (*na, *excluded_concepts), satisfied, needed, deferred)
 
 
 # Singleton per-requirement acquisition defaults (pre-batching model). Each
@@ -170,6 +188,37 @@ _GROUP_FOR_REQUIREMENT: dict[str, tuple[str, ...]] = {
     requirement_id: group for group in _CAPABILITY_GROUPS for requirement_id in group
 }
 
+# Stage-2 final closure (Root Cause A): requirements whose own authorized
+# acquisition plan is a dedicated, non-search channel (its OWN failures are
+# always recorded per-requirement in budget.requirement_failures -- see
+# repository.py's official shareholding feed) and which never themselves
+# append to the SHARED budget.failures list. SHAREHOLDING is batched with
+# ORDER_BOOK_CAPEX_GUIDANCE/GOVERNANCE_HISTORY above purely for provider-call
+# collapsing (Performance Fix #2); those two genuinely share one generic
+# search/document-discovery pass and may legitimately attribute a shared
+# budget.failures entry to each other, but SHAREHOLDING's ownership path
+# (NSE structured/XBRL -> Yahoo -> NSE official document) never runs through
+# that generic search mechanism at all, so a budget.failures entry seen by
+# _finalize() for SHAREHOLDING can only ever be some OTHER group member's
+# unrelated failure (e.g. a generic SEARCH_PROVIDER_* outage). Add a
+# requirement id here only when its acquisition is similarly self-contained.
+_NO_SHARED_BUDGET_FAILURE_ATTRIBUTION: frozenset[str] = frozenset({"SHAREHOLDING"})
+
+# Budget-exhaustion reason strings are CONSEQUENCES of the per-refresh
+# document/query ceiling being consumed, not root-cause failures. They are kept
+# here (mirroring failure_taxonomy.TECHNICAL_REASONS) so _finalize() can prefer a
+# genuine causal technical failure (e.g. PDF_EXTRACTION_TIMEOUT, NETWORK_TIMEOUT,
+# PARSER_FAILED) that was recorded EARLIER in the same acquisition pass over a
+# later budget-exhaustion entry that merely records that the shared pass starved
+# a subsequent filing. All of these remain TECHNICAL_RETRYABLE (a repair attempt
+# gets a fresh per-refresh budget), so this only reorders WHICH technical reason
+# is surfaced -- it never reclassifies a genuine technical failure as permanent.
+_BUDGET_EXHAUSTION_CONSEQUENCES = frozenset({
+    "DOCUMENT_BUDGET_EXHAUSTED",
+    "DISCOVERY_QUERY_BUDGET_EXHAUSTED",
+    "BUDGET_EXHAUSTED",
+})
+
 
 def _prior_failure(runtime, instrument_id, requirement_id):
     loader = getattr(getattr(runtime, "repository", None), "acquisition_observations_for", None)
@@ -183,6 +232,79 @@ def _prior_failure(runtime, instrument_id, requirement_id):
     if latest.get("outcome") != "FAILED":
         return None
     return str(latest.get("failure_reason") or "PRIOR_ACQUISITION_FAILED")
+
+
+def _prior_readiness_executor_verdict(runtime, instrument_id, requirement_id):
+    """The most recent FINAL classification this module itself already
+    reached for `requirement_id` (provider == 'READINESS_EXECUTOR', written
+    by _finalize()'s own record_acquisition_observation call below) --
+    distinct from _prior_failure/_prior_success_empty, which deliberately
+    exclude these rows because they look at genuine PROVIDER attempts.
+
+    Returns the failure_reason only when it already classifies
+    EVIDENCE_UNAVAILABLE (deterministic, permanent for that attempt's
+    unchanged evidence) -- never for a TECHNICAL_RETRYABLE verdict, which
+    must always get a fresh attempt. Used by _requires_acquisition so a
+    repair pass does not rerun an identical acquisition for a requirement
+    whose last completed plan already proved the gap permanent, while an
+    already-satisfied readiness state (checked by the caller BEFORE this)
+    still always takes priority -- this only short-circuits the "still
+    unresolved" case, on the assumption that a requirement whose status has
+    not advanced to satisfied has not had its evidence meaningfully change.
+    """
+    loader = getattr(getattr(runtime, "repository", None), "acquisition_observations_for", None)
+    if not callable(loader):
+        return None
+    rows = [row for row in loader(instrument_id) or ()
+            if row.get("requirement_id") == requirement_id and row.get("provider") == "READINESS_EXECUTOR"]
+    if not rows:
+        return None
+    latest = max(rows, key=lambda row: str(row.get("observed_at") or ""))
+    if latest.get("outcome") != "FAILED":
+        return None
+    reason = latest.get("failure_reason")
+    if not reason or classify_reason(reason) != EVIDENCE_UNAVAILABLE:
+        return None
+    # Issue 2 (production: 0dfbe654-9788-42ae-923c-b1ce0aceaa4b SHAREHOLDING
+    # permanently EXTERNAL_CAPABILITY_UNSUPPORTED, with NEITHER
+    # shareholding_routing_decision NOR shareholding_final_reason_emitted
+    # ever appearing -- proving execute_primary's generic per-target loop
+    # never runs again for this requirement). Every OTHER
+    # PERMANENT_REASONS entry describes a DOCUMENT this module actually
+    # discovered/parsed (content, discovery outcome, parser result) --
+    # unchanged evidence genuinely cannot produce a different verdict on
+    # retry, so skipping re-dispatch is correct. EXTERNAL_CAPABILITY_
+    # UNSUPPORTED is different in kind: it is never decided by this
+    # repository at all (see HttpExternalResearchToolGateway.
+    # acquire_requirement in app.yahoo_mcp_acquisition) -- it is read
+    # verbatim from an EXTERNAL gateway response, and whether that
+    # gateway is even CALLED (and with what region) is entirely decided
+    # by this instrument's LOCAL jurisdiction/profile computation at
+    # execute_primary time. That computation is exactly what two prior
+    # stabilization passes in this project corrected (country/exchange
+    # hydration fixes to _global_master_instrument /
+    # _hydrate_verified_exchange_mappings) -- fixes that can only ever
+    # take effect on an instrument's SHAREHOLDING requirement if
+    # execute_primary is actually invoked for it again. Treating a
+    # pre-fix verdict recorded under what may have been a wrong
+    # jurisdiction as a permanent, un-retriable fact would durably lock
+    # that instrument out of ever benefiting from a jurisdiction/
+    # identity correction. This narrowly excludes ONLY this one reason
+    # from _requires_acquisition's cross-cycle skip -- classify_reason
+    # and PERMANENT_REASONS themselves are UNCHANGED (every other use of
+    # this classification -- repair-budget retryability, candidate-level
+    # disposition in app.global_opportunity_orchestration, etc. -- still
+    # treats EXTERNAL_CAPABILITY_UNSUPPORTED as EVIDENCE_UNAVAILABLE
+    # exactly as before). If the gateway genuinely still declines it on
+    # the next attempt, the SAME reason is recorded again and nothing
+    # about readiness/success semantics changes -- this only lets a
+    # requirement whose last verdict depended on local routing actually
+    # get re-evaluated through CURRENT routing instead of being
+    # permanently skipped.
+    components = {part.strip() for part in str(reason).split("|") if part.strip()}
+    if "EXTERNAL_CAPABILITY_UNSUPPORTED" in components:
+        return None
+    return str(reason)
 
 
 def _prior_success_empty(runtime, instrument_id, requirement_id):
@@ -251,6 +373,9 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
     plan = build_plan(readiness, nomination_paths, company_context)
     logger.info("deep_plan_created instrument_id=%s families=%s required=%s acquisition=%s",
                 instrument_id, plan.applicable_rule_families, plan.required_evidence, plan.acquisition_needed)
+    logger.info("radar_acquisition_count operation=pdf_fallback_avoided reason=DURABLE_EVIDENCE count=%d",
+                len(set(plan.already_satisfied) & {"QUARTERLY_FINANCIALS", "GROWTH_FACTS",
+                    "BUSINESS_QUALITY_FACTS", "BALANCE_SHEET_FACTS", "ORDER_BOOK_CAPEX_GUIDANCE", "GOVERNANCE_HISTORY"}))
     failures, capabilities, attempted = {}, [], []
     matrix = {}
     # Include fresh quarterly evidence so the existing NSE authority-upgrade
@@ -311,8 +436,50 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
             # Priority order: specific technical failures > discovery outcome > budget state.
             if requirement_id in budget.requirement_failures:
                 reason = budget.requirement_failures[requirement_id]
-            elif budget.failures:
-                reason = budget.failures[-1]
+            elif budget.failures and requirement_id not in _NO_SHARED_BUDGET_FAILURE_ATTRIBUTION:
+                # Stage-2 final closure (Root Cause A): budget.failures is a
+                # single flat list shared by every member of a capability
+                # group (e.g. SHAREHOLDING batched alongside ORDER_BOOK_
+                # CAPEX_GUIDANCE/GOVERNANCE_HISTORY, which genuinely share
+                # ONE underlying generic search/document-discovery pass).
+                # A requirement in _NO_SHARED_BUDGET_FAILURE_ATTRIBUTION has
+                # its OWN dedicated, non-search acquisition channel that
+                # already reports its own failures through
+                # budget.requirement_failures (handled above) and never
+                # appends to this shared list itself -- so any entry found
+                # here can only have come from a DIFFERENT group member's
+                # unrelated operation (e.g. a generic SEARCH_PROVIDER_*
+                # failure from GOVERNANCE_HISTORY's RISKS/REGULATORY search).
+                # Borrowing it would violate "search/news provider state
+                # must never determine SHAREHOLDING readiness" -- skip
+                # straight to the discovery-outcome/budget-state
+                # classification below, which correctly reports this
+                # requirement's OWN plan state instead.
+                # Preserve the CAUSAL technical classification: a real attempted
+                # failure (NETWORK_TIMEOUT, PDF_EXTRACTION_TIMEOUT, PARSER_FAILED,
+                # HTTP_FETCH_FAILED, ...) recorded earlier in this acquisition pass
+                # must take priority over a later DOCUMENT_BUDGET_EXHAUSTED /
+                # DISCOVERY_QUERY_BUDGET_EXHAUSTED / BUDGET_EXHAUSTED that is merely
+                # a CONSEQUIENCE of the per-refresh document/query ceiling being
+                # consumed by the same pass (e.g. a PDF extraction timeout on
+                # filing A caused the shared budget to starve filing B, which was
+                # then recorded as budget-exhausted). Both are technically
+                # retryable (budget exhaustion is listed in TECHNICAL_REASONS with
+                # an explicit "a repair attempt gets a fresh budget" comment), so
+                # this selection only changes WHICH technical reason is surfaced --
+                # never the technical-vs-genuine classification -- and it only
+                # reorders the recorded list, it never drops a failure. When every
+                # recorded failure is itself a budget-exhaustion consequence (i.e.
+                # the pass was purely starved with no attempted-failure), fall back
+                # to the last failure so genuine pure-starvation cases keep
+                # surfacing DOCUMENT_BUDGET_EXHAUSTED as documented at the
+                # documents_attempted >= max_documents branch below.
+                causal = next(
+                    (f for f in budget.failures
+                     if f not in _BUDGET_EXHAUSTION_CONSEQUENCES),
+                    None,
+                )
+                reason = causal if causal is not None else budget.failures[-1]
             elif failures.get(requirement_id):
                 reason = failures[requirement_id]
             else:
@@ -587,6 +754,25 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
             logger.info("deep_requirement_satisfied instrument_id=%s requirement=%s", instrument_id, requirement_id)
             return False
         if requirement_id not in selected:
+            return False
+        # Stage-2 final closure (Root Cause B/D, Invariant 2): this
+        # requirement is still unresolved by CURRENT durable evidence (the
+        # checks above already re-read it fresh), but a previous completed
+        # plan for this exact requirement already proved EVIDENCE_UNAVAILABLE
+        # (deterministic, permanent) and nothing has advanced it to
+        # satisfied since. Re-running the identical authorized acquisition
+        # against unchanged evidence cannot discover a different answer, so
+        # a repair pass must not spend budget on it again -- reuse the
+        # durable verdict instead. A TECHNICAL_RETRYABLE prior verdict is
+        # deliberately NOT short-circuited here: that is exactly the case
+        # that must keep getting a fresh attempt.
+        prior_permanent = _prior_readiness_executor_verdict(runtime, instrument_id, requirement_id)
+        if prior_permanent is not None:
+            logger.info(
+                "deep_requirement_skipped_permanent_verdict instrument_id=%s requirement=%s reason=%s",
+                instrument_id, requirement_id, prior_permanent,
+            )
+            failures[requirement_id] = prior_permanent
             return False
         return True
 

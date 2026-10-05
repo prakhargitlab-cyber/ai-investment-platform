@@ -1,9 +1,9 @@
 """Explicit engineering ranking over already-read canonical and persisted evidence.
 
 With an injected readiness runtime (acquisition_enabled=True), ALL eligible stocks
-receive the same baseline data contract before any shortlist or deep-enrichment
-decision is made. In production Radar V2, shortlist_limit sets investigation
-priority; every remaining eligible canonical stock is then considered sequentially.
+receive provider-free evaluation of persisted evidence. Deterministic discovery
+then admits at most shortlist_limit candidates for live baseline acquisition and
+deep research; unselected candidates are explicitly deferred.
 
 Without an injected readiness runtime this remains a persisted-only diagnostic for
 dashboard reads.
@@ -16,8 +16,8 @@ preserved; this operation does not persist ranking snapshots.
 
 Use a fixed timezone-aware as_of to reproduce evidence selection/fingerprints.
 generated_at is the completion clock; cache_hit diagnostics may change on a warm
-run, but ranking content does not. shortlist_limit bounds the deep-investigating
-working set (priority order) and is never a recommendation cap. When run() is
+run, but ranking content does not. shortlist_limit bounds deep investigation
+and is never a recommendation display cap. When run() is
 invoked with top_n=None -- the production Radar V2 path -- EVERY rank-eligible
 investigated entry is exposed in ranking.top_n, in global rank order, with no
 numeric cap. The legacy integer top_n (a display/legacy metadata knob at the
@@ -59,12 +59,30 @@ from app.stock_rule_engine import StockRuleEngineResult, StockRuleEngineService
 from app.news_intelligence import EventImpactFeature, latest_known_features
 
 logger = logging.getLogger(__name__)
+DEFAULT_DEEP_LIMIT = 25
+ACQUISITION_SELECTION_VERSION = "BOUNDED_ACQUISITION_V1"
 
 
 @dataclass(frozen=True)
 class _BaselineOutcome:
     # The caller needs only acquisition disposition, never the readiness graph.
     planned_requirement_ids: tuple[str, ...]
+    ready: bool = False
+    attempted: bool = False
+    timed_out: bool = False
+    failed: bool = False
+
+    @classmethod
+    def from_result(cls, result):
+        failures = getattr(result, "failures", {}) or {}
+        readiness = getattr(result, "readiness", None)
+        ready = callable(getattr(readiness, "for_requirement", None)) and all(
+            (row := readiness.for_requirement(key)) is not None
+            and row.status in {"READY_FRESH", "NOT_APPLICABLE"}
+            for key in BASELINE_REQUIREMENT_IDS)
+        return cls(tuple(result.planned_requirement_ids), bool(ready and not failures),
+                   bool(getattr(result, "executed_capabilities", ())),
+                   any("TIMEOUT" in str(reason).upper() for reason in failures.values()), bool(failures))
 
 
 def _baseline_jurisdiction(profile) -> str:
@@ -161,6 +179,12 @@ class OpportunityRanking(ResearchBaseModel):
     baseline_ready_count: int = 0
     baseline_acquisition_needed_count: int = 0
     baseline_incomplete_count: int = 0
+    baseline_evaluated_count: int = 0
+    acquisition_admitted_count: int = 0
+    acquisition_deferred_count: int = 0
+    baseline_acquisition_attempted_count: int = 0
+    baseline_acquisition_timeout_count: int = 0
+    baseline_acquisition_failed_count: int = 0
     preliminary_eligible_count: int = 0
     deep_pool_eligible_count: int = 0
     deep_candidate_count: int = 0
@@ -298,21 +322,31 @@ class GlobalOpportunityOrchestrator:
             key = candidate.global_instrument_id
             if checkpoint is None:
                 return await _acquire_one_body(candidate)
+            if await self._run_blocking(checkpoint.persistence.cycle_cancellation_requested, checkpoint.cycle_id):
+                raise asyncio.CancelledError("CYCLE_CANCELLED")
             restored = checkpoint.restorable(PHASE_BASELINE, key)
             if restored is not None:
-                checkpoint.note_restored(PHASE_BASELINE)
                 stored = restored.get("payload") or {}
-                if restored["state"] == CandidateState.COMPLETED:
-                    return key, (_BaselineOutcome(tuple(stored.get("planned_requirement_ids") or ()))
-                                 if stored.get("has_outcome", True) else None), None
-                return key, None, restored.get("failure_reason") or "BASELINE_ACQUISITION_FAILED"
+                if "ready" in stored or restored["state"] != CandidateState.COMPLETED:
+                    checkpoint.note_restored(PHASE_BASELINE)
+                    if stored.get("has_outcome"):
+                        return key, _BaselineOutcome(
+                            tuple(stored.get("planned_requirement_ids") or ()),
+                            stored.get("ready", False), stored.get("attempted", False),
+                            stored.get("timed_out", False), stored.get("failed", False)), None
+                    return key, None, restored.get("failure_reason") or "BASELINE_ACQUISITION_FAILED"
+                # Legacy COMPLETED meant only that ensure returned. Reassess
+                # admitted candidates instead of restoring fabricated readiness.
             await checkpoint.start(PHASE_BASELINE, key)
             outcome = await _acquire_one_body(candidate)
             _, result, reason = outcome
-            if reason is None:
-                await checkpoint.finish(PHASE_BASELINE, key, CandidateState.COMPLETED, disposition="BASELINE_EVALUATED",
-                                        payload={"has_outcome": result is not None,
-                                                 "planned_requirement_ids": list(result.planned_requirement_ids) if result else []})
+            if result is not None:
+                await checkpoint.finish(PHASE_BASELINE, key,
+                    CandidateState.COMPLETED if result.ready else CandidateState.RETRYABLE_FAILURE,
+                    disposition="BASELINE_READY" if result.ready else "BASELINE_INCOMPLETE",
+                    payload={"has_outcome": True, "planned_requirement_ids": list(result.planned_requirement_ids),
+                             "ready": result.ready, "attempted": result.attempted,
+                             "timed_out": result.timed_out, "failed": result.failed})
             else:
                 await checkpoint.finish(PHASE_BASELINE, key, state_for_disposition(reason),
                                         disposition=reason, failure_reason=reason)
@@ -363,7 +397,7 @@ class GlobalOpportunityOrchestrator:
                     requirement_ids=BASELINE_REQUIREMENT_IDS,
                     identity_headers=identity_headers,
                 )
-                return key, (_BaselineOutcome(tuple(result.planned_requirement_ids))
+                return key, (_BaselineOutcome.from_result(result)
                              if result is not None else None), None
             except Exception as exc:
                 # readiness/ensure exception (and any other unexpected failure)
@@ -657,10 +691,24 @@ class GlobalOpportunityOrchestrator:
         or insufficient history per TechnicalFeatureEngine's own readiness
         gating) stays None here; missing_inputs/stale_inputs/history_readiness
         are carried through so a consumer can tell why, not just that.
+
+        history_end is a raw datetime on TechnicalFeatureSnapshot. Every
+        normal (evaluated-entry) snapshot reaches persistence via
+        OpportunityRankingEntry.model_dump(mode="json"), which converts it to
+        an ISO-8601 string -- but the "previous_states review" / price-lifecycle
+        path in global_opportunity_cycle.py reads this dict (via
+        OpportunityRanking.review_evidence) by plain attribute access and never
+        calls model_dump, so a raw datetime here reaches
+        json.dumps(..., allow_nan=False) at final persistence unconverted and
+        raises "TypeError: Object of type datetime is not JSON serializable".
+        Isoformat it at the source, same as the analyst provenance block
+        below, so every consumer of this dict gets the same canonical
+        JSON-safe representation regardless of which path it took.
         """
+        history_end = getattr(snapshot, 'history_end', None)
         technical = {
             'latest_price': snapshot.latest_price,
-            'history_end': getattr(snapshot, 'history_end', None),
+            'history_end': history_end.isoformat() if history_end is not None else None,
             'feature_version': getattr(snapshot, 'feature_version', ''),
             'currency': getattr(snapshot, 'currency', None),
         }
@@ -689,20 +737,12 @@ class GlobalOpportunityOrchestrator:
 
     async def run(self, canonical_instruments: Iterable[dict], *, as_of: datetime,
                   sector_contexts: Mapping[UUID, SectorContext] | None = None,
-                  shortlist_limit: int | None = 25, top_n: int | None = 10,
+                  shortlist_limit: int | None = DEFAULT_DEEP_LIMIT, top_n: int | None = 10,
                   review_ids: Iterable[UUID] = (), identity_headers=None,
                   correlation_id=None, discovery_v2=False, rotation_after=None,
                   checkpoint=None) -> OpportunityRanking:
-        # shortlist_limit is a sanity bound on the *bounded display/legacy* mode
-        # below (used only by unit-level callers that pass an int top_n). It is
-        # NOT a result cap: production passes top_n=None here, and
-        # shortlist_limit only governs the priority investigation working set,
-        # never the size of the published qualifying set.
-        # shortlist_limit=None means UNBOUNDED: the production contract
-        # (candidate_ids=None, enforced by run_global_opportunity_cycle) is
-        # that the complete applicable deep-research universe is processed,
-        # never truncated by a fixed-size working set. Controlled/manual
-        # cycles keep passing a real 1..100 int to bound their sample.
+        # Production supplies the requested deep limit independently of top_n.
+        # Explicit diagnostic callers may still opt into an unbounded pool.
         if (not (shortlist_limit is None
                  or (type(shortlist_limit) is int and 1 <= shortlist_limit <= 100))
                 or (top_n is not None and (type(top_n) is not int or not 0 <= top_n <= 100))):
@@ -726,6 +766,12 @@ class GlobalOpportunityOrchestrator:
         baseline_ready_count = 0
         baseline_acquisition_needed_count = 0
         baseline_incomplete_count = 0
+        baseline_evaluated_count = sum(c.eligible_for_acquisition for c in scan.candidates)
+        baseline_acquisition_attempted_count = 0
+        baseline_acquisition_timeout_count = 0
+        baseline_acquisition_failed_count = 0
+        acquisition_admitted_count = 0
+        acquisition_deferred_count = 0
         preliminary_eligible_count = 0
         deep_pool_eligible_count = 0
         deep_candidate_count = 0
@@ -746,6 +792,7 @@ class GlobalOpportunityOrchestrator:
         nominations, investigation_matrix = {}, {}
         stage_b = []
         baseline_eligible_ids = set()
+        deep_ids = set()
         ensure_results = {}
         baseline_failures = {}
         diagnostics = []
@@ -790,54 +837,22 @@ class GlobalOpportunityOrchestrator:
             public_analyst_by_id = {}
 
         if self.acquisition_enabled:
-            # Phase 1: Baseline acquisition for ALL identity-valid eligible stocks.
-            # Every eligible stock receives the same baseline data contract before
-            # any shortlist or deep-enrichment decision is made: a stock that is
-            # identity-valid but already deep-ready (fresh cached/persisted evidence,
-            # including prior manual research) is reused at zero provider cost — the
-            # ensure is still issued (a cache-hit with no planned targets) so that
-            # every eligible stock is recorded as baseline-evaluated. shortlist_limit
-            # never caps this evaluation: every eligible stock is baseline-evaluated.
-            baseline_eligible = [
-                c for c in scan.candidates
-                if c.eligible_for_acquisition
-            ]
-            baseline_eligible_ids = {c.global_instrument_id for c in baseline_eligible}
-            ensure_results, baseline_failures = await self._acquire_baseline_requirements(
-                baseline_eligible, metadata, as_of, identity_headers, checkpoint=checkpoint)
-
-            for candidate in baseline_eligible:
-                key = candidate.global_instrument_id
-                result = ensure_results.get(key)
-                if result is None:
-                    baseline_incomplete_count += 1
-                else:
-                    baseline_ready_count += 1
-                    if result.planned_requirement_ids:
-                        baseline_acquisition_needed_count += 1
-
-            logger.info(
-                "stage2_start correlationId=%s baseline_ready=%d baseline_needed=%d "
-                "baseline_incomplete=%d phase2_universe=%d",
-                correlation_id, baseline_ready_count, baseline_acquisition_needed_count,
-                baseline_incomplete_count, len(baseline_eligible),
-            )
-            # Phase 2: Re-scan to refresh pre-scores
-            evaluation_at = max(as_of, self.clock())
-            baseline_scan = await scanner.scan(as_of=evaluation_at, top_n=0, progress_label="stage2")
-
-            # Phase 3: Preliminary evaluation for ALL deep-ready candidates.  A
-            # candidate is deep-ready if its durable evidence (acquired above, or
-            # already fresh from cache/persistence) satisfies the deep-analysis
-            # gate.  This deliberately draws from the re-scan, NOT only from the
-            # Phase-1 baseline set, so candidates that were already deep-ready and
-            # skipped Phase 1 still enter the dynamic deep pool.  shortlist_limit
-            # never restricts this preliminary evaluation.
+            # Stage A is the provider-free scan already completed above. Missing
+            # evidence is a nomination input, never a reason to acquire the whole
+            # universe. Rotation can admit sparse candidates independently of the
+            # market pool; only admitted identities proceed to live acquisition.
+            baseline_scan = scan
             deep_ready_candidates = [c for c in baseline_scan.candidates if c.eligible_for_deep_analysis]
             baseline_ready_candidates = deep_ready_candidates
             preliminary_eligible_count = len(deep_ready_candidates)
 
-            # Phase 4: Dynamic deep pool - exclude review_ids
+            # Reviews share the same admission boundary as discovery. Unselected
+            # prior recommendations retain a persisted-only lifecycle review.
+            # review_id_set is also the discovery/rotation exclusion set below:
+            # an already-reviewed candidate must never consume a second, fresh
+            # admission slot (and its re-acquisition budget) on top of its
+            # existing persisted-only review -- that would silently shrink how
+            # many genuinely new candidates this cycle's shortlist_limit admits.
             review_id_set = set(review_ids) if review_ids else set()
             pre_review_pool = self._form_dynamic_deep_pool(baseline_ready_candidates, exclude_ids=review_id_set)
             deep_pool_eligible_count = len(pre_review_pool)
@@ -852,31 +867,39 @@ class GlobalOpportunityOrchestrator:
             restored_selection = (await checkpoint.selection()) if checkpoint is not None else None
             selected_missing: list = []
             if restored_selection is not None:
-                by_scan = {c.global_instrument_id: c for c in baseline_scan.candidates}
+                restored_selection = dict(restored_selection)
+                restored_selection["deep_ids"] = list(dict.fromkeys(restored_selection.get("deep_ids", [])))[:shortlist_limit]
+                by_scan = {c.global_instrument_id: c for c in baseline_scan.candidates if c.eligible_for_acquisition}
                 deep_candidates = [by_scan[UUID(i)] for i in restored_selection.get("deep_ids", []) if UUID(i) in by_scan]
                 selected_missing = [UUID(i) for i in restored_selection.get("deep_ids", []) if UUID(i) not in by_scan]
                 shortlist = [by_scan[UUID(i)] for i in restored_selection.get("shortlist_ids", []) if UUID(i) in by_scan]
                 nominations = restored_selection.get("nominations") or {}
                 rotation_after = restored_selection.get("rotation_after", rotation_after)
-            elif discovery_v2:
+            else:
                 from app.opportunity_discovery import discover
-                # discover()'s budget bounds per-path nomination bookkeeping
-                # only -- with full_universe=True (always the case here) it
-                # already includes every eligible candidate in its result
-                # regardless of budget, but budget must still be a real
-                # positive int (it drives internal range()/slice arithmetic).
-                # Production (shortlist_limit is None/falsy) passes the full
-                # pool size so nomination-priority bookkeeping is not
-                # arbitrarily narrowed either.
                 discover_budget = shortlist_limit if shortlist_limit else max(1, len(pre_review_pool))
                 deep_candidates, nominations, rotation_after = await discover(
                     baseline_scan.candidates, pre_review_pool, budget=discover_budget,
                     as_of=evaluation_at, repository=self.repository, run_blocking=self._run_blocking,
-                    rotation_after=rotation_after, exclude_ids=review_id_set, full_universe=True)
+                    rotation_after=rotation_after, exclude_ids=review_id_set,
+                    full_universe=shortlist_limit is None)
                 shortlist = deep_candidates[:shortlist_limit] if shortlist_limit else deep_candidates
-            if checkpoint is not None and restored_selection is None:
+            # Also bound checkpoints produced by the former unbounded policy.
+            # Preserve their order; do not re-nominate on resume.
+            if shortlist_limit is not None:
+                if restored_selection is not None:
+                    selected_ids = restored_selection.get("deep_ids", [])[:shortlist_limit]
+                    selected_set = {UUID(key) for key in selected_ids}
+                    deep_candidates = [c for c in deep_candidates if c.global_instrument_id in selected_set]
+                    selected_missing = [key for key in selected_missing if key in selected_set]
+                else:
+                    deep_candidates = deep_candidates[:shortlist_limit]
+                shortlist = list(deep_candidates)
+            if checkpoint is not None:
                 await checkpoint.save_selection({
-                    "deep_ids": [str(c.global_instrument_id) for c in deep_candidates],
+                    "acquisition_selection_version": ACQUISITION_SELECTION_VERSION,
+                    "deep_ids": (restored_selection["deep_ids"] if restored_selection is not None
+                                 else [str(c.global_instrument_id) for c in deep_candidates]),
                     "shortlist_ids": [str(c.global_instrument_id) for c in shortlist],
                     "nominations": nominations, "rotation_after": rotation_after})
             for missing_key in selected_missing:
@@ -894,8 +917,58 @@ class GlobalOpportunityOrchestrator:
                         investigation_matrix[str(candidate.global_instrument_id)] = dict(
                             rule_evaluated=False, disposition="CANONICAL_INELIGIBLE")
             deep_candidate_count = len(deep_candidates)
+            from app.deep_investigation import deferred_investigation
+            deep_ids = {c.global_instrument_id for c in deep_candidates}
+            for candidate in baseline_scan.candidates:
+                if candidate.eligible_for_acquisition and candidate.global_instrument_id not in deep_ids:
+                    diagnostics.append(CandidateDiagnostic(
+                        global_instrument_id=candidate.global_instrument_id,
+                        status="DEFERRED", disposition="DEFERRED"))
+                    investigation_matrix[str(candidate.global_instrument_id)] = deferred_investigation()
+            acquisition_admitted_count = len(deep_ids)
+            acquisition_deferred_count = baseline_evaluated_count - acquisition_admitted_count
+            logger.info("radar_acquisition_count operation=baseline_candidates_evaluated count=%d", baseline_evaluated_count)
+            logger.info("radar_acquisition_count operation=acquisition_candidates_admitted count=%d", acquisition_admitted_count)
+            logger.info("radar_acquisition_count operation=acquisition_candidates_deferred count=%d", acquisition_deferred_count)
+            logger.info("radar_acquisition_count operation=deep_candidates_selected count=%d", deep_candidate_count)
             logger.info("stage2_selected correlationId=%s preliminary=%d pool=%d shortlist=%d",
                         correlation_id, preliminary_eligible_count, deep_pool_eligible_count, len(shortlist))
+
+            # Stage B shares exactly the deep admission set; there is no second
+            # limit or post-enrichment replacement queue that could fan out.
+            baseline_eligible_ids = deep_ids
+            ensure_results, baseline_failures = await self._acquire_baseline_requirements(
+                deep_candidates, metadata, as_of, identity_headers, checkpoint=checkpoint)
+            for key in deep_ids:
+                outcome = ensure_results.get(key)
+                baseline_ready_count += int(outcome is not None and outcome.ready)
+                baseline_acquisition_needed_count += int(outcome is not None and bool(outcome.planned_requirement_ids))
+                baseline_acquisition_attempted_count += int(outcome is not None and outcome.attempted)
+                baseline_acquisition_timeout_count += int(outcome is not None and outcome.timed_out)
+                baseline_acquisition_failed_count += int(outcome is None or outcome.failed)
+            baseline_incomplete_count = acquisition_admitted_count - baseline_ready_count
+            logger.info("baseline_acquisition_outcomes evaluated=%d admitted=%d deferred=%d needed=%d attempted=%d ready=%d incomplete=%d timed_out=%d failed=%d",
+                        baseline_evaluated_count, acquisition_admitted_count, acquisition_deferred_count,
+                        baseline_acquisition_needed_count, baseline_acquisition_attempted_count, baseline_ready_count,
+                        baseline_incomplete_count, baseline_acquisition_timeout_count, baseline_acquisition_failed_count)
+
+            # DI-16: Stage 1 -> Stage 2 transition must be observable so a
+            # silent post-Stage-1 stall (stage2_start logged with no matching
+            # stage2_complete) is diagnosable. Emitted immediately before the
+            # Phase-2 re-scan, the first thing Stage 2 actually does.
+            logger.info("stage2_start correlationId=%s admitted=%d", correlation_id, acquisition_admitted_count)
+
+            # Refresh only admitted scanner observations. Preserve admission order
+            # and membership even if fresh evidence changes their pre-scores.
+            evaluation_at = max(as_of, self.clock())
+            admitted_id_strings = {str(key) for key in deep_ids}
+            admitted_scanner = GlobalScanner(
+                _PersistedUniverse([row for row in rows if str(row.get("globalInstrumentId")) in admitted_id_strings]),
+                self.persistence, batch_size=1, run_blocking=self._run_blocking)
+            admitted_scan = await admitted_scanner.scan(as_of=evaluation_at, top_n=0, progress_label="admitted")
+            refreshed_by_id = {c.global_instrument_id: c for c in admitted_scan.candidates}
+            deep_candidates = [refreshed_by_id[c.global_instrument_id] for c in deep_candidates]
+            shortlist = list(deep_candidates)
 
             # V2 enriches only the current ready stock below; never pre-enrich
             # the full investigation universe. Preserve the legacy diagnostic path.
@@ -987,6 +1060,12 @@ class GlobalOpportunityOrchestrator:
             # process shutdown" (app/main.py's `research_lifespan`).
             from app.background_task_registry import current_news_background_tasks
             pending_news_tasks = current_news_background_tasks
+            acquired_deep_ids = set()
+
+            def note_deep_acquisition(key, result):
+                if getattr(result, "planned_requirement_ids", ()) and key not in acquired_deep_ids:
+                    acquired_deep_ids.add(key)
+                    logger.info("radar_acquisition_count operation=deep_candidates_acquired count=1")
 
             async def _acquire_deep(item):
                 item_key = item.global_instrument_id
@@ -1016,10 +1095,12 @@ class GlobalOpportunityOrchestrator:
                         company_context={k: item_payload.get(k) for k in ('sector', 'industry', 'assetType')},
                         identity_headers=identity_headers, correlation_id=correlation_id,
                         background_tasks=pending_news_tasks)
+                    note_deep_acquisition(item_key, item_result)
                     return item_profile, item_payload, item_result, item_plan, item_matrix
                 item_result = await self.readiness.ensure(
                     item_key, jurisdiction=_baseline_jurisdiction(item_profile), requirement_ids=None,
                     identity_headers=identity_headers, wait_for_completion=True)
+                note_deep_acquisition(item_key, item_result)
                 return item_profile, item_payload, item_result, None, None
 
             lookahead_depth = 4 * stage2_concurrency
@@ -1307,6 +1388,7 @@ class GlobalOpportunityOrchestrator:
                         # indistinguishable from a readiness rejection.
                         reason = str(e)
                         disposition = reason if reason in self._KNOWN_STAGE2_FAILURE_REASONS else "STAGE2_INTERNAL_ERROR"
+                        reason = disposition
                         if disposition == "STAGE2_INTERNAL_ERROR":
                             stage2_internal_error_count += 1
                         diagnostics.append(CandidateDiagnostic(
@@ -1366,11 +1448,41 @@ class GlobalOpportunityOrchestrator:
                 logger.info(
                     "stage2_timing_report cycle_id=%s stage2WallClockMs=%s maxConcurrentMandatoryInvestigations=%s "
                     "trackedOperations=%s droppedOperations=%s aggregatePdfQueueWaitMs=%s aggregateProviderWaitMs=%s "
-                    "aggregatePersistenceWaitMs=%s slowestOperationsJson=%s persistenceOperationTimingJson=%s",
+                    "aggregatePersistenceWaitMs=%s aggregateSingleFlightWaitMs=%s aggregateSearchProviderMs=%s aggregateCurrentNewsThrottleMs=%s "
+                    "aggregateNewsWorkerLockWaitMs=%s "
+                    "slowestOperationsJson=%s "
+                    "persistenceOperationTimingJson=%s",
                     _timing_report["cycle_id"], _timing_report["stage2_wall_clock_ms"],
                     _timing_report["max_concurrent_mandatory_investigations"], _timing_report["tracked_operation_count"],
                     _timing_report["dropped_operation_count"], _timing_report["aggregate_pdf_queue_wait_ms"],
                     _timing_report["aggregate_provider_wait_ms"], _timing_report["aggregate_persistence_wait_ms"],
+                    # Area 2 production-validation gap: this value was already
+                    # computed by cycle_timing (record_single_flight_wait_elapsed
+                    # -> _cycle_single_flight_wait_ms -> report()'s
+                    # aggregate_single_flight_wait_ms) but never included in this
+                    # log line, so the overlap-aware runtime_ensure fix had no
+                    # production-visible counter to confirm its impact by. Purely
+                    # additive: no new instrumentation, no runtime_ensure change.
+                    _timing_report["aggregate_single_flight_wait_ms"],
+                    # Issue 2 (CURRENT_NEWS 84-133s runtime_ensure latency):
+                    # search-provider HTTP time was previously invisible
+                    # (see _safe_search_get / record_search_provider_elapsed
+                    # in app.source_discovery) and folded entirely into
+                    # other_unattributed_ms. Purely additive: no behavior
+                    # change, no new provider calls, no retry/concurrency
+                    # change.
+                    _timing_report["aggregate_search_provider_ms"],
+                    _timing_report["aggregate_current_news_throttle_ms"],
+                    # Turn-7 diagnostics-only pass: time spent awaiting
+                    # this instrument's keyed entry in
+                    # Repository._news_worker_locks before acquire_news()
+                    # starts (see record_news_worker_lock_wait_elapsed in
+                    # app.cycle_timing and refresh_news_intelligence in
+                    # app.repository). Now isolates same-instrument
+                    # queueing only -- the lock was changed from
+                    # process-wide to per-instrument-keyed (Issue 1 fix),
+                    # so unrelated candidates no longer serialize here.
+                    _timing_report["aggregate_news_worker_lock_wait_ms"],
                     json.dumps(_timing_report["slowest_operations"]),
                     json.dumps(_timing_report["persistence_operation_timing"]),
                 )
@@ -1439,6 +1551,29 @@ class GlobalOpportunityOrchestrator:
                 continue
 
             candidate = stage_by_id.get(key, screening_by_id[key])
+
+            if self.acquisition_enabled:
+                if key in rules and key in by_id:
+                    review_evidence[str(key)] = self._evidence_state(by_id[key], rules[key], public_analyst_by_id.get(key))
+                    continue
+                # A deferred prior recommendation may still need price lifecycle
+                # handling. Supply durable technical observations only; never run
+                # rules, restore a previous score, or put it into ranked entries.
+                review_scan = type("ScanResult", (), {"candidates": [candidate], "as_of": evaluation_at})()
+                try:
+                    enriched_reviews = await self._run_blocking(scanner.enrich_candidates,
+                        review_scan, sector_contexts=dict(sector_contexts or {}), include_unready=True)
+                except Exception:
+                    # Unavailable persisted observations cannot become a price.
+                    enriched_reviews = []
+                if enriched_reviews:
+                    enriched = enriched_reviews[0]
+                    review_evidence[str(key)] = {
+                        "technical": self._technical_evidence(enriched.technical_feature_snapshot),
+                        "sector": {"sector_score": enriched.sector_relative_strength_snapshot.relative_strength_score,
+                                   "sector_state": enriched.sector_relative_strength_snapshot.sector_state},
+                    }
+                continue
 
             if key in rules:
                 result = rules[key]
@@ -1522,9 +1657,8 @@ class GlobalOpportunityOrchestrator:
                 ))
 
         # Build final ranking over every analyzed candidate (shortlist deep
-        # evaluations + prior-recommendation reviews). In Radar V2 shortlist_limit
-        # sets investigation priority only; it never caps the published qualifying
-        # set. top_n is None in production (unbounded): ALL rank-eligible entries
+        # evaluations + prior-recommendation reviews). shortlist_limit bounds
+        # acquisition, not publication. top_n is None in production: ALL rank-eligible entries
         # round-trip into ranking.top_n in global rank order. A bounded integer
         # top_n is a legacy/test knob only that truncates ranking.top_n to its
         # first N rank-eligible entries. Every analyzed candidate also
@@ -1580,7 +1714,7 @@ class GlobalOpportunityOrchestrator:
             sum(1 for d in diagnostics if d.status == "SUPPRESSED"), len(eligible_ids),
             deep_technical_failure_count, deep_repair_attempted_count, deep_repair_recovered_count,
         )
-        logger.info("stage2_disposition_counts correlationId=%s shortlist=%d baseline_failed=%d suppressed=%d diagnostics=%d",
+        logger.info("stage2_disposition_counts correlationId=%s shortlist=%d baseline_incomplete=%d suppressed=%d diagnostics=%d",
                     correlation_id, len(shortlist), baseline_incomplete_count,
                     sum(1 for d in diagnostics if d.status == "SUPPRESSED"), len(diagnostics))
 
@@ -1598,6 +1732,12 @@ class GlobalOpportunityOrchestrator:
             baseline_ready_count=baseline_ready_count,
             baseline_acquisition_needed_count=baseline_acquisition_needed_count,
             baseline_incomplete_count=baseline_incomplete_count,
+            baseline_evaluated_count=baseline_evaluated_count,
+            acquisition_admitted_count=acquisition_admitted_count,
+            acquisition_deferred_count=acquisition_deferred_count,
+            baseline_acquisition_attempted_count=baseline_acquisition_attempted_count,
+            baseline_acquisition_timeout_count=baseline_acquisition_timeout_count,
+            baseline_acquisition_failed_count=baseline_acquisition_failed_count,
             preliminary_eligible_count=preliminary_eligible_count,
             deep_pool_eligible_count=deep_pool_eligible_count,
             deep_candidate_count=deep_candidate_count,

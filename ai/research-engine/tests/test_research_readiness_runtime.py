@@ -699,6 +699,94 @@ async def test_concurrent_same_instrument_ensure_reuses_single_flight() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disjoint_requirement_groups_for_same_instrument_run_concurrently() -> None:
+    """Area 2 / runtime_ensure bottleneck root cause: ResearchReadinessRuntime
+    used to key its single-flight join purely on the instrument, so an
+    ensure() call for one requirement group (e.g. a mandatory
+    BUSINESS_QUALITY_FACTS-style group) would block ANY concurrently issued
+    ensure() for a totally disjoint requirement on the SAME instrument (e.g.
+    CURRENT_NEWS, which deep_investigation.investigate deliberately runs
+    concurrently with the mandatory loop -- see _acquire_news_in_background)
+    until the unrelated flight finished entirely. That is exactly why
+    CURRENT_NEWS's own runtime_ensure_elapsed_ms tracked almost the whole
+    investigation's wall time in production. The join must now be scoped to
+    actual requirement-id overlap: a disjoint call must start its own
+    acquisition immediately, without waiting on an unrelated in-flight one."""
+    source = StateDataSource({"CURRENT_NEWS", "SHAREHOLDING"})
+    executor = UpdatingExecutor(source)
+    executor.release = asyncio.Event()
+    runtime = _runtime(source, executor)
+
+    first = asyncio.create_task(runtime.ensure(
+        INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["CURRENT_NEWS"]
+    ))
+    await executor.started.wait()
+    assert executor.primary_calls == [{"CURRENT_NEWS"}]
+
+    second = asyncio.create_task(runtime.ensure(
+        INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["SHAREHOLDING"]
+    ))
+    # The disjoint second call must reach its own execute_primary and block
+    # there (on the SAME shared release event) rather than being stuck
+    # waiting on the first call's single-flight task before ever starting.
+    for _ in range(50):
+        if len(executor.primary_calls) == 2:
+            break
+        await asyncio.sleep(0)
+    assert executor.primary_calls == [{"CURRENT_NEWS"}, {"SHAREHOLDING"}]
+
+    executor.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.planned_requirement_ids == ("CURRENT_NEWS",)
+    assert second_result.planned_requirement_ids == ("SHAREHOLDING",)
+    # Neither call joined the other's flight -- both ran their own.
+    assert first_result.reused_single_flight is False
+    assert second_result.reused_single_flight is False
+    assert runtime._flights == {}
+
+
+@pytest.mark.asyncio
+async def test_partially_overlapping_requirement_groups_only_wait_on_the_overlap() -> None:
+    """A follower requesting a MIX of one requirement already owned by an
+    in-flight group and one entirely disjoint requirement must still join
+    (and subtract the already-attempted id from) the overlapping flight --
+    the overlap-scoped fix must not regress the pre-existing exact-overlap
+    join behavior into "never join."""
+    source = StateDataSource({"CURRENT_NEWS", "SHAREHOLDING"})
+    executor = UpdatingExecutor(source)
+    executor.release = asyncio.Event()
+    runtime = _runtime(source, executor)
+
+    first = asyncio.create_task(runtime.ensure(
+        INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["CURRENT_NEWS"]
+    ))
+    await executor.started.wait()
+    assert executor.primary_calls == [{"CURRENT_NEWS"}]
+
+    second = asyncio.create_task(runtime.ensure(
+        INSTRUMENT_ID, jurisdiction="INDIA",
+        requirement_ids=["CURRENT_NEWS", "SHAREHOLDING"],
+    ))
+    await asyncio.sleep(0)
+    # The overlapping portion (CURRENT_NEWS) is genuinely shared: the
+    # follower shield-waits on the owner's flight for that id before its own
+    # (disjoint) SHAREHOLDING remainder can be dispatched -- releasing here
+    # lets the owner's flight (and, in turn, the follower's join) complete.
+    executor.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    # The follower's own fresh acquisition only covers SHAREHOLDING -- the
+    # CURRENT_NEWS portion was served entirely by joining the first call's
+    # flight, exactly as the single-overlap join already did before this fix.
+    assert executor.primary_calls == [{"CURRENT_NEWS"}, {"SHAREHOLDING"}]
+
+    assert first_result.reused_single_flight is False
+    assert second_result.reused_single_flight is False
+    assert set(second_result.planned_requirement_ids) == {"CURRENT_NEWS", "SHAREHOLDING"}
+    assert runtime._flights == {}
+
+
+@pytest.mark.asyncio
 async def test_orchestration_wait_expiry_does_not_duplicate_scheduling() -> None:
     """Stage2 Final Fix -- Item 5: correlate orchestration_wait_expired with
     duplicate scheduling, without changing the 25s timeout itself.
@@ -1656,11 +1744,18 @@ def test_market_session_data_reuse_within_cycle(tmp_path) -> None:
     assert frozenset({"XNSE"}) in repository._market_session_cache
 
 
-def test_market_session_data_cache_cleared_on_write(tmp_path) -> None:
-    """A persistence write (e.g. record_acquisition_observation) must invalidate
-    the market-session cache so schedule data is never served stale across a
-    mutation boundary. The cache must be empty after the write, forcing a
-    reload on the next market_session_data call."""
+def test_market_session_data_cache_survives_unrelated_writes(tmp_path) -> None:
+    """Area 3 fix: a persistence write that cannot possibly touch the
+    market_schedules / market_trading_calendar_exceptions tables (e.g.
+    record_acquisition_observation -- grep of app/persistence.py confirms no
+    upsert/insert/delete path exists for those two tables at all) must NOT
+    invalidate the market-session cache. Previously ANY write cleared it,
+    which is exactly why load_market_schedules/load_market_calendar_exceptions
+    were observed ~598 times in a single Radar cycle despite this cache
+    already existing -- upsert_market_price_observation alone (~3944 calls/
+    cycle) was wiping it almost continuously. The readiness mutation
+    generation (which gates the SEPARATE evidence-only readiness cache) must
+    still bump on every write, unaffected by this narrowing."""
     persistence = SqliteResearchPersistence(tmp_path / "sched-write.sqlite")
     repository = ResearchRepository(
         settings=Settings(research_demo_enabled=False), persistence=persistence
@@ -1681,15 +1776,76 @@ def test_market_session_data_cache_cleared_on_write(tmp_path) -> None:
             NOW,
         )
     )
-    assert len(repository._market_session_cache) == 0  # invalidated by the write
+    assert len(repository._market_session_cache) == 1  # survives an unrelated write
+    assert repository._readiness_mutation_generation == 1  # still bumped
+
+
+def test_market_session_data_cache_invalidated_by_schedule_relevant_write(tmp_path) -> None:
+    """Safety net for the Area 3 narrowing above: a write whose operation name
+    actually matches a market-schedule/calendar-exception mutation (none
+    exists in this codebase today, but _is_market_session_cache_invalidating_write
+    exists precisely so one could be added safely later) still invalidates the
+    cache -- this proves the narrowing never lets a genuinely schedule-relevant
+    write serve a stale cached snapshot across the mutation boundary."""
+    persistence = SqliteResearchPersistence(tmp_path / "sched-relevant.sqlite")
+    repository = ResearchRepository(
+        settings=Settings(research_demo_enabled=False), persistence=persistence
+    )
+    repository._market_session_cache.clear()
+    profile = _profile(uuid4())
+    repository.profiles.append(profile)
+
+    _run_market_session_sync(repository, {"XNSE"})  # populates cache
+    assert len(repository._market_session_cache) == 1
+
+    def upsert_market_schedule(*_args, **_kwargs):
+        return None
+
+    _run_sync(repository._run_blocking_persistence(upsert_market_schedule))
+    assert len(repository._market_session_cache) == 0  # invalidated
     assert repository._readiness_mutation_generation == 1
 
 
+def test_market_session_data_cache_expires_after_ttl(tmp_path, monkeypatch) -> None:
+    """The narrowed-invalidation market-session cache has no write-driven
+    reset left for ordinary cycle traffic, and ResearchRepository outlives a
+    single Radar cycle -- so it must not serve schedule/calendar data
+    indefinitely stale. A bounded TTL re-reads reference data periodically
+    without reintroducing broad per-write invalidation."""
+    persistence = SqliteResearchPersistence(tmp_path / "sched-ttl.sqlite")
+    repository = ResearchRepository(
+        settings=Settings(research_demo_enabled=False), persistence=persistence
+    )
+    repository._market_session_cache.clear()
+    profile = _profile(uuid4())
+    repository.profiles.append(profile)
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        "app.repository.time.monotonic", lambda: clock["now"]
+    )
+
+    _run_market_session_sync(repository, {"XNSE"})  # populates cache at t=1000
+    assert len(repository._market_session_cache) == 1
+
+    # Still within the TTL window: the cached tuple is reused as-is.
+    clock["now"] = 1000.0 + repository._MARKET_SESSION_CACHE_TTL_SECONDS - 1
+    cached_entry = repository._market_session_cache[frozenset({"XNSE"})]
+    _run_market_session_sync(repository, {"XNSE"})
+    assert repository._market_session_cache[frozenset({"XNSE"})] is cached_entry
+
+    # Past the TTL: the next call must reload (new cache-entry timestamp),
+    # proving the cache does not serve stale reference data indefinitely.
+    clock["now"] = 1000.0 + repository._MARKET_SESSION_CACHE_TTL_SECONDS + 1
+    _run_market_session_sync(repository, {"XNSE"})
+    assert repository._market_session_cache[frozenset({"XNSE"})] is not cached_entry
+
+
 def test_market_session_data_does_not_leak_across_instruments(tmp_path) -> None:
-    """A persistence write for instrument A must invalidate the global
-    market-session cache so instrument B cannot observe schedule data cached
+    """A schedule-relevant persistence write invalidates the global
+    market-session cache so no instrument can observe schedule data cached
     before the mutation boundary. This proves the cache cannot leak a stale
-    schedule snapshot across an unsafe (write) boundary."""
+    schedule snapshot across an unsafe (schedule-write) boundary."""
     persistence = SqliteResearchPersistence(tmp_path / "sched-leak.sqlite")
     repository = ResearchRepository(
         settings=Settings(research_demo_enabled=False), persistence=persistence
@@ -1703,16 +1859,10 @@ def test_market_session_data_does_not_leak_across_instruments(tmp_path) -> None:
     cached_before = _run_market_session_sync(repository, {"XNSE"})
     assert len(repository._market_session_cache) == 1
 
-    # A write for instrument A invalidates the global schedule cache.
-    _run_sync(
-        repository.record_acquisition_observation(
-            profile_a.instrument_id,
-            "CURRENT_NEWS",
-            "READINESS_EXECUTOR",
-            "COMPLETED",
-            NOW,
-        )
-    )
+    def upsert_market_schedule(*_args, **_kwargs):
+        return None
+
+    _run_sync(repository._run_blocking_persistence(upsert_market_schedule))
     assert len(repository._market_session_cache) == 0
 
     # The next load for B is fresh (re-queried from storage), not the pre-write

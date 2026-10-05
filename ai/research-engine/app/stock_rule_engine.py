@@ -1072,7 +1072,16 @@ class StockRuleEngineV1:
                     change = current.percentage - previous.percentage
                     datum = _shareholding_datum(latest, change, name, extra_snapshot=snapshots[-2])
                     metrics.append((_metric_result(name, datum, _higher_better(change, ((-5, 15), (-2, 35), (0, 55), (2, 75), (5, 92))), f"{name}_QUARTERLY_V1", "PERCENTAGE_POINTS"), weight))
-        return self._finish(value, RuleEngineArea.SHAREHOLDING, metrics, [] if metrics else ["STRUCTURED_OWNERSHIP_VALUES"])
+        return self._finish(
+            value, RuleEngineArea.SHAREHOLDING, metrics,
+            # Stage-2 follow-up: reconciled with readiness's own mandatory-input
+            # vocabulary (app.research_readiness's SHAREHOLDING requirement, gated
+            # by app.research_applicability.shareholding_scorable_ownership_
+            # coverage()) so a reported missing input always names the SAME
+            # identifier on both sides -- never a second, unrelated string
+            # ("STRUCTURED_OWNERSHIP_VALUES") that readiness has no concept of.
+            [] if metrics else ["PROMOTER_INSTITUTIONAL_PUBLIC_CATEGORIES"],
+        )
 
     def _governance(self, value: StockRuleEngineInput) -> AreaScoreResult:
         events = [event for event in value.events if _governance_event(event)]

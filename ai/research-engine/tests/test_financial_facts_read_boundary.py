@@ -85,6 +85,12 @@ def _ingest_nse_financial_results(
         reliability=ReliabilityLevel.LEVEL_A,
         source_mode=SourceMode.REAL,
         source_classification=SourceClassification.EXCHANGE,
+        # DI-20E: a generic fixture ingestion alone does not confer NSE
+        # authority. These helpers model the verified NSE-official filing feed,
+        # so they MUST tag the document as such for nse_authority_rejection()
+        # to treat it as authoritative evidence (discovery_provider is the
+        # required authenticity tag, not a mere discovery-path label).
+        discovery_provider="NSE_OFFICIAL_API",
         expected_profile=profile,
     )
 

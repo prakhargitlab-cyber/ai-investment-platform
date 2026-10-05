@@ -75,6 +75,29 @@ class RequirementTimingRecord:
     # provider_elapsed_ms nor network_elapsed_ms above ever captured them.
     mapping_resolution_elapsed_ms: float = 0.0
     discovery_elapsed_ms: float = 0.0
+    # SEARCH_PROVIDER: CURRENT_NEWS search providers (Brave/Google/Searxng-
+    # compatible, app.source_discovery) share one HTTP chokepoint,
+    # _safe_search_get -- but, like MAPPING_RESOLUTION/DISCOVERY before
+    # Slice 6, that chokepoint used a raw httpx client never wired into
+    # this module, so this time was previously unattributed.
+    search_provider_elapsed_ms: float = 0.0
+    # CURRENT_NEWS_THROTTLE: the inter-query politeness/backoff sleep in
+    # app.news_acquisition.acquire_news (paces consecutive search-provider
+    # queries using market_data_population_request_interval_seconds -- a
+    # setting owned by the unrelated India market-data population job,
+    # reused here as a stand-in). Genuinely intentional, kept unchanged;
+    # timed so it no longer folds into other_unattributed_ms.
+    current_news_throttle_elapsed_ms: float = 0.0
+    # Time spent AWAITING acquisition of this instrument's per-instrument
+    # Repository._news_worker_locks[instrument_id] entry in
+    # refresh_news_intelligence(), before acquire_news() even starts.
+    # Originally a single process-wide lock serialized ALL CURRENT_NEWS
+    # work across every candidate (proven in production: ~388s aggregate
+    # wait in one cycle); it is now keyed per instrument_id so unrelated
+    # candidates run concurrently, and this field now isolates genuine
+    # same-instrument queueing (two overlapping refreshes for the SAME
+    # instrument) instead.
+    news_worker_lock_wait_ms: float = 0.0
     # READINESS_LOAD: the initial runtime.read() at the top of
     # deep_investigation.investigate(), which runs BEFORE any per-requirement
     # span exists (see cycle-level _cycle_readiness_load_ms below for the
@@ -129,6 +152,9 @@ class RequirementTimingRecord:
             "network_elapsed_ms": self.network_elapsed_ms,
             "mapping_resolution_elapsed_ms": self.mapping_resolution_elapsed_ms,
             "discovery_elapsed_ms": self.discovery_elapsed_ms,
+            "search_provider_elapsed_ms": self.search_provider_elapsed_ms,
+            "current_news_throttle_elapsed_ms": self.current_news_throttle_elapsed_ms,
+            "news_worker_lock_wait_ms": self.news_worker_lock_wait_ms,
             "readiness_load_elapsed_ms": self.readiness_load_elapsed_ms,
             "final_readiness_reload_elapsed_ms": self.final_readiness_reload_elapsed_ms,
             "pdf_queue_wait_ms": self.pdf_queue_wait_ms,
@@ -157,6 +183,9 @@ class RequirementTimingRecord:
             self.provider_elapsed_ms + self.network_elapsed_ms
             + self.mapping_resolution_elapsed_ms + self.discovery_elapsed_ms
             + self.readiness_load_elapsed_ms + self.final_readiness_reload_elapsed_ms
+            + self.search_provider_elapsed_ms
+            + self.current_news_throttle_elapsed_ms
+            + self.news_worker_lock_wait_ms
             + self.pdf_queue_wait_ms
             + self.pdf_parse_elapsed_ms + self.persistence_wait_ms
             + self.persistence_elapsed_ms + self.retry_backoff_elapsed_ms
@@ -190,6 +219,9 @@ class CycleTimingRecorder:
         self._cycle_persistence_wait_ms = 0.0
         self._cycle_mapping_resolution_ms = 0.0
         self._cycle_discovery_ms = 0.0
+        self._cycle_search_provider_ms = 0.0
+        self._cycle_current_news_throttle_ms = 0.0
+        self._cycle_news_worker_lock_wait_ms = 0.0
         self._cycle_readiness_load_ms = 0.0
         self._cycle_final_readiness_reload_ms = 0.0
         self._cycle_planning_ms = 0.0
@@ -330,6 +362,9 @@ class CycleTimingRecorder:
             "aggregate_persistence_wait_ms": round(self._cycle_persistence_wait_ms, 3),
             "aggregate_mapping_resolution_ms": round(self._cycle_mapping_resolution_ms, 3),
             "aggregate_discovery_ms": round(self._cycle_discovery_ms, 3),
+            "aggregate_search_provider_ms": round(self._cycle_search_provider_ms, 3),
+            "aggregate_current_news_throttle_ms": round(self._cycle_current_news_throttle_ms, 3),
+            "aggregate_news_worker_lock_wait_ms": round(self._cycle_news_worker_lock_wait_ms, 3),
             "aggregate_readiness_load_ms": round(self._cycle_readiness_load_ms, 3),
             "aggregate_final_readiness_reload_ms": round(self._cycle_final_readiness_reload_ms, 3),
             "aggregate_planning_ms": round(self._cycle_planning_ms, 3),
@@ -473,6 +508,40 @@ def record_discovery_elapsed(ms: float | None) -> None:
     recorder = _current_recorder.get()
     if recorder is not None:
         recorder._add_cycle_aggregate("_cycle_discovery_ms", ms)
+
+
+def record_search_provider_elapsed(ms: float | None) -> None:
+    """CURRENT_NEWS search-provider HTTP time (_safe_search_get in
+    app.source_discovery) -- purely additive observability, same shape as
+    record_discovery_elapsed above. Added to identify how much of a
+    CURRENT_NEWS runtime_ensure span (previously absorbed into
+    other_unattributed_ms) is genuine external search-provider latency."""
+    _record("search_provider_elapsed_ms", ms)
+    recorder = _current_recorder.get()
+    if recorder is not None:
+        recorder._add_cycle_aggregate("_cycle_search_provider_ms", ms)
+
+
+def record_current_news_throttle_elapsed(ms: float | None) -> None:
+    """CURRENT_NEWS inter-query throttle sleep (app.news_acquisition.
+    acquire_news) -- purely additive observability. Intentional pacing is
+    kept unchanged; this only makes its wall-clock cost visible instead of
+    folding into other_unattributed_ms."""
+    _record("current_news_throttle_elapsed_ms", ms)
+    recorder = _current_recorder.get()
+    if recorder is not None:
+        recorder._add_cycle_aggregate("_cycle_current_news_throttle_ms", ms)
+
+
+def record_news_worker_lock_wait_elapsed(ms: float | None) -> None:
+    """Time spent awaiting the per-instrument entry in
+    Repository._news_worker_locks before acquire_news() starts -- purely
+    additive observability. Isolates same-instrument queueing now that
+    the lock is keyed per instrument_id rather than process-wide."""
+    _record("news_worker_lock_wait_ms", ms)
+    recorder = _current_recorder.get()
+    if recorder is not None:
+        recorder._add_cycle_aggregate("_cycle_news_worker_lock_wait_ms", ms)
 
 
 def record_readiness_load_elapsed(ms: float | None) -> None:

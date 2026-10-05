@@ -1008,7 +1008,7 @@ async def test_cancellation_vs_publication_race():
 
 _CANCEL_ADMIN_HEADERS = {
     'X-AIP-User-Id': 'test-admin', 'X-AIP-User-Issuer': 'test-issuer',
-    'X-AIP-User-Subject': 'test-admin',
+    'X-AIP-User-Subject': 'test-admin', 'X-AIP-User-Roles': 'ADMIN',
 }
 
 def _wire_cancel_contract_api(monkeypatch, store, worker):
@@ -1020,6 +1020,31 @@ def _wire_cancel_contract_api(monkeypatch, store, worker):
     # application lifespan, and this worker never launches a research runner.
     monkeypatch.setattr(worker, 'start', lambda: None)
     return main.app
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('roles', [None, 'USER'])
+async def test_cancel_endpoints_require_admin_header_without_query_override(monkeypatch, roles):
+    import httpx
+    store = SqliteResearchPersistence()
+    _, worker = _pod(store, None)
+    cycle_id = str(uuid4())
+    store.create_cycle_run(cycle_id, {'top_n': 4})
+    app = _wire_cancel_contract_api(monkeypatch, store, worker)
+    headers = {key: value for key, value in _CANCEL_ADMIN_HEADERS.items() if key != 'X-AIP-User-Roles'}
+    if roles is not None:
+        headers['X-AIP-User-Roles'] = roles
+    path = f'/api/v1/research/opportunities/cycles/{cycle_id}'
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test',
+                                    headers=headers) as client:
+            for method, suffix in [('DELETE', '/cancel'), ('POST', '/finalize-cancel')]:
+                response = await client.request(method, path + suffix, params={'x_aip_user_roles': 'ADMIN'})
+                assert response.status_code == 403
+        assert store.cycle_run(cycle_id)['status'] == 'ACCEPTED'
+    finally:
+        await worker.close()
+        store._connection.close()
 
 
 @pytest.mark.asyncio
@@ -1044,18 +1069,17 @@ async def test_cancel_contract_api_finalization_updates_status_and_coalescing(mo
         worker.queue.put_nowait(dict(job))
     app = _wire_cancel_contract_api(monkeypatch, store, worker)
     path = f'/api/v1/research/opportunities/cycles/{cycle_id}'
-    admin = {'x_aip_user_roles': 'ADMIN'}
     reader = None
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test',
                                      headers=_CANCEL_ADMIN_HEADERS) as client:
             initial = await client.get(path + '/status')
             assert initial.status_code == 200 and initial.json()['status'] == 'RUNNING'
-            requested = await client.delete(path + '/cancel', params=admin)
+            requested = await client.delete(path + '/cancel')
             assert requested.status_code == 200
             assert requested.json()['previous_status'] == 'RUNNING'
             assert requested.json()['status'] == 'CANCEL_REQUESTED'
-            repeated = await client.delete(path + '/cancel', params=admin)
+            repeated = await client.delete(path + '/cancel')
             assert repeated.json()['cancelled'] is True
             assert repeated.json()['previous_status'] == 'CANCEL_REQUESTED'
             assert (await client.get(path + '/status')).json()['status'] == 'CANCEL_REQUESTED'
@@ -1066,7 +1090,7 @@ async def test_cancel_contract_api_finalization_updates_status_and_coalescing(mo
             assert draining.json()['status'] == 'CANCEL_REQUESTED'
             assert store.active_cycle_run()['cycle_id'] == cycle_id
 
-            finalized = await client.post(path + '/finalize-cancel', params=admin)
+            finalized = await client.post(path + '/finalize-cancel')
             assert finalized.status_code == 200
             assert finalized.json() == {'cycle_id': cycle_id, 'transitioned': True, 'status': 'CANCELLED'}
             assert store.active_cycle_run() is None
@@ -1098,8 +1122,8 @@ async def test_cancel_contract_api_finalization_updates_status_and_coalescing(mo
             assert queued['cycle_id'] == replacement_id
 
             # Preserve the supported idempotent responses and the new slot.
-            assert (await client.delete(path + '/cancel', params=admin)).json()['status'] == 'CANCELLED'
-            repeated_finalize = await client.post(path + '/finalize-cancel', params=admin)
+            assert (await client.delete(path + '/cancel')).json()['status'] == 'CANCELLED'
+            repeated_finalize = await client.post(path + '/finalize-cancel')
             assert repeated_finalize.status_code == 409
             assert repeated_finalize.json()['detail'] == 'ALREADY_CANCELLED'
             assert reader.active_cycle_run()['cycle_id'] == replacement_id
@@ -1124,8 +1148,8 @@ async def test_cancel_contract_status_survives_missing_job_event(monkeypatch):
     path = f'/api/v1/research/opportunities/cycles/{cycle_id}'
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test',
                                  headers=_CANCEL_ADMIN_HEADERS) as client:
-        await client.delete(path + '/cancel', params={'x_aip_user_roles': 'ADMIN'})
-        finalized = await client.post(path + '/finalize-cancel', params={'x_aip_user_roles': 'ADMIN'})
+        await client.delete(path + '/cancel')
+        finalized = await client.post(path + '/finalize-cancel')
         assert finalized.json()['transitioned'] is True
         result = await client.get(path + '/status')
         assert result.status_code == 200 and result.json()['status'] == 'CANCELLED'

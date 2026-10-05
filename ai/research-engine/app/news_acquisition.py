@@ -1,9 +1,11 @@
 """Explicit bounded news worker. Never imported/called by ranking or GET flows."""
 import asyncio
+import time
 from datetime import datetime, timezone, timedelta
 from uuid import NAMESPACE_URL, uuid5
 from urllib.parse import urlparse
 from app.business_exposure import BusinessEvidence, SourceReference, extract_profile, query_plan
+from app import cycle_timing
 from app.news_intelligence import ProviderOutcome, aggregate_search, extract_impacts
 from app.source_discovery import SearchDateWindow, CandidateSearchResult, _candidate_rank, classify_source, reliability_for_classification, source_type_for_classification
 from app.normalization import canonicalize_url, content_hash, extract_text, extract_published_at
@@ -204,7 +206,20 @@ async def acquire_news(repository, company, *, providers, industry=None, now=Non
                 # through every remaining query -- only the amount of wasted
                 # work against an already-proven-unresponsive provider changes.
                 break
-            await sleep(repository.settings.market_data_population_request_interval_seconds)
+            if query_index + 1 < len(plan):
+                # Issue 2 (CURRENT_NEWS 60-84s latency): the prior
+                # unconditional sleep here paced the NEXT query -- after
+                # the LAST query in `plan` there is no next query to pace,
+                # so that final sleep was pure waste, uncounted anywhere
+                # (cycle_timing has no span for it), folding straight into
+                # other_unattributed_ms. The remaining, genuinely-paced
+                # sleeps are intentional (politeness/backoff protection for
+                # the search provider -- see _MAX_CONSECUTIVE_DEGRADED_QUERIES
+                # above) and are kept unchanged, just timed so they no
+                # longer read as unattributed.
+                _throttle_started = time.monotonic()
+                await sleep(repository.settings.market_data_population_request_interval_seconds)
+                cycle_timing.record_current_news_throttle_elapsed((time.monotonic() - _throttle_started) * 1000)
         failed=bool(codes)
         state=('PARTIAL' if failed else 'SUCCESS_WITH_RESULTS' if count else 'SUCCESS_EMPTY') if completed else 'FAILED'
         outcomes.append(ProviderOutcome(provider=provider.provider_name,outcome=state,candidate_count=count,

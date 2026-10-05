@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 _parse_datetime = datetime.fromisoformat
 from uuid import uuid4, UUID
 from copy import deepcopy
-from app.global_opportunity_orchestration import GlobalOpportunityOrchestrator
+from app.global_opportunity_orchestration import GlobalOpportunityOrchestrator, DEFAULT_DEEP_LIMIT
 from app.recommendation_engine import RecommendationEngineV1, lifecycle, area_scores, digest
 
 
@@ -195,17 +195,14 @@ async def _blocking(repository, operation, *args, **kwargs):
     return operation(*args, **kwargs)
 
 
-async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4, shortlist_limit=25,
+async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4, shortlist_limit=DEFAULT_DEEP_LIMIT,
                                        candidate_ids=None, identity_headers=None, readiness_runtime=None,
                                        correlation_id=None, cycle_id=None, checkpoint=None):
-    # Production contract: candidate_ids=None means "process the complete
-    # applicable deep-research universe", so shortlist_limit (a bounded
-    # working-set size meant for controlled/manual validation runs only) must
-    # never truncate it -- regardless of what value the caller passed.
-    # Controlled cycles (an explicit candidate_ids list) keep their requested
-    # bound unchanged. GlobalOpportunityOrchestrator.run treats
-    # shortlist_limit=None as unbounded (see its docstring/validation).
-    effective_shortlist_limit = shortlist_limit if candidate_ids is not None else None
+    # Baseline evaluation always covers the eligible universe. Only expensive
+    # deep investigation is bounded. Old scheduler jobs persisted None; apply
+    # the existing request default to those production jobs as well.
+    effective_shortlist_limit = (DEFAULT_DEEP_LIMIT if candidate_ids is None and shortlist_limit is None
+                                 else shortlist_limit)
     # cycle_id/checkpoint: a resumable production cycle keeps ONE stable
     # cycle_id across worker restarts (app/cycle_checkpoint.py). Controlled
     # (candidate_ids) cycles never carry a checkpoint.

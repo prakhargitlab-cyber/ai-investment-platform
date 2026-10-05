@@ -4,7 +4,6 @@ import logging
 import re
 import asyncio
 import time
-from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
@@ -18,6 +17,7 @@ import yfinance as yf
 from app import cycle_timing
 from app.models import ProvenancedValue, StructuredInstrumentResolution, StructuredMarketSnapshot
 from app.settings import Settings
+from app.yahoo_ticker_context import YahooTickerContexts
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,19 @@ class StructuredResearchProvider(Protocol):
 
     async def collect(self, instrument: dict[str, Any]) -> StructuredMarketSnapshot:
         ...
+
+
+class StructuredClassProvider(Protocol):
+    """Optional acquisition seam for verified providers with separate APIs.
+
+    Return only acquired fields with their original provenance/timestamps;
+    orchestration merges them without refreshing omitted classes. Existing
+    bundled Yahoo providers continue using collect/collect_baseline.
+    """
+    provider_name: str
+
+    async def collect_classes(self, instrument: dict[str, Any], classes: frozenset[str],
+                              *, acquisition_context: object | None = None) -> StructuredMarketSnapshot: ...
 
 
 class YahooFinanceProvider:
@@ -54,22 +67,10 @@ class YahooFinanceProvider:
         )
         self._cache: dict[str, tuple[datetime, StructuredMarketSnapshot]] = {}
         self.ticker_factory = ticker_factory or yf.Ticker
+        self.ticker_contexts = YahooTickerContexts(self.ticker_factory)
         self.use_yfinance = client is None or ticker_factory is not None
-        # Explicit, caller-scoped same-cycle ticker reuse (Item 2): keyed by
-        # the caller-supplied `acquisition_context` (never a time window --
-        # a prior time-based attempt broke independent-retry freshness
-        # contracts in test_baseline_market_reuse.py). Each context holds,
-        # per ticker, either the live yf.Ticker instance already used in
-        # that context (so yfinance's own per-instance property caching
-        # transparently reuses .info/.news/statement fetches for a second
-        # call with the SAME context+ticker) or a recorded ("FAILED", exc)
-        # marker so a repeat failure in the same context is reraised
-        # without a second network attempt. Absent/None context => untouched
-        # original behavior (a fresh ticker_factory() call every time).
-        # Bounded like the discovery module's own per-symbol row cache so a
-        # long-lived process does not accumulate unbounded context entries.
-        self._context_tickers: "OrderedDict[object, dict[str, Any]]" = OrderedDict()
-        self._context_tickers_max = 64
+        # The shared pool serializes access to each mutable ticker and bounds
+        # retention. No context means no reuse; new contexts always retry.
 
     async def collect(self, instrument: dict[str, Any], *, acquisition_context: object | None = None) -> StructuredMarketSnapshot:
         return await self._collect(instrument, acquisition_context=acquisition_context)
@@ -90,6 +91,7 @@ class YahooFinanceProvider:
         cached = self._cache.get(cache_key)
         now = datetime.now(timezone.utc)
         if not baseline_only and cached and cached[0] > now:
+            logger.info("radar_acquisition_count operation=yahoo_structured_reuse source=CACHE count=1")
             return cached[1]
         durable_ticker = _clean_identity(instrument.get("structuredProviderTicker"))
         durable_status = str(instrument.get("structuredProviderStatus") or "").upper()
@@ -259,52 +261,26 @@ class YahooFinanceProvider:
             raise StructuredProviderError("COMPANY_NOT_RESOLVED")
         return await self._collect_resolved(resolution)
 
-    def _context_ticker_slot(self, acquisition_context: object) -> dict[str, Any]:
-        slot = self._context_tickers.get(acquisition_context)
-        if slot is None:
-            slot = {}
-            self._context_tickers[acquisition_context] = slot
-        self._context_tickers.move_to_end(acquisition_context)
-        while len(self._context_tickers) > self._context_tickers_max:
-            self._context_tickers.popitem(last=False)
-        return slot
-
     def _collect_resolved_yfinance(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False,
                                     acquisition_context: object | None = None) -> StructuredMarketSnapshot:
+        with self.ticker_contexts.acquire(resolution.provider_ticker, acquisition_context) as access:
+            if access.structured_failure:
+                raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{access.structured_failure}")
+            try:
+                return self._collect_ticker(resolution, access, baseline_only=baseline_only)
+            except Exception as exc:
+                access.structured_failure = type(exc).__name__
+                if isinstance(exc, StructuredProviderError):
+                    raise
+                raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{type(exc).__name__}") from exc
+
+    def _collect_ticker(self, resolution, access, *, baseline_only=False):
         ticker = resolution.provider_ticker
         retrieved = datetime.now(timezone.utc)
-        slot = self._context_ticker_slot(acquisition_context) if acquisition_context is not None else None
-        if slot is not None:
-            cached_state = slot.get(ticker)
-            if isinstance(cached_state, tuple) and cached_state[0] == "FAILED":
-                # Same-context, same-ticker: a prior attempt in this exact
-                # candidate/cycle already failed. Reuse that outcome instead
-                # of hitting finance.yahoo.com again -- bounded strictly to
-                # this context, never a permanent cache (a new context, i.e.
-                # a new candidate/cycle, always gets a fresh attempt).
-                raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{cached_state[1]}")
-        try:
-            # Reusing the SAME yf.Ticker instance for a second call with the
-            # identical (acquisition_context, ticker) lets yfinance's own
-            # per-instance property caching transparently satisfy .info/
-            # .news/statement access without a second network round trip --
-            # no manual field-level cache is needed, and a caller that still
-            # needs data this context hasn't fetched yet (e.g. baseline_only
-            # fetched .info but not .news) gets it fetched fresh exactly
-            # once, on the shared instance, visible to any later same-context
-            # call too.
-            provider = slot.get(ticker) if slot is not None and not isinstance(slot.get(ticker), tuple) else None
-            if provider is None:
-                provider = self.ticker_factory(ticker)
-            info = provider.info or {}
-            raw_news = [] if baseline_only else provider.news or []
-        except Exception as exc:
-            if slot is not None:
-                slot[ticker] = ("FAILED", type(exc).__name__)
-            raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{type(exc).__name__}") from exc
-        else:
-            if slot is not None:
-                slot[ticker] = provider
+        logger.info("radar_acquisition_count operation=%s source=CONTEXT count=1",
+                    "yahoo_structured_live_acquisition" if access._info is None else "yahoo_structured_reuse")
+        provider, info = access.ticker, access.info
+        raw_news = [] if baseline_only else provider.news or []
         if not isinstance(info, dict):
             raise StructuredProviderError("STRUCTURED_PROVIDER_UNAVAILABLE:INVALID_INFO")
         _validate_returned_identity(
@@ -358,6 +334,7 @@ class YahooFinanceProvider:
         )
 
     async def _collect_resolved_http(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False) -> StructuredMarketSnapshot:
+        logger.info("radar_acquisition_count operation=yahoo_structured_live_acquisition source=HTTP count=1")
         ticker = resolution.provider_ticker
         retrieved = datetime.now(timezone.utc)
         quote_payload: dict[str, Any] = {}

@@ -546,11 +546,17 @@ class YahooFinanceMcpProvider:
             "providerSymbol",
             "expectedExchange",
             "expectedCurrency",
+            "financialGapFill",
         }
         if set(arguments) - allowed:
             raise McpGatewayError(McpErrorCode.INVALID_ARGUMENT)
         region = str(arguments.get("region") or "").upper()
         requirement = str(arguments.get("requirementId") or "").upper()
+        financial_gap_fill = arguments.get("financialGapFill", False)
+        if not isinstance(financial_gap_fill, bool) or (financial_gap_fill and (
+                region != "INDIA" or requirement not in {
+                    "QUARTERLY_FINANCIALS", "GROWTH_FACTS", "BUSINESS_QUALITY_FACTS", "BALANCE_SHEET_FACTS"})):
+            raise McpGatewayError(McpErrorCode.INVALID_ARGUMENT)
         symbol = str(arguments.get("providerSymbol") or "").strip()
         global_instrument_id = str(arguments.get("globalInstrumentId") or "").strip()
         capability = self.capability_for(region=region, requirement_id=requirement)
@@ -592,7 +598,7 @@ class YahooFinanceMcpProvider:
             requirement=requirement,
             tool=tool,
         )
-        self._validate_completeness(normalized, capability)
+        self._validate_completeness(normalized, capability, financial_gap_fill=financial_gap_fill)
         return normalized
 
     async def _call(
@@ -830,11 +836,19 @@ class YahooFinanceMcpProvider:
 
     @staticmethod
     def _validate_completeness(
-        result: dict[str, Any], capability: ExternalMcpProviderCapability
+        result: dict[str, Any], capability: ExternalMcpProviderCapability, *, financial_gap_fill: bool = False
     ) -> None:
         requirement = capability.requirement_id
         structured = {item["metric"] for item in result["structuredFacts"]}
         financial = result["financialFacts"]
+        if financial_gap_fill:
+            # Identity, schema, capability and freshness have already passed.
+            # Research-engine filters these period/basis-labelled facts against
+            # post-NSE input gaps and proves readiness after persistence. This
+            # internal option is never sent to the external Yahoo tool.
+            if not financial:
+                raise McpGatewayError(McpErrorCode.EXTERNAL_RESULT_INCOMPLETE)
+            return
         metrics = {item["metric"] for item in financial}
         available = structured | metrics
         missing_configured = set(capability.required_fields) - available

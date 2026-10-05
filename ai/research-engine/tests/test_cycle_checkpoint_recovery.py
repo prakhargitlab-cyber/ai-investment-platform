@@ -377,6 +377,9 @@ async def test_crash_after_publication_completes_suggestions_exactly_once(world_
 async def test_live_owner_lease_blocks_second_worker_and_submissions_coalesce(world_factory, monkeypatch):
     world = world_factory(6)
     repo, _, runner = build_process(world, monkeypatch)
+    # Construct synchronous fixtures before starting a subsecond heartbeat;
+    # repository/client initialization must not block the live owner's loop.
+    repo2, _, runner2 = build_process(world, monkeypatch)
     gate = asyncio.Event()
     release = asyncio.Event()
 
@@ -387,7 +390,6 @@ async def test_live_owner_lease_blocks_second_worker_and_submissions_coalesce(wo
     first = OpportunityCycleWorker(repo, slow_runner, lease_seconds=0.3, poll_seconds=0.05)
     job = first.submit({"top_n": 4, "shortlist_limit": 100})
     await asyncio.wait_for(gate.wait(), 5)
-    repo2, _, runner2 = build_process(world, monkeypatch)
     second = OpportunityCycleWorker(repo2, runner2, lease_seconds=0.3, poll_seconds=0.05)
     second.start()
     coalesced = second.submit({"top_n": 4, "shortlist_limit": 100})

@@ -32,7 +32,7 @@ from app.settings import Settings
 from app.source_registry import registered_sources_for
 from app.structured_research import enrich_company_research, financial_statement_history_from_facts
 from app.structured_market import StructuredProviderError, StructuredResearchProvider, YahooFinanceProvider, _is_financial_identity
-from app.market_sessions import class_due, market_session_status, price_sync_eligible
+from app.market_sessions import class_due, market_session_status, price_sync_eligible, price_session_valid_until
 from app.international_fundamentals import InternationalFundamentalsResult, international_provider_for
 from app.sector_performance import belongs_to_region
 
@@ -589,7 +589,6 @@ class PortfolioResearchOrchestrator:
         records: list[StructuredMarketSnapshotRecord] | None = None,
         market_data=None,
         requested_classes: set[str] | None = None,
-        force_requested: bool = False,
         baseline_only: bool = False,
         acquisition_context: object | None = None,
     ) -> StructuredReconciliationOutcome:
@@ -611,10 +610,15 @@ class PortfolioResearchOrchestrator:
             unknown = requested - {"PRICE", "VALUATION", "FUNDAMENTALS", "ANALYST"}
             if unknown:
                 raise ValueError(f"UNKNOWN_STRUCTURED_DATA_CLASS:{','.join(sorted(unknown))}")
-            due = requested if force_requested else due & requested
+            due = _requested_structured_due_classes(
+                record, requested, self.settings, now, market, schedules, exceptions,
+                baseline_only=baseline_only)
         if not due:
+            logger.info("radar_acquisition_count operation=structured_durable_reuse provider=%s count=1",
+                        record.provider if record else "UNKNOWN")
             return StructuredReconciliationOutcome(record.snapshot if record else None, None, frozenset(), status)
         try:
+            collect_classes = getattr(self.structured_provider, "collect_classes", None)
             collect_baseline = getattr(self.structured_provider, "collect_baseline", None)
             # Item 2 (same-cycle Yahoo ticker reuse): only pass the explicit
             # acquisition context to a provider that actually declares it --
@@ -623,15 +627,18 @@ class PortfolioResearchOrchestrator:
             context_kwargs = (
                 {"acquisition_context": acquisition_context}
                 if acquisition_context is not None and _accepts_acquisition_context(
+                    collect_classes if callable(collect_classes) else
                     collect_baseline if baseline_only and callable(collect_baseline) else self.structured_provider.collect
                 )
                 else {}
             )
-            if baseline_only and callable(collect_baseline):
+            if callable(collect_classes):
+                snapshot = await collect_classes(instrument, frozenset(due), **context_kwargs)
+            elif baseline_only and callable(collect_baseline):
                 snapshot = await collect_baseline(instrument, **context_kwargs)
             else:
                 snapshot = await self.structured_provider.collect(instrument, **context_kwargs)
-            if baseline_only:
+            if baseline_only or callable(collect_classes):
                 previous = next((item for item in records
                     if item.provider == snapshot.resolution.provider
                     and item.provider_instrument_id == snapshot.resolution.provider_ticker), None)
@@ -669,7 +676,6 @@ class PortfolioResearchOrchestrator:
             self._instrument_for_registered_profile(instrument_id),
             requested_classes=requested_classes,
             acquisition_context=acquisition_context,
-            force_requested=True,
             baseline_only=baseline_only,
         )
 
@@ -1148,9 +1154,9 @@ class PortfolioResearchOrchestrator:
             source_url=snapshot.source_url, source_name=snapshot.source_name, source_type=snapshot.source_type,
             source_identity=snapshot.resolution.provider_ticker, market_as_of=snapshot.market_as_of, retrieved_at=snapshot.retrieved_at, persisted_at=now,
             last_price_at=snapshot.market_as_of if _positive_decimal_fact(facts.get("latestPrice")) is not None else None,
-            last_valuation_at=now if any(key in facts for key in ("trailingPE", "forwardPE", "priceToBook")) else None,
-            last_fundamentals_at=now if any(key in facts for key in ("trailingEPS", "roe", "roa", "roce")) else None,
-            last_analyst_at=now if any(key.startswith("publicAnalyst") for key in facts) else None,
+            last_valuation_at=snapshot.retrieved_at if any(key in facts for key in ("trailingPE", "forwardPE", "priceToBook")) else None,
+            last_fundamentals_at=snapshot.retrieved_at if any(key in facts for key in ("trailingEPS", "trailingEps", "roe", "roa", "roce", "sector", "industry")) else None,
+            last_analyst_at=snapshot.retrieved_at if any(key.startswith("publicAnalyst") for key in facts) else None,
             last_success_at=now, last_provider_attempt_at=now, acquisition_status="SUCCESS", snapshot=snapshot,
         )
         if previous is not None:
@@ -1163,8 +1169,8 @@ class PortfolioResearchOrchestrator:
             }) for key, value in previous.snapshot.facts.items() if key not in facts}
             merged = snapshot.model_copy(update={
                 "facts": {**retained, **facts},
-                "statement_facts": previous.snapshot.statement_facts,
-                "news": previous.snapshot.news,
+                "statement_facts": snapshot.statement_facts or previous.snapshot.statement_facts,
+                "news": snapshot.news or previous.snapshot.news,
             })
             record = record.model_copy(update={
                 "snapshot": merged,
@@ -1913,6 +1919,23 @@ def _global_master_instrument(payload: dict, global_instrument_id: UUID) -> dict
         instrument["ticker"] = instrument.get("nseSymbol") or instrument.get("bseSymbol")
     if not instrument["exchange"]:
         instrument["exchange"] = "NSE" if instrument.get("nseSymbol") else ("BSE" if instrument.get("bseSymbol") else None)
+    if not instrument["country"]:
+        # Same verified NSE/BSE trust signal already used two lines above
+        # for the exchange fallback -- a provider mapping that passed
+        # _trusted_mapping_for_provider() is the strictest identity bar
+        # this function has. Without this, register_global_profile_metadata
+        # (the Stage2/global-opportunity profile_hydrator, which calls
+        # _refresh_profile_from_global_instrument() -- NOT
+        # _hydrate_verified_exchange_mappings(), which only the portfolio-
+        # position _resolve_profile() path reaches) sets profile.country
+        # straight from instrument.get("country"), with no fallback at
+        # all, even when a VERIFIED NSE/BSE mapping is present. That left
+        # a real NSE/BSE equity permanently non-INDIA whenever the
+        # upstream country field was missing/blank, routing SHAREHOLDING
+        # into the generic Yahoo-first path instead of the INDIA-only
+        # NSE path. Mirrors the exchange fallback exactly: only fills a
+        # missing value, never overrides an existing one.
+        instrument["country"] = "IN" if instrument.get("nseSymbol") or instrument.get("bseSymbol") else None
     return instrument
 
 
@@ -1934,6 +1957,26 @@ def _hydrate_verified_exchange_mappings(profile: CompanyResearchProfile, instrum
     has_mapping_data = "providerMappings" in instrument
     if instrument.get("nseSymbol"):
         mappings["NSE"] = str(instrument["nseSymbol"])
+        # Identity-hydration fix: a VERIFIED NSE mapping is the exact same
+        # trust signal already gating mappings["NSE"] above -- the strictest
+        # identity bar this function has (see _trusted_nse_provider_mapping).
+        # jurisdiction_for_profile()/_baseline_jurisdiction() do not read
+        # provider_instrument_ids at all; they read profile.country/
+        # profile.exchange, which this function never touched. A profile
+        # reused via _resolve_profile() (every match branch returns
+        # _hydrate_verified_exchange_mappings(), never
+        # _refresh_profile_from_global_instrument()) could therefore keep
+        # whatever country/exchange it was first created with forever, even
+        # after a fresh cycle proves a VERIFIED NSE identity -- silently
+        # routing an actual NSE equity's INDIA-only capabilities (e.g.
+        # SHAREHOLDING's NSE_XBRL path) as a non-INDIA jurisdiction instead.
+        # Set them from the SAME verified signal, not a parallel ".NS"-
+        # suffix or other inference -- mirroring exactly what
+        # _refresh_profile_from_global_instrument already does for a
+        # freshly-registered profile (profile.exchange = .../profile.country
+        # = ...), just reached from the reuse path too.
+        profile.exchange = "NSE"
+        profile.country = "IN"
     elif has_mapping_data:
         mappings.pop("NSE", None)
     if instrument.get("bseSymbol"):
@@ -2159,6 +2202,47 @@ def _preferred_structured_record(records: list[StructuredMarketSnapshotRecord]) 
         or next((record for record in records if record.provider == "YAHOO_FINANCE"), None)
         or (records[0] if records else None)
     )
+
+
+def _requested_structured_due_classes(record, requested, settings, now, market, schedules, exceptions, *, baseline_only):
+    """Explicit readiness requests validate each class, not the last bundle success.
+
+    Automatic market scheduling remains unchanged. A requested missing/stale
+    quote can repair a gap after close, while a genuine close remains reusable
+    through the next session open. No failure or unrelated class resets a TTL.
+    """
+    if record is None or record.last_success_at is None:
+        return set(requested)
+    facts = record.snapshot.facts
+    due = set()
+    if "PRICE" in requested:
+        price = facts.get("latestPrice")
+        stamps = [stamp for stamp in (record.last_price_at, price.as_of_date if price else None,
+                                      record.snapshot.market_as_of) if stamp is not None]
+        stamp = min(stamps) if stamps else None
+        valid_until = price_session_valid_until(market, schedules, exceptions, stamp) if stamp else None
+        if (_positive_decimal_fact(price) is None or stamp is None or stamp > now
+                or (not (valid_until and stamp <= now < valid_until)
+                    and class_due(stamp, settings.structured_market_price_freshness_seconds, now))):
+            due.add("PRICE")
+    for name, keys, stamp, ttl in (
+        ("VALUATION", ("trailingPE", "forwardPE", "priceToBook"), record.last_valuation_at,
+         settings.structured_valuation_freshness_seconds),
+        ("FUNDAMENTALS", ("trailingEPS", "trailingEps", "roe", "roa", "roce", "sector", "industry"), record.last_fundamentals_at,
+         settings.structured_fundamentals_freshness_seconds),
+        ("ANALYST", tuple(key for key in facts if key.startswith("publicAnalyst")), record.last_analyst_at,
+         settings.structured_analyst_freshness_seconds),
+    ):
+        values = [facts[key] for key in keys if key in facts and facts[key].value is not None]
+        if name in requested and (not values or stamp is None or stamp > now or class_due(stamp, ttl, now)
+                or any((value.as_of_date or value.retrieved_at) > now
+                       or class_due(value.as_of_date or value.retrieved_at, ttl, now) for value in values)):
+            due.add(name)
+    # Baseline .info is not a statement-history acquisition. Allow the existing
+    # financial fallback to fill that gap using the same context's ticker.
+    if "FUNDAMENTALS" in requested and not baseline_only and not record.snapshot.statement_facts:
+        due.add("FUNDAMENTALS")
+    return due
 
 
 def _structured_due_classes(

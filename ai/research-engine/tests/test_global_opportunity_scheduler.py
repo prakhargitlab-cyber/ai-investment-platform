@@ -104,10 +104,8 @@ def test_category_h_hourly_submission_during_market_hours():
     params = worker.submissions[0]
     assert params["candidate_ids"] is None
     assert params["top_n"] == 4
-    # Production submission (candidate_ids=None) must never carry a
-    # finite shortlist cap -- the complete applicable deep-research
-    # universe is processed, not a bounded working set.
-    assert params["shortlist_limit"] is None
+    # Full baseline coverage is independent of the default expensive deep cap.
+    assert params["shortlist_limit"] == 25
 
 
 def test_category_h_uses_nse_market_hours_and_skips_when_closed():
@@ -371,10 +369,8 @@ def test_category_o_bootstrap_submits_when_no_snapshot_exists():
     params = worker.submissions[0]
     assert params["candidate_ids"] is None
     assert params["top_n"] == 4
-    # Production submission (candidate_ids=None) must never carry a
-    # finite shortlist cap -- the complete applicable deep-research
-    # universe is processed, not a bounded working set.
-    assert params["shortlist_limit"] is None
+    # Full baseline coverage is independent of the default expensive deep cap.
+    assert params["shortlist_limit"] == 25
 
 
 def test_category_o_bootstrap_skips_when_valid_production_snapshot_exists():

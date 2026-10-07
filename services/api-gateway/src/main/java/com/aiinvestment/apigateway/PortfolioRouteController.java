@@ -134,16 +134,34 @@ public class PortfolioRouteController {
     }
 
     @RequestMapping({"/api/v1/research/**", "/api/v1/research"})
-    public ResponseEntity<String> routeResearch(HttpServletRequest request) throws IOException {
+    public ResponseEntity<byte[]> routeResearch(HttpServletRequest request) throws IOException {
+        // Root cause (runtime defect closure): this route used to call the
+        // String-based forward(), which reads the raw request body via
+        // StreamUtils.copyToString(..., StandardCharsets.UTF_8). A
+        // multipart/form-data body carrying a binary file part (a pasted PNG
+        // screenshot, any image/PDF/DOCX upload) is not valid UTF-8 text, so
+        // that decode (and the re-encode back to bytes when RestClient sends
+        // the String body onward) corrupts exactly the byte sequences that
+        // are not valid UTF-8 -- producing bytes that are no longer the
+        // original PNG by the time research-engine's Pillow validation sees
+        // them ("cannot identify image file"). /api/v1/portfolios/** already
+        // avoids this by using the byte-preserving forwardBytes() for its own
+        // file-upload routes; /api/v1/research/** must use the same
+        // byte-exact path for ALL of its traffic (JSON bodies pass through
+        // forwardBytes unchanged too), not a multipart-only special case, so
+        // every evidence type that accepts a file (SHAREHOLDING, CURRENT_NEWS,
+        // and any future image/PDF/DOCX-backed evidence type) is fixed by this
+        // one change rather than a per-type workaround.
         try {
-            return forward(request, researchEngineBaseUrl, true);
+            return forwardBytes(request, researchEngineBaseUrl, true, restClient);
         } catch (ResourceAccessException exception) {
             if (!isTimeoutFailure(exception)) throw exception;
             logger.warn("RESEARCH_ENGINE_TIMEOUT path={} sanitizedMessage={}", request.getRequestURI(),
                     sanitizeDiagnosticMessage(exception.getMessage()));
             return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT)
                     .contentType(MediaType.APPLICATION_JSON)
-                    .body("{\"error\":\"Gateway Timeout\",\"code\":\"RESEARCH_ENGINE_TIMEOUT\"}");
+                    .body("{\"error\":\"Gateway Timeout\",\"code\":\"RESEARCH_ENGINE_TIMEOUT\"}"
+                            .getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -233,7 +251,17 @@ public class PortfolioRouteController {
         ResponseEntity<byte[]> response;
         try {
             response = client.method(HttpMethod.valueOf(request.getMethod()))
-                    .uri(target)
+                    // Root cause (query double-encoding regression):
+                    // RestClient#uri(String) treats a String as a URI
+                    // TEMPLATE and percent-encodes it, which double-encodes
+                    // a query string that is already percent-encoded (e.g.
+                    // "Alpha%20%26%20Beta" becomes "Alpha%2520%2526%2520Beta").
+                    // forward() already avoids this by pre-building a real
+                    // java.net.URI via URI.create(target) and passing THAT
+                    // (a URI is taken as-is, never re-encoded) -- apply the
+                    // same fix here so forwardBytes() preserves exact query
+                    // semantics too, for every route that uses it.
+                    .uri(java.net.URI.create(target))
                     .headers(outbound -> outbound.addAll(headers))
                     .body(body)
                     .exchange((clientRequest, clientResponse) -> {

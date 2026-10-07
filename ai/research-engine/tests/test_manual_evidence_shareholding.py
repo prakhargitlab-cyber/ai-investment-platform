@@ -150,7 +150,10 @@ class TestFileTypeDetection:
         # supported file types -- see test_image_evidence_manual_upload.py.
         assert detect_mime_type("scan.png", None) == "image/png"
         assert detect_mime_type("image.jpg", None) == "image/jpeg"
-        assert detect_mime_type("doc.docx", None) is None
+        # Superseded (reusable DocumentExtractor closure): DOCX now has a
+        # genuine native extraction path (python-docx), gated at the
+        # capability-advertisement layer exactly like PNG/JPG/OCR.
+        assert detect_mime_type("doc.docx", None) == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
     def test_detect_mime_type_by_content_type(self):
         assert detect_mime_type(None, "application/pdf") == "application/pdf"
@@ -166,7 +169,7 @@ class TestFileTypeDetection:
         assert is_supported_file_type("notes.txt", "text/plain") is True
         assert is_supported_file_type("scan.png", "image/png") is True
         assert is_supported_file_type("image.jpg", "image/jpeg") is True
-        assert is_supported_file_type("doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document") is False
+        assert is_supported_file_type("doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document") is True
         assert is_supported_file_type("doc.exe", None) is False
         assert is_supported_file_type("doc.xlsx", None) is False
 
@@ -176,7 +179,8 @@ class TestFileTypeDetection:
         assert "TXT" in SUPPORTED_FILE_TYPE_LABELS
         assert "PNG" in SUPPORTED_FILE_TYPE_LABELS
         assert "JPG" in SUPPORTED_FILE_TYPE_LABELS
-        assert set(SUPPORTED_FILE_TYPE_LABELS) == {"PDF", "CSV", "TXT", "PNG", "JPG"}
+        assert "DOCX" in SUPPORTED_FILE_TYPE_LABELS
+        assert set(SUPPORTED_FILE_TYPE_LABELS) == {"PDF", "CSV", "TXT", "PNG", "JPG", "DOCX"}
 
     def test_supported_evidence_types(self):
         # Generalized beyond the original SHAREHOLDING-only slice: CURRENT_NEWS
@@ -184,8 +188,12 @@ class TestFileTypeDetection:
         # requirements (BUSINESS_QUALITY_FACTS, GROWTH_FACTS, BALANCE_SHEET_FACTS,
         # QUARTERLY_FINANCIALS -- also manual-fields, see
         # test_manual_evidence_financial_facts.py) now have genuine accept
-        # paths too. VALUATION_INPUTS is deliberately excluded: see that
-        # file's module docstring and the final report for why.
+        # paths too. Superseded: VALUATION_INPUTS, LATEST_PRICE,
+        # HISTORICAL_PRICE_SERIES and SECTOR_MACRO are now ALSO supported
+        # (the authoritative product rule -- status != READY_FRESH => Upload
+        # Evidence must be offered, for every requirement -- supersedes the
+        # prior restriction; see each type's own validation/build/persist
+        # methods in app.manual_evidence and the final report).
         assert EvidenceType.SHAREHOLDING in SUPPORTED_EVIDENCE_TYPES
         assert EvidenceType.CURRENT_NEWS in SUPPORTED_EVIDENCE_TYPES
         assert EvidenceType.ORDER_BOOK_CAPEX_GUIDANCE in SUPPORTED_EVIDENCE_TYPES
@@ -194,7 +202,11 @@ class TestFileTypeDetection:
         assert EvidenceType.GROWTH_FACTS in SUPPORTED_EVIDENCE_TYPES
         assert EvidenceType.BALANCE_SHEET_FACTS in SUPPORTED_EVIDENCE_TYPES
         assert EvidenceType.QUARTERLY_FINANCIALS in SUPPORTED_EVIDENCE_TYPES
-        assert len(SUPPORTED_EVIDENCE_TYPES) == 8
+        assert EvidenceType.VALUATION_INPUTS in SUPPORTED_EVIDENCE_TYPES
+        assert EvidenceType.LATEST_PRICE in SUPPORTED_EVIDENCE_TYPES
+        assert EvidenceType.HISTORICAL_PRICE_SERIES in SUPPORTED_EVIDENCE_TYPES
+        assert EvidenceType.SECTOR_MACRO in SUPPORTED_EVIDENCE_TYPES
+        assert len(SUPPORTED_EVIDENCE_TYPES) == 12
 
     def test_file_types_endpoint_advertises_only_extractable_formats(self):
         from fastapi.testclient import TestClient
@@ -203,10 +215,11 @@ class TestFileTypeDetection:
         response = TestClient(app).get("/api/v1/research/evidence/file-types")
 
         assert response.status_code == 200
-        assert set(response.json()["supportedFileTypes"]) == {"CSV", "PDF", "TXT", "PNG", "JPG"}
+        assert set(response.json()["supportedFileTypes"]) == {"CSV", "PDF", "TXT", "PNG", "JPG", "DOCX"}
         assert set(response.json()["supportedEvidenceTypes"]) == {
             "SHAREHOLDING", "CURRENT_NEWS", "ORDER_BOOK_CAPEX_GUIDANCE", "GOVERNANCE_HISTORY",
             "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS",
+            "VALUATION_INPUTS", "LATEST_PRICE", "HISTORICAL_PRICE_SERIES", "SECTOR_MACRO",
         }
 
 
@@ -286,17 +299,22 @@ class TestEvidenceExtraction:
                 instrument_id=RELIANCE_ID,
             )
 
-    def test_docx_is_still_rejected_before_draft(self, ingestor):
-        """DOCX has no extraction path at all (see app.manual_evidence's
-        _extract_docx_text requiring python-docx, which is not installed);
-        unlike PNG/JPG (Defect 2 closure), it stays a hard UNSUPPORTED_FILE_TYPE."""
-        with pytest.raises(ValueError, match="UNSUPPORTED_FILE_TYPE"):
-            ingestor.ingest(
-                evidence_type="SHAREHOLDING",
-                file_bytes=b"not extractable by the supported pipeline",
-                filename="document.docx",
-                instrument_id=RELIANCE_ID,
-            )
+    def test_docx_now_creates_a_draft_via_native_extraction(self, ingestor):
+        """Superseded (reusable DocumentExtractor closure): DOCX now has a
+        genuine native extraction path (paragraphs + tables via
+        python-docx, installed in this environment -- see
+        app.document_extraction.docx_extraction_available()), so a DOCX
+        upload with no recognizable shareholding text produces an ordinary
+        invalid/no-values draft, the same outcome unrecognizable PNG/JPG
+        text produces, rather than a hard UNSUPPORTED_FILE_TYPE rejection."""
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=b"not extractable by the deterministic shareholding parser",
+            filename="document.docx",
+            instrument_id=RELIANCE_ID,
+        )
+        assert draft.status.value == "DRAFT"
+        assert draft.proposed_facts == []
 
     def test_png_jpg_now_create_a_draft_via_bounded_ocr_not_a_hard_rejection(self, ingestor):
         """Defect 2 closure: PNG/JPG are genuinely extractable now (bounded

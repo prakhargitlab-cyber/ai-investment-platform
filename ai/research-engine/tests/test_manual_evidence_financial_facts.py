@@ -139,12 +139,18 @@ def _quarterly_facts(q1: str, q2: str, source: str = "https://example.com/filing
 
 
 class TestCapabilityContract:
-    def test_four_financial_fact_types_are_supported_valuation_inputs_is_not(self):
+    def test_five_financial_fact_types_are_supported(self):
+        # Superseded: VALUATION_INPUTS now has a genuine, narrowly-scoped
+        # manual contract (EARNINGS_BASIS only -- eps/pat/net_income/
+        # net_profit -- see ALLOWED_METRICS_BY_EVIDENCE_TYPE below), reusing
+        # this exact FinancialFact "facts" row mechanism. The authoritative
+        # product rule (status != READY_FRESH => Upload Evidence must be
+        # offered, for every requirement) supersedes the prior restriction.
         assert EvidenceType.BUSINESS_QUALITY_FACTS in SUPPORTED_EVIDENCE_TYPES
         assert EvidenceType.GROWTH_FACTS in SUPPORTED_EVIDENCE_TYPES
         assert EvidenceType.BALANCE_SHEET_FACTS in SUPPORTED_EVIDENCE_TYPES
         assert EvidenceType.QUARTERLY_FINANCIALS in SUPPORTED_EVIDENCE_TYPES
-        assert not hasattr(EvidenceType, "VALUATION_INPUTS")
+        assert EvidenceType.VALUATION_INPUTS in SUPPORTED_EVIDENCE_TYPES
 
     def test_allowed_metrics_are_nonempty_and_disjoint_from_nothing_fabricated(self):
         for etype in FINANCIAL_FACT_EVIDENCE_TYPES:

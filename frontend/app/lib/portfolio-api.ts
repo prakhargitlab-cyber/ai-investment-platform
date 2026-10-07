@@ -954,20 +954,29 @@ export const MANUAL_EVIDENCE_TYPES = [
   "BUSINESS_QUALITY_FACTS",
   "GROWTH_FACTS",
   "BALANCE_SHEET_FACTS",
-  "QUARTERLY_FINANCIALS"
+  "QUARTERLY_FINANCIALS",
+  "VALUATION_INPUTS",
+  "LATEST_PRICE",
+  "HISTORICAL_PRICE_SERIES",
+  "SECTOR_MACRO"
 ] as const;
 export type ManualEvidenceType = (typeof MANUAL_EVIDENCE_TYPES)[number];
 
 // Evidence types backed by a repeating structured-row schema (one
 // FinancialFact per row) rather than flat scalar fields -- see
-// FinancialFactRow below. VALUATION_INPUTS is NOT a member: the backend
-// does not support it (see app.manual_evidence.EvidenceType), so it never
-// appears in supportedEvidenceTypes and Upload Evidence stays hidden for it.
+// FinancialFactRow below. VALUATION_INPUTS IS a member: the backend
+// deliberately scopes its manual contract to the single EARNINGS_BASIS
+// input (eps/pat/net_income/net_profit -- see app.manual_evidence
+// ALLOWED_METRICS_BY_EVIDENCE_TYPE[VALUATION_INPUTS]), reusing this exact
+// "facts" row schema; PE/PB/EV_EBITDA/FCF_YIELD/LATEST_USABLE_PRICE are
+// derived ratios from trusted structured market data and are never
+// accepted as manual rows here.
 export const FINANCIAL_FACT_EVIDENCE_TYPES = [
   "BUSINESS_QUALITY_FACTS",
   "GROWTH_FACTS",
   "BALANCE_SHEET_FACTS",
-  "QUARTERLY_FINANCIALS"
+  "QUARTERLY_FINANCIALS",
+  "VALUATION_INPUTS"
 ] as const;
 export type FinancialFactEvidenceType = (typeof FINANCIAL_FACT_EVIDENCE_TYPES)[number];
 
@@ -996,7 +1005,7 @@ export function isRestrictedEventTypeEvidenceType(
 
 // PNG/JPG (Defect 2 closure): server advertises these in supportedFileTypes
 // once app.manual_evidence.SUPPORTED_FILE_TYPES includes them.
-export type EvidenceFileType = "CSV" | "PDF" | "TXT" | "PNG" | "JPG";
+export type EvidenceFileType = "CSV" | "PDF" | "TXT" | "PNG" | "JPG" | "DOCX";
 
 export type EvidenceFileTypes = {
   // Fail-closed, runtime-gated: PNG/JPG are only present here when the
@@ -1013,6 +1022,7 @@ export type EvidenceFileTypes = {
   ocrCapability?: {
     imageOcrAvailable: boolean;
     scannedPdfOcrAvailable: boolean;
+    docxExtractionAvailable?: boolean;
   };
   // Canonical metric names accept() will actually validate against, per
   // FinancialFact-backed evidence type -- the server's own
@@ -1086,6 +1096,20 @@ export type EvidenceDraft = {
   // at accept() time instead of correcting extracted facts.
   requiresManualFields: boolean;
   manualFieldSchema: string[];
+  // Read-only reference text (OCR/PDF/text extraction) shown on the
+  // Review screen for manual-field evidence types, so the user is not
+  // left re-reading the original file by eye while filling in
+  // manualFieldSchema. Never auto-fills a field and is never itself a
+  // proposedFact. null/absent when no text could be extracted (see
+  // validationResults.warnings instead) or for non-manual-field types.
+  extractedText?: string | null;
+  // Conservative, NON-BINDING pre-fill suggestions for manualFieldSchema
+  // keys (e.g. {"title": "...", "eventDate": "...", "sourceUrl": "..."})
+  // produced by an evidence interpreter from extractedText. Never a
+  // proposedFact, never auto-applied: the user must still explicitly
+  // review and submit every manualFieldSchema field as `corrections` at
+  // accept() time. null/absent when no suggestions were found.
+  fieldSuggestions?: Record<string, string> | null;
 };
 
 export type EvidenceAcceptRequest = {

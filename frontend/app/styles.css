@@ -2352,6 +2352,10 @@ tbody tr[class*="ownership-"] td {
 .evidence-manual-field { display: flex; flex-direction: column; gap: var(--space-1); font-size: 13px; font-weight: 600; }
 .evidence-manual-field input { padding: var(--space-2); border-radius: var(--radius); border: 1px solid var(--border); }
 .evidence-manual-field select { padding: var(--space-2); border-radius: var(--radius); border: 1px solid var(--border); font: inherit; }
+.evidence-manual-field textarea { padding: var(--space-2); border-radius: var(--radius); border: 1px solid var(--border); font: inherit; resize: vertical; }
+.evidence-extracted-text { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-subtle); }
+.evidence-extracted-text-label { font-size: 12px; font-weight: 700; color: var(--text-muted); }
+.evidence-extracted-text pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; font-size: 13px; max-height: 200px; overflow-y: auto; }
 .evidence-actions {
   display: flex;
   align-items: center;

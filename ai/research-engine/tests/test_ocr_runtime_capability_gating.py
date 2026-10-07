@@ -52,7 +52,11 @@ class TestRuntimeSupportedFileTypeLabels:
     def test_all_binaries_present_advertises_png_jpg(self, monkeypatch):
         monkeypatch.setattr(ocr_mod.shutil, "which", _which_only("tesseract", "pdftoppm", "pdfinfo"))
         labels = manual_evidence.runtime_supported_file_type_labels()
-        assert set(labels) == {"PDF", "CSV", "TXT", "PNG", "JPG"}
+        # DOCX is gated on python-docx being importable (unaffected by the
+        # shutil.which tesseract/poppler mocking here), and it is installed
+        # in this test environment -- see app.document_extraction.
+        # docx_extraction_available().
+        assert set(labels) == {"PDF", "CSV", "TXT", "PNG", "JPG", "DOCX"}
 
     def test_tesseract_missing_drops_png_and_jpg_only(self, monkeypatch):
         monkeypatch.setattr(ocr_mod.shutil, "which", _which_only())
@@ -60,8 +64,9 @@ class TestRuntimeSupportedFileTypeLabels:
         assert "PNG" not in labels
         assert "JPG" not in labels
         # Ordinary text PDF/CSV/TXT extraction has no OCR dependency and
-        # must remain advertised regardless of tesseract availability.
-        assert set(labels) == {"PDF", "CSV", "TXT"}
+        # must remain advertised regardless of tesseract availability --
+        # DOCX likewise has no tesseract/poppler dependency at all.
+        assert set(labels) == {"PDF", "CSV", "TXT", "DOCX"}
 
     def test_poppler_missing_but_tesseract_present_still_advertises_png_jpg(self, monkeypatch):
         # PNG/JPEG OCR only needs tesseract; poppler-utils is only needed
@@ -84,16 +89,21 @@ class TestFileTypesEndpointRuntimeGating:
     def test_all_binaries_present(self, monkeypatch):
         monkeypatch.setattr(ocr_mod.shutil, "which", _which_only("tesseract", "pdftoppm", "pdfinfo"))
         body = self._get().json()
-        assert set(body["supportedFileTypes"]) == {"CSV", "PDF", "TXT", "PNG", "JPG"}
-        assert body["ocrCapability"] == {"imageOcrAvailable": True, "scannedPdfOcrAvailable": True}
+        assert set(body["supportedFileTypes"]) == {"CSV", "PDF", "TXT", "PNG", "JPG", "DOCX"}
+        assert body["ocrCapability"] == {
+            "imageOcrAvailable": True, "scannedPdfOcrAvailable": True, "docxExtractionAvailable": True,
+        }
 
     def test_tesseract_missing(self, monkeypatch):
         monkeypatch.setattr(ocr_mod.shutil, "which", _which_only())
         body = self._get().json()
         assert "PNG" not in body["supportedFileTypes"]
         assert "JPG" not in body["supportedFileTypes"]
-        assert set(body["supportedFileTypes"]) == {"CSV", "PDF", "TXT"}
-        assert body["ocrCapability"] == {"imageOcrAvailable": False, "scannedPdfOcrAvailable": False}
+        # DOCX has no tesseract/poppler dependency, so it stays advertised.
+        assert set(body["supportedFileTypes"]) == {"CSV", "PDF", "TXT", "DOCX"}
+        assert body["ocrCapability"] == {
+            "imageOcrAvailable": False, "scannedPdfOcrAvailable": False, "docxExtractionAvailable": True,
+        }
 
     def test_poppler_missing_only(self, monkeypatch):
         monkeypatch.setattr(ocr_mod.shutil, "which", _which_only("tesseract"))
@@ -101,7 +111,9 @@ class TestFileTypesEndpointRuntimeGating:
         # PNG/JPEG OCR is unaffected by a missing poppler-utils.
         assert "PNG" in body["supportedFileTypes"]
         assert "JPG" in body["supportedFileTypes"]
-        assert body["ocrCapability"] == {"imageOcrAvailable": True, "scannedPdfOcrAvailable": False}
+        assert body["ocrCapability"] == {
+            "imageOcrAvailable": True, "scannedPdfOcrAvailable": False, "docxExtractionAvailable": True,
+        }
 
     def test_ordinary_text_formats_always_advertised(self, monkeypatch):
         # Regardless of OCR binary availability, CSV/TXT/PDF (native text

@@ -25,12 +25,22 @@ test("portfolio API exposes one strongly typed manual-evidence contract", () => 
   assert.match(api, /"GROWTH_FACTS"/);
   assert.match(api, /"BALANCE_SHEET_FACTS"/);
   assert.match(api, /"QUARTERLY_FINANCIALS"/);
-  assert.doesNotMatch(api, /"VALUATION_INPUTS"/);
+  // Superseded: the authoritative product rule (status != READY_FRESH =>
+  // Upload Evidence must be offered, for every requirement) means
+  // VALUATION_INPUTS, LATEST_PRICE, HISTORICAL_PRICE_SERIES and
+  // SECTOR_MACRO now ALSO have genuine backend contracts -- see
+  // app.manual_evidence.EvidenceType and the final report.
+  assert.match(api, /"VALUATION_INPUTS"/);
+  assert.match(api, /"LATEST_PRICE"/);
+  assert.match(api, /"HISTORICAL_PRICE_SERIES"/);
+  assert.match(api, /"SECTOR_MACRO"/);
   // Defect 2 closure: PNG/JPG now have a genuine bounded OCR extraction
   // path server-side, so the typed contract includes them; DOCX still has
   // no extraction path at all and must stay excluded.
-  assert.match(api, /EvidenceFileType = "CSV" \| "PDF" \| "TXT" \| "PNG" \| "JPG"/);
-  assert.doesNotMatch(api, /EvidenceFileType = [^;]*DOCX/);
+  // Superseded (reusable DocumentExtractor closure): DOCX now has a
+  // genuine native extraction path (paragraphs + tables via python-docx),
+  // gated by the same truthful runtime-capability pattern as PNG/JPG.
+  assert.match(api, /EvidenceFileType = "CSV" \| "PDF" \| "TXT" \| "PNG" \| "JPG" \| "DOCX"/);
   assert.match(api, /supportedFileTypes: EvidenceFileType\[\]/);
   assert.match(api, /supportedEvidenceTypes: ManualEvidenceType\[\]/);
   assert.match(api, /uploadEvidence: \(globalInstrumentId: string, evidenceType: ManualEvidenceType, file: File\)/);
@@ -198,15 +208,50 @@ test("G4. an evidence type still unsupported by the backend never exposes a dead
   }
 });
 
-test("needsManualEvidence is true for MISSING, PARTIAL, READY_STALE, FAILED, CONFLICTING", () => {
-  const expectTrue = ["MISSING", "PARTIAL", "READY_STALE", "FAILED", "CONFLICTING"];
-  const expectFalse = ["READY_FRESH", "UNSUPPORTED", "REFRESHING", "NOT_APPLICABLE"];
+test("needsManualEvidence is true for every status except READY_FRESH (the authoritative universal rule)", () => {
+  // Superseded: needsManualEvidence is no longer a frontend status
+  // allowlist. It is now exactly \`status !== "READY_FRESH\`\`; REFRESHING and
+  // NOT_APPLICABLE are correctly excluded from the end-to-end visibility
+  // decision by shouldOfferManualEvidenceUpload's separate supportedActions
+  // check instead (the server's own authority -- see
+  // ResearchRequirementReadiness._result() on the backend), not by this
+  // function pretending to know about them.
+  const expectTrue = [
+    "MISSING", "PARTIAL", "READY_STALE", "FAILED", "CONFLICTING",
+    "UNSUPPORTED", "REFRESHING", "NOT_APPLICABLE"
+  ];
   for (const status of expectTrue) {
     assert.equal(needsManualEvidence(status), true, `${status} should need manual evidence`);
   }
-  for (const status of expectFalse) {
-    assert.equal(needsManualEvidence(status), false, `${status} should not need manual evidence`);
-  }
+  assert.equal(needsManualEvidence("READY_FRESH"), false);
+});
+
+test("shouldOfferManualEvidenceUpload hides Upload Evidence for REFRESHING/NOT_APPLICABLE via the server's own supportedActions, not a frontend status guess", () => {
+  const supportedEvidenceTypes = ["SHAREHOLDING"];
+  assert.equal(
+    shouldOfferManualEvidenceUpload(
+      { requirementId: "SHAREHOLDING", status: "REFRESHING", mandatory: true, supportedActions: ["FIND_DATA"] },
+      supportedEvidenceTypes
+    ),
+    null
+  );
+  assert.equal(
+    shouldOfferManualEvidenceUpload(
+      { requirementId: "SHAREHOLDING", status: "NOT_APPLICABLE", mandatory: true, supportedActions: ["NOT_APPLICABLE"] },
+      supportedEvidenceTypes
+    ),
+    null
+  );
+  // UNSUPPORTED deliberately keeps UPLOAD_EVIDENCE (only FIND_DATA is
+  // stripped server-side), matching the task's explicit "unsupported/
+  // unavailable automated acquisition => Upload Evidence MUST be shown".
+  assert.equal(
+    shouldOfferManualEvidenceUpload(
+      { requirementId: "SHAREHOLDING", status: "UNSUPPORTED", mandatory: true, supportedActions: ["UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"] },
+      supportedEvidenceTypes
+    ),
+    "SHAREHOLDING"
+  );
 });
 
 // Defect 1 closure: the complete status x capability matrix for every
@@ -218,7 +263,11 @@ test("needsManualEvidence is true for MISSING, PARTIAL, READY_STALE, FAILED, CON
 // non-mandatory requirement. Upload Evidence must be visible iff:
 // mandatory AND status in {MISSING, PARTIAL, READY_STALE, FAILED,
 // CONFLICTING} AND the type is in supportedEvidenceTypes.
-test("Defect 1: complete status x capability matrix for all backend-supported evidence types", () => {
+test("Defect 1/2: complete status x capability matrix for all twelve backend-supported evidence types", () => {
+  // Superseded: all twelve evidence types the backend genuinely supports
+  // (see app.manual_evidence.SUPPORTED_EVIDENCE_TYPES) now participate in
+  // the SAME authoritative rule -- status !== READY_FRESH, no per-type
+  // carve-out.
   const SUPPORTED_TYPES = [
     "SHAREHOLDING",
     "CURRENT_NEWS",
@@ -227,25 +276,42 @@ test("Defect 1: complete status x capability matrix for all backend-supported ev
     "BUSINESS_QUALITY_FACTS",
     "GROWTH_FACTS",
     "BALANCE_SHEET_FACTS",
-    "QUARTERLY_FINANCIALS"
+    "QUARTERLY_FINANCIALS",
+    "VALUATION_INPUTS",
+    "LATEST_PRICE",
+    "HISTORICAL_PRICE_SERIES",
+    "SECTOR_MACRO"
   ];
-  const ALL_STATUSES = [
-    "READY_FRESH", "READY_STALE", "PARTIAL", "MISSING",
-    "CONFLICTING", "UNSUPPORTED", "REFRESHING", "FAILED", "NOT_APPLICABLE"
-  ];
-  const NEEDS_UPLOAD = new Set(["MISSING", "PARTIAL", "READY_STALE", "FAILED", "CONFLICTING"]);
+  // supportedActions modeled exactly as the real backend computes them
+  // (ResearchRequirementReadiness._result()): UPLOAD_EVIDENCE is present
+  // for every status except READY_FRESH/REFRESHING/NOT_APPLICABLE, and
+  // FIND_DATA is additionally stripped for UNSUPPORTED.
+  const SUPPORTED_ACTIONS_BY_STATUS = {
+    READY_FRESH: [],
+    REFRESHING: [],
+    NOT_APPLICABLE: [],
+    UNSUPPORTED: ["UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"],
+    READY_STALE: ["FIND_DATA", "UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"],
+    PARTIAL: ["FIND_DATA", "UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"],
+    MISSING: ["FIND_DATA", "UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"],
+    FAILED: ["FIND_DATA", "UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"],
+    CONFLICTING: ["FIND_DATA", "UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"]
+  };
+  const ALL_STATUSES = Object.keys(SUPPORTED_ACTIONS_BY_STATUS);
+  const NEEDS_UPLOAD = new Set(["READY_STALE", "PARTIAL", "MISSING", "FAILED", "CONFLICTING", "UNSUPPORTED"]);
 
   for (const requirementId of SUPPORTED_TYPES) {
     for (const status of ALL_STATUSES) {
+      const supportedActions = SUPPORTED_ACTIONS_BY_STATUS[status];
       const expectedWhenMandatory = NEEDS_UPLOAD.has(status) ? requirementId : null;
       assert.equal(
-        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: true }, SUPPORTED_TYPES),
+        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: true, supportedActions }, SUPPORTED_TYPES),
         expectedWhenMandatory,
         `mandatory ${requirementId} @ ${status} should ${expectedWhenMandatory ? "" : "NOT "}offer Upload Evidence`
       );
       // Non-mandatory never offers upload, regardless of status or capability.
       assert.equal(
-        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: false }, SUPPORTED_TYPES),
+        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: false, supportedActions }, SUPPORTED_TYPES),
         null,
         `non-mandatory ${requirementId} @ ${status} must never offer Upload Evidence`
       );
@@ -258,7 +324,10 @@ test("Defect 1: complete status x capability matrix for all backend-supported ev
   for (const requirementId of SUPPORTED_TYPES) {
     for (const status of [...NEEDS_UPLOAD]) {
       assert.equal(
-        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: true }, []),
+        shouldOfferManualEvidenceUpload(
+          { requirementId, status, mandatory: true, supportedActions: SUPPORTED_ACTIONS_BY_STATUS[status] },
+          []
+        ),
         null,
         `${requirementId} @ ${status} must not offer Upload Evidence when the backend advertises no capability`
       );
@@ -266,16 +335,15 @@ test("Defect 1: complete status x capability matrix for all backend-supported ev
   }
 });
 
-// LATEST_PRICE, HISTORICAL_PRICE_SERIES, VALUATION_INPUTS and SECTOR_MACRO
-// intentionally have no safe manual canonical ingestion path yet (see
-// app.manual_evidence.EvidenceType) -- the backend never advertises them in
-// supportedEvidenceTypes, so Upload Evidence must stay hidden for them even
-// in their worst (stale/missing) states. Find Data remains available
-// independently (ResearchReadinessRow gates FIND_DATA on supportedActions,
-// not on manual-evidence capability -- see "Find Data remains independent
-// from manual upload capability" below).
-test("Defect 1: LATEST_PRICE and other unsupported-ingestion types never show Upload Evidence", () => {
-  const UNSUPPORTED_INGESTION_TYPES = [
+// Superseded: LATEST_PRICE, HISTORICAL_PRICE_SERIES, VALUATION_INPUTS and
+// SECTOR_MACRO now each have a genuine, narrowly-scoped manual contract
+// (see app.manual_evidence -- structured price/observation/valuation-row/
+// sector-summary fields, USER_UPLOAD provenance, lower authority than
+// trusted automated sources) and the backend genuinely advertises all four
+// in supportedEvidenceTypes. The authoritative product rule applies to
+// them exactly like every other requirement.
+test("Defect 1: LATEST_PRICE and the other three newly-supported types DO show Upload Evidence when genuinely non-fresh", () => {
+  const NEWLY_SUPPORTED_TYPES = [
     "LATEST_PRICE",
     "HISTORICAL_PRICE_SERIES",
     "VALUATION_INPUTS",
@@ -283,16 +351,25 @@ test("Defect 1: LATEST_PRICE and other unsupported-ingestion types never show Up
   ];
   const SUPPORTED_TYPES = [
     "SHAREHOLDING", "CURRENT_NEWS", "ORDER_BOOK_CAPEX_GUIDANCE", "GOVERNANCE_HISTORY",
-    "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS"
+    "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS",
+    ...NEWLY_SUPPORTED_TYPES
   ];
-  for (const requirementId of UNSUPPORTED_INGESTION_TYPES) {
+  for (const requirementId of NEWLY_SUPPORTED_TYPES) {
     for (const status of ["READY_STALE", "PARTIAL", "MISSING", "FAILED", "CONFLICTING"]) {
       assert.equal(
-        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: true }, SUPPORTED_TYPES),
-        null,
-        `${requirementId} @ ${status} must not offer Upload Evidence -- no safe ingestion path exists`
+        shouldOfferManualEvidenceUpload(
+          { requirementId, status, mandatory: true, supportedActions: ["FIND_DATA", "UPLOAD_EVIDENCE", "RUN_PARTIAL_ANALYSIS"] },
+          SUPPORTED_TYPES
+        ),
+        requirementId,
+        `${requirementId} @ ${status} must offer Upload Evidence -- it now has a genuine manual contract`
       );
     }
+    // READY_FRESH still hides it, same as every other requirement.
+    assert.equal(
+      shouldOfferManualEvidenceUpload({ requirementId, status: "READY_FRESH", mandatory: true }, SUPPORTED_TYPES),
+      null
+    );
   }
 });
 
@@ -322,12 +399,16 @@ test("Browse and Paste converge on the same File ingestion function using standa
   assert.match(workspace, /type="file"/);
 });
 
-test("Defect 2: PNG/JPG now flow through the normal upload path; DOCX still stops before draft upload", () => {
-  assert.match(workspace, /REVIEWABLE_EVIDENCE_FILE_TYPES = \["PDF", "CSV", "TXT", "PNG", "JPG"\]/);
+test("Defect 2 / reusable extraction closure: PNG/JPG/DOCX all flow through the normal upload path, gated only by server capability", () => {
+  assert.match(workspace, /REVIEWABLE_EVIDENCE_FILE_TYPES = \["PDF", "CSV", "TXT", "PNG", "JPG", "DOCX"\]/);
   assert.doesNotMatch(workspace, /typeLabel === "PNG" \|\| typeLabel === "JPG"/);
   assert.doesNotMatch(workspace, /Image text extraction is not available/);
-  assert.match(workspace, /typeLabel === "DOCX"/);
-  assert.match(workspace, /DOCX text extraction is not available/);
+  // Superseded: DOCX no longer has a hardcoded client-side refusal -- it
+  // falls through to the same supportedFileTypes.includes(...) gate as
+  // every other type (app.document_extraction.docx_extraction_available()
+  // drives whether the server actually lists it).
+  assert.doesNotMatch(workspace, /typeLabel === "DOCX"/);
+  assert.doesNotMatch(workspace, /DOCX text extraction is not available/);
   assert.match(workspace, /accept=\{inputAccept\}/);
 });
 
@@ -447,22 +528,27 @@ test("E. QUARTERLY_FINANCIALS + FAILED => Upload Evidence visible", () => {
   );
 });
 
-test("F. VALUATION_INPUTS + MISSING => hidden because backend never advertises it", () => {
-  // The server's supportedEvidenceTypes list genuinely never contains
-  // VALUATION_INPUTS (app.manual_evidence.EvidenceType has no such member);
-  // this models that real response shape rather than guessing client-side.
+test("F. VALUATION_INPUTS + MISSING => visible once the backend genuinely advertises it (reuses the FinancialFact row editor, EARNINGS_BASIS only)", () => {
+  // Superseded: the backend now advertises VALUATION_INPUTS in
+  // supportedEvidenceTypes, reusing the FinancialFact "facts" row schema
+  // scoped to EARNINGS_BASIS only (eps/pat/net_income/net_profit) --
+  // PE/PB/EV_EBITDA/FCF_YIELD/LATEST_USABLE_PRICE remain derived ratios
+  // from trusted structured market data and are never accepted as manual
+  // rows.
   const realisticSupportedEvidenceTypes = [
     "SHAREHOLDING", "CURRENT_NEWS",
-    "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS"
+    "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS",
+    "VALUATION_INPUTS"
   ];
   assert.equal(
     shouldOfferManualEvidenceUpload(
       { requirementId: "VALUATION_INPUTS", status: "MISSING", mandatory: true },
       realisticSupportedEvidenceTypes
     ),
-    null
+    "VALUATION_INPUTS"
   );
-  assert.doesNotMatch(api, /"VALUATION_INPUTS"/);
+  assert.match(api, /"VALUATION_INPUTS"/);
+  assert.match(api, /FINANCIAL_FACT_EVIDENCE_TYPES = \[[\s\S]*?"VALUATION_INPUTS"/);
 });
 
 const dialogSource = workspace.slice(workspace.indexOf("function UploadEvidenceDialog"));
@@ -676,4 +762,77 @@ test("Z. portfolio API advertises the two new ResearchEvent-backed evidence type
   assert.match(api, /allowedEventTypesByEvidenceType\?: Partial<Record<RestrictedEventTypeEvidenceType, string\[\]>>/);
   assert.match(api, /eventImpactValues\?: string\[\];/);
   assert.match(api, /timeHorizonValues\?: string\[\];/);
+});
+
+// ---------------------------------------------------------------------------
+// LATEST_PRICE / HISTORICAL_PRICE_SERIES / SECTOR_MACRO structured field
+// schemas and rendering (flat scalar fields, not the FinancialFact row
+// editor -- see MANUAL_FIELD_SCHEMA in app.manual_evidence).
+// ---------------------------------------------------------------------------
+
+test("AA. LATEST_PRICE + READY_STALE => Upload Evidence visible with its own manual schema", () => {
+  assert.equal(
+    shouldOfferManualEvidenceUpload(
+      { requirementId: "LATEST_PRICE", status: "READY_STALE", mandatory: true },
+      ["LATEST_PRICE"]
+    ),
+    "LATEST_PRICE"
+  );
+});
+
+test("BB. HISTORICAL_PRICE_SERIES + PARTIAL => Upload Evidence visible", () => {
+  assert.equal(
+    shouldOfferManualEvidenceUpload(
+      { requirementId: "HISTORICAL_PRICE_SERIES", status: "PARTIAL", mandatory: true },
+      ["HISTORICAL_PRICE_SERIES"]
+    ),
+    "HISTORICAL_PRICE_SERIES"
+  );
+});
+
+test("CC. SECTOR_MACRO + MISSING => Upload Evidence visible", () => {
+  assert.equal(
+    shouldOfferManualEvidenceUpload(
+      { requirementId: "SECTOR_MACRO", status: "MISSING", mandatory: true },
+      ["SECTOR_MACRO"]
+    ),
+    "SECTOR_MACRO"
+  );
+});
+
+test("DD. LATEST_PRICE/HISTORICAL_PRICE_SERIES/SECTOR_MACRO are NOT FinancialFact row types -- they render as flat manual fields, not the facts-table editor", () => {
+  assert.doesNotMatch(api, /FINANCIAL_FACT_EVIDENCE_TYPES = \[[\s\S]*?"LATEST_PRICE"/);
+  assert.doesNotMatch(api, /FINANCIAL_FACT_EVIDENCE_TYPES = \[[\s\S]*?"HISTORICAL_PRICE_SERIES"/);
+  assert.doesNotMatch(api, /FINANCIAL_FACT_EVIDENCE_TYPES = \[[\s\S]*?"SECTOR_MACRO"/);
+});
+
+test("EE. the observations field renders as a textarea (multi-line date,close rows), not a single-line input", () => {
+  assert.match(dialogSource, /field === "observations" \? \(/);
+  assert.match(dialogSource, /<textarea/);
+  assert.match(dialogSource, /YYYY-MM-DD,close/);
+});
+
+test("FF. extracted OCR text is shown as reference-only in Review, never auto-applied to a manual field", () => {
+  assert.match(workspace, /draft\.extractedText/);
+  assert.match(workspace, /Extracted from file \(reference only -- not auto-filled\)/);
+  assert.match(styles, /\.evidence-extracted-text/);
+});
+
+test("GG. fieldSuggestions is a declared, optional, non-binding type on EvidenceDraft", () => {
+  assert.match(api, /fieldSuggestions\?: Record<string, string> \| null;/);
+  assert.match(api, /Never a\s*\n\s*\/\/ proposedFact, never auto-applied/);
+});
+
+test("HH. CURRENT_NEWS field suggestions pre-fill the editable manual-fields form without bypassing explicit review", () => {
+  // The suggestion seeds the SAME editable manualFields state the user
+  // can freely overwrite -- it is never submitted directly, and the
+  // reset effect only runs when a new draft loads (draft?.draftId).
+  assert.match(
+    workspace,
+    /setManualFields\(draft\?\.fieldSuggestions \? \{ \.\.\.draft\.fieldSuggestions \} : \{\}\);/
+  );
+  assert.match(workspace, /\[draft\?\.draftId\]\);/);
+  // The Review screen tells the user suggested fields were pre-filled
+  // and must be reviewed -- it never claims they were auto-accepted.
+  assert.match(workspace, /pre-filled from the uploaded\s*\n\s*file as a non-binding suggestion/);
 });

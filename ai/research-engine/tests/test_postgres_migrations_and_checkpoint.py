@@ -663,3 +663,216 @@ def test_yahoo_mcp_event_with_long_url_persists_through_production_path_on_postg
     assert tier == ResearchSourceTier.APPROVED_EXTERNAL_TOOL
     # (3) no StringDataRightTruncation was raised anywhere above -- the test
     # would have failed with that exception rather than completing.
+
+
+
+# ---------------------------------------------------------------------------
+# Runtime defect closure: global_manual_evidence migration (Defect B) and
+# PostgreSQL transaction-poisoning recovery (Defect C).
+#
+# A real browser upload against a real deployed PostgreSQL-backed
+# research-engine failed with:
+#   psycopg.errors.UndefinedTable: relation "global_manual_evidence" does
+#   not exist
+# via create_evidence_draft -> manual_evidence_ingestor.ingest ->
+# _find_duplicate -> load_manual_evidence_drafts -> SELECT * FROM
+# global_manual_evidence. No Flyway migration in
+# services/research-service/.../db/migration ever created this table --
+# app/persistence.py's SQLite dev/test backend self-creates it inline
+# (CREATE TABLE IF NOT EXISTS), which masked the gap until a real
+# PostgreSQL-backed request hit it. V22__global_manual_evidence.sql fixes
+# this with the smallest correct migration, following the exact column
+# shapes already used by the SQLite schema and this repository's existing
+# PostgreSQL type conventions (see V2/V20 for precedent).
+#
+# A second, independent failure followed in the same real runtime:
+#   psycopg.errors.InFailedSqlTransaction: current transaction is aborted,
+#   commands ignored until end of transaction block
+# surfacing in UNRELATED background code (opportunity_worker ->
+# _maybe_take_over -> active_cycle_run), because
+# load_manual_evidence_drafts() issued its SELECT directly on the shared
+# _PostgresConnectionAdapter without a `with self._connection:` block, so
+# nothing rolled back the aborted transaction after UndefinedTable --
+# poisoning the one shared psycopg connection (OpportunityPersistenceMixin
+# and the manual-evidence persistence methods are mixed into the same
+# PostgresResearchPersistence instance, i.e. the same connection) for every
+# later caller. The fix moves the rollback-on-failure into
+# _PostgresConnectionAdapter.execute() itself, so it protects every call
+# site -- wrapped in `with self._connection:` or not -- without suppressing
+# the original exception or reconnecting.
+# ---------------------------------------------------------------------------
+
+
+def test_v22_global_manual_evidence_migration_creates_expected_schema(database):
+    conn = _connect(database)
+    _apply(conn, _migrations())
+
+    tables = {r[0] for r in conn.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='research'").fetchall()}
+    assert "global_manual_evidence" in tables
+
+    columns = {
+        r[0]: r[1] for r in conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema='research' AND table_name='global_manual_evidence'"
+        ).fetchall()
+    }
+    assert columns == {
+        "draft_id": "uuid",
+        "evidence_type": "character varying",
+        "content_hash": "character",
+        "original_filename": "character varying",
+        "content_type": "character varying",
+        "instrument_id": "uuid",
+        "reporting_period": "timestamp with time zone",
+        "extraction_method": "character varying",
+        "extraction_results": "text",
+        "validation_results": "text",
+        "corrections": "text",
+        "accepted_at": "timestamp with time zone",
+    }
+
+    indexes = {r[0] for r in conn.execute(
+        "SELECT indexname FROM pg_indexes WHERE schemaname='research' AND tablename='global_manual_evidence'"
+    ).fetchall()}
+    assert {"idx_global_manual_evidence_instrument", "idx_global_manual_evidence_content_hash"} <= indexes
+
+    # The engine's own startup schema assertion (now including
+    # global_manual_evidence) must pass against the fully migrated schema.
+    _store(database)
+
+
+def test_global_manual_evidence_unique_constraint_rejects_duplicate_content_hash_and_type(database):
+    conn = _connect(database)
+    _apply(conn, _migrations())
+    row = dict(
+        draft_id=str(uuid.uuid4()), evidence_type="SHAREHOLDING", content_hash="a" * 64,
+        original_filename="snip.png", content_type="image/png", instrument_id=None,
+        reporting_period=None, extraction_method="PNG_TEXT", extraction_results="{}",
+        validation_results="{}", corrections="{}", accepted_at=datetime.now(timezone.utc),
+    )
+    conn.execute(
+        """INSERT INTO global_manual_evidence (
+            draft_id, evidence_type, content_hash, original_filename, content_type,
+            instrument_id, reporting_period, extraction_method, extraction_results,
+            validation_results, corrections, accepted_at
+        ) VALUES (%(draft_id)s, %(evidence_type)s, %(content_hash)s, %(original_filename)s, %(content_type)s,
+                  %(instrument_id)s, %(reporting_period)s, %(extraction_method)s, %(extraction_results)s,
+                  %(validation_results)s, %(corrections)s, %(accepted_at)s)""",
+        row,
+    )
+    conn.commit()
+    duplicate = dict(row, draft_id=str(uuid.uuid4()))
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        conn.execute(
+            """INSERT INTO global_manual_evidence (
+                draft_id, evidence_type, content_hash, original_filename, content_type,
+                instrument_id, reporting_period, extraction_method, extraction_results,
+                validation_results, corrections, accepted_at
+            ) VALUES (%(draft_id)s, %(evidence_type)s, %(content_hash)s, %(original_filename)s, %(content_type)s,
+                      %(instrument_id)s, %(reporting_period)s, %(extraction_method)s, %(extraction_results)s,
+                      %(validation_results)s, %(corrections)s, %(accepted_at)s)""",
+            duplicate,
+        )
+    conn.rollback()
+
+
+def test_manual_evidence_draft_persistence_and_duplicate_lookup_on_real_postgres(database):
+    """Defect B closure, end-to-end through the real persistence contract
+    (not an in-memory fake): the exact call path that previously hit
+    UndefinedTable -- upsert_manual_evidence_draft / load_manual_evidence_drafts
+    -- now works against a real PostgreSQL database migrated by the real
+    Flyway SQL files, including V22."""
+    _apply(_connect(database), _migrations())
+    store = _store(database)
+
+    instrument_id = uuid.uuid4()
+    accepted_at = datetime.now(timezone.utc)
+    digest = hashlib.sha256(b"fake-shareholding-png-bytes").hexdigest()
+
+    inserted = store.upsert_manual_evidence_draft(
+        draft_id=uuid.uuid4(), evidence_type="SHAREHOLDING", content_hash=digest,
+        original_filename="gokul-agro-shareholding.png", content_type="image/png",
+        instrument_id=instrument_id, reporting_period=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        extraction_method="PNG_TEXT", extraction_results='{"promoter": "74.24"}',
+        validation_results="{}", corrections="{}", accepted_at=accepted_at,
+    )
+    assert inserted is True
+
+    drafts = store.load_manual_evidence_drafts(evidence_type="SHAREHOLDING")
+    assert len(drafts) == 1
+    assert drafts[0]["content_hash"] == digest
+    assert str(drafts[0]["instrument_id"]) == str(instrument_id)
+
+    # Dedup by (content_hash, evidence_type): re-uploading the identical file
+    # for the same evidence type must not create a second row.
+    inserted_again = store.upsert_manual_evidence_draft(
+        draft_id=uuid.uuid4(), evidence_type="SHAREHOLDING", content_hash=digest,
+        original_filename="gokul-agro-shareholding.png", content_type="image/png",
+        instrument_id=instrument_id, reporting_period=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        extraction_method="PNG_TEXT", extraction_results='{"promoter": "74.24"}',
+        validation_results="{}", corrections="{}", accepted_at=datetime.now(timezone.utc),
+    )
+    assert inserted_again is False
+    assert len(store.load_manual_evidence_drafts(evidence_type="SHAREHOLDING")) == 1
+
+    # A different evidence type with the same bytes is a genuinely distinct
+    # record (the UNIQUE constraint is on (content_hash, evidence_type), not
+    # content_hash alone).
+    inserted_other_type = store.upsert_manual_evidence_draft(
+        draft_id=uuid.uuid4(), evidence_type="CURRENT_NEWS", content_hash=digest,
+        original_filename="gokul-agro-shareholding.png", content_type="image/png",
+        instrument_id=instrument_id, reporting_period=None,
+        extraction_method="PNG_TEXT", extraction_results="{}",
+        validation_results="{}", corrections="{}", accepted_at=datetime.now(timezone.utc),
+    )
+    assert inserted_other_type is True
+    assert len(store.load_manual_evidence_drafts()) == 2
+
+
+def test_failed_sql_operation_does_not_poison_the_shared_connection_for_the_next_operation(database):
+    """Defect C closure: a failed persistence operation must not leave the
+    shared PostgreSQL connection in InFailedSqlTransaction for whatever
+    unrelated operation runs next (the real failure surfaced in
+    opportunity_worker's background cycle takeover, which shares this same
+    connection via OpportunityPersistenceMixin).
+
+    This drives a real SQL failure (querying a table that genuinely does not
+    exist) directly against the adapter -- the same kind of failure
+    UndefinedTable was -- and proves a subsequent, unrelated, legitimate
+    query on the SAME store/connection succeeds afterwards rather than
+    raising InFailedSqlTransaction."""
+    _apply(_connect(database), _migrations())
+    store = _store(database)
+
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        store._connection.execute("SELECT * FROM table_that_does_not_exist_at_all")
+
+    # Before the fix, nothing rolled back here, so the next statement on this
+    # same connection would raise InFailedSqlTransaction instead of running.
+    drafts = store.load_manual_evidence_drafts()
+    assert drafts == []
+
+    # And a completely unrelated operation (the real-world symptom: the
+    # opportunity worker's background takeover check) also succeeds on the
+    # same connection afterwards.
+    assert store.active_cycle_run() is None
+
+
+def test_manual_evidence_sql_failure_does_not_poison_connection_for_opportunity_worker_path(database):
+    """Reproduces the real observed failure shape as closely as possible
+    without the application's HTTP layer: the manual-evidence persistence
+    path fails first (UndefinedTable, simulated by querying the real table
+    with a typo'd/missing column so it fails the same way a genuinely
+    missing relation would), then the opportunity-cycle background path --
+    which shares this exact connection via OpportunityPersistenceMixin --
+    must still succeed."""
+    _apply(_connect(database), _migrations())
+    store = _store(database)
+
+    with pytest.raises(psycopg.errors.UndefinedColumn):
+        store._connection.execute("SELECT nonexistent_column FROM global_manual_evidence")
+
+    run, created = store.create_cycle_run("defect-c-regression", {"top_n": 4})
+    assert created is True
+    assert run["cycle_id"] == "defect-c-regression"

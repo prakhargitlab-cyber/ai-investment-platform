@@ -176,10 +176,14 @@ class PortfolioRouteControllerTest {
         request.setContent("{}".getBytes(StandardCharsets.UTF_8));
         addTrustedIdentity(request);
 
-        ResponseEntity<String> response = controller.routeResearch(request);
+        // routeResearch now returns ResponseEntity<byte[]> (byte-exact
+        // transport fix, runtime defect closure); the timeout error body is
+        // still UTF-8 JSON text, just carried as bytes like every other
+        // research-engine response now is.
+        ResponseEntity<byte[]> response = controller.routeResearch(request);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
-        assertThat(response.getBody()).contains("RESEARCH_ENGINE_TIMEOUT");
+        assertThat(new String(response.getBody(), StandardCharsets.UTF_8)).contains("RESEARCH_ENGINE_TIMEOUT");
     }
 
     private void startServer(ExchangeHandler handler) throws IOException {

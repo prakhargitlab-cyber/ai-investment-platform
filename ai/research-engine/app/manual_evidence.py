@@ -51,7 +51,6 @@ from app.models import (
     SourceType,
     TimeHorizon,
 )
-from app.shareholding import parse_official_shareholding
 
 # _ORDER_EVENTS / _GOVERNANCE_EVENTS are the SAME frozensets
 # app.research_readiness_runtime._append_events() already uses to route a
@@ -115,6 +114,20 @@ class EvidenceType(StrEnum):
     GROWTH_FACTS = "GROWTH_FACTS"
     BALANCE_SHEET_FACTS = "BALANCE_SHEET_FACTS"
     QUARTERLY_FINANCIALS = "QUARTERLY_FINANCIALS"
+    # Universal non-READY_FRESH manual evidence rule closure: every
+    # requirement must have a legitimate manual evidence contract, not just
+    # a frontend button. These four were previously excluded on
+    # market-integrity grounds (see the comment above about
+    # LATEST_USABLE_PRICE/PB); they are now supported with the SAME
+    # lowest-authority USER_UPLOAD tier/precedence boundary every other
+    # manual evidence type already uses, so they can only ever fill a
+    # genuine gap, never outrank or overwrite trusted automated evidence,
+    # and never bypass deterministic valuation/scoring calculations (see
+    # PRICE_EVIDENCE_TYPES and ALLOWED_METRICS_BY_EVIDENCE_TYPE below).
+    LATEST_PRICE = "LATEST_PRICE"
+    HISTORICAL_PRICE_SERIES = "HISTORICAL_PRICE_SERIES"
+    VALUATION_INPUTS = "VALUATION_INPUTS"
+    SECTOR_MACRO = "SECTOR_MACRO"
 
 
 SUPPORTED_EVIDENCE_TYPES: tuple[EvidenceType, ...] = (
@@ -126,6 +139,10 @@ SUPPORTED_EVIDENCE_TYPES: tuple[EvidenceType, ...] = (
     EvidenceType.GROWTH_FACTS,
     EvidenceType.BALANCE_SHEET_FACTS,
     EvidenceType.QUARTERLY_FINANCIALS,
+    EvidenceType.LATEST_PRICE,
+    EvidenceType.HISTORICAL_PRICE_SERIES,
+    EvidenceType.VALUATION_INPUTS,
+    EvidenceType.SECTOR_MACRO,
 )
 
 # Evidence types backed by the canonical ResearchEvent / research_events
@@ -168,7 +185,69 @@ FINANCIAL_FACT_EVIDENCE_TYPES: frozenset[EvidenceType] = frozenset({
     EvidenceType.GROWTH_FACTS,
     EvidenceType.BALANCE_SHEET_FACTS,
     EvidenceType.QUARTERLY_FINANCIALS,
+    # VALUATION_INPUTS is included here ONLY for its one FinancialFact-backed
+    # input (EARNINGS_BASIS, satisfied by eps/pat/net_income/net_profit --
+    # see ALLOWED_METRICS_BY_EVIDENCE_TYPE and
+    # app.research_readiness_runtime._financial_fact_coverage). Its other
+    # mandatory inputs (LATEST_USABLE_PRICE, PE, PB, EV_EBITDA, FCF_YIELD)
+    # are derived ratios computed exclusively from trusted structured market
+    # data (app.valuation_evidence.materialize_valuation) and are NOT
+    # satisfiable by manual upload -- a manual upload can therefore move
+    # VALUATION_INPUTS from MISSING towards PARTIAL, never fabricate a
+    # derived ratio or bypass the deterministic valuation calculation.
+    EvidenceType.VALUATION_INPUTS,
 })
+
+# LATEST_PRICE / HISTORICAL_PRICE_SERIES: structured, NOT a free-text/repeating
+# "facts" row upload like FINANCIAL_FACT_EVIDENCE_TYPES above. Each is backed
+# by its own dedicated validate/build method (see _validate_latest_price_fields
+# / _build_latest_price_fact and _validate_historical_price_series_fields /
+# _build_historical_price_series_facts) because price data has a materially
+# different shape (price+currency+asOf+source; a date-ordered observation
+# series) from a generic metric/periodEnd/periodType fact row. Both still
+# persist as real FinancialFact rows tagged FactSourceTier.USER_UPLOAD through
+# the SAME merge_fact()/upsert_financial_fact precedence boundary every other
+# manual evidence type uses -- see PRICE_EVIDENCE_METRICS below for the
+# synthetic metric names app.research_readiness_runtime._financial_fact_coverage
+# recognizes, and the module docstring note on why these two types were
+# reintroduced after being previously excluded on market-integrity grounds.
+PRICE_EVIDENCE_TYPES: frozenset[EvidenceType] = frozenset({
+    EvidenceType.LATEST_PRICE,
+    EvidenceType.HISTORICAL_PRICE_SERIES,
+})
+
+# Synthetic FinancialFact metric names used ONLY by the two evidence types
+# above -- never exposed to the user, never overlapping with any real
+# automated metric name (see ALLOWED_METRICS_BY_EVIDENCE_TYPE for the
+# automated-aligned metric vocabulary FINANCIAL_FACT_EVIDENCE_TYPES uses).
+# app.research_readiness_runtime._financial_fact_coverage recognizes these
+# exact strings to route coverage to LATEST_PRICE/HISTORICAL_PRICE_SERIES/
+# VALUATION_INPUTS(LATEST_USABLE_PRICE), mirroring how the trusted
+# structured-market path already covers the same inputs (see
+# _structured_fact_coverage's "latestPrice" handling) -- NOT duplicating
+# that trusted path, since these facts live in global_financial_facts, not
+# global_market_price_observations/global_daily_market_bars, and are never
+# read by stock_rule_engine/ranking (see FactSourceTier.USER_UPLOAD's own
+# docstring on SUPPORTED_FINANCIAL_SOURCE_TIERS exclusion).
+MANUAL_LATEST_PRICE_METRIC = "manual_latest_price"
+MANUAL_HISTORICAL_CLOSE_METRIC = "manual_historical_close"
+
+# SECTOR_MACRO is document-backed (app.research_readiness_runtime
+# _append_documents' qualitative macro-term scan over document text), NOT
+# ResearchEvent-backed like ORDER_BOOK_CAPEX_GUIDANCE/GOVERNANCE_HISTORY --
+# see _build_sector_macro_document / _ensure_sector_macro_document. A manual
+# SECTOR_MACRO upload is NEVER routed through the automated _MACRO_TERMS
+# keyword heuristic (that heuristic exists only to classify automated/
+# unlabeled document text; an explicit manual SECTOR_MACRO submission
+# already carries unambiguous human intent and would be fragile/surprising
+# if it silently failed to register just because the user's wording did not
+# happen to match one of 8 hardcoded terms) -- see
+# _append_manual_sector_macro_evidence, a small dedicated function that
+# unconditionally recognizes it via a distinct canonical_url marker. This
+# NEVER mutates CANONICAL_SECTOR (canonical instrument classification);
+# it only ever contributes RELEVANT_MACRO_EVENT_EXPOSURE, the same
+# qualitative input an automated macro-relevant document contributes.
+SECTOR_MACRO_DOCUMENT_URL_PREFIX = "manual-evidence:sector-macro:"
 
 # Canonical metric names a manual upload is permitted to submit for each
 # FinancialFact-backed evidence type, derived EXACTLY from
@@ -202,6 +281,13 @@ ALLOWED_METRICS_BY_EVIDENCE_TYPE: dict[EvidenceType, frozenset[str]] = {
         "eps",
         "ebitda", "operating_profit", "operating_income",
         "operating_margin", "profit_margin", "ebitda_margin",
+    }),
+    # Only the metrics app.research_readiness_runtime._financial_fact_coverage
+    # actually maps to VALUATION_INPUTS (-> EARNINGS_BASIS). PE/PB/EV_EBITDA/
+    # FCF_YIELD/LATEST_USABLE_PRICE are deliberately absent -- see
+    # FINANCIAL_FACT_EVIDENCE_TYPES' comment on VALUATION_INPUTS above.
+    EvidenceType.VALUATION_INPUTS: frozenset({
+        "eps", "pat", "net_income", "net_profit",
     }),
 }
 
@@ -242,6 +328,21 @@ GOVERNANCE_HISTORY_MANUAL_FIELDS: tuple[str, ...] = CURRENT_NEWS_MANUAL_FIELDS
 # separate frontend undertaking, reported as a remaining gap.
 FINANCIAL_FACT_MANUAL_FIELDS: tuple[str, ...] = ("facts",)
 
+# LATEST_PRICE: a single structured observation. asOf is the real market
+# as-of date/time the price was observed -- never defaulted to upload time,
+# same discipline as periodEnd in the FinancialFact rows above.
+LATEST_PRICE_MANUAL_FIELDS: tuple[str, ...] = ("price", "currency", "asOf", "source")
+# HISTORICAL_PRICE_SERIES: "observations" is a structured, line-oriented
+# "YYYY-MM-DD,close" list (one observation per line) rather than free prose
+# -- see _validate_historical_price_series_fields for the deterministic
+# parse/validate rules (dates, numeric range, duplicates, future dates).
+# currency/source apply to the whole submitted batch.
+HISTORICAL_PRICE_SERIES_MANUAL_FIELDS: tuple[str, ...] = ("observations", "currency", "source")
+# SECTOR_MACRO: same discipline as CURRENT_NEWS -- no auto-extraction of a
+# sector/macro-exposure judgment from arbitrary prose; the user explicitly
+# supplies a dated, sourced summary. See SECTOR_MACRO_DOCUMENT_URL_PREFIX.
+SECTOR_MACRO_MANUAL_FIELDS: tuple[str, ...] = ("summary", "asOf", "source")
+
 MANUAL_FIELD_SCHEMA: dict[EvidenceType, tuple[str, ...]] = {
     EvidenceType.CURRENT_NEWS: CURRENT_NEWS_MANUAL_FIELDS,
     EvidenceType.ORDER_BOOK_CAPEX_GUIDANCE: ORDER_BOOK_CAPEX_GUIDANCE_MANUAL_FIELDS,
@@ -250,6 +351,10 @@ MANUAL_FIELD_SCHEMA: dict[EvidenceType, tuple[str, ...]] = {
     EvidenceType.GROWTH_FACTS: FINANCIAL_FACT_MANUAL_FIELDS,
     EvidenceType.BALANCE_SHEET_FACTS: FINANCIAL_FACT_MANUAL_FIELDS,
     EvidenceType.QUARTERLY_FINANCIALS: FINANCIAL_FACT_MANUAL_FIELDS,
+    EvidenceType.VALUATION_INPUTS: FINANCIAL_FACT_MANUAL_FIELDS,
+    EvidenceType.LATEST_PRICE: LATEST_PRICE_MANUAL_FIELDS,
+    EvidenceType.HISTORICAL_PRICE_SERIES: HISTORICAL_PRICE_SERIES_MANUAL_FIELDS,
+    EvidenceType.SECTOR_MACRO: SECTOR_MACRO_MANUAL_FIELDS,
 }
 
 
@@ -273,6 +378,12 @@ SUPPORTED_FILE_TYPES: dict[str, str] = {
     "text/plain": "TXT",
     "image/png": "PNG",
     "image/jpeg": "JPG",
+    # DOCX (paragraphs + tables via python-docx, no LibreOffice/Word
+    # runtime) -- gated the same way PNG/JPG are: see
+    # _ocr_dependent_labels_available / runtime_supported_file_type_labels
+    # below, which only advertise "DOCX" when python-docx is actually
+    # importable (app.document_extraction.docx_extraction_available()).
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "DOCX",
 }
 
 # Extensions without standard MIME types.
@@ -283,6 +394,7 @@ _EXTENSION_MAPPING: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
 
@@ -316,9 +428,10 @@ SUPPORTED_FILE_TYPE_LABELS = sorted(set(SUPPORTED_FILE_TYPES.values()))
 # dependency (native pypdf/CSV/text parsing only) and are therefore never
 # gated here -- only the OCR-dependent PNG/JPEG path is.
 def _ocr_dependent_labels_available() -> dict[str, bool]:
+    from app.document_extraction import docx_extraction_available
     from app.image_evidence_extraction import image_ocr_available
     available = image_ocr_available()
-    return {"PNG": available, "JPG": available}
+    return {"PNG": available, "JPG": available, "DOCX": docx_extraction_available()}
 
 
 def runtime_supported_file_type_labels() -> list[str]:
@@ -405,6 +518,23 @@ class ManualEvidenceDraft:
     # them as `corrections` to accept(). Always False for SHAREHOLDING.
     requires_manual_fields: bool = False
     manual_field_schema: tuple[str, ...] = field(default_factory=tuple)
+    # Read-only reference text surfaced to the Review screen so the user
+    # does not have to re-read the original file by eye while filling in
+    # manual_field_schema (CURRENT_NEWS / ORDER_BOOK_CAPEX_GUIDANCE /
+    # GOVERNANCE_HISTORY / FinancialFact families). Never auto-populates
+    # any field and is never itself treated as a proposed fact -- it is
+    # strictly informational provenance the user may copy from. None when
+    # no text could be extracted (see validation_results warnings instead).
+    extracted_text: str | None = None
+    # Conservative, NON-BINDING field suggestions produced by an Evidence
+    # Interpreter (see app.evidence_interpretation.interpret_current_news)
+    # from extracted_text -- e.g. {"title": "...", "eventDate": "...",
+    # "source": "..."}. Never auto-applied, never validated as a fact,
+    # never required: the frontend may offer these as pre-fill for
+    # MANUAL_FIELD_SCHEMA, but the user still explicitly supplies and
+    # submits every field as `corrections` at accept() time, unchanged.
+    # None for evidence types with no suggestion interpreter.
+    field_suggestions: dict[str, str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -479,16 +609,30 @@ class ManualEvidenceIngestor:
         proposed_facts: list[ProposedFact] = []
         validation = ValidationResult(valid=True)
         requires_manual_fields = False
+        field_suggestions: dict[str, str] | None = None
 
         if evidence_type_enum == EvidenceType.SHAREHOLDING:
-            proposed_facts, reporting_period, validation = self._extract_shareholding(
+            proposed_facts, reporting_period, validation, shareholding_supplementary = self._extract_shareholding(
                 text, instrument_id, digest, filename, mime
             )
+            # Non-canonical reference metadata the table interpreter
+            # recognized alongside the canonical category values (e.g.
+            # shareholder count, the original source-period text) but
+            # with no field in the existing ShareholdingCategory domain
+            # model -- surfaced read-only via the same advisory
+            # field_suggestions mechanism CURRENT_NEWS uses, never
+            # persisted as a canonical fact, never required at accept().
+            field_suggestions = shareholding_supplementary
         elif evidence_type_enum == EvidenceType.CURRENT_NEWS:
-            # No auto-extraction: see CURRENT_NEWS_MANUAL_FIELDS. The file is
-            # kept as supporting evidence (original_bytes/content_hash below);
-            # proposed_facts stays empty -- nothing is proposed as fact until
-            # the user supplies the required fields explicitly at accept().
+            # No auto-extraction of CANONICAL facts: see
+            # CURRENT_NEWS_MANUAL_FIELDS. The file is kept as supporting
+            # evidence (original_bytes/content_hash below); proposed_facts
+            # stays empty -- nothing is proposed as fact until the user
+            # supplies the required fields explicitly at accept(). A
+            # separate, conservative Evidence Interpreter MAY surface
+            # non-binding field SUGGESTIONS (see field_suggestions below)
+            # to reduce retyping -- this is advisory pre-fill, never a
+            # proposed fact, and never changes the accept() contract.
             requires_manual_fields = True
             if not text.strip():
                 validation = ValidationResult(
@@ -497,6 +641,8 @@ class ManualEvidenceIngestor:
                               "it is still kept as supporting evidence, but none of its "
                               "content could be used to help you fill in the required fields"],
                 )
+            else:
+                field_suggestions = self._suggest_current_news_fields(text)
         elif evidence_type_enum in (EvidenceType.ORDER_BOOK_CAPEX_GUIDANCE, EvidenceType.GOVERNANCE_HISTORY):
             # Same rationale as CURRENT_NEWS: converting arbitrary order-book
             # / capex / governance prose into a structured, authoritative
@@ -533,6 +679,24 @@ class ManualEvidenceIngestor:
                               "it is still kept as supporting evidence, but none of its "
                               "content could be used to help you fill in the required fact rows"],
                 )
+        elif evidence_type_enum in PRICE_EVIDENCE_TYPES or evidence_type_enum == EvidenceType.SECTOR_MACRO:
+            # Same rationale again: a price, OHLC observation, or
+            # sector/macro exposure judgment is exactly the kind of
+            # authoritative, freshness-driving value that must never be
+            # guessed from arbitrary prose. The uploaded file (if any) is
+            # kept only as supporting context; the user supplies the
+            # structured fields explicitly as corrections at accept() time
+            # (see MANUAL_FIELD_SCHEMA / _validate_latest_price_fields /
+            # _validate_historical_price_series_fields /
+            # _validate_sector_macro_fields).
+            requires_manual_fields = True
+            if not text.strip():
+                validation = ValidationResult(
+                    valid=True,
+                    warnings=["NO_TEXT_EXTRACTED: the file could not be read as text; "
+                              "it is still kept as supporting evidence, but none of its "
+                              "content could be used to help you fill in the required fields"],
+                )
 
         draft = ManualEvidenceDraft(
             draft_id=uuid4(),
@@ -550,6 +714,14 @@ class ManualEvidenceIngestor:
             corrections={},
             requires_manual_fields=requires_manual_fields,
             manual_field_schema=MANUAL_FIELD_SCHEMA.get(evidence_type_enum, ()),
+            # Informational only (see ManualEvidenceDraft.extracted_text):
+            # surfaced for manual-field evidence types where there are no
+            # proposed_facts to review against, so the user is not left
+            # re-reading the original file by eye. Never set for
+            # SHAREHOLDING, whose proposed_facts already carry evidence_text
+            # per field.
+            extracted_text=(text.strip() or None) if requires_manual_fields else None,
+            field_suggestions=field_suggestions,
         )
         if duplicate_of is not None:
             draft.validation_results.warnings.append(
@@ -570,98 +742,63 @@ class ManualEvidenceIngestor:
         """Retrieve a draft by ID (in-process only)."""
         return _drafts.get(draft_id)
 
+    @staticmethod
+    def _suggest_current_news_fields(text: str) -> dict[str, str] | None:
+        """Conservative, NON-BINDING CURRENT_NEWS field suggestions.
+
+        Delegates to app.evidence_interpretation.interpret_current_news --
+        a candidate title/eventDate/source extracted from noisy
+        screenshot/OCR text, never fabricated, never auto-accepted. The
+        result is advisory pre-fill only: the user still explicitly
+        supplies and submits every CURRENT_NEWS field as `corrections` at
+        accept() time (see _validate_current_news_fields), completely
+        unchanged by this. Returns None (no suggestions block at all)
+        when nothing recognizable was found for any field.
+        """
+        from types import SimpleNamespace
+
+        from app.evidence_interpretation import interpret_current_news
+
+        candidate = interpret_current_news(SimpleNamespace(text=text))
+        suggestions: dict[str, str] = {}
+        if candidate.title:
+            suggestions["title"] = candidate.title
+        if candidate.event_date:
+            suggestions["eventDate"] = candidate.event_date
+        if candidate.source_url:
+            # Matches CURRENT_NEWS_MANUAL_FIELDS' "sourceUrl" key exactly,
+            # so the frontend can pre-fill the same field the user must
+            # ultimately submit as a correction.
+            suggestions["sourceUrl"] = candidate.source_url
+        return suggestions or None
+
     # -- text extraction ---------------------------------------------------
 
     def _extract_text(self, file_bytes: bytes, mime: str, filename: str) -> str | None:
         """Extract text from a file based on its MIME type.
 
-        Returns None if no text could be extracted (e.g. image without OCR).
+        Delegates to the provider-neutral app.document_extraction.
+        DocumentExtractor -- this method is now a thin adapter that keeps
+        ManualEvidenceIngestor's existing str|None contract (None means
+        "no extraction path exists for this MIME type at all"; "" means
+        "a path exists but nothing could be extracted this time") so
+        every existing caller (ingest(), _extract_shareholding, ...) is
+        unaffected by the refactor. The actual extraction logic -- PDF/
+        DOCX/image/CSV/TXT, OCR bounds, subprocess isolation -- lives
+        entirely in DocumentExtractor now, independent of this module, so
+        it can be reused by a future LLM-based interpreter without
+        depending on ManualEvidenceIngestor or ResearchReadinessRuntime.
         """
-        if mime in ("text/csv", "text/plain"):
-            return file_bytes.decode("utf-8", errors="replace")
-        if mime == "application/pdf":
-            return self._extract_pdf_text(file_bytes)  # falls back to scanned-PDF OCR internally
-        if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            return self._extract_docx_text(file_bytes)
-        if mime in ("image/png", "image/jpeg"):
-            return self._extract_image_text(file_bytes, mime)
-        return None
+        from app.document_extraction import DocumentExtractor, DocumentInput, EXTRACTABLE_MIME_TYPES
 
-    def _extract_pdf_text(self, file_bytes: bytes) -> str | None:
-        """Extract text from a PDF using pypdf, falling back to bounded
-        scanned-PDF OCR (Defect 2) when the PDF has no extractable text
-        layer at all. A PDF with even a little real text is NOT treated as
-        scanned -- OCR is only attempted when pypdf found nothing."""
-        try:
-            from pypdf import PdfReader
-        except ImportError:
+        if mime not in EXTRACTABLE_MIME_TYPES:
             return None
-        try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            pages = []
-            for page in reader.pages:
-                text = page.extract_text() or ""
-                pages.append(text)
-            native_text = "\n".join(pages) if pages else ""
-        except Exception as exc:
-            logger.warning("pdf_text_extraction_failed reason=%s", exc)
-            return None
-        if native_text.strip():
-            return native_text
-        return self._extract_scanned_pdf_text(file_bytes)
-
-    def _extract_scanned_pdf_text(self, file_bytes: bytes) -> str | None:
-        """Bounded OCR fallback for a scanned PDF with no text layer.
-
-        See app.image_evidence_extraction.extract_text_from_scanned_pdf for
-        the bounds enforced (page count, size, per-call timeout). Any
-        rejection/timeout/failure here is truthfully reported as "no text
-        extracted" (returns ""), never silently fabricated and never
-        raised as a hard error -- a scanned PDF the OCR path cannot handle
-        is still kept as supporting evidence, exactly like any other file
-        whose text could not be read (see the NO_TEXT_EXTRACTED warning in
-        ingest()).
-        """
-        from app.image_evidence_extraction import extract_text_from_scanned_pdf
-        result = extract_text_from_scanned_pdf(file_bytes)
-        if result.status != "EXTRACTED":
-            logger.info("scanned_pdf_ocr_not_extracted status=%s reason=%s", result.status, result.reason)
-            return ""
-        return result.text or ""
-
-    def _extract_docx_text(self, file_bytes: bytes) -> str | None:
-        """Extract text from a DOCX file using python-docx if available."""
-        try:
-            from docx import Document
-        except ImportError:
-            return None
-        try:
-            doc = Document(io.BytesIO(file_bytes))
-            paragraphs = [p.text for p in doc.paragraphs if p.text]
-            return "\n".join(paragraphs) if paragraphs else ""
-        except Exception as exc:
-            logger.warning("docx_text_extraction_failed reason=%s", exc)
-            return None
-
-    def _extract_image_text(self, file_bytes: bytes, mime: str) -> str | None:
-        """Extract text from a PNG/JPEG image via the bounded, subprocess-
-        isolated OCR path (Defect 2 closure).
-
-        Deliberately does NOT call pytesseract/PIL directly in-process --
-        see app.image_evidence_extraction's module docstring for why: file
-        size, decoded pixel count, and OCR wall-clock time are all bounded
-        BEFORE anything runs, and the OCR step itself runs as a separate
-        tesseract process so it can be killed by a timeout without taking
-        this process down with it. Returns "" (truthfully, no fabricated
-        text) for any rejection/timeout/failure rather than raising -- the
-        file is still kept as supporting evidence either way.
-        """
-        from app.image_evidence_extraction import extract_text_from_image
-        result = extract_text_from_image(file_bytes, mime)
-        if result.status != "EXTRACTED":
-            logger.info("image_ocr_not_extracted status=%s reason=%s", result.status, result.reason)
-            return ""
-        return result.text or ""
+        extracted = DocumentExtractor().extract(DocumentInput(
+            file_bytes=file_bytes, mime_type=mime, filename=filename,
+        ))
+        for warning in extracted.warnings:
+            logger.info("document_extraction_warning mime=%s method=%s warning=%s", mime, extracted.extraction_method, warning)
+        return extracted.text
 
     # -- shareholding extraction --------------------------------------------
 
@@ -672,54 +809,44 @@ class ManualEvidenceIngestor:
         content_digest: str,
         filename: str,
         mime: str,
-    ) -> tuple[list[ProposedFact], datetime | None, ValidationResult]:
+    ) -> tuple[list[ProposedFact], datetime | None, ValidationResult, dict[str, str] | None]:
         """Extract shareholding facts from extracted text.
 
-        Reuses the deterministic ``parse_official_shareholding`` parser
-        from ``shareholding.py`` by constructing a synthetic
-        ResearchDocument that satisfies its prerequisites.
+        Delegates the actual interpretation (extracted text -> candidate
+        shareholding values) to app.evidence_interpretation.
+        interpret_shareholding -- EVIDENCE INTERPRETATION is kept separate
+        from DOCUMENT EXTRACTION (app.document_extraction, see
+        _extract_text above) and from this module's own CANDIDATE DRAFT /
+        VALIDATION responsibilities, so the same interpretation step can
+        later be reused by a future LLM-based interpreter without
+        depending on ManualEvidenceIngestor. This method remains a thin
+        adapter converting the interpreter's output into this module's
+        ProposedFact/ValidationResult contract -- zero behavior change
+        from the previous inline implementation.
         """
-        from app.models import (
-            DocumentStatus,
-            DocumentType,
-            ResearchDocument,
-        )
-        from app.normalization import normalize_text
+        from types import SimpleNamespace
 
-        document = ResearchDocument(
-            canonical_url=f"manual-evidence:{content_digest}",
-            original_url=f"manual-evidence:{content_digest}",
-            title=filename,
-            source_type=SourceType.REGULATORY_FILING,
-            source_classification=SourceClassification.REGULATORY,
-            source_name="USER_UPLOAD",
-            published_at=None,
-            retrieved_at=datetime.now(timezone.utc),
-            language="en",
-            content_type=mime,
-            document_type=DocumentType.TEXT,
-            status=DocumentStatus.PROCESSED,
-            reliability_level=ReliabilityLevel.LEVEL_D,
+        from app.evidence_interpretation import interpret_shareholding
+
+        interpretation = interpret_shareholding(
+            SimpleNamespace(text=text),
             instrument_id=instrument_id,
-            source_mode=SourceMode.REAL,
-            freshness="REAL",
-            content_hash=content_digest,
+            content_digest=content_digest,
+            filename=filename,
+            mime=mime,
         )
-
-        document.normalized_text = normalize_text(text)
-        document.raw_text = text
-
-        snapshot = parse_official_shareholding(document)
-        if snapshot is None or not snapshot.values:
+        if interpretation.errors or not interpretation.values:
             return [], None, ValidationResult(
                 valid=False,
-                errors=["NO_SHAREHOLDING_VALUES_EXTRACTED: could not find "
-                        "recognizable shareholding category percentages in the document"],
-                warnings=[],
-            )
+                errors=interpretation.errors or [
+                    "NO_SHAREHOLDING_VALUES_EXTRACTED: could not find "
+                    "recognizable shareholding category percentages in the document"
+                ],
+                warnings=list(interpretation.warnings),
+            ), interpretation.supplementary
 
         proposed: list[ProposedFact] = []
-        for value in snapshot.values:
+        for value in interpretation.values:
             category_str = value.category.value if hasattr(value.category, "value") else str(value.category)
             proposed.append(ProposedFact(
                 field=f"shareholding:{category_str}",
@@ -731,9 +858,17 @@ class ManualEvidenceIngestor:
                 confidence=0.90,
             ))
 
-        validation = self._validate_shareholding_draft(proposed, snapshot)
+        validation = self._validate_shareholding_draft(
+            proposed, SimpleNamespace(period_end=interpretation.period_end)
+        )
+        # Non-blocking interpreter warnings (e.g. a table row whose column
+        # count did not match the header, an implausible ownership-percentage
+        # sum, or a reporting period that could not be mapped to a
+        # canonical quarter-end date) -- surfaced for Review, never
+        # silently dropped and never escalated into a hard error here.
+        validation.warnings = [*validation.warnings, *interpretation.warnings]
 
-        return proposed, snapshot.period_end, validation
+        return proposed, interpretation.period_end, validation, interpretation.supplementary
 
     def _validate_shareholding_draft(
         self, proposed: list[ProposedFact], snapshot
@@ -747,7 +882,7 @@ class ManualEvidenceIngestor:
           * PROMOTER_PLEDGE values have an explicit metric basis.
           * Period end is a valid quarter-end date.
         """
-        from app.repository import _is_quarter_end
+        from app.repository import _is_shareholding_quarter_period
 
         errors: list[str] = []
         warnings: list[str] = []
@@ -780,7 +915,12 @@ class ManualEvidenceIngestor:
                     )
 
         if snapshot.period_end is not None:
-            if not _is_quarter_end(snapshot.period_end):
+            # Semantic quarter-period check: accepts EITHER an explicit
+            # calendar quarter-end day OR the first-of-month day a
+            # MONTH-precision source period ("Jun 2026") normalizes to --
+            # both represent the same semantic reporting period (see
+            # app.repository._is_shareholding_quarter_period).
+            if not _is_shareholding_quarter_period(snapshot.period_end):
                 warnings.append(
                     f"PERIOD_NOT_QUARTER_END: {snapshot.period_end.date().isoformat()}"
                 )
@@ -828,10 +968,15 @@ class ManualEvidenceIngestor:
         return None
 
 
-def _record_id(record: ShareholdingSnapshot | ResearchEvent) -> UUID:
+def _record_id(record: ShareholdingSnapshot | ResearchEvent | Any) -> UUID:
     """The persisted record's own identity, regardless of evidence type
-    (ShareholdingSnapshot.id vs ResearchEvent.event_id)."""
-    return record.id if isinstance(record, ShareholdingSnapshot) else record.event_id
+    (ShareholdingSnapshot.id vs ResearchEvent.event_id vs
+    ResearchDocument.document_id for the SECTOR_MACRO document path)."""
+    if isinstance(record, ShareholdingSnapshot):
+        return record.id
+    if hasattr(record, "event_id"):
+        return record.event_id
+    return record.document_id
 
 
 def content_hash_hex(data: bytes) -> str:
@@ -934,6 +1079,13 @@ class ManualEvidenceAcceptor:
                 f"DRAFT_INVALID: {draft.evidence_type.value} requires fact rows to be "
                 f"supplied as corrections['facts']"
             )
+        if (
+            draft.evidence_type in PRICE_EVIDENCE_TYPES or draft.evidence_type == EvidenceType.SECTOR_MACRO
+        ) and not draft.corrections:
+            raise AcceptanceError(
+                f"DRAFT_INVALID: {draft.evidence_type.value} requires the manual fields "
+                f"{MANUAL_FIELD_SCHEMA[draft.evidence_type]} to be supplied as corrections"
+            )
 
         # Re-validate after corrections.
         draft.validation_results = self._revalidate(draft)
@@ -961,6 +1113,15 @@ class ManualEvidenceAcceptor:
             # accept. Handled generically below wherever code must branch on
             # "one record" vs "a batch" (record_id, _persist_and_signal).
             snapshot = self._build_financial_facts(draft)
+        elif draft.evidence_type == EvidenceType.LATEST_PRICE:
+            snapshot = self._build_latest_price_fact(draft)
+        elif draft.evidence_type == EvidenceType.HISTORICAL_PRICE_SERIES:
+            snapshot = self._build_historical_price_series_facts(draft)
+        elif draft.evidence_type == EvidenceType.SECTOR_MACRO:
+            # A ResearchDocument, not an Event -- SECTOR_MACRO's
+            # RELEVANT_MACRO_EVENT_EXPOSURE input is document-backed (see
+            # SECTOR_MACRO_DOCUMENT_URL_PREFIX / _append_manual_sector_macro_evidence).
+            snapshot = self._build_sector_macro_document(draft)
         else:
             raise AcceptanceError(
                 f"UNSUPPORTED_EVIDENCE_TYPE_FOR_ACCEPT: {draft.evidence_type}"
@@ -1070,7 +1231,7 @@ class ManualEvidenceAcceptor:
                         snapshot, durable=self.repository._documents_are_durable())
                     if created:
                         self.repository._persistence.upsert_event(snapshot)
-                elif draft.evidence_type in FINANCIAL_FACT_EVIDENCE_TYPES:
+                elif draft.evidence_type in FINANCIAL_FACT_EVIDENCE_TYPES or draft.evidence_type in PRICE_EVIDENCE_TYPES:
                     # merge_fact() (via upsert_financial_fact) is the ONLY
                     # precedence authority here: USER_UPLOAD's authority is
                     # lower than every automated tier, so this can only ever
@@ -1079,9 +1240,40 @@ class ManualEvidenceAcceptor:
                     # overwrite it. No pre-check/reconcile step is needed
                     # (unlike SHAREHOLDING) because the existing conflict-
                     # preservation architecture already enforces this
-                    # declaratively at the write boundary.
+                    # declaratively at the write boundary. LATEST_PRICE /
+                    # HISTORICAL_PRICE_SERIES reuse this IDENTICAL FinancialFact
+                    # persistence path (synthetic metric names -- see
+                    # PRICE_EVIDENCE_TYPES), never global_market_price_observations
+                    # / global_daily_market_bars, so they are never read by
+                    # stock_rule_engine/ranking.
                     written = self.repository.persist_international_financial_facts(snapshot)
                     created = written > 0
+                elif draft.evidence_type == EvidenceType.SECTOR_MACRO:
+                    # `snapshot` is the ResearchDocument itself here (see
+                    # _build_sector_macro_document) -- persisted directly,
+                    # with the same dedup-by-content_hash/canonical_url
+                    # semantics upsert_document already gives every other
+                    # document (re-uploading the identical summary reuses
+                    # the existing row rather than creating a duplicate).
+                    persistence_for_doc = getattr(self.repository, "_persistence", None)
+                    if persistence_for_doc is None or not hasattr(persistence_for_doc, "upsert_document"):
+                        raise AcceptanceError(
+                            "NO_DOCUMENT_PERSISTENCE: cannot durably persist SECTOR_MACRO "
+                            "evidence without a document store"
+                        )
+                    created = persistence_for_doc.upsert_document(snapshot)
+                    # upsert_document() only writes the durable row -- unlike
+                    # the CURRENT_NEWS/ORDER_BOOK_CAPEX_GUIDANCE/GOVERNANCE_HISTORY
+                    # paths above, this document IS the evidence itself (read
+                    # back via repository.documents_for() -> _append_documents()
+                    # / _append_manual_sector_macro_evidence()), not merely an
+                    # FK target for an event that repository.events.add()
+                    # already registers in its own resident index. Without
+                    # this, documents_for() returns an empty list forever
+                    # (its ref index, not the DB row, is what it actually
+                    # reads) and the manual evidence is accepted/persisted
+                    # but invisible to every future readiness read.
+                    self.repository.remember_persisted_document(snapshot)
                 else:
                     raise AcceptanceError(
                         f"UNSUPPORTED_EVIDENCE_TYPE_FOR_ACCEPT: {draft.evidence_type}")
@@ -1142,7 +1334,7 @@ class ManualEvidenceAcceptor:
     def _revalidate(self, draft: ManualEvidenceDraft) -> ValidationResult:
         """Re-run validation after corrections have been applied."""
         if draft.evidence_type == EvidenceType.SHAREHOLDING:
-            from app.repository import _is_quarter_end
+            from app.repository import _is_shareholding_quarter_period
             snapshot_values = self._draft_facts_to_snapshot_values(draft)
             errors: list[str] = []
             warnings: list[str] = []
@@ -1160,7 +1352,7 @@ class ManualEvidenceAcceptor:
             for v in snapshot_values:
                 if v.category == ShareholdingCategory.PROMOTER_PLEDGE and not v.metric_basis:
                     errors.append(f"PROMOTER_PLEDGE_REQUIRES_METRIC_BASIS: {v.category}")
-            if draft.reporting_period and not _is_quarter_end(draft.reporting_period):
+            if draft.reporting_period and not _is_shareholding_quarter_period(draft.reporting_period):
                 warnings.append(
                     f"PERIOD_NOT_QUARTER_END: {draft.reporting_period.date().isoformat()}"
                 )
@@ -1173,6 +1365,12 @@ class ManualEvidenceAcceptor:
             )
         if draft.evidence_type in FINANCIAL_FACT_EVIDENCE_TYPES:
             return self._validate_financial_fact_rows(draft)
+        if draft.evidence_type == EvidenceType.LATEST_PRICE:
+            return self._validate_latest_price_fields(draft)
+        if draft.evidence_type == EvidenceType.HISTORICAL_PRICE_SERIES:
+            return self._validate_historical_price_series_fields(draft)
+        if draft.evidence_type == EvidenceType.SECTOR_MACRO:
+            return self._validate_sector_macro_fields(draft)
         return draft.validation_results
 
     def _validate_financial_fact_rows(self, draft: ManualEvidenceDraft) -> ValidationResult:
@@ -1325,6 +1523,262 @@ class ManualEvidenceAcceptor:
                 source_mode=SourceMode.REAL,
             ))
         return facts
+
+    # -- LATEST_PRICE -------------------------------------------------------
+
+    def _validate_latest_price_fields(self, draft: ManualEvidenceDraft) -> ValidationResult:
+        """Deterministically validate a single structured manual price
+        observation. Nothing here is ever defaulted or guessed: a missing
+        or unparseable field is a hard error, and asOf is NEVER defaulted
+        to upload time (that would fabricate freshness)."""
+        c = draft.corrections or {}
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        price_raw = c.get("price")
+        price: Decimal | None = None
+        if not price_raw and price_raw != 0:
+            errors.append("MISSING_PRICE: price is required")
+        else:
+            try:
+                price = Decimal(str(price_raw))
+                if not price.is_finite() or price <= 0:
+                    raise ValueError("not a positive finite number")
+            except Exception:
+                errors.append(f"INVALID_PRICE: '{price_raw}' is not a positive finite number")
+                price = None
+
+        currency = str(c.get("currency") or "").strip().upper()
+        if not currency:
+            errors.append("MISSING_CURRENCY: currency is required (e.g. 'INR', 'USD')")
+        elif not (currency.isalpha() and len(currency) == 3):
+            errors.append(f"INVALID_CURRENCY: '{c.get('currency')}' must be a 3-letter code (e.g. 'INR')")
+
+        as_of_raw = c.get("asOf") or c.get("as_of")
+        if not as_of_raw:
+            errors.append(
+                "MISSING_AS_OF: the real market as-of date/time is required -- "
+                "freshness is computed from this value and is never defaulted "
+                "to the upload time"
+            )
+        else:
+            try:
+                as_of = datetime.fromisoformat(str(as_of_raw).replace("Z", "+00:00"))
+                if as_of.tzinfo is None:
+                    as_of = as_of.replace(tzinfo=timezone.utc)
+                if as_of > datetime.now(timezone.utc):
+                    errors.append(f"AS_OF_IN_FUTURE: '{as_of_raw}'")
+            except (ValueError, TypeError):
+                errors.append(f"INVALID_AS_OF: could not parse '{as_of_raw}' as a date/time")
+
+        source = str(c.get("source") or "").strip()
+        if not source:
+            errors.append("MISSING_SOURCE: a source reference is required")
+
+        if not draft.instrument_id:
+            errors.append("MISSING_INSTRUMENT: instrument_id is required")
+
+        return ValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
+
+    def _build_latest_price_fact(self, draft: ManualEvidenceDraft) -> list[FinancialFact]:
+        """Build a single USER_UPLOAD-tier FinancialFact carrying the manual
+        price observation. Stored under a synthetic metric name
+        (MANUAL_LATEST_PRICE_METRIC) that
+        app.research_readiness_runtime._financial_fact_coverage recognizes
+        and routes to LATEST_PRICE/VALUATION_INPUTS(LATEST_USABLE_PRICE) --
+        this is a real FinancialFact row in global_financial_facts, merged
+        through the SAME merge_fact() precedence boundary as every other
+        manual fact, so it can only ever fill a genuine gap."""
+        c = draft.corrections or {}
+        now = datetime.now(timezone.utc)
+        as_of = datetime.fromisoformat(str(c.get("asOf") or c.get("as_of")).replace("Z", "+00:00"))
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+        price = Decimal(str(c["price"]))
+        currency = str(c["currency"]).strip().upper()
+        source = str(c["source"]).strip()
+        period_end = as_of.date().isoformat()
+        key = FinancialFactKey(
+            instrument_id=draft.instrument_id,
+            metric=MANUAL_LATEST_PRICE_METRIC,
+            period_end=period_end,
+            period_type="POINT_IN_TIME",
+            reporting_basis="UNKNOWN",
+        )
+        provenanced = ProvenancedValue(
+            value=price,
+            unit=currency,
+            as_of_date=None,
+            source_url=source,
+            source_name="USER_UPLOAD",
+            source_type="MANUAL_UPLOAD",
+            retrieved_at=now,
+            confidence=1.0,
+        )
+        return [FinancialFact(
+            key=key,
+            value=provenanced,
+            source_tier=FactSourceTier.USER_UPLOAD,
+            source_provider="USER_UPLOAD",
+            source_identity=f"manual-evidence:{draft.content_hash}:{MANUAL_LATEST_PRICE_METRIC}:{period_end}",
+            source_mode=SourceMode.REAL,
+        )]
+
+    # -- HISTORICAL_PRICE_SERIES ---------------------------------------------
+
+    _MAX_HISTORICAL_PRICE_OBSERVATIONS = 2000
+
+    def _parse_historical_observations(self, raw: str) -> tuple[list[tuple[Any, Decimal]], list[str]]:
+        """Parse a line-oriented 'YYYY-MM-DD,close' observation list.
+
+        Returns (parsed observations, errors). Never raises -- every
+        malformed line is reported as a specific error, never silently
+        skipped or defaulted.
+        """
+        errors: list[str] = []
+        parsed: list[tuple[Any, Decimal]] = []
+        today = datetime.now(timezone.utc).date()
+        seen_dates: set[Any] = set()
+        lines = [line.strip() for line in str(raw).splitlines() if line.strip()]
+        if not lines:
+            errors.append("MISSING_OBSERVATIONS: at least one 'date,close' observation is required")
+            return parsed, errors
+        if len(lines) > self._MAX_HISTORICAL_PRICE_OBSERVATIONS:
+            errors.append(
+                f"TOO_MANY_OBSERVATIONS: {len(lines)} exceeds the "
+                f"{self._MAX_HISTORICAL_PRICE_OBSERVATIONS}-row bound per upload"
+            )
+            return parsed, errors
+        for idx, line in enumerate(lines):
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 2:
+                errors.append(f"INVALID_OBSERVATION_ROW[{idx}]: '{line}' must be 'date,close'")
+                continue
+            date_raw, close_raw = parts[0], parts[1]
+            try:
+                parsed_date = datetime.fromisoformat(date_raw[:10]).date()
+            except (ValueError, TypeError):
+                errors.append(f"INVALID_OBSERVATION_DATE[{idx}]: could not parse '{date_raw}' as YYYY-MM-DD")
+                continue
+            if parsed_date > today:
+                errors.append(f"OBSERVATION_DATE_IN_FUTURE[{idx}]: '{date_raw}'")
+                continue
+            try:
+                close = Decimal(close_raw)
+                if not close.is_finite() or close <= 0:
+                    raise ValueError("not a positive finite number")
+            except Exception:
+                errors.append(f"INVALID_OBSERVATION_CLOSE[{idx}]: '{close_raw}' is not a positive finite number")
+                continue
+            if parsed_date in seen_dates:
+                errors.append(f"DUPLICATE_OBSERVATION_DATE[{idx}]: '{date_raw}' already supplied by another row")
+                continue
+            seen_dates.add(parsed_date)
+            parsed.append((parsed_date, close))
+        return parsed, errors
+
+    def _validate_historical_price_series_fields(self, draft: ManualEvidenceDraft) -> ValidationResult:
+        c = draft.corrections or {}
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        currency = str(c.get("currency") or "").strip().upper()
+        if not currency:
+            errors.append("MISSING_CURRENCY: currency is required (e.g. 'INR', 'USD')")
+        elif not (currency.isalpha() and len(currency) == 3):
+            errors.append(f"INVALID_CURRENCY: '{c.get('currency')}' must be a 3-letter code (e.g. 'INR')")
+
+        source = str(c.get("source") or "").strip()
+        if not source:
+            errors.append("MISSING_SOURCE: a source reference is required")
+
+        observations_raw = c.get("observations")
+        if not observations_raw or not str(observations_raw).strip():
+            errors.append("MISSING_OBSERVATIONS: at least one 'date,close' observation is required")
+        else:
+            _, parse_errors = self._parse_historical_observations(str(observations_raw))
+            errors.extend(parse_errors)
+
+        if not draft.instrument_id:
+            errors.append("MISSING_INSTRUMENT: instrument_id is required")
+
+        return ValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
+
+    def _build_historical_price_series_facts(self, draft: ManualEvidenceDraft) -> list[FinancialFact]:
+        """Build one USER_UPLOAD-tier FinancialFact per validated daily
+        observation. See _build_latest_price_fact's docstring -- the same
+        merge_fact() precedence boundary, metric-routing mechanism, and
+        scoring-invisibility guarantee apply here."""
+        c = draft.corrections or {}
+        now = datetime.now(timezone.utc)
+        currency = str(c["currency"]).strip().upper()
+        source = str(c["source"]).strip()
+        observations, _ = self._parse_historical_observations(str(c["observations"]))
+        facts: list[FinancialFact] = []
+        for observed_date, close in observations:
+            period_end = observed_date.isoformat()
+            key = FinancialFactKey(
+                instrument_id=draft.instrument_id,
+                metric=MANUAL_HISTORICAL_CLOSE_METRIC,
+                period_end=period_end,
+                period_type="DAILY",
+                reporting_basis="UNKNOWN",
+            )
+            provenanced = ProvenancedValue(
+                value=close,
+                unit=currency,
+                as_of_date=None,
+                source_url=source,
+                source_name="USER_UPLOAD",
+                source_type="MANUAL_UPLOAD",
+                retrieved_at=now,
+                confidence=1.0,
+            )
+            facts.append(FinancialFact(
+                key=key,
+                value=provenanced,
+                source_tier=FactSourceTier.USER_UPLOAD,
+                source_provider="USER_UPLOAD",
+                source_identity=f"manual-evidence:{draft.content_hash}:{MANUAL_HISTORICAL_CLOSE_METRIC}:{period_end}",
+                source_mode=SourceMode.REAL,
+            ))
+        return facts
+
+    # -- SECTOR_MACRO ---------------------------------------------------------
+
+    def _validate_sector_macro_fields(self, draft: ManualEvidenceDraft) -> ValidationResult:
+        """Deterministically validate the user-supplied SECTOR_MACRO fields.
+        No auto-extraction: the user explicitly asserts the sector/macro
+        exposure summary, its as-of date, and a source -- see
+        SECTOR_MACRO_DOCUMENT_URL_PREFIX for why this is never routed
+        through the automated _MACRO_TERMS keyword heuristic."""
+        c = draft.corrections or {}
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        summary = str(c.get("summary") or "").strip()
+        if not summary:
+            errors.append("MISSING_SUMMARY: a sector/macro exposure summary is required")
+
+        as_of_raw = c.get("asOf") or c.get("as_of")
+        if not as_of_raw:
+            errors.append("MISSING_AS_OF: the real as-of date is required")
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(as_of_raw)[:10]).date()
+                if parsed > datetime.now(timezone.utc).date():
+                    errors.append(f"AS_OF_IN_FUTURE: '{as_of_raw}'")
+            except (ValueError, TypeError):
+                errors.append(f"INVALID_AS_OF: could not parse '{as_of_raw}' as a date (expected YYYY-MM-DD)")
+
+        source = str(c.get("source") or "").strip()
+        if not source:
+            errors.append("MISSING_SOURCE: a source reference is required")
+
+        if not draft.instrument_id:
+            errors.append("MISSING_INSTRUMENT: instrument_id is required")
+
+        return ValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
 
     def _validate_current_news_fields(self, draft: ManualEvidenceDraft) -> ValidationResult:
         """Deterministically validate the user-supplied CURRENT_NEWS fields.
@@ -1711,6 +2165,63 @@ class ManualEvidenceAcceptor:
             raw_evidence_reference=f"manual-evidence:{draft.content_hash}",
             published_at=event_date,
             retrieved_at=datetime.now(timezone.utc),
+        )
+
+    def _build_sector_macro_document(self, draft: ManualEvidenceDraft):
+        """Build a ResearchDocument carrying the user-supplied sector/macro
+        exposure summary as its normalized_text.
+
+        Deliberately a ResearchDocument, not a ResearchEvent: SECTOR_MACRO's
+        RELEVANT_MACRO_EVENT_EXPOSURE input is document-backed in
+        app.research_readiness_runtime (see
+        _append_manual_sector_macro_evidence / SECTOR_MACRO_DOCUMENT_URL_PREFIX),
+        not event-backed like ORDER_BOOK_CAPEX_GUIDANCE/GOVERNANCE_HISTORY.
+        The distinguishing canonical_url prefix is what lets readiness
+        recognize this specific document as an explicit manual SECTOR_MACRO
+        submission (always counted) rather than running it through the
+        automated _MACRO_TERMS keyword heuristic meant for unlabeled text.
+        This never touches CANONICAL_SECTOR (canonical instrument
+        classification) -- only the qualitative RELEVANT_MACRO_EVENT_EXPOSURE
+        input.
+        """
+        from app.models import DocumentStatus, DocumentType, ResearchDocument
+
+        c = draft.corrections or {}
+        as_of_raw = c.get("asOf") or c.get("as_of")
+        as_of = datetime.fromisoformat(str(as_of_raw)[:10]).replace(tzinfo=timezone.utc)
+
+        company_id = None
+        try:
+            if draft.instrument_id is not None:
+                company_id = self.repository.profile(draft.instrument_id).company_id
+        except StopIteration:
+            company_id = None
+
+        return ResearchDocument(
+            document_id=draft.draft_id,
+            canonical_url=f"{SECTOR_MACRO_DOCUMENT_URL_PREFIX}{draft.content_hash}",
+            # The user's real source reference (never the synthetic marker
+            # above, which exists only so readiness can recognize this as an
+            # explicit manual SECTOR_MACRO submission -- see
+            # _append_manual_sector_macro_evidence, which reads source_url
+            # from original_url, not canonical_url).
+            original_url=str(c.get("source") or "").strip(),
+            title=(c.get("summary") or draft.original_filename or None),
+            normalized_text=str(c.get("summary") or "").strip(),
+            source_type=SourceType.NEWS,
+            source_classification=SourceClassification.OTHER,
+            source_name="USER_UPLOAD",
+            published_at=as_of,
+            retrieved_at=datetime.now(timezone.utc),
+            content_type=draft.content_type or "text/plain",
+            document_type=DocumentType.TEXT,
+            status=DocumentStatus.PROCESSED,
+            reliability_level=ReliabilityLevel.LEVEL_D,
+            instrument_id=draft.instrument_id,
+            company_id=company_id,
+            source_mode=SourceMode.REAL,
+            freshness="REAL",
+            content_hash=draft.content_hash,
         )
 
     def _draft_facts_to_snapshot_values(

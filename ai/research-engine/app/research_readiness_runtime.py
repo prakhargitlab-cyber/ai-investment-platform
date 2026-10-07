@@ -230,6 +230,7 @@ class RepositoryResearchReadinessAdapter:
                 retrieved_at=value.retrieved_at,as_of=value.as_of_date,value_fingerprint=str(value.value),
                 source_url=value.source_url,covered_input_ids=('PE' if name=='trailingPE' else 'PB',)))
         self._append_documents(evidence, documents)
+        self._append_manual_sector_macro_evidence(evidence, documents)
         self._append_events(evidence, events)
         from app.research_applicability import shareholding_scorable_ownership_coverage
         self._append_shareholding(
@@ -579,6 +580,44 @@ class RepositoryResearchReadinessAdapter:
                         ("RELEVANT_MACRO_EVENT_EXPOSURE",),
                     )
                 )
+
+    @staticmethod
+    def _append_manual_sector_macro_evidence(
+        evidence: dict[str, list[ResearchEvidence]], documents: Sequence[ResearchDocument]
+    ) -> None:
+        """Unconditionally recognize an explicit manual SECTOR_MACRO upload
+        (app.manual_evidence._build_sector_macro_document) as
+        RELEVANT_MACRO_EVENT_EXPOSURE evidence.
+
+        Deliberately NOT routed through the _MACRO_TERMS keyword heuristic
+        above: that heuristic exists to classify unlabeled/automated
+        document text, and an explicit manual SECTOR_MACRO submission
+        already carries unambiguous human intent -- requiring it to also
+        happen to contain one of 8 hardcoded terms would silently drop
+        legitimate submissions. The distinguishing canonical_url prefix
+        (SECTOR_MACRO_DOCUMENT_URL_PREFIX in app.manual_evidence, duplicated
+        here as a literal to avoid a circular import -- app.manual_evidence
+        already imports from this module) is written ONLY by that one
+        accept() path. Always USER_UPLOAD tier (see _document_source's
+        identical "manual-evidence:" prefix branch) and never touches
+        CANONICAL_SECTOR.
+        """
+        for document in documents:
+            if not document.canonical_url.startswith("manual-evidence:sector-macro:"):
+                continue
+            evidence["SECTOR_MACRO"].append(
+                ResearchEvidence(
+                    evidence_id=f"manual-sector-macro:{document.document_id}",
+                    requirement_id="SECTOR_MACRO",
+                    source="USER_UPLOAD",
+                    source_tier=ResearchSourceTier.USER_UPLOAD,
+                    retrieved_at=document.retrieved_at,
+                    as_of=document.published_at or document.retrieved_at,
+                    published_at=document.published_at,
+                    source_url=document.original_url or document.canonical_url,
+                    covered_input_ids=("RELEVANT_MACRO_EVENT_EXPOSURE",),
+                )
+            )
 
     @staticmethod
     def _append_events(
@@ -2213,6 +2252,25 @@ def _financial_fact_coverage(
 
     if metric in {"eps", "pat", "net_income", "net_profit"}:
         add("VALUATION_INPUTS", "EARNINGS_BASIS")
+    # Manual LATEST_PRICE / HISTORICAL_PRICE_SERIES evidence (Research
+    # Readiness universal non-READY_FRESH manual evidence rule closure):
+    # these are synthetic metric names app.manual_evidence stores as real
+    # FinancialFact rows (FactSourceTier.USER_UPLOAD) when uploaded --
+    # NEVER written to global_market_price_observations/
+    # global_daily_market_bars, so stock_rule_engine/ranking never see them
+    # (see FactSourceTier.USER_UPLOAD's own docstring). This mirrors how the
+    # trusted structured-market path already covers the same inputs (see
+    # _structured_fact_coverage's "latestPrice" handling) without
+    # duplicating it.
+    if metric == "manual_latest_price":
+        add("LATEST_PRICE", "LATEST_USABLE_PRICE")
+        add("VALUATION_INPUTS", "LATEST_USABLE_PRICE")
+    if metric == "manual_historical_close":
+        add("HISTORICAL_PRICE_SERIES", "DURABLE_PRICE_OBSERVATIONS")
+        if len(periods_by_metric.get(metric, set())) >= 50:
+            add("HISTORICAL_PRICE_SERIES", "FIFTY_OBSERVATION_TECHNICAL_BASIS")
+        if len(periods_by_metric.get(metric, set())) >= 150:
+            add("HISTORICAL_PRICE_SERIES", "ONE_HUNDRED_FIFTY_OBSERVATION_TECHNICAL_BASIS")
     if metric in {"pat", "net_income", "net_profit", "roe", "return_on_equity", "roce", "return_on_capital_employed", "operating_margin", "profit_margin", "net_margin", "operating_cash_flow"}:
         if len(periods_by_metric.get(metric, set())) >= 2:
             add("BUSINESS_QUALITY_FACTS", "PROFITABILITY_HISTORY")
@@ -2455,6 +2513,16 @@ def _financial_source(fact: FinancialFact) -> tuple[str, ResearchSourceTier]:
 def _document_source(
     document: ResearchDocument, requirement_id: str
 ) -> tuple[str, ResearchSourceTier]:
+    # Manual-evidence documents (CURRENT_NEWS's own source document, and
+    # SECTOR_MACRO's -- see app.manual_evidence) use the literal
+    # "manual-evidence:" canonical_url prefix convention, exclusively (no
+    # automated pipeline writes this prefix). Without this branch such a
+    # document fell through source_classification == OTHER into the generic
+    # "APPROVED_SECONDARY" default below -- the same authority rank as an
+    # actual automated secondary source. This mirrors the identical,
+    # already-existing fix in _event_source for manually uploaded events.
+    if document.canonical_url.startswith("manual-evidence:"):
+        return "USER_UPLOAD", ResearchSourceTier.USER_UPLOAD
     if document.discovery_provider == "YAHOO_FINANCE_MCP":
         return "APPROVED_EXTERNAL_TOOL", ResearchSourceTier.APPROVED_EXTERNAL_TOOL
     host = (urlparse(document.canonical_url).hostname or "").casefold()

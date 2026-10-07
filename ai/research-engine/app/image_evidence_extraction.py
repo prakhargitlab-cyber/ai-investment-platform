@@ -138,7 +138,7 @@ def _run_tesseract(image_path: Path, workdir: Path) -> tuple[str | None, str | N
     return text, None
 
 
-def extract_text_from_image(file_bytes: bytes, content_type: str) -> ImageExtractionResult:
+def extract_text_from_image(file_bytes: bytes, content_type: str, filename: str | None = None) -> ImageExtractionResult:
     """Bounded OCR extraction for a single PNG/JPEG image."""
     digest = hashlib.sha256(file_bytes).hexdigest()
     if content_type not in SUPPORTED_IMAGE_MIME_TYPES:
@@ -174,7 +174,21 @@ def extract_text_from_image(file_bytes: bytes, content_type: str) -> ImageExtrac
                 image.convert("L").save(normalized_path, format="PNG")
                 text, failure = _run_tesseract(normalized_path, workdir)
     except Exception as exc:  # noqa: BLE001 -- any decode failure is a truthful rejection, never a crash
-        logger.warning("image_validation_failed reason=%s", exc)
+        # Bounded diagnostics only (runtime defect closure: clipboard-paste
+        # transport tracing) -- filename, declared MIME, byte length, and
+        # the first 8 bytes' hex signature (a real PNG is always
+        # 89 50 4E 47 0D 0A 1A 0A; a real JPEG always starts FF D8) are
+        # exactly enough to tell "these are genuinely not image bytes"
+        # apart from "these bytes were corrupted/truncated/re-encoded
+        # somewhere upstream of this process" on the next occurrence,
+        # without ever logging raw file bytes, base64, or any private
+        # screenshot content.
+        logger.warning(
+            "image_validation_failed reason=%s filename=%s declaredMime=%s byteLength=%s "
+            "firstEightBytesHex=%s contentHash=%s",
+            exc, filename or "unknown", content_type, len(file_bytes),
+            file_bytes[:8].hex(), digest,
+        )
         return ImageExtractionResult("REJECTED", None, "INVALID_IMAGE", digest)
 
     if failure == "TIMEOUT":

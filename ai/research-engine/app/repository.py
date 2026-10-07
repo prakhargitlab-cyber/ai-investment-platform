@@ -991,10 +991,17 @@ class ResearchRepository:
     def shareholding_period_groups(
         self, instrument_id: UUID, *, limit: int = 4
     ) -> list[list[ShareholdingSnapshot]]:
-        """All qualifying real quarter-end snapshots, grouped by exact
-        period_end (up to `limit` distinct periods, newest first); each
-        group is ordered best-authority-first by the same selection_key
-        shareholding_for() has always used.
+        """All qualifying real quarter-period snapshots, grouped by the
+        SEMANTIC (year, month) reporting period (up to `limit` distinct
+        periods, newest first); each group is ordered best-authority-first
+        by the same selection_key shareholding_for() has always used.
+
+        Grouping is semantic, not by exact period_end datetime: a
+        MONTH-precision source period normalized to e.g. 2026-06-01 and
+        an explicit-date source period of 2026-06-30 both represent the
+        SAME Jun-2026 reporting period and MUST land in the same group
+        (see _shareholding_period_key) -- the synthetic/explicit day is
+        never required to identify the quarter.
 
         This exists so a caller that needs authority-aware FIELD-level
         coverage (a different source may hold a field -- e.g. promoter
@@ -1017,7 +1024,11 @@ class ResearchRepository:
             )
             # Choose an intact source snapshot; never relabel/merge another
             # filing's values (including pledge) under the selected provenance.
-            return (snapshot.period_end, qualifying_official, official_xbrl,
+            # Sorted by the SEMANTIC period first (not the exact
+            # datetime), so two representations of the same reporting
+            # period compare equal here and fall through to the
+            # authority/provenance tie-breakers below.
+            return (_shareholding_period_key(snapshot.period_end), qualifying_official, official_xbrl,
                     snapshot.published_at or datetime.min.replace(tzinfo=timezone.utc),
                     snapshot.retrieved_at, snapshot.source_identity_key, str(snapshot.id))
 
@@ -1025,18 +1036,19 @@ class ResearchRepository:
             [snapshot for snapshot in self.shareholding_snapshots.values()
              if snapshot.instrument_id == instrument_id
              and snapshot.source_mode == SourceMode.REAL
-             and _is_quarter_end(snapshot.period_end)],
+             and _is_shareholding_quarter_period(snapshot.period_end)],
             key=selection_key, reverse=True,
         )
         groups: list[list[ShareholdingSnapshot]] = []
-        index: dict[datetime, int] = {}
+        index: dict[tuple[int, int], int] = {}
         for snapshot in ordered:
-            position = index.get(snapshot.period_end)
+            period_key = _shareholding_period_key(snapshot.period_end)
+            position = index.get(period_key)
             if position is None:
                 if len(groups) == limit:
                     continue
                 position = len(groups)
-                index[snapshot.period_end] = position
+                index[period_key] = position
                 groups.append([])
             groups[position].append(snapshot)
         return groups
@@ -4502,6 +4514,46 @@ def _is_transport_fetch_failure(exc: FetchError) -> bool:
 
 def _is_quarter_end(value: datetime) -> bool:
     return (value.month, value.day) in {(3, 31), (6, 30), (9, 30), (12, 31)}
+
+
+# Fixed last calendar day of each quarter-end month -- no Feb-29 concern
+# since only months 3/6/9/12 are quarter months.
+_QUARTER_MONTH_LAST_DAY: dict[int, int] = {3: 31, 6: 30, 9: 30, 12: 31}
+
+
+def _is_shareholding_quarter_period(value: datetime) -> bool:
+    """SHAREHOLDING-specific semantic quarter-period check.
+
+    A shareholding reporting period may reach this repository as EITHER:
+      - an explicit DAY-precision source date (e.g. "30 Jun 2026" ->
+        2026-06-30, the exact calendar quarter-end day), or
+      - a MONTH-precision source period (e.g. "Jun 2026") normalized per
+        the platform's common reporting-period rule to the first day of
+        that month (2026-06-01) -- see app.reporting_period /
+        app.evidence_interpretation. The application must never
+        manufacture a day absent from the source, so this is NOT also
+        normalized to a month-end here.
+
+    Both representations are the SAME semantic (year, month) reporting
+    period and must both be recognized as a valid shareholding quarter
+    period -- the synthetic day is never required to identify the
+    quarter. This is a SHAREHOLDING-SPECIFIC adaptation of the generic,
+    exact-day _is_quarter_end check above; it does not change
+    _is_quarter_end's behavior for its other (non-shareholding) callers.
+    """
+    last_day = _QUARTER_MONTH_LAST_DAY.get(value.month)
+    if last_day is None:
+        return False
+    return value.day in (1, last_day)
+
+
+def _shareholding_period_key(value: datetime) -> tuple[int, int]:
+    """The semantic (year, month) identity of a shareholding reporting
+    period -- used to GROUP snapshots so that a MONTH-normalized
+    2026-06-01 and an explicit-date 2026-06-30 are recognized as the
+    SAME Jun-2026 period rather than two independent periods merely
+    because their synthetic/explicit day differs."""
+    return (value.year, value.month)
 
 
 def _next_quarter_window(period_end: datetime) -> datetime:

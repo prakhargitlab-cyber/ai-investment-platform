@@ -4822,22 +4822,24 @@ function StockSearchField({
   );
 }
 
-// PNG/JPG (Defect 2 closure): a genuine bounded OCR extraction path now
-// exists server-side (app.image_evidence_extraction + the scanned-PDF
-// fallback in app.manual_evidence), so they are reviewable like any other
+// PNG/JPG (Defect 2 closure) and DOCX (reusable DocumentExtractor closure):
+// genuine bounded extraction paths now exist server-side
+// (app.document_extraction.DocumentExtractor, reused by
+// app.manual_evidence), so all three are reviewable like any other
 // evidence file -- capability is still gated by the server's own
 // supportedFileTypes (never assumed client-side; see the supportedFileTypes
 // check in ingestFile below).
-const REVIEWABLE_EVIDENCE_FILE_TYPES = ["PDF", "CSV", "TXT", "PNG", "JPG"] as const;
+const REVIEWABLE_EVIDENCE_FILE_TYPES = ["PDF", "CSV", "TXT", "PNG", "JPG", "DOCX"] as const;
 type ReviewableEvidenceFileType = (typeof REVIEWABLE_EVIDENCE_FILE_TYPES)[number];
-type DetectedEvidenceFileType = EvidenceFileType | "DOCX" | "JPG" | "PNG";
+type DetectedEvidenceFileType = EvidenceFileType;
 
 const EVIDENCE_FILE_ACCEPT: Record<ReviewableEvidenceFileType, string> = {
   PDF: ".pdf",
   CSV: ".csv",
   TXT: ".txt",
   PNG: ".png",
-  JPG: ".jpg,.jpeg"
+  JPG: ".jpg,.jpeg",
+  DOCX: ".docx"
 };
 
 function isReviewableEvidenceFileType(value: DetectedEvidenceFileType): value is ReviewableEvidenceFileType {
@@ -4998,7 +5000,14 @@ function UploadEvidenceDialog({
 
   useEffect(() => {
     setCorrections({});
-    setManualFields({});
+    // Conservative, NON-BINDING pre-fill: when an evidence interpreter
+    // produced field suggestions (see EvidenceDraft.fieldSuggestions),
+    // seed the editable manual-fields form with them so the user is not
+    // retyping a title/date/source the upload already made legible --
+    // exactly like a browser form autofill. The user sees the same
+    // editable input either way and can freely overwrite or clear it;
+    // nothing here is submitted until they explicitly review and accept.
+    setManualFields(draft?.fieldSuggestions ? { ...draft.fieldSuggestions } : {});
     // A financial-fact draft always starts with one empty, editable row --
     // there is no safe auto-extraction into structured facts (see
     // EMPTY_FINANCIAL_FACT_ROW), never a fabricated prefilled value.
@@ -5018,10 +5027,10 @@ function UploadEvidenceDialog({
   const ingestFile = useCallback(async (file: File) => {
     setPasteError(null);
     const typeLabel = evidenceFileType(file);
-    if (typeLabel === "DOCX") {
-      setPasteError("DOCX text extraction is not available. Upload a text-based PDF, CSV, TXT, PNG, or JPG file.");
-      return;
-    }
+    // DOCX is gated exactly like PNG/JPG: truthful server capability
+    // (supportedFileTypes only lists "DOCX" when python-docx is actually
+    // importable in this runtime -- see app.document_extraction.
+    // docx_extraction_available()), never a hardcoded client-side refusal.
     if (!typeLabel || !isReviewableEvidenceFileType(typeLabel) || !supportedFileTypes.includes(typeLabel)) {
       setPasteError(`Unsupported file type: ${file.type || file.name}`);
       return;
@@ -5147,7 +5156,7 @@ function UploadEvidenceDialog({
             <div className="evidence-drop-zone">
               <UploadCloud size={48} aria-hidden="true" />
               {reviewableFileTypes.length ? <p>Supported formats: {reviewableFileTypes.join(", ")}.</p> : null}
-              <p className="hint">PNG/JPG images and scanned PDFs are extracted via OCR -- review the extracted text before accepting. DOCX extraction is not available.</p>
+              <p className="hint">PNG/JPG images and scanned PDFs are extracted via OCR; DOCX paragraphs/tables are extracted natively -- review the extracted text before accepting.</p>
               {pasteError ? <p role="alert" className="readiness-popup-error">{pasteError}</p> : null}
               {error ? <p role="alert" className="readiness-popup-error">{error}</p> : null}
               {!reviewableFileTypes.length ? <p role="alert" className="readiness-popup-error">No reviewable evidence file format is currently available.</p> : null}
@@ -5319,6 +5328,12 @@ function UploadEvidenceDialog({
                     canonical {requirementId} event types are selectable below -- arbitrary text
                     cannot be submitted as the event type.
                   </p>
+                  {draft.extractedText ? (
+                    <div className="evidence-extracted-text">
+                      <span className="evidence-extracted-text-label">Extracted from file (reference only -- not auto-filled):</span>
+                      <pre>{draft.extractedText}</pre>
+                    </div>
+                  ) : null}
                   {draft.manualFieldSchema.map((field) => {
                     const label = field.replace(/([A-Z])/g, " $1").replace(/^./, (c) => c.toUpperCase());
                     const value = manualFields[field] ?? "";
@@ -5382,20 +5397,50 @@ function UploadEvidenceDialog({
                   <p className="hint">
                     This evidence type has no safe automatic extraction. Supply the fields below
                     yourself; nothing is accepted until every required field is filled in.
+                    {draft.fieldSuggestions ? (
+                      <> Fields marked with a suggestion have been pre-filled from the uploaded
+                      file as a non-binding suggestion -- review and correct them before accepting.</>
+                    ) : null}
                   </p>
+                  {draft.extractedText ? (
+                    <div className="evidence-extracted-text">
+                      <span className="evidence-extracted-text-label">Extracted from file (reference only -- not auto-filled):</span>
+                      <pre>{draft.extractedText}</pre>
+                    </div>
+                  ) : null}
                   {draft.manualFieldSchema.map((field) => (
                     <label key={field} className="evidence-manual-field">
                       <span>{field.replace(/([A-Z])/g, " $1").replace(/^./, (c) => c.toUpperCase())}</span>
-                      <input
-                        type="text"
-                        value={manualFields[field] ?? ""}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          setManualFields((current) => ({ ...current, [field]: value }));
-                        }}
-                        disabled={accepting}
-                        aria-label={field}
-                      />
+                      {field === "observations" ? (
+                        <>
+                          <p className="hint">
+                            One observation per line: <code>YYYY-MM-DD,close</code> (e.g.
+                            <code>2026-09-30,1482.50</code>). Dates must not be in the future, each
+                            date may appear only once, and close must be a positive number.
+                          </p>
+                          <textarea
+                            rows={8}
+                            value={manualFields[field] ?? ""}
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              setManualFields((current) => ({ ...current, [field]: value }));
+                            }}
+                            disabled={accepting}
+                            aria-label={field}
+                          />
+                        </>
+                      ) : (
+                        <input
+                          type="text"
+                          value={manualFields[field] ?? ""}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setManualFields((current) => ({ ...current, [field]: value }));
+                          }}
+                          disabled={accepting}
+                          aria-label={field}
+                        />
+                      )}
                     </label>
                   ))}
                 </div>

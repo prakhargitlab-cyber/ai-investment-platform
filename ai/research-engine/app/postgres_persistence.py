@@ -67,6 +67,7 @@ class PostgresResearchPersistence(SqliteResearchPersistence):
             self._connection.execute("SELECT 1 FROM etf_holdings_positions LIMIT 0")
             self._connection.execute("SELECT 1 FROM etf_listing_observations LIMIT 0")
             self._connection.execute("SELECT 1 FROM etf_acquisition_attempts LIMIT 0")
+            self._connection.execute("SELECT 1 FROM global_manual_evidence LIMIT 0")
             self._connection.commit()
         except Exception as exc:
             self._connection.connection.rollback()
@@ -81,7 +82,22 @@ class _PostgresConnectionAdapter:
         statement = sql.replace("?", "%s")
         if "INSERT OR IGNORE INTO" in statement:
             statement = statement.replace("INSERT OR IGNORE INTO", "INSERT INTO") + " ON CONFLICT DO NOTHING"
-        return self.connection.execute(statement, params)
+        # A failed statement must never leave this shared connection sitting in
+        # PostgreSQL's aborted-transaction state ("current transaction is
+        # aborted, commands ignored until end of transaction block"). Plenty of
+        # call sites issue a single read (e.g. load_manual_evidence_drafts)
+        # without wrapping the call in `with self._connection:`, so there is no
+        # other __exit__ to perform that rollback for them. Roll back here on
+        # any failure and re-raise the original exception unchanged: the error
+        # is never hidden, nothing is reconnected, and a multi-statement
+        # `with self._connection:` block that later also rolls back in its own
+        # __exit__ is unaffected (rollback on an already-aborted transaction is
+        # a harmless no-op).
+        try:
+            return self.connection.execute(statement, params)
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def executescript(self, sql: str) -> None:
         self.connection.execute(sql)

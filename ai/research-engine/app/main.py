@@ -56,6 +56,7 @@ from app.manual_evidence import (
     SUPPORTED_EVIDENCE_TYPES,
     runtime_supported_file_type_labels,
 )
+from app.document_extraction import docx_extraction_available
 from app.image_evidence_extraction import image_ocr_available, scanned_pdf_ocr_available
 from app.models import EventImpact, TimeHorizon
 
@@ -1601,6 +1602,7 @@ def supported_evidence_file_types():
         "ocrCapability": {
             "imageOcrAvailable": image_ocr_available(),
             "scannedPdfOcrAvailable": scanned_pdf_ocr_available(),
+            "docxExtractionAvailable": docx_extraction_available(),
         },
         "supportedEvidenceTypes": [e.value for e in SUPPORTED_EVIDENCE_TYPES],
         "allowedMetricsByEvidenceType": {
@@ -1659,6 +1661,26 @@ async def create_evidence_draft(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        # Safety net (runtime defect closure): an unexpected exception
+        # anywhere in extraction/interpretation (e.g. a deterministic
+        # parser choking on a genuinely noisy real-world OCR result that
+        # none of our synthetic test fixtures reproduced) must never reach
+        # the browser as an opaque, undiagnosable 500 -- it is logged here
+        # with the full traceback and correlation id so the NEXT occurrence
+        # is immediately diagnosable, and the client gets a safe, non-leaky
+        # message rather than an internal stack trace.
+        logger.exception(
+            "research_flow operation=EVIDENCE_DRAFT globalInstrumentId=%s "
+            "evidenceType=%s outcome=FAILURE correlationId=%s durationMs=%s",
+            global_instrument_id, evidence_type, x_correlation_id or "NONE",
+            round((time.perf_counter() - started) * 1000),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="EVIDENCE_DRAFT_FAILED: an unexpected error occurred while processing "
+                   "this file. The issue has been logged for investigation.",
+        ) from exc
     logger.info(
         "research_flow operation=EVIDENCE_DRAFT globalInstrumentId=%s outcome=SUCCESS "
         "durationMs=%s draftId=%s",
@@ -1724,6 +1746,20 @@ async def accept_evidence_draft(
         )
     except AcceptanceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        # Same safety net as the draft endpoint above: never let an
+        # unexpected exception during accept/persist/readiness-recompute
+        # reach the browser as an undiagnosable 500.
+        logger.exception(
+            "research_flow operation=EVIDENCE_ACCEPT draftId=%s outcome=FAILURE "
+            "correlationId=%s durationMs=%s",
+            draft_id, x_correlation_id or "NONE", round((time.perf_counter() - started) * 1000),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="EVIDENCE_ACCEPT_FAILED: an unexpected error occurred while accepting "
+                   "this evidence. The issue has been logged for investigation.",
+        ) from exc
     logger.info(
         "research_flow operation=EVIDENCE_ACCEPT draftId=%s outcome=SUCCESS "
         "durationMs=%s snapshotId=%s",
@@ -1743,6 +1779,9 @@ def _draft_response(draft):
         "contentType": draft.content_type,
         "instrumentId": str(draft.instrument_id) if draft.instrument_id else None,
         "reportingPeriod": draft.reporting_period.isoformat() if draft.reporting_period else None,
+        # Informational only -- see ManualEvidenceDraft.extracted_text.
+        # Never a proposed fact, never auto-applied to any field.
+        "extractedText": draft.extracted_text,
         "proposedFacts": [
             {
                 "field": f.field,
@@ -1770,4 +1809,11 @@ def _draft_response(draft):
         # accept() -- see app.manual_evidence.MANUAL_FIELD_SCHEMA.
         "requiresManualFields": draft.requires_manual_fields,
         "manualFieldSchema": list(draft.manual_field_schema),
+        # Conservative, NON-BINDING pre-fill suggestions (see
+        # app.evidence_interpretation.interpret_current_news) -- never a
+        # proposed fact, never auto-applied; the user still explicitly
+        # supplies and submits every manualFieldSchema field as
+        # `corrections` at accept() time. None when no evidence
+        # interpreter produced suggestions for this draft.
+        "fieldSuggestions": draft.field_suggestions,
     }

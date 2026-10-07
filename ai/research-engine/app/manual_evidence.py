@@ -261,10 +261,18 @@ def _normalize_metric(value: str) -> str:
 
 # File types with a complete extraction path. Keep this capability contract
 # aligned with what an upload can actually turn into a reviewable draft.
+#
+# PNG/JPEG (Defect 2 closure): extraction goes through
+# app.image_evidence_extraction's bounded, subprocess-isolated OCR path
+# (_extract_image_text below), never an unbounded in-process OCR/model
+# call. A scanned PDF (no extractable text layer) also falls back to that
+# same bounded path -- see _extract_pdf_text.
 SUPPORTED_FILE_TYPES: dict[str, str] = {
     "application/pdf": "PDF",
     "text/csv": "CSV",
     "text/plain": "TXT",
+    "image/png": "PNG",
+    "image/jpeg": "JPG",
 }
 
 # Extensions without standard MIME types.
@@ -272,6 +280,9 @@ _EXTENSION_MAPPING: dict[str, str] = {
     ".pdf": "application/pdf",
     ".csv": "text/csv",
     ".txt": "text/plain",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
 }
 
 
@@ -297,6 +308,35 @@ def is_supported_file_type(filename: str | None, content_type: str | None) -> bo
 
 
 SUPPORTED_FILE_TYPE_LABELS = sorted(set(SUPPORTED_FILE_TYPES.values()))
+
+# File types whose complete extraction path additionally depends on an OS
+# binary (OCR) that may not be installed in a given runtime image, mapped to
+# the lightweight availability check that must pass before that label is
+# truthfully advertised as supported. PDF/CSV/TXT have no such runtime
+# dependency (native pypdf/CSV/text parsing only) and are therefore never
+# gated here -- only the OCR-dependent PNG/JPEG path is.
+def _ocr_dependent_labels_available() -> dict[str, bool]:
+    from app.image_evidence_extraction import image_ocr_available
+    available = image_ocr_available()
+    return {"PNG": available, "JPG": available}
+
+
+def runtime_supported_file_type_labels() -> list[str]:
+    """Fail-closed capability advertisement (Defect: runtime OCR blocker).
+
+    Returns the file-type labels that are ACTUALLY usable right now in this
+    process, not merely the ones this codebase has an extraction path for.
+    PNG/JPEG are only included when the tesseract binary they depend on is
+    actually present (a cheap ``shutil.which`` lookup -- no OCR is ever run
+    here). This prevents a deployment that is missing the tesseract-ocr /
+    poppler-utils OS packages from advertising an Upload Evidence feature
+    that would fail on every image/scanned-PDF attempt.
+    """
+    gated = _ocr_dependent_labels_available()
+    return sorted(
+        label for label in set(SUPPORTED_FILE_TYPES.values())
+        if gated.get(label, True)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -540,15 +580,18 @@ class ManualEvidenceIngestor:
         if mime in ("text/csv", "text/plain"):
             return file_bytes.decode("utf-8", errors="replace")
         if mime == "application/pdf":
-            return self._extract_pdf_text(file_bytes)
+            return self._extract_pdf_text(file_bytes)  # falls back to scanned-PDF OCR internally
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             return self._extract_docx_text(file_bytes)
         if mime in ("image/png", "image/jpeg"):
-            return self._extract_image_text(file_bytes)
+            return self._extract_image_text(file_bytes, mime)
         return None
 
     def _extract_pdf_text(self, file_bytes: bytes) -> str | None:
-        """Extract text from a PDF using pypdf."""
+        """Extract text from a PDF using pypdf, falling back to bounded
+        scanned-PDF OCR (Defect 2) when the PDF has no extractable text
+        layer at all. A PDF with even a little real text is NOT treated as
+        scanned -- OCR is only attempted when pypdf found nothing."""
         try:
             from pypdf import PdfReader
         except ImportError:
@@ -559,10 +602,32 @@ class ManualEvidenceIngestor:
             for page in reader.pages:
                 text = page.extract_text() or ""
                 pages.append(text)
-            return "\n".join(pages) if pages else ""
+            native_text = "\n".join(pages) if pages else ""
         except Exception as exc:
             logger.warning("pdf_text_extraction_failed reason=%s", exc)
             return None
+        if native_text.strip():
+            return native_text
+        return self._extract_scanned_pdf_text(file_bytes)
+
+    def _extract_scanned_pdf_text(self, file_bytes: bytes) -> str | None:
+        """Bounded OCR fallback for a scanned PDF with no text layer.
+
+        See app.image_evidence_extraction.extract_text_from_scanned_pdf for
+        the bounds enforced (page count, size, per-call timeout). Any
+        rejection/timeout/failure here is truthfully reported as "no text
+        extracted" (returns ""), never silently fabricated and never
+        raised as a hard error -- a scanned PDF the OCR path cannot handle
+        is still kept as supporting evidence, exactly like any other file
+        whose text could not be read (see the NO_TEXT_EXTRACTED warning in
+        ingest()).
+        """
+        from app.image_evidence_extraction import extract_text_from_scanned_pdf
+        result = extract_text_from_scanned_pdf(file_bytes)
+        if result.status != "EXTRACTED":
+            logger.info("scanned_pdf_ocr_not_extracted status=%s reason=%s", result.status, result.reason)
+            return ""
+        return result.text or ""
 
     def _extract_docx_text(self, file_bytes: bytes) -> str | None:
         """Extract text from a DOCX file using python-docx if available."""
@@ -578,22 +643,25 @@ class ManualEvidenceIngestor:
             logger.warning("docx_text_extraction_failed reason=%s", exc)
             return None
 
-    def _extract_image_text(self, file_bytes: bytes) -> str | None:
-        """Extract text from an image using OCR (pytesseract + PIL).
+    def _extract_image_text(self, file_bytes: bytes, mime: str) -> str | None:
+        """Extract text from a PNG/JPEG image via the bounded, subprocess-
+        isolated OCR path (Defect 2 closure).
 
-        Returns None if OCR libraries are not available.
+        Deliberately does NOT call pytesseract/PIL directly in-process --
+        see app.image_evidence_extraction's module docstring for why: file
+        size, decoded pixel count, and OCR wall-clock time are all bounded
+        BEFORE anything runs, and the OCR step itself runs as a separate
+        tesseract process so it can be killed by a timeout without taking
+        this process down with it. Returns "" (truthfully, no fabricated
+        text) for any rejection/timeout/failure rather than raising -- the
+        file is still kept as supporting evidence either way.
         """
-        try:
-            import pytesseract
-            from PIL import Image
-        except ImportError:
-            return None
-        try:
-            image = Image.open(io.BytesIO(file_bytes))
-            return pytesseract.image_to_string(image)
-        except Exception as exc:
-            logger.warning("image_ocr_failed reason=%s", exc)
-            return None
+        from app.image_evidence_extraction import extract_text_from_image
+        result = extract_text_from_image(file_bytes, mime)
+        if result.status != "EXTRACTED":
+            logger.info("image_ocr_not_extracted status=%s reason=%s", result.status, result.reason)
+            return ""
+        return result.text or ""
 
     # -- shareholding extraction --------------------------------------------
 

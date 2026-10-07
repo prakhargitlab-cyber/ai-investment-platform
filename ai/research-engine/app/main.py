@@ -54,8 +54,9 @@ from app.manual_evidence import (
     ManualEvidenceAcceptor,
     ManualEvidenceIngestor,
     SUPPORTED_EVIDENCE_TYPES,
-    SUPPORTED_FILE_TYPE_LABELS,
+    runtime_supported_file_type_labels,
 )
+from app.image_evidence_extraction import image_ocr_available, scanned_pdf_ocr_available
 from app.models import EventImpact, TimeHorizon
 
 settings = Settings()
@@ -1591,7 +1592,16 @@ def supported_evidence_file_types():
     CURRENT_NEWS).
     """
     return {
-        "supportedFileTypes": SUPPORTED_FILE_TYPE_LABELS,
+        # Fail-closed: PNG/JPG are only listed when the tesseract OCR
+        # binary they depend on is actually present in this runtime image
+        # (see app.manual_evidence.runtime_supported_file_type_labels).
+        # SUPPORTED_FILE_TYPE_LABELS (the full source-level contract) is
+        # intentionally no longer returned here.
+        "supportedFileTypes": runtime_supported_file_type_labels(),
+        "ocrCapability": {
+            "imageOcrAvailable": image_ocr_available(),
+            "scannedPdfOcrAvailable": scanned_pdf_ocr_available(),
+        },
         "supportedEvidenceTypes": [e.value for e in SUPPORTED_EVIDENCE_TYPES],
         "allowedMetricsByEvidenceType": {
             evidence_type.value: sorted(metrics)

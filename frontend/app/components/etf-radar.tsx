@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { request } from "../lib/portfolio-api";
+import { RadarProgressPanel, isTerminalRadarStatus, type RadarProgressCounter } from "./radar-progress";
 
 /**
  * ETF Radar's dedicated frontend surface. Deliberately separate from
@@ -143,10 +144,28 @@ export function EtfRadarContent({ data }: { data: EtfCycleResult }) {
 
 type EtfRadarStatus = "loading" | "empty" | "error" | "ready";
 
+type EtfActiveCycle = {
+  cycleId: string;
+  status: string;
+  startedAt: string | null;
+  updatedAt: string | null;
+  errorCode: string | null;
+  pollError: boolean;
+};
+
+// Client-side only (not a backend capability): the current ETF API surface
+// has no "discover the active cycle" endpoint, so a page refresh cannot
+// recover progress from the server alone. Persisting the cycle_id we were
+// already handed, in this tab's sessionStorage, lets a refresh resume
+// polling the real status endpoint for that same cycle -- it never
+// fabricates state, it only remembers an ID the backend already gave us.
+const ETF_ACTIVE_CYCLE_STORAGE_KEY = "aip.etfRadar.activeCycleId";
+
 export function EtfRadar() {
   const [data, setData] = useState<EtfCycleResult | null>(null);
   const [status, setStatus] = useState<EtfRadarStatus>("loading");
-  const [running, setRunning] = useState(false);
+  const [activeCycle, setActiveCycle] = useState<EtfActiveCycle | null>(null);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -157,23 +176,86 @@ export function EtfRadar() {
         if (!active) return;
         if (failure?.status === 404) { setData(null); setStatus("empty"); } else setStatus("error");
       });
+    let storedCycleId: string | null = null;
+    try { storedCycleId = window.sessionStorage.getItem(ETF_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
+    if (storedCycleId) {
+      setActiveCycle({ cycleId: storedCycleId, status: "RUNNING", startedAt: null, updatedAt: null, errorCode: null, pollError: false });
+    }
     return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    if (!activeCycle || isTerminalRadarStatus(activeCycle.status)) {
+      try { if (!activeCycle) window.sessionStorage.removeItem(ETF_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string }>(
+        `/api/v1/etf-radar/cycles/${activeCycle.cycleId}/status`
+      )
+        .then((value) => {
+          if (!active) return;
+          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+            ? { ...previous, status: value.status, updatedAt: value.updated_at ?? previous.updatedAt,
+                startedAt: previous.startedAt ?? value.created_at ?? null,
+                errorCode: value.error_code ?? previous.errorCode, pollError: false }
+            : previous);
+          if (isTerminalRadarStatus(value.status)) {
+            try { window.sessionStorage.removeItem(ETF_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
+            if (value.status === "COMPLETED") {
+              request<EtfCycleResult>("/api/v1/etf-radar/current")
+                .then((result) => { if (active) { setData(result); setStatus("ready"); } })
+                .catch(() => { /* keep showing the terminal status panel */ });
+            }
+          } else {
+            pollTimer.current = setTimeout(poll, 2500);
+          }
+        })
+        .catch(() => {
+          if (!active) return;
+          // A transient poll failure must never leave the panel stuck
+          // silently forever: surface it, but keep polling.
+          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+            ? { ...previous, pollError: true } : previous);
+          pollTimer.current = setTimeout(poll, 2500);
+        });
+    };
+    poll();
+    return () => { active = false; if (pollTimer.current) clearTimeout(pollTimer.current); };
+    // Re-run whenever the tracked cycle_id changes; status itself is
+    // updated inside the closure above, not via this dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCycle?.cycleId]);
+
   const runCycle = () => {
-    setRunning(true);
-    request<EtfCycleResult>("/api/v1/etf-radar/cycles", { method: "POST", body: JSON.stringify({ top_n: 10 }) })
-      .then((value) => { setData(value); setStatus("ready"); })
-      .catch(() => setStatus("error"))
-      .finally(() => setRunning(false));
+    request<{ cycle_id: string; status: string; updated_at?: string }>(
+      "/api/v1/etf-radar/cycles", { method: "POST", body: JSON.stringify({ top_n: 10 }) }
+    )
+      .then((value) => {
+        setActiveCycle({ cycleId: value.cycle_id, status: value.status, startedAt: value.updated_at ?? null,
+                          updatedAt: value.updated_at ?? null, errorCode: null, pollError: false });
+        try { window.sessionStorage.setItem(ETF_ACTIVE_CYCLE_STORAGE_KEY, value.cycle_id); } catch { /* ignore */ }
+      })
+      .catch(() => setStatus("error"));
   };
+
+  const running = !!activeCycle && !isTerminalRadarStatus(activeCycle.status);
+  const counters: RadarProgressCounter[] = []; // ETF Radar's cycle is single-pass/bounded and does not expose
+  // per-instrument progress counters (see app/etf_opportunity_cycle.py) -- an
+  // indeterminate bar plus the lifecycle status is the truthful presentation.
 
   return (
     <section className="opportunity-radar etf-radar" aria-label="ETF radar">
       <h2>ETF radar</h2>
-      <button type="button" className="opportunity-show-more" disabled={running} onClick={runCycle}>
-        {running ? "Running…" : "Run ETF radar"}
+      <button type="button" className="button button-primary radar-run-action" disabled={running} onClick={runCycle}>
+        {running ? "Running…" : "Run ETF Radar"}
       </button>
+      {activeCycle ? (
+        <RadarProgressPanel radarType="ETF" cycleId={activeCycle.cycleId} status={activeCycle.status}
+          startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={counters}
+          percent={null} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+      ) : null}
       {status === "error" ? <p role="alert">ETF radar unavailable.</p> : null}
       {status === "empty" ? <p>No persisted ETF radar cycle yet. Run it to evaluate the current ETF universe.</p> : null}
       {status === "loading" ? <p>Loading persisted ETF opportunities…</p> : null}

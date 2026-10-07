@@ -4822,14 +4822,22 @@ function StockSearchField({
   );
 }
 
-const REVIEWABLE_EVIDENCE_FILE_TYPES = ["PDF", "CSV", "TXT"] as const;
+// PNG/JPG (Defect 2 closure): a genuine bounded OCR extraction path now
+// exists server-side (app.image_evidence_extraction + the scanned-PDF
+// fallback in app.manual_evidence), so they are reviewable like any other
+// evidence file -- capability is still gated by the server's own
+// supportedFileTypes (never assumed client-side; see the supportedFileTypes
+// check in ingestFile below).
+const REVIEWABLE_EVIDENCE_FILE_TYPES = ["PDF", "CSV", "TXT", "PNG", "JPG"] as const;
 type ReviewableEvidenceFileType = (typeof REVIEWABLE_EVIDENCE_FILE_TYPES)[number];
 type DetectedEvidenceFileType = EvidenceFileType | "DOCX" | "JPG" | "PNG";
 
 const EVIDENCE_FILE_ACCEPT: Record<ReviewableEvidenceFileType, string> = {
   PDF: ".pdf",
   CSV: ".csv",
-  TXT: ".txt"
+  TXT: ".txt",
+  PNG: ".png",
+  JPG: ".jpg,.jpeg"
 };
 
 function isReviewableEvidenceFileType(value: DetectedEvidenceFileType): value is ReviewableEvidenceFileType {
@@ -5010,12 +5018,8 @@ function UploadEvidenceDialog({
   const ingestFile = useCallback(async (file: File) => {
     setPasteError(null);
     const typeLabel = evidenceFileType(file);
-    if (typeLabel === "PNG" || typeLabel === "JPG") {
-      setPasteError("Image text extraction is not available. Upload a text-based PDF, CSV, or TXT file.");
-      return;
-    }
     if (typeLabel === "DOCX") {
-      setPasteError("DOCX text extraction is not available. Upload a text-based PDF, CSV, or TXT file.");
+      setPasteError("DOCX text extraction is not available. Upload a text-based PDF, CSV, TXT, PNG, or JPG file.");
       return;
     }
     if (!typeLabel || !isReviewableEvidenceFileType(typeLabel) || !supportedFileTypes.includes(typeLabel)) {
@@ -5143,7 +5147,7 @@ function UploadEvidenceDialog({
             <div className="evidence-drop-zone">
               <UploadCloud size={48} aria-hidden="true" />
               {reviewableFileTypes.length ? <p>Supported formats: {reviewableFileTypes.join(", ")}.</p> : null}
-              <p className="hint">Image paste and PNG/JPG extraction are not available. DOCX extraction is also unavailable.</p>
+              <p className="hint">PNG/JPG images and scanned PDFs are extracted via OCR -- review the extracted text before accepting. DOCX extraction is not available.</p>
               {pasteError ? <p role="alert" className="readiness-popup-error">{pasteError}</p> : null}
               {error ? <p role="alert" className="readiness-popup-error">{error}</p> : null}
               {!reviewableFileTypes.length ? <p role="alert" className="readiness-popup-error">No reviewable evidence file format is currently available.</p> : null}

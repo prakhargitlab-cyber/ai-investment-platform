@@ -145,8 +145,11 @@ class TestFileTypeDetection:
         assert detect_mime_type("doc.pdf", None) == "application/pdf"
         assert detect_mime_type("data.csv", None) == "text/csv"
         assert detect_mime_type("notes.txt", None) == "text/plain"
-        assert detect_mime_type("scan.png", None) is None
-        assert detect_mime_type("image.jpg", None) is None
+        # Defect 2 closure: PNG/JPEG now have a genuine bounded OCR
+        # extraction path (app.image_evidence_extraction), so they are
+        # supported file types -- see test_image_evidence_manual_upload.py.
+        assert detect_mime_type("scan.png", None) == "image/png"
+        assert detect_mime_type("image.jpg", None) == "image/jpeg"
         assert detect_mime_type("doc.docx", None) is None
 
     def test_detect_mime_type_by_content_type(self):
@@ -161,8 +164,8 @@ class TestFileTypeDetection:
         assert is_supported_file_type("doc.pdf", None) is True
         assert is_supported_file_type("data.csv", "text/csv") is True
         assert is_supported_file_type("notes.txt", "text/plain") is True
-        assert is_supported_file_type("scan.png", "image/png") is False
-        assert is_supported_file_type("image.jpg", "image/jpeg") is False
+        assert is_supported_file_type("scan.png", "image/png") is True
+        assert is_supported_file_type("image.jpg", "image/jpeg") is True
         assert is_supported_file_type("doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document") is False
         assert is_supported_file_type("doc.exe", None) is False
         assert is_supported_file_type("doc.xlsx", None) is False
@@ -171,7 +174,9 @@ class TestFileTypeDetection:
         assert "PDF" in SUPPORTED_FILE_TYPE_LABELS
         assert "CSV" in SUPPORTED_FILE_TYPE_LABELS
         assert "TXT" in SUPPORTED_FILE_TYPE_LABELS
-        assert set(SUPPORTED_FILE_TYPE_LABELS) == {"PDF", "CSV", "TXT"}
+        assert "PNG" in SUPPORTED_FILE_TYPE_LABELS
+        assert "JPG" in SUPPORTED_FILE_TYPE_LABELS
+        assert set(SUPPORTED_FILE_TYPE_LABELS) == {"PDF", "CSV", "TXT", "PNG", "JPG"}
 
     def test_supported_evidence_types(self):
         # Generalized beyond the original SHAREHOLDING-only slice: CURRENT_NEWS
@@ -198,7 +203,7 @@ class TestFileTypeDetection:
         response = TestClient(app).get("/api/v1/research/evidence/file-types")
 
         assert response.status_code == 200
-        assert set(response.json()["supportedFileTypes"]) == {"CSV", "PDF", "TXT"}
+        assert set(response.json()["supportedFileTypes"]) == {"CSV", "PDF", "TXT", "PNG", "JPG"}
         assert set(response.json()["supportedEvidenceTypes"]) == {
             "SHAREHOLDING", "CURRENT_NEWS", "ORDER_BOOK_CAPEX_GUIDANCE", "GOVERNANCE_HISTORY",
             "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS",
@@ -281,15 +286,36 @@ class TestEvidenceExtraction:
                 instrument_id=RELIANCE_ID,
             )
 
-    @pytest.mark.parametrize("filename", ["scan.png", "image.jpg", "document.docx"])
-    def test_file_type_without_supported_extraction_is_rejected_before_draft(self, ingestor, filename):
+    def test_docx_is_still_rejected_before_draft(self, ingestor):
+        """DOCX has no extraction path at all (see app.manual_evidence's
+        _extract_docx_text requiring python-docx, which is not installed);
+        unlike PNG/JPG (Defect 2 closure), it stays a hard UNSUPPORTED_FILE_TYPE."""
         with pytest.raises(ValueError, match="UNSUPPORTED_FILE_TYPE"):
             ingestor.ingest(
                 evidence_type="SHAREHOLDING",
                 file_bytes=b"not extractable by the supported pipeline",
-                filename=filename,
+                filename="document.docx",
                 instrument_id=RELIANCE_ID,
             )
+
+    def test_png_jpg_now_create_a_draft_via_bounded_ocr_not_a_hard_rejection(self, ingestor):
+        """Defect 2 closure: PNG/JPG are genuinely extractable now (bounded
+        OCR), so an image with no recognizable shareholding text produces an
+        ordinary invalid/no-values draft -- the same outcome unrecognizable
+        PDF/TXT content already produces -- never UNSUPPORTED_FILE_TYPE."""
+        import io
+        from PIL import Image
+        blank = Image.new("RGB", (200, 80), color="white")
+        buffer = io.BytesIO()
+        blank.save(buffer, format="PNG")
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=buffer.getvalue(),
+            filename="scan.png",
+            instrument_id=RELIANCE_ID,
+        )
+        assert draft.content_type == "image/png"
+        assert draft.proposed_facts == []
 
     def test_unsupported_evidence_type_rejected(self, ingestor):
         with pytest.raises(ValueError, match="UNSUPPORTED_EVIDENCE_TYPE"):

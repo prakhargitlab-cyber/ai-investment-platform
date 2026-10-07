@@ -180,12 +180,12 @@ test('RadarTabs holds no loading/error/result state of its own that could leak b
   assert.match(radarTabsSource, /useState<"equity" \| "etf">\("equity"\)/);
 });
 
-test('switching tabs cannot target the wrong radar\'s refresh action: "Run ETF radar" is scoped to etf-radar.tsx only', () => {
+test('switching tabs cannot target the wrong radar\'s refresh action: "Run ETF Radar" is scoped to etf-radar.tsx only', () => {
   const etfRadarSource = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
   const opportunityRadarSource = fs.readFileSync(new URL('../app/components/opportunity-radar.tsx', import.meta.url), 'utf8');
-  assert.match(etfRadarSource, /Run ETF radar/);
-  assert.doesNotMatch(radarTabsSource, /Run ETF radar/);
-  assert.doesNotMatch(opportunityRadarSource, /Run ETF radar/);
+  assert.match(etfRadarSource, /Run ETF Radar/);
+  assert.doesNotMatch(radarTabsSource, /Run ETF Radar/);
+  assert.doesNotMatch(opportunityRadarSource, /Run ETF Radar/);
   // And the ETF run action calls only the ETF-radar endpoints, never the
   // Equity opportunities endpoints.
   assert.doesNotMatch(etfRadarSource, /\/api\/v1\/research\/opportunities/);

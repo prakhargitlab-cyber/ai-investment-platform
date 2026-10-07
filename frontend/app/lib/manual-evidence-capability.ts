@@ -24,13 +24,28 @@ export function manualEvidenceTypeForRequirement(
 }
 
 // Statuses that represent a genuine evidence gap: missing, partial,
-// stale, or a failed acquisition. A requirement in one of these states
-// may benefit from manually supplied evidence.
+// stale, a failed acquisition, or a trusted-source conflict. A requirement
+// in one of these states may benefit from manually supplied evidence.
+//
+// CONFLICTING is included deliberately: app.research_readiness sets this
+// status when existing sources disagree (resolution.conflict_reason), and
+// UploadEvidenceDialog already has a dedicated reconciliation path for
+// exactly this case (reconcileConflicts / payload.reconcileWithConflicts --
+// see tests/manual-evidence-upload-ui.test.mjs's "trusted-evidence conflicts
+// require explicit reconciliation"). Hiding Upload Evidence for a
+// CONFLICTING requirement would strand the user with no way to supply the
+// correcting evidence the dialog is already built to accept.
+//
+// REFRESHING, UNSUPPORTED and NOT_APPLICABLE are deliberately excluded:
+// REFRESHING means an acquisition is already in flight (uploading now would
+// race it), UNSUPPORTED/NOT_APPLICABLE mean there is nothing a manual
+// upload could resolve for this requirement.
 const STATUSES_NEEDING_MANUAL_EVIDENCE: ReadonlySet<ResearchRequirementStatus> = new Set([
   "MISSING",
   "PARTIAL",
   "READY_STALE",
-  "FAILED"
+  "FAILED",
+  "CONFLICTING"
 ]);
 
 // Whether the requirement's current readiness state indicates a need for

@@ -2242,6 +2242,24 @@ tbody tr[class*="ownership-"] td {
 .radar-tab { padding: 8px 16px; border: 1px solid var(--border, #657080); border-radius: 999px; background: transparent; cursor: pointer; font: inherit; }
 .radar-tab-active { background: var(--border, #657080); font-weight: 600; }
 .etf-radar-factors { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.radar-run-action { margin-bottom: 16px; }
+.radar-progress-panel { margin-bottom: 20px; padding: 16px 18px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-raised); display: grid; gap: 10px; }
+.radar-progress-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.radar-progress-heading small { color: var(--text-soft); }
+.radar-progress-completed { border-color: var(--primary); }
+.radar-progress-failed { border-color: #b91c1c; }
+.radar-progress-cancelled { border-color: var(--text-soft); }
+.radar-progress-counters { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px 16px; margin: 0; }
+.radar-progress-counters div { display: flex; flex-direction: column; gap: 2px; }
+.radar-progress-counters dt { color: var(--text-soft); font-size: 12px; }
+.radar-progress-counters dd { margin: 0; font-weight: 700; }
+.radar-progress-meta { margin: 0; color: var(--text-soft); font-size: 13px; }
+.bar-track-indeterminate span { width: 35% !important; animation: radar-progress-indeterminate 1.4s ease-in-out infinite; }
+@keyframes radar-progress-indeterminate {
+  0% { margin-left: 0%; }
+  50% { margin-left: 65%; }
+  100% { margin-left: 0%; }
+}
 .opportunity-radar { padding: 24px; margin-bottom: 24px; border: 1px solid var(--border, #657080); border-radius: 16px; }
 .opportunity-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
 .opportunity-card { display: grid; align-content: start; gap: 12px; padding: 18px; border: 1px solid var(--border, #657080); border-radius: 12px; }

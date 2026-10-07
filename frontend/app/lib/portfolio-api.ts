@@ -994,11 +994,26 @@ export function isRestrictedEventTypeEvidenceType(
   return (RESTRICTED_EVENT_TYPE_EVIDENCE_TYPES as readonly string[]).includes(evidenceType);
 }
 
-export type EvidenceFileType = "CSV" | "PDF" | "TXT";
+// PNG/JPG (Defect 2 closure): server advertises these in supportedFileTypes
+// once app.manual_evidence.SUPPORTED_FILE_TYPES includes them.
+export type EvidenceFileType = "CSV" | "PDF" | "TXT" | "PNG" | "JPG";
 
 export type EvidenceFileTypes = {
+  // Fail-closed, runtime-gated: PNG/JPG are only present here when the
+  // server's tesseract OCR binary is actually available in that runtime
+  // (app.manual_evidence.runtime_supported_file_type_labels). Never assume
+  // PNG/JPG client-side -- always check this array, exactly as the
+  // existing supportedFileTypes.includes(...) gating already does.
   supportedFileTypes: EvidenceFileType[];
   supportedEvidenceTypes: ManualEvidenceType[];
+  // Informational detail behind the supportedFileTypes gating above --
+  // not required for correct UI behavior (supportedFileTypes already
+  // reflects it), but useful for diagnostics. Absent on older backends
+  // that predate this field.
+  ocrCapability?: {
+    imageOcrAvailable: boolean;
+    scannedPdfOcrAvailable: boolean;
+  };
   // Canonical metric names accept() will actually validate against, per
   // FinancialFact-backed evidence type -- the server's own
   // ALLOWED_METRICS_BY_EVIDENCE_TYPE (app.manual_evidence), not a

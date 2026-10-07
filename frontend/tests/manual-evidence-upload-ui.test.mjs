@@ -26,8 +26,11 @@ test("portfolio API exposes one strongly typed manual-evidence contract", () => 
   assert.match(api, /"BALANCE_SHEET_FACTS"/);
   assert.match(api, /"QUARTERLY_FINANCIALS"/);
   assert.doesNotMatch(api, /"VALUATION_INPUTS"/);
-  assert.match(api, /EvidenceFileType = "CSV" \| "PDF" \| "TXT"/);
-  assert.doesNotMatch(api, /EvidenceFileType = [^;]*(?:PNG|JPG|DOCX)/);
+  // Defect 2 closure: PNG/JPG now have a genuine bounded OCR extraction
+  // path server-side, so the typed contract includes them; DOCX still has
+  // no extraction path at all and must stay excluded.
+  assert.match(api, /EvidenceFileType = "CSV" \| "PDF" \| "TXT" \| "PNG" \| "JPG"/);
+  assert.doesNotMatch(api, /EvidenceFileType = [^;]*DOCX/);
   assert.match(api, /supportedFileTypes: EvidenceFileType\[\]/);
   assert.match(api, /supportedEvidenceTypes: ManualEvidenceType\[\]/);
   assert.match(api, /uploadEvidence: \(globalInstrumentId: string, evidenceType: ManualEvidenceType, file: File\)/);
@@ -195,14 +198,101 @@ test("G4. an evidence type still unsupported by the backend never exposes a dead
   }
 });
 
-test("needsManualEvidence is true only for MISSING, PARTIAL, READY_STALE, FAILED", () => {
-  const expectTrue = ["MISSING", "PARTIAL", "READY_STALE", "FAILED"];
-  const expectFalse = ["READY_FRESH", "CONFLICTING", "UNSUPPORTED", "REFRESHING", "NOT_APPLICABLE"];
+test("needsManualEvidence is true for MISSING, PARTIAL, READY_STALE, FAILED, CONFLICTING", () => {
+  const expectTrue = ["MISSING", "PARTIAL", "READY_STALE", "FAILED", "CONFLICTING"];
+  const expectFalse = ["READY_FRESH", "UNSUPPORTED", "REFRESHING", "NOT_APPLICABLE"];
   for (const status of expectTrue) {
     assert.equal(needsManualEvidence(status), true, `${status} should need manual evidence`);
   }
   for (const status of expectFalse) {
     assert.equal(needsManualEvidence(status), false, `${status} should not need manual evidence`);
+  }
+});
+
+// Defect 1 closure: the complete status x capability matrix for every
+// evidence-type category the backend genuinely advertises through
+// supportedEvidenceTypes (SHAREHOLDING, CURRENT_NEWS,
+// ORDER_BOOK_CAPEX_GUIDANCE, GOVERNANCE_HISTORY, BUSINESS_QUALITY_FACTS,
+// GROWTH_FACTS, BALANCE_SHEET_FACTS, QUARTERLY_FINANCIALS) crossed with
+// every ResearchRequirementStatus value, for both a mandatory and a
+// non-mandatory requirement. Upload Evidence must be visible iff:
+// mandatory AND status in {MISSING, PARTIAL, READY_STALE, FAILED,
+// CONFLICTING} AND the type is in supportedEvidenceTypes.
+test("Defect 1: complete status x capability matrix for all backend-supported evidence types", () => {
+  const SUPPORTED_TYPES = [
+    "SHAREHOLDING",
+    "CURRENT_NEWS",
+    "ORDER_BOOK_CAPEX_GUIDANCE",
+    "GOVERNANCE_HISTORY",
+    "BUSINESS_QUALITY_FACTS",
+    "GROWTH_FACTS",
+    "BALANCE_SHEET_FACTS",
+    "QUARTERLY_FINANCIALS"
+  ];
+  const ALL_STATUSES = [
+    "READY_FRESH", "READY_STALE", "PARTIAL", "MISSING",
+    "CONFLICTING", "UNSUPPORTED", "REFRESHING", "FAILED", "NOT_APPLICABLE"
+  ];
+  const NEEDS_UPLOAD = new Set(["MISSING", "PARTIAL", "READY_STALE", "FAILED", "CONFLICTING"]);
+
+  for (const requirementId of SUPPORTED_TYPES) {
+    for (const status of ALL_STATUSES) {
+      const expectedWhenMandatory = NEEDS_UPLOAD.has(status) ? requirementId : null;
+      assert.equal(
+        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: true }, SUPPORTED_TYPES),
+        expectedWhenMandatory,
+        `mandatory ${requirementId} @ ${status} should ${expectedWhenMandatory ? "" : "NOT "}offer Upload Evidence`
+      );
+      // Non-mandatory never offers upload, regardless of status or capability.
+      assert.equal(
+        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: false }, SUPPORTED_TYPES),
+        null,
+        `non-mandatory ${requirementId} @ ${status} must never offer Upload Evidence`
+      );
+    }
+  }
+
+  // A type the backend does NOT advertise (empty supportedEvidenceTypes) never
+  // offers Upload Evidence, however stale/missing/conflicting the status --
+  // capability must come from the server, never be assumed client-side.
+  for (const requirementId of SUPPORTED_TYPES) {
+    for (const status of [...NEEDS_UPLOAD]) {
+      assert.equal(
+        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: true }, []),
+        null,
+        `${requirementId} @ ${status} must not offer Upload Evidence when the backend advertises no capability`
+      );
+    }
+  }
+});
+
+// LATEST_PRICE, HISTORICAL_PRICE_SERIES, VALUATION_INPUTS and SECTOR_MACRO
+// intentionally have no safe manual canonical ingestion path yet (see
+// app.manual_evidence.EvidenceType) -- the backend never advertises them in
+// supportedEvidenceTypes, so Upload Evidence must stay hidden for them even
+// in their worst (stale/missing) states. Find Data remains available
+// independently (ResearchReadinessRow gates FIND_DATA on supportedActions,
+// not on manual-evidence capability -- see "Find Data remains independent
+// from manual upload capability" below).
+test("Defect 1: LATEST_PRICE and other unsupported-ingestion types never show Upload Evidence", () => {
+  const UNSUPPORTED_INGESTION_TYPES = [
+    "LATEST_PRICE",
+    "HISTORICAL_PRICE_SERIES",
+    "VALUATION_INPUTS",
+    "SECTOR_MACRO"
+  ];
+  const SUPPORTED_TYPES = [
+    "SHAREHOLDING", "CURRENT_NEWS", "ORDER_BOOK_CAPEX_GUIDANCE", "GOVERNANCE_HISTORY",
+    "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS"
+  ];
+  for (const requirementId of UNSUPPORTED_INGESTION_TYPES) {
+    for (const status of ["READY_STALE", "PARTIAL", "MISSING", "FAILED", "CONFLICTING"]) {
+      assert.equal(
+        shouldOfferManualEvidenceUpload({ requirementId, status, mandatory: true }, SUPPORTED_TYPES),
+        null,
+        `${requirementId} @ ${status} must not offer Upload Evidence -- no safe ingestion path exists`
+      );
+    }
   }
 });
 
@@ -232,14 +322,21 @@ test("Browse and Paste converge on the same File ingestion function using standa
   assert.match(workspace, /type="file"/);
 });
 
-test("PNG, JPEG and DOCX behavior is truthful and stops before draft upload", () => {
-  assert.match(workspace, /REVIEWABLE_EVIDENCE_FILE_TYPES = \["PDF", "CSV", "TXT"\]/);
-  assert.match(workspace, /typeLabel === "PNG" \|\| typeLabel === "JPG"/);
-  assert.match(workspace, /Image text extraction is not available/);
+test("Defect 2: PNG/JPG now flow through the normal upload path; DOCX still stops before draft upload", () => {
+  assert.match(workspace, /REVIEWABLE_EVIDENCE_FILE_TYPES = \["PDF", "CSV", "TXT", "PNG", "JPG"\]/);
+  assert.doesNotMatch(workspace, /typeLabel === "PNG" \|\| typeLabel === "JPG"/);
+  assert.doesNotMatch(workspace, /Image text extraction is not available/);
   assert.match(workspace, /typeLabel === "DOCX"/);
   assert.match(workspace, /DOCX text extraction is not available/);
   assert.match(workspace, /accept=\{inputAccept\}/);
-  assert.doesNotMatch(workspace, /Paste an image \(Ctrl\+V\)/);
+});
+
+test("clipboard image paste reuses the exact same ingestFile path as Browse (no separate image-only code path)", () => {
+  // The existing generic clipboard-file handler (handlePaste/ingestFile)
+  // already supported arbitrary pasted files; Defect 2 enables PNG/JPG
+  // through it rather than adding a parallel paste-image implementation.
+  assert.match(workspace, /item\.kind === "file"/);
+  assert.match(workspace, /void ingestFile\(file\)/);
 });
 
 test("an empty or invalid draft cannot be accepted or silently persisted", () => {

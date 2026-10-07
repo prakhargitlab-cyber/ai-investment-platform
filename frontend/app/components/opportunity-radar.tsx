@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { request } from "../lib/portfolio-api";
 import { investorLabel } from "../lib/investor-labels";
+import { RadarProgressPanel, isTerminalRadarStatus, type RadarProgressCounter } from "./radar-progress";
 
 export { investorLabel } from "../lib/investor-labels";
 
@@ -232,16 +233,130 @@ export function RadarContent({ data, heldIds = [], watchlistedIds = [] }: { data
   </>;
 }
 
+type EquityAuthoritativeProgress = {
+  deep_completed?: number; deep_denominator?: number;
+  ready?: number; failed?: number; technical?: number; eligible?: number;
+};
+
+type EquityActiveCycle = {
+  cycleId: string;
+  status: string;
+  startedAt: string | null;
+  updatedAt: string | null;
+  errorCode: string | null;
+  progress: EquityAuthoritativeProgress | null;
+  pollError: boolean;
+};
+
+// Same client-side-only recovery rationale as EtfRadar's
+// ETF_ACTIVE_CYCLE_STORAGE_KEY (see radar-progress.tsx / etf-radar.tsx):
+// there is no "discover the active Equity cycle" endpoint, so this only
+// remembers a cycle_id the backend already handed us, in this tab's
+// sessionStorage, under its own key -- never shared with ETF Radar's key.
+const EQUITY_ACTIVE_CYCLE_STORAGE_KEY = "aip.opportunityRadar.activeCycleId";
+
+function equityCounters(progress: EquityAuthoritativeProgress | null): RadarProgressCounter[] {
+  if (!progress) return [];
+  return [
+    { label: "Deep attempted", value: progress.deep_denominator ?? null },
+    { label: "Deep completed", value: progress.deep_completed ?? null },
+    { label: "Eligible", value: progress.eligible ?? null },
+    { label: "Ready", value: progress.ready ?? null },
+    { label: "Readiness failed", value: progress.failed ?? null },
+    { label: "Technical failures", value: progress.technical ?? null },
+  ];
+}
+
+function equityPercent(progress: EquityAuthoritativeProgress | null): number | null {
+  if (!progress || !progress.deep_denominator) return null;
+  return (((progress.deep_completed ?? 0) / progress.deep_denominator) * 100);
+}
+
 export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[]; watchlistedIds: string[] }) {
   const [data, setData] = useState<Radar | null>(null);
   const [error, setError] = useState(false);
+  const [activeCycle, setActiveCycle] = useState<EquityActiveCycle | null>(null);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useEffect(() => {
     let active = true;
     request<Radar>("/api/v1/research/opportunities/current").then(normalizeRadar).then(value => { if (active) setData(value); }).catch(() => { if (active) setError(true); });
+    let storedCycleId: string | null = null;
+    try { storedCycleId = window.sessionStorage.getItem(EQUITY_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
+    if (storedCycleId) {
+      setActiveCycle({ cycleId: storedCycleId, status: "RUNNING", startedAt: null, updatedAt: null, errorCode: null, progress: null, pollError: false });
+    }
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (!activeCycle || isTerminalRadarStatus(activeCycle.status)) {
+      try { if (!activeCycle) window.sessionStorage.removeItem(EQUITY_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      request<{ status: string; updated_at?: string; error_code?: string; authoritative_progress?: EquityAuthoritativeProgress }>(
+        `/api/v1/research/opportunities/cycles/${activeCycle.cycleId}/status`
+      )
+        .then((value) => {
+          if (!active) return;
+          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+            ? { ...previous, status: value.status, updatedAt: value.updated_at ?? previous.updatedAt,
+                startedAt: previous.startedAt ?? value.updated_at ?? null,
+                errorCode: value.error_code ?? previous.errorCode,
+                progress: value.authoritative_progress ?? previous.progress, pollError: false }
+            : previous);
+          if (isTerminalRadarStatus(value.status)) {
+            try { window.sessionStorage.removeItem(EQUITY_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
+            if (value.status === "COMPLETED") {
+              request<Radar>("/api/v1/research/opportunities/current").then(normalizeRadar)
+                .then((result) => { if (active) setData(result); })
+                .catch(() => { /* keep showing the terminal status panel */ });
+            }
+          } else {
+            pollTimer.current = setTimeout(poll, 2500);
+          }
+        })
+        .catch(() => {
+          if (!active) return;
+          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+            ? { ...previous, pollError: true } : previous);
+          pollTimer.current = setTimeout(poll, 2500);
+        });
+    };
+    poll();
+    return () => { active = false; if (pollTimer.current) clearTimeout(pollTimer.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCycle?.cycleId]);
+
+  const runCycle = () => {
+    // Deliberately sends no analysis_scope (defaults to the existing safe
+    // BOUNDED scope server-side -- see app/main.py's OpportunityCycleRequest).
+    // The UI must never request FULL.
+    request<{ cycle_id: string; status: string; updated_at?: string }>(
+      "/api/v1/research/opportunities/cycles", { method: "POST", body: JSON.stringify({}) }
+    )
+      .then((value) => {
+        setActiveCycle({ cycleId: value.cycle_id, status: value.status, startedAt: value.updated_at ?? null,
+                          updatedAt: value.updated_at ?? null, errorCode: null, progress: null, pollError: false });
+        try { window.sessionStorage.setItem(EQUITY_ACTIVE_CYCLE_STORAGE_KEY, value.cycle_id); } catch { /* ignore */ }
+      })
+      .catch(() => setError(true));
+  };
+
+  const running = !!activeCycle && !isTerminalRadarStatus(activeCycle.status);
+
   return <section className="opportunity-radar" aria-label="Global opportunity radar">
     <h2>Global opportunity radar</h2>
+    <button type="button" className="button button-primary radar-run-action" disabled={running} onClick={runCycle}>
+      {running ? "Running…" : "Run Equity Radar"}
+    </button>
+    {activeCycle ? (
+      <RadarProgressPanel radarType="Equity" cycleId={activeCycle.cycleId} status={activeCycle.status}
+        startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={equityCounters(activeCycle.progress)}
+        percent={equityPercent(activeCycle.progress)} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+    ) : null}
     {error ? <p role="alert">Opportunity radar unavailable.</p> : data ? <RadarContent data={data} heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <p>Loading persisted opportunities…</p>}
   </section>;
 }

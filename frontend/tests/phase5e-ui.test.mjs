@@ -22,7 +22,7 @@ test("manual-import display-name editing lives inside the holding drawer", () =>
   assert.match(workspace, /maxLength=\{160\}/);
   assert.match(api, /positions\/\$\{positionId\}\/display-name/);
   assert.doesNotMatch(workspace, /dangerouslySetInnerHTML/);
-  assert.match(workspace, /<strong>\{position\.displayName\}<\/strong>/);
+  assert.match(workspace, /<PortfolioRadarCompanyName companyName=\{position\.displayName\} signal=\{radarSignal\} \/>/);
 });
 
 test("research selection uses global instrument identity rather than a display ticker alias", () => {

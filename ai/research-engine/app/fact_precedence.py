@@ -14,6 +14,22 @@ from app.models import ProvenancedValue, SourceMode
 
 
 class FactSourceTier(IntEnum):
+    # Manual (USER_UPLOAD) evidence is deliberately the lowest-authority
+    # tier of all: strictly below every automated provider, so merge_fact()
+    # below can never let it silently outrank or overwrite ANY automated
+    # source, even the weakest one (SEARCH). It still wins over a true gap
+    # (no existing fact at all), which is the only case manual evidence is
+    # meant to resolve. This mirrors the existing, pre-defined
+    # ResearchSourceTier.USER_UPLOAD in app/research_readiness.py, which
+    # already places USER_UPLOAD as the second-weakest of 8 tiers there --
+    # this is the same architectural intent, now wired up for FinancialFact.
+    # Deliberately NOT added to SUPPORTED_FINANCIAL_SOURCE_TIERS below: that
+    # frozenset gates scoring/ranking/rule-engine read eligibility, which is
+    # out of scope for this change -- manual facts must remain invisible to
+    # scoring/ranking/Radar while still visible to Research Readiness (whose
+    # read path, ResearchRepository.financial_facts_for, does not filter by
+    # SUPPORTED_FINANCIAL_SOURCE_TIERS at all).
+    USER_UPLOAD = 0
     SEARCH = 1
     YAHOO = 2
     # 3 is durable historical storage for official NSE facts. Never reuse it.
@@ -34,6 +50,7 @@ SUPPORTED_FINANCIAL_SOURCE_TIERS = frozenset({
 def fact_source_authority(tier: FactSourceTier) -> int:
     """Return authority without changing durable source-tier identities."""
     return {
+        FactSourceTier.USER_UPLOAD: 0,
         FactSourceTier.SEARCH: 1,
         FactSourceTier.YAHOO: 2,
         FactSourceTier.STRUCTURED_FUNDAMENTALS: 3,

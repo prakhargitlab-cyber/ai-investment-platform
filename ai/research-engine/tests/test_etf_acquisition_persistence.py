@@ -333,7 +333,9 @@ def test_migration_adds_only_etf_tables_and_matches_sqlite_schema():
     assert SQLITE_SCHEMA.replace("IF NOT EXISTS ", "") in migration
     statements = [line.strip() for line in migration.splitlines() if line.strip() and not line.startswith("--")]
     assert not any(line.startswith(("ALTER", "DROP", "DELETE", "UPDATE")) for line in statements)
-    assert migration.count("CREATE TABLE etf_") == 6
+    # 6 ETF-1/2/3 evidence tables plus etf_radar_cycles (ETF Radar cycle
+    # persistence, added alongside app.etf_opportunity_cycle).
+    assert migration.count("CREATE TABLE etf_") == 7
 
 
 def test_attempt_and_evidence_atomic_rollback(store, monkeypatch):

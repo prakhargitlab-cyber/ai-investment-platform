@@ -1,3 +1,4 @@
+from typing import Any, Literal
 from uuid import UUID, uuid4
 import logging
 import time
@@ -5,7 +6,7 @@ from contextlib import asynccontextmanager
 import asyncio
 
 import httpx
-from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Body, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
 from app.models import CategoryEvidence, PortfolioResearchCompany, PortfolioResearchSummary, ReliabilityLevel, ResearchEventType, ResearchSummary
@@ -46,6 +47,16 @@ from app.yahoo_mcp_acquisition import (
     HttpExternalResearchToolGateway,
     McpFirstResearchCapabilityExecutor,
 )
+from app.manual_evidence import (
+    AcceptanceError,
+    ALLOWED_EVENT_TYPES_BY_EVIDENCE_TYPE,
+    ALLOWED_METRICS_BY_EVIDENCE_TYPE,
+    ManualEvidenceAcceptor,
+    ManualEvidenceIngestor,
+    SUPPORTED_EVIDENCE_TYPES,
+    SUPPORTED_FILE_TYPE_LABELS,
+)
+from app.models import EventImpact, TimeHorizon
 
 settings = Settings()
 configure_application_logging(settings)
@@ -81,6 +92,12 @@ research_readiness_runtime = ResearchReadinessRuntime(
     ensure_timeout_seconds=settings.research_readiness_ensure_timeout_seconds,
 )
 stock_rule_engine_service = StockRuleEngineService(repository, research_readiness_adapter)
+manual_evidence_ingestor = ManualEvidenceIngestor(repository=repository)
+manual_evidence_acceptor = ManualEvidenceAcceptor(
+    repository=repository, runtime=research_readiness_runtime
+)
+
+
 @asynccontextmanager
 async def research_lifespan(application):
     if hasattr(repository.persistence, 'record_opportunity_job'):
@@ -92,6 +109,13 @@ async def research_lifespan(application):
         _opportunity_worker().start()
         if settings.research_opportunity_scheduler_enabled:
             _opportunity_scheduler().start()
+    if hasattr(repository.persistence, 'create_cycle_run'):
+        # ETF Radar's own worker, same generic lifecycle machinery, isolated
+        # by market='ETF' (its own durable active-cycle slot/lease
+        # namespace, never colliding with Equity's 'NSE' one). No scheduler:
+        # ETF Radar cycles are only ever submitted on demand (API), never
+        # auto-scheduled.
+        _etf_radar_worker().start()
     try:
         yield
     finally:
@@ -103,6 +127,10 @@ async def research_lifespan(application):
         if scheduler is not None:
             await scheduler.close()
             del application.state.opportunity_scheduler
+        etf_worker = getattr(application.state, 'etf_radar_worker', None)
+        if etf_worker is not None:
+            await etf_worker.close()
+            del application.state.etf_radar_worker
         # Readiness uses shielded single-flight tasks: explicitly drain them on shutdown.
         # Each instrument may now hold several concurrently running flights
         # (see ResearchReadinessRuntime.ensure's overlap-scoped join), so this
@@ -151,11 +179,41 @@ def _opportunity_scheduler():
     return app.state.opportunity_scheduler
 
 
+def _etf_radar_worker():
+    from app.opportunity_worker import OpportunityCycleWorker
+    if not hasattr(app.state, 'etf_radar_worker'):
+        async def etf_runner(**parameters):
+            from app.etf_opportunity_cycle import run_etf_radar_cycle_async
+            return await run_etf_radar_cycle_async(repository, portfolio_orchestrator, **parameters)
+        app.state.etf_radar_worker = OpportunityCycleWorker(repository, etf_runner, market='ETF')
+    return app.state.etf_radar_worker
+
+
 @app.get('/api/v1/research/opportunities/cycles/{cycle_id}/status')
 async def opportunity_cycle_status(cycle_id: UUID):
-    with repository._persistence_worker_lock:
-        values = repository.persistence.opportunity_jobs() if hasattr(repository.persistence, 'opportunity_jobs') else []
-    value = next((v for v in values if v['cycle_id'] == str(cycle_id)), None)
+    # Production discovery executes synchronous scanner reads in a worker
+    # thread under the repository's serialization lock. Waiting for that lock
+    # directly in this async route blocks Uvicorn's event loop, so one status
+    # poll can also starve /health and /health/live. Route the targeted durable
+    # read through the repository's existing bounded persistence offload.
+    loader = getattr(repository.persistence, 'opportunity_job', None)
+    run_blocking = getattr(repository, '_run_blocking_persistence', None)
+    if run_blocking is not None and loader is not None:
+        value = await run_blocking(loader, str(cycle_id))
+    elif run_blocking is not None:
+        jobs_loader = getattr(repository.persistence, 'opportunity_jobs', None)
+        values = await run_blocking(jobs_loader) if jobs_loader is not None else []
+        value = next((v for v in values if v['cycle_id'] == str(cycle_id)), None)
+    else:
+        # Compatibility for minimal SQLite-only test doubles. The production
+        # ResearchRepository always supplies the offload boundary above.
+        with repository._persistence_worker_lock:
+            if loader is not None:
+                value = loader(str(cycle_id))
+            else:
+                jobs_loader = getattr(repository.persistence, 'opportunity_jobs', None)
+                values = jobs_loader() if jobs_loader is not None else []
+                value = next((v for v in values if v['cycle_id'] == str(cycle_id)), None)
     if value is None:
         raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
     return value
@@ -167,10 +225,193 @@ async def opportunity_radar():
         return repository.persistence.global_opportunity_radar()
 
 
+@app.get('/api/v1/research/recommendations/current')
+async def current_portfolio_recommendations(
+    global_instrument_id: list[UUID] = Query(default=[]),
+):
+    """Bulk current Radar projection for portfolio holdings."""
+    with repository._persistence_worker_lock:
+        return repository.persistence.portfolio_recommendation_signals(
+            instrument_ids=global_instrument_id
+        )
+
+
 @app.get('/api/v1/research/opportunities/history/{instrument_id}')
 async def opportunity_history(instrument_id: UUID):
     with repository._persistence_worker_lock:
         return repository.persistence.recommendation_history(instrument_id)
+
+
+@app.get('/api/v1/research/etf-recommendations/current')
+async def current_etf_portfolio_recommendations(
+    global_instrument_id: list[UUID] = Query(default=[]),
+):
+    """Bulk current ETF Radar projection for portfolio holdings -- the ETF
+    counterpart of /api/v1/research/recommendations/current above. DB-only
+    read of the latest persisted ETF Radar cycle; never acquires or
+    triggers a new cycle. Returns only global fields (score/recommendation/
+    confidence/data completeness/as-of/version) -- callers supply their own
+    private position data (quantity, cost, account) separately and merge
+    client-side; this endpoint never receives or returns it."""
+    with repository._persistence_worker_lock:
+        return repository.persistence.etf_portfolio_recommendation_signals(
+            instrument_ids=global_instrument_id
+        )
+
+
+# ---------------------------------------------------------------------------
+# ETF Radar -- a separate, ETF-only Radar. Deliberately NOT routed through
+# the Equity opportunity-cycle worker/job-queue machinery above: this is a
+# bounded, synchronous, DB-evidence-only cycle (see
+# app.etf_opportunity_cycle.run_etf_radar_cycle) with no company-specific
+# acquisition, which also means the GET endpoints below never trigger any
+# provider acquisition -- they only ever read already-persisted evidence.
+# ---------------------------------------------------------------------------
+
+@app.get('/api/v1/etf-radar/current')
+async def etf_radar_current():
+    """DB-only read of the most recently persisted ETF Radar cycle. Never
+    triggers acquisition or a new cycle -- opening this endpoint is safe to
+    call as often as the UI likes."""
+    with repository._persistence_worker_lock:
+        result = repository.persistence.latest_etf_radar_cycle()
+    if result is None:
+        raise HTTPException(404, 'ETF_RADAR_CYCLE_NOT_FOUND')
+    return result
+
+
+@app.get('/api/v1/etf-radar/cycles/{cycle_id}')
+async def etf_radar_cycle_status(cycle_id: UUID):
+    with repository._persistence_worker_lock:
+        result = repository.persistence.etf_radar_cycle(cycle_id)
+    if result is None:
+        raise HTTPException(404, 'ETF_RADAR_CYCLE_NOT_FOUND')
+    return result
+
+
+class EtfRadarCycleRequest(BaseModel):
+    top_n: int | None = Field(default=10, ge=1, le=100)
+    candidate_ids: list[UUID] | None = Field(default=None, max_length=200)
+
+
+@app.post('/api/v1/etf-radar/cycles')
+async def etf_radar_cycle(body: EtfRadarCycleRequest, request: Request):
+    """Start one ETF Radar cycle.
+
+    An explicit candidate_ids override is a small, bounded diagnostic set
+    (the only case where fixture-sized runs are expected -- see the project
+    guardrails against ever running a full-universe ETF Radar outside this
+    kind of bounded, explicit call); it is still evaluated synchronously and
+    returned in the same response, exactly as before.
+
+    Without an override, candidates come from the canonical ETF-only
+    universe, which can be arbitrarily large, so the analysis runs on the
+    same generic, durable, lease-owned worker/job lifecycle Equity Radar
+    uses (app.opportunity_worker.OpportunityCycleWorker), under its own
+    'ETF' market namespace. This endpoint returns as soon as the durable
+    run row is created/coalesced -- it does NOT wait for admission,
+    readiness, metrics, ETF_RULE_ENGINE_V1, risk gates, recommendation,
+    ranking, or persistence to finish. Poll
+    GET /api/v1/etf-radar/cycles/{cycle_id}/status for progress, and
+    GET /api/v1/etf-radar/cycles/{cycle_id} (or /current) for the persisted
+    result once status is COMPLETED. Either way, this endpoint itself never
+    acquires anything from a provider, and never touches company-specific
+    (Equity) research acquisition.
+    """
+    from app.etf_opportunity_cycle import etf_cycle_result_to_dict, run_etf_radar_cycle
+
+    correlation_id = request.headers.get('x-correlation-id')
+    if body.candidate_ids is not None:
+        rows = [{'globalInstrumentId': str(instrument_id), 'assetType': 'ETF', 'exchange': 'NSE', 'status': 'ACTIVE'}
+                for instrument_id in body.candidate_ids]
+        with repository._persistence_worker_lock:
+            result = run_etf_radar_cycle(rows, repository.persistence, correlation_id=correlation_id, top_n=body.top_n)
+            payload = etf_cycle_result_to_dict(result)
+            repository.persistence.save_etf_radar_cycle(result.cycle_id, result.radar_version, result.correlation_id,
+                result.as_of, payload)
+        return payload
+    worker = _etf_radar_worker()
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=202, content=worker.submit({'top_n': body.top_n}))
+
+
+def _etf_owned_run(store, cycle_id: str):
+    """Fetch the durable run row, but only if it belongs to the ETF market
+    namespace -- never leaks an Equity cycle's internal run/job state back
+    through an ETF-Radar-labelled response, even though cycle_id (a UUID)
+    is technically unique enough that no row would ever collide."""
+    getter = getattr(store, 'cycle_run', None)
+    run = getter(cycle_id) if getter is not None else None
+    if run is None or run.get('market') != 'ETF':
+        return None
+    return run
+
+
+@app.get('/api/v1/etf-radar/cycles/{cycle_id}/status')
+async def etf_radar_cycle_lifecycle_status(cycle_id: UUID):
+    """Durable lifecycle status (ACCEPTED/RUNNING/COMPLETED/FAILED/
+    CANCEL_REQUESTED/CANCELLED) of a cycle submitted through the async
+    worker above. DB-only; never acquires or re-runs anything. Distinct
+    from GET /cycles/{cycle_id}, which returns the persisted ETF Radar
+    RESULT payload (only available once status is COMPLETED)."""
+    loader = getattr(repository.persistence, 'opportunity_job', None)
+    run_blocking = getattr(repository, '_run_blocking_persistence', None)
+
+    def _load():
+        with repository._persistence_worker_lock:
+            if _etf_owned_run(repository.persistence, str(cycle_id)) is None:
+                return None
+            return loader(str(cycle_id)) if loader is not None else None
+
+    if run_blocking is not None:
+        value = await run_blocking(_load)
+    else:
+        value = _load()
+    if value is None:
+        raise HTTPException(404, 'ETF_RADAR_CYCLE_NOT_FOUND')
+    return value
+
+
+@app.delete('/api/v1/etf-radar/cycles/{cycle_id}/cancel')
+async def cancel_etf_radar_cycle(
+    cycle_id: UUID,
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+    x_aip_user_roles: str | None = Header(default=None),
+):
+    """ADMIN-gated durable cancellation REQUEST for an ETF Radar cycle.
+
+    Same two-phase semantics as Equity's
+    DELETE /api/v1/research/opportunities/cycles/{cycle_id}/cancel, reusing
+    the identical generic primitives (request_cycle_cancel / cycle_run /
+    cycle_cancel_status) -- cycles are isolated by cycle_id (a UUID, unique
+    across both Equity and ETF Radar), so this can never request
+    cancellation of an Equity cycle or vice versa.
+    """
+    _require_market_data_admin(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject, x_aip_user_roles)
+    store = repository.persistence
+    if not hasattr(store, 'request_cycle_cancel'):
+        raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
+
+    def _request_cancel():
+        with repository._persistence_worker_lock:
+            run = _etf_owned_run(store, str(cycle_id))
+            if run is None:
+                raise HTTPException(404, 'ETF_RADAR_CYCLE_NOT_FOUND')
+            previous_status = run.get('status')
+            was_cancelled = store.cycle_cancel_status(str(cycle_id)) is not None
+            transitioned = store.request_cycle_cancel(str(cycle_id))
+            run = store.cycle_run(str(cycle_id)) or run
+        return {
+            'cycle_id': str(cycle_id),
+            'previous_status': previous_status,
+            'cancelled': was_cancelled or transitioned,
+            'status': (run or {}).get('status'),
+        }
+
+    run_blocking = getattr(repository, '_run_blocking_persistence', None)
+    return await run_blocking(_request_cancel) if run_blocking is not None else _request_cancel()
 
 
 class OpportunityCycleRequest(BaseModel):
@@ -181,6 +422,13 @@ class OpportunityCycleRequest(BaseModel):
     top_n: int = Field(default=4, ge=2, le=4)
     shortlist_limit: int = Field(default=25, ge=1, le=100)
     candidate_ids: list[UUID] | None = Field(default=None, max_length=100)
+    # BOUNDED (default): existing behavior -- shortlist_limit caps the deep-
+    # investigation pool. FULL: deep-investigate every candidate that passes
+    # legitimate baseline eligibility/admission, with shortlist_limit not
+    # applied as a pre-deep cap (see app/global_opportunity_cycle.py). This
+    # is persisted verbatim in the durable cycle/job parameters, so status,
+    # resume, recovery, and historical inspection all see the real scope.
+    analysis_scope: Literal['BOUNDED', 'FULL'] = 'BOUNDED'
 
 
 @app.post('/api/v1/research/opportunities/cycles')
@@ -197,12 +445,13 @@ async def opportunity_cycle(body: OpportunityCycleRequest, request: Request):
     if body.candidate_ids is None:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=202, content=worker.submit(
-            {'top_n': body.top_n, 'shortlist_limit': body.shortlist_limit}))
+            {'top_n': body.top_n, 'shortlist_limit': body.shortlist_limit, 'analysis_scope': body.analysis_scope}))
     # Diagnostics use the same process lock and never update production state.
     async with worker.run_lock:
         try:
             return await run_global_opportunity_cycle(repository, portfolio_orchestrator,
                 top_n=body.top_n, shortlist_limit=body.shortlist_limit, candidate_ids=body.candidate_ids,
+                analysis_scope=body.analysis_scope,
                 readiness_runtime=research_readiness_runtime,
                 identity_headers=_internal_service_identity(portfolio_orchestrator.settings))
         except PortfolioServiceUnavailableError as exc:
@@ -238,21 +487,29 @@ async def cancel_opportunity_cycle(
     store = repository.persistence
     if not hasattr(store, 'request_cycle_cancel'):
         raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
-    with repository._persistence_worker_lock:
-        run = store.cycle_run(str(cycle_id))
-        if run is None:
-            raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
-        previous_status = run.get('status')
-        was_cancelled = store.cycle_cancel_status(str(cycle_id)) is not None
-        transitioned = store.request_cycle_cancel(str(cycle_id))
-        run = store.cycle_run(str(cycle_id)) or run
-    return {
-        'cycle_id': str(cycle_id),
-        'previous_status': previous_status,
-        'cancelled': was_cancelled or transitioned,
-        'status': (run or {}).get('status'),
-        'status_phase': 'CANCEL_REQUESTED' if (was_cancelled or transitioned) and run.get('status') == 'CANCEL_REQUESTED' else ('CANCELLED' if run.get('status') == 'CANCELLED' else None),
-    }
+
+    def _request_cancel():
+        # Keep the existing atomic read/transition/read sequence and lock. In
+        # production this closure runs in the repository worker thread, where
+        # the outer serialization lock is safely re-entrant.
+        with repository._persistence_worker_lock:
+            run = store.cycle_run(str(cycle_id))
+            if run is None:
+                raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
+            previous_status = run.get('status')
+            was_cancelled = store.cycle_cancel_status(str(cycle_id)) is not None
+            transitioned = store.request_cycle_cancel(str(cycle_id))
+            run = store.cycle_run(str(cycle_id)) or run
+        return {
+            'cycle_id': str(cycle_id),
+            'previous_status': previous_status,
+            'cancelled': was_cancelled or transitioned,
+            'status': (run or {}).get('status'),
+            'status_phase': 'CANCEL_REQUESTED' if (was_cancelled or transitioned) and run.get('status') == 'CANCEL_REQUESTED' else ('CANCELLED' if run.get('status') == 'CANCELLED' else None),
+        }
+
+    run_blocking = getattr(repository, '_run_blocking_persistence', None)
+    return await run_blocking(_request_cancel) if run_blocking is not None else _request_cancel()
 
 
 @app.post('/api/v1/research/opportunities/cycles/{cycle_id}/finalize-cancel')
@@ -302,6 +559,11 @@ class BacktestRequest(BaseModel):
     market: str = 'NSE'
     horizon: str = 'SHORT_TERM'
     benchmark_id: UUID | None = None
+    # Pins the evaluation clock ("as of" date) instead of always using the
+    # real current time -- makes NOT_MATURED vs EVALUATED/MISSING_MARKET_DATA
+    # reproducible for a chosen evaluation date. Optional and backward
+    # compatible: omitted, behavior is identical to before this field existed.
+    as_of: str | None = None
 
 
 @app.get('/api/v1/research/backtesting/runs')
@@ -320,7 +582,7 @@ async def create_backtest(body: BacktestRequest):
     try:
         with repository._persistence_worker_lock:
             return run_backtest(repository.persistence, start=body.start, end=body.end,
-                                horizon=body.horizon, benchmark_id=body.benchmark_id)
+                                horizon=body.horizon, benchmark_id=body.benchmark_id, as_of=body.as_of)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -356,9 +618,36 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": settings.service_name}
 
 
+@app.get("/health/live")
+def liveness() -> dict[str, str]:
+    """Cheap process liveness check for the Kubernetes liveness probe.
+
+    Keep this independent of persistence, providers, readiness, and Radar
+    state.  A slow dependency or a busy event loop must make the pod
+    temporarily unready, never look dead to Kubernetes.
+    """
+    return {"status": "ok", "service": settings.service_name}
+
+
 @app.get("/providers/llm")
 def llm_provider() -> dict[str, str]:
-    return {"provider": settings.llm_provider, "mode": "optional-not-called"}
+    """Report the configured LLM provider and prove config-driven resolution works.
+
+    `mode` stays "optional-not-called": no business logic currently invokes the
+    resolved provider's structured_extract. This endpoint exists to demonstrate
+    that provider selection is entirely configuration-driven (AIP_LLM_PROVIDER)
+    via app.llm.get_llm_provider's registry, so adding a future provider (e.g.
+    Llama) only requires implementing the LlmProvider contract and registering it
+    there, never touching this endpoint or any domain/business logic.
+    """
+    from app.llm import get_llm_provider
+
+    resolved = get_llm_provider(settings.llm_provider)
+    return {
+        "provider": settings.llm_provider,
+        "resolved_provider_class": type(resolved).__name__,
+        "mode": "optional-not-called",
+    }
 
 
 @app.get("/api/v1/research/sources")
@@ -1282,3 +1571,193 @@ def _require_market_data_user(user_id: str | None, issuer: str | None, subject: 
 def _require_research_user(user_id: str | None, issuer: str | None, subject: str | None) -> None:
     if not (user_id and issuer and subject):
         raise HTTPException(status_code=401, detail="Research ensure access denied")
+
+
+# ---------------------------------------------------------------------------
+# Manual Evidence Upload endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/research/evidence/file-types")
+def supported_evidence_file_types():
+    """Return supported file types for manual evidence upload.
+
+    allowedMetricsByEvidenceType is additive, read-only capability discovery
+    for evidence types backed by a repeating structured-row schema (the
+    FinancialFact family -- see ALLOWED_METRICS_BY_EVIDENCE_TYPE in
+    app.manual_evidence) so the frontend's metric picker is driven by the
+    same canonical list accept() itself validates against, rather than a
+    hand-maintained, driftable duplicate. Omitted entirely for evidence
+    types with no such restricted metric set (e.g. SHAREHOLDING,
+    CURRENT_NEWS).
+    """
+    return {
+        "supportedFileTypes": SUPPORTED_FILE_TYPE_LABELS,
+        "supportedEvidenceTypes": [e.value for e in SUPPORTED_EVIDENCE_TYPES],
+        "allowedMetricsByEvidenceType": {
+            evidence_type.value: sorted(metrics)
+            for evidence_type, metrics in ALLOWED_METRICS_BY_EVIDENCE_TYPE.items()
+            if evidence_type in SUPPORTED_EVIDENCE_TYPES
+        },
+        # Additive capability discovery for the ResearchEvent-backed,
+        # restricted-event-type evidence types (ORDER_BOOK_CAPEX_GUIDANCE,
+        # GOVERNANCE_HISTORY): the canonical event types accept() will
+        # actually validate against (ALLOWED_EVENT_TYPES_BY_EVIDENCE_TYPE in
+        # app.manual_evidence), so the frontend's event-type dropdown is
+        # driven by the server's own list rather than a hand-maintained,
+        # driftable duplicate. Omitted for evidence types with no such
+        # restriction (SHAREHOLDING, CURRENT_NEWS, the FinancialFact family).
+        "allowedEventTypesByEvidenceType": {
+            evidence_type.value: sorted(t.value for t in event_types)
+            for evidence_type, event_types in ALLOWED_EVENT_TYPES_BY_EVIDENCE_TYPE.items()
+            if evidence_type in SUPPORTED_EVIDENCE_TYPES
+        },
+        # The full canonical EventImpact / TimeHorizon value sets -- sourced
+        # from the server's own enums (app.models) rather than a frontend
+        # duplicate, for the same drift-free reason as above. These two
+        # fields apply to every ResearchEvent-backed evidence type.
+        "eventImpactValues": [v.value for v in EventImpact],
+        "timeHorizonValues": [v.value for v in TimeHorizon],
+    }
+
+
+@app.post("/api/v1/research/evidence/draft")
+async def create_evidence_draft(
+    global_instrument_id: UUID,
+    evidence_type: str = Query(..., description="Evidence type, e.g. SHAREHOLDING"),
+    file: UploadFile = File(...),
+    x_correlation_id: str | None = Header(default=None),
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+):
+    """Upload an evidence file and produce a DRAFT extraction proposal.
+
+    Extraction creates a DRAFT/proposal only.  Extracted structured facts
+    MUST NOT directly modify normalized investment data.  Only an explicit
+    Accept (separate endpoint) may persist validated normalized facts.
+    """
+    _require_research_user(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject)
+    started = time.perf_counter()
+    file_bytes = await file.read()
+    try:
+        draft = manual_evidence_ingestor.ingest(
+            evidence_type=evidence_type,
+            file_bytes=file_bytes,
+            filename=file.filename or "uploaded",
+            content_type=file.content_type,
+            instrument_id=global_instrument_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    logger.info(
+        "research_flow operation=EVIDENCE_DRAFT globalInstrumentId=%s outcome=SUCCESS "
+        "durationMs=%s draftId=%s",
+        global_instrument_id, round((time.perf_counter() - started) * 1000),
+        draft.draft_id,
+    )
+    return _draft_response(draft)
+
+
+@app.get("/api/v1/research/evidence/draft/{draft_id}")
+async def get_evidence_draft(
+    draft_id: UUID,
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+):
+    """Retrieve a DRAFT by ID for review."""
+    _require_research_user(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject)
+    draft = manual_evidence_ingestor.get_draft(draft_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail=f"DRAFT_NOT_FOUND: {draft_id}")
+    return _draft_response(draft)
+
+
+class EvidenceAcceptRequest(BaseModel):
+    corrections: dict[str, Any] | None = Field(default=None)
+    reconcileWithConflicts: bool = Field(default=False)
+
+
+@app.post("/api/v1/research/evidence/draft/{draft_id}/accept")
+async def accept_evidence_draft(
+    draft_id: UUID,
+    payload: EvidenceAcceptRequest | None = Body(default=None),
+    x_correlation_id: str | None = Header(default=None),
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+):
+    """Explicitly accept a reviewed DRAFT, persisting validated normalized facts.
+
+    This is the ONLY endpoint that may persist normalized facts from manual
+    evidence.  It performs:
+      1. Re-validation of the draft (including user corrections).
+      2. Conflict detection against existing trusted official evidence.
+      3. Atomic acceptance: persists the snapshot through the existing
+         repository/persistence contract and signals evidence commitment.
+      4. Readiness recalculation through the normal Research Readiness path
+         (NEVER hard-coded READY).
+    """
+    _require_research_user(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject)
+    started = time.perf_counter()
+    try:
+        result = await manual_evidence_acceptor.accept(
+            draft_id=draft_id,
+            corrections=payload.corrections if payload else None,
+            # Pre-existing bug: this read the snake_case name of a
+            # camelCase-only Pydantic field (reconcileWithConflicts), which
+            # raises AttributeError on ANY accept call that actually sends a
+            # request body -- i.e. every real HTTP call, SHAREHOLDING
+            # included. Fixed to the field's real name; no request/response
+            # shape changed (the wire field was always reconcileWithConflicts).
+            reconcile_with_conflicts=payload.reconcileWithConflicts if payload else False,
+        )
+    except AcceptanceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    logger.info(
+        "research_flow operation=EVIDENCE_ACCEPT draftId=%s outcome=SUCCESS "
+        "durationMs=%s snapshotId=%s",
+        draft_id, round((time.perf_counter() - started) * 1000),
+        result.get("snapshotId"),
+    )
+    return result
+
+
+def _draft_response(draft):
+    """Serialize a ManualEvidenceDraft to a JSON-friendly dict."""
+    return {
+        "draftId": str(draft.draft_id),
+        "evidenceType": draft.evidence_type.value,
+        "contentHash": draft.content_hash,
+        "originalFilename": draft.original_filename,
+        "contentType": draft.content_type,
+        "instrumentId": str(draft.instrument_id) if draft.instrument_id else None,
+        "reportingPeriod": draft.reporting_period.isoformat() if draft.reporting_period else None,
+        "proposedFacts": [
+            {
+                "field": f.field,
+                "value": str(f.value),
+                "sourceLocator": f.source_locator,
+                "evidenceText": f.evidence_text,
+                "rawSourceLabel": f.raw_source_label,
+                "metricBasis": f.metric_basis,
+                "confidence": f.confidence,
+                "validationError": f.validation_error,
+            }
+            for f in draft.proposed_facts
+        ],
+        "validationResults": {
+            "valid": draft.validation_results.valid,
+            "errors": draft.validation_results.errors,
+            "warnings": draft.validation_results.warnings,
+            "conflicts": draft.validation_results.conflicts,
+        },
+        "extractionMethod": draft.extraction_method,
+        "createdAt": draft.created_at.isoformat(),
+        "status": draft.status.value,
+        # CURRENT_NEWS (and any future type with no safe auto-extraction):
+        # the frontend must collect these fields from the user before
+        # accept() -- see app.manual_evidence.MANUAL_FIELD_SCHEMA.
+        "requiresManualFields": draft.requires_manual_fields,
+        "manualFieldSchema": list(draft.manual_field_schema),
+    }

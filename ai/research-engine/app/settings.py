@@ -140,6 +140,16 @@ class Settings(BaseSettings):
     research_analyst_freshness_seconds: int = 604_800
     structured_provider_enabled: bool = True
     structured_provider_timeout_seconds: float = 10.0
+    # Backpressure for the real OS thread doing synchronous yfinance work
+    # (dispatched via asyncio.to_thread). A cancelled/abandoned owner
+    # coroutine cannot stop that thread; it keeps running until its
+    # synchronous call returns. This bounds how many such threads can be
+    # concurrently alive -- including abandoned ones still finishing --
+    # independent of asyncio-level admission (see
+    # YahooFinanceProvider._thread_dispatch_semaphore). Default matches the
+    # existing baseline acquisition concurrency (_BASELINE_CONCURRENCY=8),
+    # so normal (non-abandoned) operation is unaffected.
+    structured_provider_max_concurrent_threads: int = 8
     yahoo_search_url: str = "https://query1.finance.yahoo.com/v1/finance/search"
     yahoo_quote_url: str = "https://query1.finance.yahoo.com/v7/finance/quote"
     yahoo_summary_url: str = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"

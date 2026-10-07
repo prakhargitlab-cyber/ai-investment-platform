@@ -5,6 +5,15 @@ _parse_datetime = datetime.fromisoformat
 from uuid import uuid4, UUID
 from copy import deepcopy
 from app.global_opportunity_orchestration import GlobalOpportunityOrchestrator, DEFAULT_DEEP_LIMIT
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Explicit, repository-naming-consistent analysis-scope contract (see
+# run_global_opportunity_cycle below). BOUNDED is the existing default and
+# is unconditionally backward compatible; FULL is new and additive.
+ANALYSIS_SCOPE_BOUNDED = 'BOUNDED'
+ANALYSIS_SCOPE_FULL = 'FULL'
 from app.recommendation_engine import RecommendationEngineV1, lifecycle, area_scores, digest
 
 
@@ -197,12 +206,31 @@ async def _blocking(repository, operation, *args, **kwargs):
 
 async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4, shortlist_limit=DEFAULT_DEEP_LIMIT,
                                        candidate_ids=None, identity_headers=None, readiness_runtime=None,
-                                       correlation_id=None, cycle_id=None, checkpoint=None):
+                                       correlation_id=None, cycle_id=None, checkpoint=None,
+                                       analysis_scope=ANALYSIS_SCOPE_BOUNDED):
     # Baseline evaluation always covers the eligible universe. Only expensive
     # deep investigation is bounded. Old scheduler jobs persisted None; apply
     # the existing request default to those production jobs as well.
-    effective_shortlist_limit = (DEFAULT_DEEP_LIMIT if candidate_ids is None and shortlist_limit is None
-                                 else shortlist_limit)
+    #
+    # analysis_scope is the explicit, persisted request-level control for
+    # whether the pre-deep shortlist cap applies at all (BOUNDED, the
+    # existing/default behavior, unchanged) or is bypassed entirely (FULL).
+    # FULL does not invent a new selection mechanism: GlobalOpportunityOrchestrator.run()
+    # already treats shortlist_limit=None as "no pre-deep cap" (see its own
+    # docstring: "Explicit diagnostic callers may still opt into an unbounded
+    # pool") and app/opportunity_discovery.py's discover(full_universe=True)
+    # already unions in every eligible_for_acquisition candidate regardless
+    # of the ranking-based dynamic deep pool. So FULL mode simply forces
+    # shortlist_limit=None through to the orchestrator, superseding whatever
+    # shortlist_limit value was supplied -- a cap and "no cap" are mutually
+    # exclusive, so shortlist_limit is not meaningful once FULL is requested.
+    if analysis_scope not in (ANALYSIS_SCOPE_BOUNDED, ANALYSIS_SCOPE_FULL):
+        raise ValueError('INVALID_ANALYSIS_SCOPE')
+    effective_shortlist_limit = (None if analysis_scope == ANALYSIS_SCOPE_FULL
+                                 else (DEFAULT_DEEP_LIMIT if candidate_ids is None and shortlist_limit is None
+                                       else shortlist_limit))
+    logger.info("opportunity_cycle_analysis_scope cycleId=%s analysisScope=%s effectiveShortlistLimit=%s",
+                cycle_id, analysis_scope, effective_shortlist_limit)
     # cycle_id/checkpoint: a resumable production cycle keeps ONE stable
     # cycle_id across worker restarts (app/cycle_checkpoint.py). Controlled
     # (candidate_ids) cycles never carry a checkpoint.

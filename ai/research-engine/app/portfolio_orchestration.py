@@ -113,6 +113,27 @@ class PortfolioResearchOrchestrator:
         except (httpx.HTTPError, ValueError) as exc:
             raise PortfolioServiceUnavailableError("Portfolio service unavailable for instrument enumeration") from exc
 
+    async def active_global_etfs(
+        self,
+        *,
+        correlation_id: str | None = None,
+        identity_headers: dict[str, str | None] | None = None,
+    ) -> list[dict]:
+        """Read the portfolio-service owned active-ETF universe; never mutate it.
+
+        A separate, disjoint server-side query (assetType=ETF) from
+        active_global_equities (assetType=EQUITY) -- never a local filter
+        split out of one shared instrument list.
+        """
+        from app.etf_universe import CanonicalEtfUniverse
+
+        try:
+            return await CanonicalEtfUniverse(self._client, self.settings.portfolio_service_base_url).active_global_etfs(
+                correlation_id=correlation_id, identity_headers=identity_headers,
+            )
+        except (httpx.HTTPError, ValueError) as exc:
+            raise PortfolioServiceUnavailableError("Portfolio service unavailable for instrument enumeration") from exc
+
     async def sector_benchmark_contexts(self, instrument_ids: set[UUID], *, correlation_id=None, identity_headers=None):
         """Read-only canonical dependencies, prepared before pure Stage-B computation."""
         if not instrument_ids:

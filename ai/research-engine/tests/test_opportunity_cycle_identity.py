@@ -45,12 +45,14 @@ async def test_opportunity_cycle_forwards_server_identity_and_preserves_params(m
     captured = {}
 
     async def fake_run(repository, canonical_source, *, top_n=None, shortlist_limit=None,
-                       candidate_ids=None, identity_headers=None, readiness_runtime=None):
+                       candidate_ids=None, identity_headers=None, readiness_runtime=None,
+                       analysis_scope=None):
         captured['readiness_runtime'] = readiness_runtime
         captured["identity_headers"] = identity_headers
         captured["top_n"] = top_n
         captured["shortlist_limit"] = shortlist_limit
         captured["candidate_ids"] = candidate_ids
+        captured["analysis_scope"] = analysis_scope
         return {"cycle_id": "srv", "universe_count": 1,
                 "controlled_candidate_set": bool(candidate_ids)}
 
@@ -72,10 +74,11 @@ async def test_opportunity_cycle_forwards_server_identity_and_preserves_params(m
     forwarded = {key.lower() for key in captured["identity_headers"]}
     assert "authorization" not in forwarded
     assert "x-user-id" not in forwarded
-    # (3) top_n / shortlist_limit / candidate_ids pass through unchanged.
+    # (3) top_n / shortlist_limit / candidate_ids / analysis_scope pass through unchanged.
     assert captured["top_n"] == 3
     assert captured["shortlist_limit"] == 10
     assert captured["candidate_ids"] == [UUID(int=1), UUID(int=2)]
+    assert captured["analysis_scope"] == "BOUNDED"
     # (4) existing successful cycle behavior is unchanged.
     assert result == {"cycle_id": "srv", "universe_count": 1, "controlled_candidate_set": True}
 

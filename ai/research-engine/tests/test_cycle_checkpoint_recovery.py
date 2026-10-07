@@ -15,10 +15,12 @@ Instrumented call counts (per instrument):
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import Counter
 from datetime import timedelta
 from decimal import Decimal
 from functools import partial
+from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -43,6 +45,48 @@ from test_global_opportunity_empty_universe import _Clock
 from test_global_opportunity_ranker import inputs
 from test_global_scanner import NOW, instrument, persisted
 from test_stock_rule_engine import _readiness
+
+
+@pytest.mark.asyncio
+async def test_resume_count_is_preclaim_at_enqueue_and_increments_once_on_takeover(caplog):
+    from datetime import datetime, timezone
+    store = SqliteResearchPersistence()
+    cycle_id = 'resume-count-timing'
+    store.create_cycle_run(cycle_id, {'top_n': 4})
+    assert store.claim_cycle_run(cycle_id, 'dead-owner', lease_seconds=1,
+                                now=datetime.now(timezone.utc) - timedelta(seconds=10))
+    assert store.cycle_run(cycle_id)['resume_count'] == 0
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def runner(**kwargs):
+        assert kwargs['cycle_id'] == cycle_id
+        entered.set()
+        await release.wait()
+        return {'cycle_id': cycle_id}
+
+    worker = OpportunityCycleWorker(
+        SimpleNamespace(persistence=store, _persistence_worker_lock=RLock()),
+        runner, owner_id='replacement-owner')
+    caplog.set_level('INFO', logger='app.opportunity_worker')
+    worker.start()
+    try:
+        # start() enqueues synchronously; _run_one has not claimed yet.
+        assert store.cycle_run(cycle_id)['resume_count'] == 0
+        assert any('opportunity_cycle_resume_enqueued' in r.message and 'resumeCount=0' in r.message
+                   for r in caplog.records)
+        await asyncio.wait_for(entered.wait(), 5)
+        assert store.cycle_run(cycle_id)['resume_count'] == 1
+        assert any('opportunity_cycle_claimed' in r.message and 'resumeCount=1' in r.message
+                   for r in caplog.records)
+        assert store.claim_cycle_run(cycle_id, worker.owner_id)
+        assert store.cycle_run(cycle_id)['resume_count'] == 1
+        release.set()
+        await asyncio.wait_for(worker.queue.join(), 5)
+        assert store.cycle_run(cycle_id)['status'] == 'COMPLETED'
+        assert store.cycle_run(cycle_id)['resume_count'] == 1
+    finally:
+        release.set()
+        await worker.close()
 
 
 class SimulatedCrash(BaseException):
@@ -328,6 +372,54 @@ async def test_100_candidates_crash_at_41_resumes_same_cycle(world_factory, monk
     completed = _job(world.store, cycle_id)
     assert completed["resumed_candidates"] == {PHASE_BASELINE: 100, PHASE_DEEP: 40}
     assert completed["executed_candidates"] == {PHASE_BASELINE: 0, PHASE_DEEP: 60}
+
+
+# ------------------------------------------------ Progress truthfulness ----
+@pytest.mark.asyncio
+async def test_resume_progress_never_misleadingly_regresses_below_durable_high_water_mark(world_factory, monkeypatch, caplog):
+    """Root-cause regression test: before this fix, the per-process
+    stage2_deep_progress log counter restarted at 0 on every resume (it
+    counted raw loop iterations in THIS process, not durable completed
+    outcomes), so an operator watching logs saw completed=40/100 before a
+    restart and completed=10/100 shortly after -- even though recovery
+    itself never re-executes the 40 already-durable candidates. This test
+    proves the FIX: a resumed cycle (a) emits an explicit
+    stage2_deep_resume_state log stating the durable K/N it is resuming
+    from, and (b) every subsequent stage2_deep_progress log's completed
+    count is monotonically >= that durable K -- it must never again report
+    a number below the pre-restart durable high-water mark."""
+    import logging
+    world = world_factory(100)
+    world.crash = ("deep_before_evidence", 41)
+    job, _ = await _run_until_crash(world, monkeypatch)
+    cycle_id = job["cycle_id"]
+    # 40 candidates are durably COMPLETED before the crash (see the test above).
+    durable_before_restart = 40
+
+    caplog.set_level(logging.INFO, logger="app.global_opportunity_orchestration")
+    caplog.clear()
+    await _restart_and_finish(world, monkeypatch)
+    assert _job(world.store, cycle_id)["status"] == "COMPLETED"
+
+    resume_state = [r for r in caplog.records if "stage2_deep_resume_state" in r.getMessage()]
+    assert len(resume_state) == 1, "expected exactly one resume-state announcement"
+    resume_msg = resume_state[0].getMessage()
+    assert f"cycleId={cycle_id}" in resume_msg
+    match = re.search(r"durableCompleted=(\d+)/(\d+)", resume_msg)
+    assert match is not None, resume_msg
+    assert int(match.group(1)) == durable_before_restart
+    assert int(match.group(2)) == 100
+
+    progress_lines = [r.getMessage() for r in caplog.records if "stage2_deep_progress:" in r.getMessage()]
+    assert progress_lines, "expected at least one progress log line after resume"
+    for line in progress_lines:
+        completed, total = (int(x) for x in re.search(r"completed=(\d+)/(\d+)", line).groups())
+        assert total == 100
+        # The crux of the fix: never below the durable high-water mark
+        # established BEFORE this restart, at any point during resume.
+        assert completed >= durable_before_restart, line
+    # And progress must still reach full completion by the end.
+    assert int(re.search(r"completed=(\d+)/", progress_lines[-1]).group(1)) == 100
     _assert_no_duplicates(world.store, cycle_id, 100)
 
 

@@ -86,6 +86,27 @@ class ResearchPersistence(Protocol):
     def upsert_shareholding_snapshot(self, snapshot: ShareholdingSnapshot) -> bool:
         ...
 
+    def upsert_manual_evidence_draft(
+        self,
+        *,
+        draft_id: UUID,
+        evidence_type: str,
+        content_hash: str,
+        original_filename: str,
+        content_type: str,
+        instrument_id: UUID | None,
+        reporting_period: datetime | None,
+        extraction_method: str,
+        extraction_results: str,
+        validation_results: str,
+        corrections: str,
+        accepted_at: datetime,
+    ) -> bool:
+        ...
+
+    def load_manual_evidence_drafts(self, evidence_type: str | None = None) -> list[Any]:
+        ...
+
     def start_refresh_run(
         self,
         *,
@@ -137,7 +158,9 @@ class DisabledResearchPersistence:
         return dict(generated_at=None, best_buy_today=None, top_short_term=[], top_long_term=[], top_exit=[], previous_recommendations=[])
 
     def recommendation_history(self, instrument_id=None): return []
+    def radar_recommendation_history(self, instrument_id=None): return []
     def recommendation_states(self): return []
+    def portfolio_recommendation_signals(self, *, instrument_ids=None): return []
     def backtests(self): return []
 
     def __init__(self) -> None:
@@ -172,6 +195,12 @@ class DisabledResearchPersistence:
 
     def upsert_shareholding_snapshot(self, snapshot: ShareholdingSnapshot) -> bool:
         return True
+
+    def upsert_manual_evidence_draft(self, **kwargs) -> bool:
+        return True
+
+    def load_manual_evidence_drafts(self, evidence_type=None) -> list[Any]:
+        return []
 
     def start_refresh_run(
         self,
@@ -753,6 +782,76 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                 )
         return True
 
+    def upsert_manual_evidence_draft(
+        self,
+        *,
+        draft_id: UUID,
+        evidence_type: str,
+        content_hash: str,
+        original_filename: str,
+        content_type: str,
+        instrument_id: UUID | None,
+        reporting_period: datetime | None,
+        extraction_method: str,
+        extraction_results: str,
+        validation_results: str,
+        corrections: str,
+        accepted_at: datetime,
+    ) -> bool:
+        """Persist an accepted manual-evidence draft's provenance record.
+
+        Dedup by (content_hash, evidence_type): an identical upload for the
+        same evidence type is recorded once; the UNIQUE constraint enforces
+        this at the DB level.  Returns True if a new row was inserted.
+        """
+        with self._connection:
+            existing = self._connection.execute(
+                "SELECT draft_id FROM global_manual_evidence WHERE content_hash = ? AND evidence_type = ? LIMIT 1",
+                (content_hash, evidence_type),
+            ).fetchone()
+            if existing:
+                return False
+            self._connection.execute(
+                """INSERT INTO global_manual_evidence (
+                    draft_id, evidence_type, content_hash, original_filename, content_type,
+                    instrument_id, reporting_period, extraction_method, extraction_results,
+                    validation_results, corrections, accepted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(draft_id), evidence_type, content_hash, original_filename, content_type,
+                 str(instrument_id) if instrument_id else None,
+                 _dt(reporting_period) if reporting_period else None,
+                 extraction_method, extraction_results, validation_results, corrections,
+                 _dt(accepted_at)),
+            )
+            return True
+
+    def load_manual_evidence_drafts(self, evidence_type: str | None = None) -> list[Any]:
+        """Load accepted manual-evidence provenance records as dicts."""
+        sql = "SELECT * FROM global_manual_evidence"
+        params: list[Any] = []
+        if evidence_type is not None:
+            sql += " WHERE evidence_type = ?"
+            params.append(evidence_type)
+        sql += " ORDER BY accepted_at DESC"
+        rows = self._connection.execute(sql, params).fetchall()
+        return [
+            {
+                "draft_id": row["draft_id"],
+                "evidence_type": row["evidence_type"],
+                "content_hash": row["content_hash"],
+                "original_filename": row["original_filename"],
+                "content_type": row["content_type"],
+                "instrument_id": row["instrument_id"],
+                "reporting_period": row["reporting_period"],
+                "extraction_method": row["extraction_method"],
+                "extraction_results": row["extraction_results"],
+                "validation_results": row["validation_results"],
+                "corrections": row["corrections"],
+                "accepted_at": row["accepted_at"],
+            }
+            for row in rows
+        ]
+
     def repair_official_document(self, document: ResearchDocument) -> bool:
         """Repair a failed/legacy NSE row or a republished locator in place.
 
@@ -1256,6 +1355,25 @@ def _sqlite_schema() -> str:
         CHECK (category <> 'PROMOTER_PLEDGE' OR metric_basis IS NOT NULL),
         FOREIGN KEY (snapshot_id) REFERENCES global_shareholding_snapshots (id)
     );
+    CREATE TABLE IF NOT EXISTS global_manual_evidence (
+        draft_id TEXT PRIMARY KEY,
+        evidence_type TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        original_filename TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        instrument_id TEXT,
+        reporting_period TEXT,
+        extraction_method TEXT NOT NULL,
+        extraction_results TEXT NOT NULL,
+        validation_results TEXT NOT NULL,
+        corrections TEXT NOT NULL,
+        accepted_at TEXT NOT NULL,
+        UNIQUE (content_hash, evidence_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_global_manual_evidence_instrument
+        ON global_manual_evidence (instrument_id);
+    CREATE INDEX IF NOT EXISTS idx_global_manual_evidence_content_hash
+        ON global_manual_evidence (content_hash);
     CREATE TABLE IF NOT EXISTS global_financial_facts (
         instrument_id TEXT NOT NULL, metric TEXT NOT NULL, period_end TEXT NOT NULL, period_type TEXT NOT NULL, reporting_basis TEXT NOT NULL DEFAULT '', fact_value TEXT NOT NULL, unit TEXT,
         source_provider TEXT NOT NULL, source_identity TEXT NOT NULL, source_url TEXT NOT NULL, source_name TEXT NOT NULL, source_type TEXT, published_at TEXT, retrieved_at TEXT NOT NULL, confidence REAL, source_mode TEXT NOT NULL, source_tier INTEGER NOT NULL,

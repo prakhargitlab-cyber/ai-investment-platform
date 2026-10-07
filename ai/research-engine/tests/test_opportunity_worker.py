@@ -122,6 +122,23 @@ async def test_cancelled_error_produces_worker_stopped(store, caplog):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('message', ['CYCLE_CANCELLED', 'provider CYCLE_CANCELLED failure'])
+async def test_runtime_error_cancel_text_without_request_remains_failed(store, message):
+    worker = OpportunityCycleWorker(
+        SimpleNamespace(persistence=store, _persistence_worker_lock=RLock()),
+        AsyncMock(side_effect=RuntimeError(message)))
+    try:
+        job = worker.submit({'top_n': 4})
+        await asyncio.wait_for(worker.queue.join(), 1)
+        for final in (store.cycle_run(job['cycle_id']),
+                      next(j for j in store.opportunity_jobs() if j['cycle_id'] == job['cycle_id'])):
+            assert final['status'] == 'FAILED'
+            assert final['error_code'] == 'OPPORTUNITY_CYCLE_FAILED'
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
 async def test_runner_exception_logs_traceback_and_error_type(store, caplog):
     """Step 3.2: exception is logged server-side with traceback and errorType."""
     caplog.set_level(logging.ERROR, logger="app.opportunity_worker")

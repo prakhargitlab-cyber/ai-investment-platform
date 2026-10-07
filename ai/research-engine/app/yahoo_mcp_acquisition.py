@@ -740,11 +740,32 @@ class McpFirstResearchCapabilityExecutor:
         slot = self._context_results.get(acquisition_context)
         if slot is None:
             slot = {}
+            if isinstance(acquisition_context, asyncio.Task):
+                if acquisition_context.done():
+                    return slot
+                acquisition_context.add_done_callback(self._release_context)
             self._context_results[acquisition_context] = slot
         self._context_results.move_to_end(acquisition_context)
         while len(self._context_results) > self._context_results_max:
             self._context_results.popitem(last=False)
         return slot
+
+    def _release_context(self, owner):
+        # The LRU ceiling alone retained up to 64 completed candidate results
+        # (and their Task keys). Same-task reuse ends when that task settles.
+        self._context_results.pop(owner, None)
+
+    def retention_stats(self):
+        stats = {
+            'mcp_entries': len(self._context_results),
+            'mcp_completed_task_entries': sum(
+                isinstance(owner, asyncio.Task) and owner.done()
+                for owner in self._context_results),
+        }
+        legacy_stats = getattr(type(self.legacy_executor), 'retention_stats', None)
+        if callable(legacy_stats):
+            stats.update(self.legacy_executor.retention_stats())
+        return stats
 
     async def _financial_state(self, instrument_id):
         return await self.repository._run_blocking_persistence(

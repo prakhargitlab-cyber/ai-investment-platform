@@ -27,9 +27,10 @@ import {
   WalletCards,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { OpportunityRadar } from "./opportunity-radar";
+import { RadarTabs } from "./radar-tabs";
+import { PortfolioRadarCompanyName, EtfRadarCompanyName } from "./portfolio-radar-signal";
 import { Backtesting } from "./backtesting";
 import { frontendConfig } from "../config";
 import {
@@ -47,6 +48,8 @@ import {
   type PortfolioListItem,
   type PortfolioImportPreview,
   type PortfolioPosition,
+  type PortfolioRadarSignal,
+  type EtfPortfolioRadarSignal,
   type PortfolioResearchCompany,
   type PortfolioResearchSummary,
   type FinancialResultPeriod,
@@ -60,6 +63,14 @@ import {
   type ResearchReadiness,
   type ResearchReadinessRequirement,
   type StockRuleEngineAnalysis,
+  type EvidenceDraft,
+  type EvidenceAcceptRequest,
+  type EvidenceFileType,
+  type EvidenceFileTypes,
+  type ManualEvidenceType,
+  type FinancialFactRow,
+  isFinancialFactEvidenceType,
+  isRestrictedEventTypeEvidenceType,
   type ResearchWatchlist,
   type WatchlistResearchInstrument,
   type WatchlistResearchPresentation,
@@ -77,6 +88,7 @@ import {
   performanceRowTone,
   regionalWatchlistName
 } from "../lib/market-intelligence";
+import { shouldOfferManualEvidenceUpload } from "../lib/manual-evidence-capability";
 import { Badge, Button, Card, EmptyState, ErrorState, Field, MetricCard, Skeleton } from "./ui";
 
 type View = "dashboard" | "portfolio" | "research" | "backtesting" | "brokers" | "settings";
@@ -269,6 +281,10 @@ export function InvestmentWorkspace() {
   const [selectedPortfolioId, setSelectedPortfolioId] = useState<string>("");
   const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [positions, setPositions] = useState<PortfolioPosition[]>([]);
+  const [portfolioRadarSignals, setPortfolioRadarSignals] = useState<PortfolioRadarSignal[]>([]);
+  // ETF Radar counterpart -- its own state, its own fetch, never merged
+  // into portfolioRadarSignals above (strict Equity/ETF separation).
+  const [etfPortfolioRadarSignals, setEtfPortfolioRadarSignals] = useState<EtfPortfolioRadarSignal[]>([]);
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioHistory | null>(null);
   const [portfolioHistoryRange, setPortfolioHistoryRange] = useState<PortfolioHistoryRange>("1M");
   const [portfolioHistoryLoading, setPortfolioHistoryLoading] = useState(false);
@@ -308,6 +324,18 @@ export function InvestmentWorkspace() {
   const [researchReadinessLoading, setResearchReadinessLoading] = useState(false);
   const [researchReadinessError, setResearchReadinessError] = useState<string | null>(null);
   const [ensuringResearchRequirements, setEnsuringResearchRequirements] = useState<string[]>([]);
+  const [evidenceCapabilities, setEvidenceCapabilities] = useState<EvidenceFileTypes | null>(null);
+  const [evidenceCapabilitiesError, setEvidenceCapabilitiesError] = useState<string | null>(null);
+  const [uploadEvidenceDialog, setUploadEvidenceDialog] = useState<{
+    globalInstrumentId: string;
+    companyName: string;
+    requirementId: string;
+    evidenceType: ManualEvidenceType;
+  } | null>(null);
+  const [uploadEvidenceDraft, setUploadEvidenceDraft] = useState<EvidenceDraft | null>(null);
+  const [uploadEvidenceError, setUploadEvidenceError] = useState<string | null>(null);
+  const [uploadEvidenceUploading, setUploadEvidenceUploading] = useState(false);
+  const [uploadEvidenceAccepting, setUploadEvidenceAccepting] = useState(false);
   const [stockRuleEngineAnalysis, setStockRuleEngineAnalysis] = useState<StockRuleEngineAnalysis | null>(null);
   const [stockRuleEngineLoading, setStockRuleEngineLoading] = useState(false);
   const [stockRuleEngineError, setStockRuleEngineError] = useState<string | null>(null);
@@ -343,6 +371,8 @@ export function InvestmentWorkspace() {
     setSelectedPortfolioId("");
     setSummary(null);
     setPositions([]);
+    setPortfolioRadarSignals([]);
+    setEtfPortfolioRadarSignals([]);
     setPortfolioHistory(null);
     setBrokerConnections([]);
     setBrokerProviders([]);
@@ -358,6 +388,11 @@ export function InvestmentWorkspace() {
     setResearchReadinessDialog(null);
     setResearchReadiness(null);
     setResearchReadinessError(null);
+    setEvidenceCapabilities(null);
+    setEvidenceCapabilitiesError(null);
+    setUploadEvidenceDialog(null);
+    setUploadEvidenceDraft(null);
+    setUploadEvidenceError(null);
     setStockRuleEngineAnalysis(null);
     setStockRuleEngineError(null);
     setResearchSummary(null);
@@ -499,6 +534,84 @@ export function InvestmentWorkspace() {
       ? { kind: "PORTFOLIO", portfolioId: selectedPortfolioId }
       : current);
   }, [selectedPortfolioId]);
+
+  useEffect(() => {
+    if (!accessToken || !authenticatedUser || view !== "portfolio") return;
+    const globalInstrumentIds = positions.flatMap((position) =>
+      position.instrument.globalInstrumentId ? [position.instrument.globalInstrumentId] : []
+    );
+    if (!globalInstrumentIds.length) {
+      setPortfolioRadarSignals([]);
+      return;
+    }
+    let cancelled = false;
+    let refreshing = false;
+    async function loadRadarSignals() {
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        const signals = await portfolioApi.getPortfolioRadarSignals(globalInstrumentIds);
+        if (!cancelled) setPortfolioRadarSignals(signals);
+      } catch {
+        // Keep the last successfully loaded authoritative projection.
+      } finally {
+        refreshing = false;
+      }
+    }
+    function loadVisibleRadarSignals() {
+      if (document.visibilityState === "visible") void loadRadarSignals();
+    }
+    void loadRadarSignals();
+    window.addEventListener("focus", loadRadarSignals);
+    document.addEventListener("visibilitychange", loadVisibleRadarSignals);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", loadRadarSignals);
+      document.removeEventListener("visibilitychange", loadVisibleRadarSignals);
+    };
+  }, [accessToken, authenticatedUser, positions, view]);
+
+  // ETF Radar counterpart of the Equity effect immediately above: its own
+  // independent globalInstrumentId set (ETF positions only, via
+  // instrument.assetType), its own API call, its own state. Deliberately
+  // NOT merged into the Equity effect -- a failure or slow response here
+  // can never affect portfolioRadarSignals or vice versa.
+  useEffect(() => {
+    if (!accessToken || !authenticatedUser || view !== "portfolio") return;
+    const etfGlobalInstrumentIds = positions.flatMap((position) =>
+      position.instrument.assetType === "ETF" && position.instrument.globalInstrumentId
+        ? [position.instrument.globalInstrumentId] : []
+    );
+    if (!etfGlobalInstrumentIds.length) {
+      setEtfPortfolioRadarSignals([]);
+      return;
+    }
+    let cancelled = false;
+    let refreshing = false;
+    async function loadEtfRadarSignals() {
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        const signals = await portfolioApi.getEtfPortfolioRadarSignals(etfGlobalInstrumentIds);
+        if (!cancelled) setEtfPortfolioRadarSignals(signals);
+      } catch {
+        // Keep the last successfully loaded authoritative projection.
+      } finally {
+        refreshing = false;
+      }
+    }
+    function loadVisibleEtfRadarSignals() {
+      if (document.visibilityState === "visible") void loadEtfRadarSignals();
+    }
+    void loadEtfRadarSignals();
+    window.addEventListener("focus", loadEtfRadarSignals);
+    document.addEventListener("visibilitychange", loadVisibleEtfRadarSignals);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", loadEtfRadarSignals);
+      document.removeEventListener("visibilitychange", loadVisibleEtfRadarSignals);
+    };
+  }, [accessToken, authenticatedUser, positions, view]);
 
   useEffect(() => {
     if (!accessToken || !authenticatedUser) return;
@@ -815,12 +928,79 @@ export function InvestmentWorkspace() {
     setResearchReadiness(null);
     setResearchReadinessError(null);
     setResearchReadinessLoading(true);
+    setEvidenceCapabilities(null);
+    setEvidenceCapabilitiesError(null);
+    void portfolioApi.getEvidenceFileTypes()
+      .then(setEvidenceCapabilities)
+      .catch(() => setEvidenceCapabilitiesError("Manual evidence upload availability could not be verified."));
     try {
       setResearchReadiness(await researchApi.getReadiness(globalInstrumentId));
     } catch {
       setResearchReadinessError("Research readiness is temporarily unavailable.");
     } finally {
       setResearchReadinessLoading(false);
+    }
+  }
+
+  async function openUploadEvidence(
+    globalInstrumentId: string,
+    companyName: string,
+    requirementId: string,
+    evidenceType: ManualEvidenceType
+  ) {
+    if (!evidenceCapabilities?.supportedEvidenceTypes.includes(evidenceType)) {
+      setResearchReadinessError("Manual evidence upload is not supported for this requirement.");
+      return;
+    }
+    setUploadEvidenceDialog({ globalInstrumentId, companyName, requirementId, evidenceType });
+    setUploadEvidenceDraft(null);
+    setUploadEvidenceError(null);
+    setResearchReadiness(null);
+    setResearchReadinessError(null);
+    setResearchReadinessLoading(true);
+    try {
+      setResearchReadiness(await researchApi.getReadiness(globalInstrumentId));
+    } catch {
+      setResearchReadinessError("Research readiness is temporarily unavailable.");
+    } finally {
+      setResearchReadinessLoading(false);
+    }
+  }
+
+  async function ingestEvidence(file: File) {
+    const dialog = uploadEvidenceDialog;
+    if (!dialog) return;
+    setUploadEvidenceUploading(true);
+    setUploadEvidenceError(null);
+    try {
+      const draft = await portfolioApi.uploadEvidence(
+        dialog.globalInstrumentId,
+        dialog.evidenceType,
+        file
+      );
+      setUploadEvidenceDraft(draft);
+    } catch (error) {
+      setUploadEvidenceError(getApiFailure(error).message);
+    } finally {
+      setUploadEvidenceUploading(false);
+    }
+  }
+
+  async function acceptEvidenceDraft(corrections?: EvidenceAcceptRequest) {
+    const draft = uploadEvidenceDraft;
+    if (!draft || !uploadEvidenceDialog) return;
+    setUploadEvidenceAccepting(true);
+    setUploadEvidenceError(null);
+    try {
+      const result = await portfolioApi.acceptEvidence(draft.draftId, corrections ?? {});
+      // Refresh readiness after acceptance
+      setResearchReadiness(result.readiness ?? null);
+      setUploadEvidenceDialog(null);
+      setUploadEvidenceDraft(null);
+    } catch (error) {
+      setUploadEvidenceError(getApiFailure(error).message);
+    } finally {
+      setUploadEvidenceAccepting(false);
     }
   }
 
@@ -1514,8 +1694,8 @@ export function InvestmentWorkspace() {
 
           {view !== "research" && watchlistActionError ? <p role="alert">{watchlistActionError}</p> : null}
           {view === "backtesting" ? <Backtesting /> : null}
-          {view === "dashboard" ? <OpportunityRadar heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
           {loading ? <LoadingView /> : null}
+          {view === "dashboard" && (loading || error) ? <RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
 
           {!loading && !error ? (
             <>
@@ -1535,6 +1715,7 @@ export function InvestmentWorkspace() {
                       onAddWatchlist={(selection) => { void addRankedStockToWatchlist(selection); }}
                       savedInstrumentIds={watchlists.filter((list) => list.region === sectorPerformanceRegion && list.systemDefault).flatMap((list) => savedWatchlistIds[list.watchlistId] ?? [])}
                       watchlistBusy={watchlistMutation !== null}
+                      radar={<RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
                       performance={sectorPerformance}
                       performanceRegion={sectorPerformanceRegion}
                       performanceSector={sectorPerformanceSector}
@@ -1559,6 +1740,7 @@ export function InvestmentWorkspace() {
                       portfolio={selectedPortfolio}
                       summary={summary}
                       positions={positions}
+                      radar={<RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
                       onCreate={createPortfolio}
                       onSync={selectedPortfolio?.brokerConnectionId ? syncSelectedPortfolio : undefined}
                       onRefreshPrices={selectedPortfolio?.acquisitionSource === "MANUAL_CSV_IMPORT" ? refreshSelectedPrices : undefined}
@@ -1597,6 +1779,8 @@ export function InvestmentWorkspace() {
                   setNewPortfolioCurrency={setNewPortfolioCurrency}
                   onUpdateDisplayName={updateHoldingDisplayName}
                   portfolioResearch={portfolioResearchSummary}
+                  radarSignals={portfolioRadarSignals}
+                  etfRadarSignals={etfPortfolioRadarSignals}
                 />
               ) : null}
               {view === "brokers" ? (
@@ -1767,6 +1951,8 @@ export function InvestmentWorkspace() {
           analysis={stockRuleEngineAnalysis}
           analysisLoading={stockRuleEngineLoading}
           analysisError={stockRuleEngineError}
+          supportedEvidenceTypes={evidenceCapabilities?.supportedEvidenceTypes ?? []}
+          evidenceCapabilitiesError={evidenceCapabilitiesError}
           onClose={() => {
             setResearchReadinessDialog(null);
             setResearchReadiness(null);
@@ -1776,6 +1962,40 @@ export function InvestmentWorkspace() {
           }}
           onFindData={(requirements) => { void findResearchData(requirements); }}
           onRunAnalysis={(allowPartial) => { void runStockRuleEngineAnalysis(allowPartial); }}
+          onUploadEvidence={(requirementId, evidenceType) => {
+            void openUploadEvidence(
+              researchReadinessDialog.globalInstrumentId,
+              researchReadinessDialog.companyName,
+              requirementId,
+              evidenceType
+            );
+          }}
+        />
+      ) : null}
+      {uploadEvidenceDialog ? (
+        <UploadEvidenceDialog
+          companyName={uploadEvidenceDialog.companyName}
+          requirementId={uploadEvidenceDialog.requirementId}
+          supportedFileTypes={evidenceCapabilities?.supportedFileTypes ?? []}
+          allowedMetricsByEvidenceType={evidenceCapabilities?.allowedMetricsByEvidenceType ?? {}}
+          allowedEventTypesByEvidenceType={evidenceCapabilities?.allowedEventTypesByEvidenceType ?? {}}
+          eventImpactValues={evidenceCapabilities?.eventImpactValues ?? []}
+          timeHorizonValues={evidenceCapabilities?.timeHorizonValues ?? []}
+          draft={uploadEvidenceDraft}
+          error={uploadEvidenceError}
+          uploading={uploadEvidenceUploading}
+          accepting={uploadEvidenceAccepting}
+          onClose={() => {
+            setUploadEvidenceDialog(null);
+            setUploadEvidenceDraft(null);
+            setUploadEvidenceError(null);
+          }}
+          onUpload={ingestEvidence}
+          onResetDraft={() => {
+            setUploadEvidenceDraft(null);
+            setUploadEvidenceError(null);
+          }}
+          onAccept={acceptEvidenceDraft}
         />
       ) : null}
     </main>
@@ -1791,9 +2011,12 @@ function ResearchReadinessDialog({
   analysis,
   analysisLoading,
   analysisError,
+  supportedEvidenceTypes,
+  evidenceCapabilitiesError,
   onClose,
   onFindData,
-  onRunAnalysis
+  onRunAnalysis,
+  onUploadEvidence
 }: {
   companyName: string;
   readiness: ResearchReadiness | null;
@@ -1803,9 +2026,12 @@ function ResearchReadinessDialog({
   analysis: StockRuleEngineAnalysis | null;
   analysisLoading: boolean;
   analysisError: string | null;
+  supportedEvidenceTypes: ManualEvidenceType[];
+  evidenceCapabilitiesError: string | null;
   onClose: () => void;
   onFindData: (requirements: string[]) => void;
   onRunAnalysis: (allowPartial: boolean) => void;
+  onUploadEvidence: (requirementId: string, evidenceType: ManualEvidenceType) => void;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
   const findable = readiness?.requirements.filter((item) =>
@@ -1928,6 +2154,7 @@ function ResearchReadinessDialog({
               </div>
             </div>
             {analysisError ? <p className="readiness-popup-error" role="alert">{analysisError}</p> : null}
+            {evidenceCapabilitiesError ? <p className="readiness-refresh-state" role="status">{evidenceCapabilitiesError}</p> : null}
             {analysis ? <StockRuleEngineBreakdown analysis={analysis} /> : null}
             {readiness.refreshState?.executedCapabilities.length ? <p className="readiness-refresh-state" role="status">
               Targeted capabilities: {readiness.refreshState.executedCapabilities.join(", ").replaceAll("_", " ")}
@@ -1938,7 +2165,9 @@ function ResearchReadinessDialog({
                   key={requirement.requirementId}
                   requirement={requirement}
                   ensuring={ensuringRequirementIds.includes(requirement.requirementId)}
+                  supportedEvidenceTypes={supportedEvidenceTypes}
                   onFindData={() => onFindData([requirement.requirementId])}
+                  onUploadEvidence={onUploadEvidence}
                 />
               ))}
             </div>
@@ -1953,13 +2182,18 @@ function ResearchReadinessDialog({
 function ResearchReadinessRow({
   requirement,
   ensuring,
-  onFindData
+  supportedEvidenceTypes,
+  onFindData,
+  onUploadEvidence
 }: {
   requirement: ResearchReadinessRequirement;
   ensuring: boolean;
+  supportedEvidenceTypes: ManualEvidenceType[];
   onFindData: () => void;
+  onUploadEvidence: (requirementId: string, evidenceType: ManualEvidenceType) => void;
 }) {
   const tone = readinessStatusTone(requirement.status);
+  const evidenceType = shouldOfferManualEvidenceUpload(requirement, supportedEvidenceTypes);
   return <article className={`readiness-requirement readiness-requirement-${tone}`}>
     <div className="readiness-requirement-heading">
       <div>
@@ -1980,7 +2214,7 @@ function ResearchReadinessRow({
     {requirement.conflictReason ? <p className="readiness-reason">{requirement.conflictReason.replaceAll("_", " ")}</p> : null}
     <div className="readiness-actions">
       {requirement.supportedActions.includes("FIND_DATA") ? <Button onClick={onFindData} disabled={ensuring}>{ensuring ? "Finding…" : "Find Data"}</Button> : null}
-      {requirement.supportedActions.includes("UPLOAD_EVIDENCE") ? <Button variant="secondary" disabled title="Evidence upload arrives in a later iteration">Upload Evidence</Button> : null}
+      {evidenceType ? <Button variant="secondary" onClick={() => onUploadEvidence(requirement.requirementId, evidenceType)} title="Upload manual evidence for this requirement">Upload Evidence</Button> : null}
     </div>
   </article>;
 }
@@ -2230,6 +2464,7 @@ function PortfolioTabs({
 
 function MultiPortfolioDashboard({
   dashboard,
+  radar,
   performance,
   performanceRegion,
   performanceSector,
@@ -2253,6 +2488,7 @@ function MultiPortfolioDashboard({
   watchlistBusy: boolean;
   researchOnly?: boolean;
   dashboard: PortfolioDashboard | null;
+  radar: ReactNode;
   performance: SectorPerformance | null;
   performanceRegion: SectorPerformance["region"];
   performanceSector: string;
@@ -2267,7 +2503,7 @@ function MultiPortfolioDashboard({
   selectedResearchInstrumentId: string;
   onOpenResearch: (selection: MarketIntelligenceSelection) => void;
 }) {
-  if (!dashboard && !researchOnly) return null;
+  if (!dashboard && !researchOnly) return <div className="dashboard-grid"><div className="dashboard-radar wide-panel">{radar}</div></div>;
   return (
     <div className="dashboard-grid">
       {!researchOnly && dashboard ? <>
@@ -2297,6 +2533,7 @@ function MultiPortfolioDashboard({
       </section>
       {dashboard.portfolios.length === 0 ? <Card className="wide-panel"><EmptyState title="No portfolios" message="Connect a broker or create a portfolio to begin." /><Button onClick={onCreate} disabled={creating}>{creating ? "Creating..." : "Create portfolio"}</Button></Card> : null}
       </> : null}
+      {!researchOnly ? <div className="dashboard-radar wide-panel">{radar}</div> : null}
       <Card className="wide-panel">
         <div className="panel-header"><div><p className="eyebrow">Market intelligence</p><h2>Sector Performance</h2><p>Top gainers from durable market-price observations.</p></div></div>
         <div className="form-grid">
@@ -2399,6 +2636,7 @@ function DashboardView({
   portfolio,
   summary,
   positions,
+  radar,
   onCreate,
   onSync,
   onRefreshPrices,
@@ -2412,6 +2650,7 @@ function DashboardView({
   portfolio?: Portfolio;
   summary: PortfolioSummary | null;
   positions: PortfolioPosition[];
+  radar: ReactNode;
   onCreate: () => void;
   onSync?: () => void;
   onRefreshPrices?: () => void;
@@ -2424,14 +2663,17 @@ function DashboardView({
 }) {
   if (!portfolio) {
     return (
-      <PortfolioCreatePanel
-        onCreate={onCreate}
-        creating={creating}
-        newPortfolioName={newPortfolioName}
-        newPortfolioCurrency={newPortfolioCurrency}
-        setNewPortfolioName={setNewPortfolioName}
-        setNewPortfolioCurrency={setNewPortfolioCurrency}
-      />
+      <div className="dashboard-grid">
+        <PortfolioCreatePanel
+          onCreate={onCreate}
+          creating={creating}
+          newPortfolioName={newPortfolioName}
+          newPortfolioCurrency={newPortfolioCurrency}
+          setNewPortfolioName={setNewPortfolioName}
+          setNewPortfolioCurrency={setNewPortfolioCurrency}
+        />
+        <div className="dashboard-radar wide-panel">{radar}</div>
+      </div>
     );
   }
 
@@ -2457,6 +2699,7 @@ function DashboardView({
 
   return (
     <div className="dashboard-grid">
+      <h2 className="dashboard-section-title wide-panel">Portfolio snapshot</h2>
       <section className="metrics-grid" aria-label="Portfolio summary">
         <MetricCard
           label="Portfolio value"
@@ -2481,19 +2724,10 @@ function DashboardView({
         {summary && !onRefreshPrices ? <AllocationCharts summary={summary} /> : positions.length ? <p>Allocation uses refreshed holding values in the Portfolio view.</p> : <EmptyState title="No positions" message="This portfolio currently has no positions." />}
       </Card>
 
+      <div className="dashboard-radar wide-panel">{radar}</div>
+      <h2 className="dashboard-section-title wide-panel">Attention</h2>
       <MovementPanel title="Top gainers" icon={TrendingUp} positions={topGainers} sourceLabels={sourceLabels} />
       <MovementPanel title="Top losers" icon={TrendingDown} positions={topLosers} sourceLabels={sourceLabels} />
-
-      <Card className="wide-panel">
-        <div className="panel-header">
-          <div>
-            <h2>AI opportunities</h2>
-            <p>Recommendation logic is not yet available.</p>
-          </div>
-          <Badge tone="neutral">Future ready</Badge>
-        </div>
-        <EmptyState title="No AI ratings yet" message="BUY, HOLD, SELL, and opportunity scores will appear after recommendation services are approved and implemented." />
-      </Card>
     </div>
   );
 }
@@ -2556,7 +2790,9 @@ function PortfolioView({
   setNewPortfolioName,
   setNewPortfolioCurrency,
   onUpdateDisplayName,
-  portfolioResearch
+  portfolioResearch,
+  radarSignals,
+  etfRadarSignals
 }: {
   portfolio?: Portfolio;
   summary: PortfolioSummary | null;
@@ -2581,6 +2817,8 @@ function PortfolioView({
   setNewPortfolioCurrency: (value: string) => void;
   onUpdateDisplayName: (position: PortfolioPosition, customDisplayName: string | null) => Promise<void>;
   portfolioResearch: PortfolioResearchSummary | null;
+  radarSignals: PortfolioRadarSignal[];
+  etfRadarSignals: EtfPortfolioRadarSignal[];
 }) {
   if (!portfolio) {
     return (
@@ -2686,7 +2924,7 @@ function PortfolioView({
             action={onSync ? <Button onClick={onSync}>{sourceLabels.syncButton}</Button> : undefined}
           />
         ) : (
-          <HoldingsTable positions={positions} summary={summary} portfolioResearch={portfolioResearch} onUpdateDisplayName={onUpdateDisplayName} />
+          <HoldingsTable positions={positions} summary={summary} portfolioResearch={portfolioResearch} radarSignals={radarSignals} etfRadarSignals={etfRadarSignals} onUpdateDisplayName={onUpdateDisplayName} />
         )}
       </Card>
 
@@ -2869,16 +3107,24 @@ function ResearchCoverage({ research }: { research: PortfolioResearchSummary | n
   return <p className="research-coverage" aria-label="Portfolio research coverage"><strong>Research coverage:</strong> {companies.length} holdings · {available} available · {partial} partial · {etfUnsupported} ETF unsupported · {fresh} fresh · {stale} stale</p>;
 }
 
-function HoldingsTable({ positions, summary, portfolioResearch, onUpdateDisplayName }: {
+function HoldingsTable({ positions, summary, portfolioResearch, radarSignals, etfRadarSignals, onUpdateDisplayName }: {
   positions: PortfolioPosition[];
   summary: PortfolioSummary | null;
   portfolioResearch: PortfolioResearchSummary | null;
+  radarSignals: PortfolioRadarSignal[];
+  etfRadarSignals: EtfPortfolioRadarSignal[];
   onUpdateDisplayName: (position: PortfolioPosition, customDisplayName: string | null) => Promise<void>;
 }) {
   const [detail, setDetail] = useState<{ position: PortfolioPosition; researchInstrumentId?: string | null } | null>(null);
   const manualMarketTotal = positions.some((position) => position.sourceType === "MANUAL_CSV_IMPORT")
     && positions.every((position) => position.marketValue)
     ? positions.reduce((total, position) => total + (position.marketValue?.amount ?? 0), 0) : null;
+  const radarSignalsByInstrumentId = new Map(
+    radarSignals.map((signal) => [signal.globalInstrumentId, signal])
+  );
+  const etfRadarSignalsByInstrumentId = new Map(
+    etfRadarSignals.map((signal) => [signal.globalInstrumentId, signal])
+  );
 
   function researchFor(position: PortfolioPosition) {
     return portfolioResearch?.companies.find((company) =>
@@ -2917,11 +3163,19 @@ function HoldingsTable({ positions, summary, portfolioResearch, onUpdateDisplayN
               ? `ownership-${research.ownershipIncreases.map((value) => value.toLowerCase().replace("_fpi", "")).join("-")}`
               : "";
             const valuationClass = `valuation-${(research?.valuation.state ?? "UNKNOWN").toLowerCase()}`;
+            const radarSignal = position.instrument.globalInstrumentId
+              ? radarSignalsByInstrumentId.get(position.instrument.globalInstrumentId)
+              : undefined;
+            const etfRadarSignal = position.instrument.assetType === "ETF" && position.instrument.globalInstrumentId
+              ? etfRadarSignalsByInstrumentId.get(position.instrument.globalInstrumentId)
+              : undefined;
             return (
               <tr className={`${valuationClass} ${ownershipClass}`.trim()} key={position.positionId} onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
                 <td>
                   <button className="security-button" type="button" onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
-                    <strong>{position.displayName}</strong>
+                    {position.instrument.assetType === "ETF"
+                      ? <EtfRadarCompanyName companyName={position.displayName} signal={etfRadarSignal} />
+                      : <PortfolioRadarCompanyName companyName={position.displayName} signal={radarSignal} />}
                     <span>{position.instrument.isin ?? "No ISIN"}</span>
                   </button>
                 </td>
@@ -4565,5 +4819,634 @@ function StockSearchField({
         ))}
       </ul>
     </div>
+  );
+}
+
+const REVIEWABLE_EVIDENCE_FILE_TYPES = ["PDF", "CSV", "TXT"] as const;
+type ReviewableEvidenceFileType = (typeof REVIEWABLE_EVIDENCE_FILE_TYPES)[number];
+type DetectedEvidenceFileType = EvidenceFileType | "DOCX" | "JPG" | "PNG";
+
+const EVIDENCE_FILE_ACCEPT: Record<ReviewableEvidenceFileType, string> = {
+  PDF: ".pdf",
+  CSV: ".csv",
+  TXT: ".txt"
+};
+
+function isReviewableEvidenceFileType(value: DetectedEvidenceFileType): value is ReviewableEvidenceFileType {
+  return REVIEWABLE_EVIDENCE_FILE_TYPES.some((candidate) => candidate === value);
+}
+
+function evidenceFileType(file: File): DetectedEvidenceFileType | null {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  if (file.type === "application/pdf" || extension === "pdf") return "PDF";
+  if (file.type === "text/csv" || extension === "csv") return "CSV";
+  if (file.type === "text/plain" || extension === "txt") return "TXT";
+  if (file.type === "image/png" || extension === "png") return "PNG";
+  if (file.type === "image/jpeg" || extension === "jpg" || extension === "jpeg") return "JPG";
+  if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || extension === "docx") return "DOCX";
+  return null;
+}
+
+const EMPTY_FINANCIAL_FACT_ROW: FinancialFactRow = {
+  metric: "",
+  value: "",
+  periodEnd: "",
+  periodType: "",
+  reportingBasis: "",
+  unit: "",
+  sourceUrl: ""
+};
+
+// Per-row validation mirroring the backend's own deterministic checks
+// (app.manual_evidence._validate_financial_fact_rows) closely enough to
+// give the user inline feedback before Accept -- the backend remains the
+// actual authority; this never allows a row the server would reject to
+// slip through silently, it just surfaces the same complaint earlier.
+function financialFactRowErrors(row: FinancialFactRow, allowedMetrics: string[]): string[] {
+  const issues: string[] = [];
+  if (!row.metric.trim()) issues.push("Metric is required.");
+  else if (allowedMetrics.length && !allowedMetrics.includes(row.metric)) issues.push("Metric is not permitted for this requirement.");
+  if (!row.value.trim()) issues.push("Value is required.");
+  else if (Number.isNaN(Number(row.value))) issues.push("Value must be a number.");
+  if (!row.periodEnd.trim()) issues.push("Period end is required.");
+  if (row.periodType !== "QUARTERLY" && row.periodType !== "ANNUAL") issues.push("Period type must be Quarterly or Annual.");
+  if (!row.unit.trim()) issues.push("Unit is required.");
+  if (!row.sourceUrl.trim()) issues.push("Source is required.");
+  return issues;
+}
+
+function UploadEvidenceDialog({
+  companyName,
+  requirementId,
+  supportedFileTypes,
+  allowedMetricsByEvidenceType,
+  allowedEventTypesByEvidenceType,
+  eventImpactValues,
+  timeHorizonValues,
+  draft,
+  error,
+  uploading,
+  accepting,
+  onClose,
+  onUpload,
+  onResetDraft,
+  onAccept
+}: {
+  companyName: string;
+  requirementId: string;
+  supportedFileTypes: EvidenceFileType[];
+  allowedMetricsByEvidenceType: Partial<Record<string, string[]>>;
+  allowedEventTypesByEvidenceType: Partial<Record<string, string[]>>;
+  eventImpactValues: string[];
+  timeHorizonValues: string[];
+  draft: EvidenceDraft | null;
+  error: string | null;
+  uploading: boolean;
+  accepting: boolean;
+  onClose: () => void;
+  onUpload: (file: File) => Promise<void>;
+  onResetDraft: () => void;
+  onAccept: (corrections?: EvidenceAcceptRequest) => void;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [corrections, setCorrections] = useState<Record<string, string>>({});
+  const [manualFields, setManualFields] = useState<Record<string, string>>({});
+  const [factRows, setFactRows] = useState<FinancialFactRow[]>([]);
+  const [reconcileConflicts, setReconcileConflicts] = useState(false);
+  const isFinancialFacts = Boolean(draft && isFinancialFactEvidenceType(draft.evidenceType));
+  const allowedMetrics = draft ? allowedMetricsByEvidenceType[draft.evidenceType] ?? [] : [];
+  // ORDER_BOOK_CAPEX_GUIDANCE / GOVERNANCE_HISTORY: same manual-fields
+  // shape as CURRENT_NEWS, but eventType is a restricted dropdown driven by
+  // the server's own canonical list rather than free text (CURRENT_NEWS
+  // itself is untouched -- it still renders its existing free-text fields,
+  // see the requiresManualFields branch below).
+  const isRestrictedEventType = Boolean(draft && isRestrictedEventTypeEvidenceType(draft.evidenceType));
+  const allowedEventTypes = draft ? allowedEventTypesByEvidenceType[draft.evidenceType] ?? [] : [];
+  const reviewableFileTypes = supportedFileTypes.filter(isReviewableEvidenceFileType);
+  const inputAccept = reviewableFileTypes.map((fileType) => EVIDENCE_FILE_ACCEPT[fileType]).join(",");
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const appShell = document.querySelector<HTMLElement>(".app-shell");
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyPaddingRight = document.body.style.paddingRight;
+    const previousAppInert = appShell?.inert ?? false;
+    const previousAppAriaHidden = appShell?.getAttribute("aria-hidden") ?? null;
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+
+    document.body.style.overflow = "hidden";
+    if (scrollbarWidth > 0) {
+      const currentPadding = Number.parseFloat(window.getComputedStyle(document.body).paddingRight) || 0;
+      document.body.style.paddingRight = `${currentPadding + scrollbarWidth}px`;
+    }
+    if (appShell) {
+      appShell.inert = true;
+      appShell.setAttribute("aria-hidden", "true");
+    }
+    dialogRef.current?.querySelector<HTMLElement>("[data-evidence-close]")?.focus();
+
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.body.style.paddingRight = previousBodyPaddingRight;
+      if (appShell) {
+        appShell.inert = previousAppInert;
+        if (previousAppAriaHidden === null) appShell.removeAttribute("aria-hidden");
+        else appShell.setAttribute("aria-hidden", previousAppAriaHidden);
+      }
+      previouslyFocused?.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (!accepting) onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
+      )).filter((element) => !element.hidden && element.getClientRects().length > 0);
+      if (!focusable.length) {
+        event.preventDefault();
+        dialogRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, accepting]);
+
+  useEffect(() => {
+    setCorrections({});
+    setManualFields({});
+    // A financial-fact draft always starts with one empty, editable row --
+    // there is no safe auto-extraction into structured facts (see
+    // EMPTY_FINANCIAL_FACT_ROW), never a fabricated prefilled value.
+    setFactRows(draft && isFinancialFactEvidenceType(draft.evidenceType) ? [{ ...EMPTY_FINANCIAL_FACT_ROW }] : []);
+    setReconcileConflicts(false);
+    setPasteError(null);
+  }, [draft?.draftId]);
+
+  const updateFactRow = (index: number, patch: Partial<FinancialFactRow>) => {
+    setFactRows((current) => current.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)));
+  };
+  const addFactRow = () => setFactRows((current) => [...current, { ...EMPTY_FINANCIAL_FACT_ROW }]);
+  const removeFactRow = (index: number) => setFactRows((current) => current.filter((_, rowIndex) => rowIndex !== index));
+  const factRowErrorsByIndex = factRows.map((row) => financialFactRowErrors(row, allowedMetrics));
+  const factRowsValid = factRows.length > 0 && factRowErrorsByIndex.every((rowErrors) => rowErrors.length === 0);
+
+  const ingestFile = useCallback(async (file: File) => {
+    setPasteError(null);
+    const typeLabel = evidenceFileType(file);
+    if (typeLabel === "PNG" || typeLabel === "JPG") {
+      setPasteError("Image text extraction is not available. Upload a text-based PDF, CSV, or TXT file.");
+      return;
+    }
+    if (typeLabel === "DOCX") {
+      setPasteError("DOCX text extraction is not available. Upload a text-based PDF, CSV, or TXT file.");
+      return;
+    }
+    if (!typeLabel || !isReviewableEvidenceFileType(typeLabel) || !supportedFileTypes.includes(typeLabel)) {
+      setPasteError(`Unsupported file type: ${file.type || file.name}`);
+      return;
+    }
+    await onUpload(file);
+  }, [onUpload, supportedFileTypes]);
+
+  useEffect(() => {
+    function handlePaste(event: ClipboardEvent) {
+      const items = event.clipboardData?.items;
+      if (!items?.length) {
+        setPasteError("Clipboard does not contain a supported evidence file.");
+        return;
+      }
+      for (const item of items) {
+        if (item.kind === "file") {
+          event.preventDefault();
+          const file = item.getAsFile();
+          if (file) {
+            void ingestFile(file);
+          } else {
+            setPasteError("The clipboard file could not be read.");
+          }
+          return;
+        }
+      }
+      setPasteError("Clipboard does not contain a supported evidence file.");
+    }
+    document.addEventListener("paste", handlePaste);
+    return () => document.removeEventListener("paste", handlePaste);
+  }, [ingestFile]);
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) void ingestFile(file);
+  };
+
+  const handleAccept = () => {
+    const payload: EvidenceAcceptRequest = {};
+    if (isFinancialFacts) {
+      // The backend's corrections["facts"] row-list contract -- exact
+      // field names, never a frontend invention. reportingBasis is only
+      // sent when the user actually supplied one.
+      payload.corrections = {
+        facts: factRows.map((row) => {
+          const { reportingBasis, ...rest } = row;
+          return reportingBasis?.trim() ? { ...rest, reportingBasis: reportingBasis.trim() } : rest;
+        })
+      };
+    } else if (draft?.requiresManualFields) {
+      // CURRENT_NEWS (and any other type with no safe auto-extraction) has
+      // no proposedFacts to correct: `corrections` IS the whole
+      // user-supplied submission (title/summary/eventDate/sourceUrl/...).
+      const submitted: Record<string, string> = {};
+      Object.entries(manualFields).forEach(([field, value]) => {
+        if (value.trim()) submitted[field] = value.trim();
+      });
+      payload.corrections = submitted;
+    } else {
+      const corrected: Record<string, string> = {};
+      Object.entries(corrections).forEach(([field, value]) => {
+        if (value.trim()) corrected[field] = value.trim();
+      });
+      if (Object.keys(corrected).length > 0) payload.corrections = corrected;
+    }
+    if (reconcileConflicts) payload.reconcileWithConflicts = true;
+    onAccept(Object.keys(payload).length > 0 ? payload : undefined);
+  };
+
+  const resetDraft = () => {
+    setCorrections({});
+    setManualFields({});
+    setFactRows([]);
+    setReconcileConflicts(false);
+    setPasteError(null);
+    onResetDraft();
+  };
+
+  const hasConflicts = Boolean(draft?.validationResults.conflicts.length);
+  const manualFieldsComplete = Boolean(
+    draft?.requiresManualFields
+    && draft.manualFieldSchema.every((field) => Boolean(manualFields[field]?.trim()))
+  );
+  const canAccept = Boolean(
+    draft
+    && (!hasConflicts || reconcileConflicts)
+    && (
+      isFinancialFacts
+        ? factRowsValid
+        : draft.requiresManualFields
+          ? manualFieldsComplete
+          : draft.proposedFacts.length > 0
+            && (draft.validationResults.valid || Object.keys(corrections).length > 0)
+    )
+  );
+
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div className="readiness-popup-backdrop" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !accepting) onClose();
+    }}>
+      <section
+        ref={dialogRef}
+        className="readiness-popup evidence-upload-popup"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="evidence-upload-title"
+        tabIndex={-1}
+      >
+        <header className="readiness-popup-header">
+          <div>
+            <p className="eyebrow">Upload evidence</p>
+            <h2 id="evidence-upload-title">{companyName}</h2>
+            <small>Requirement: {requirementId.replaceAll("_", " ")}</small>
+          </div>
+          <button data-evidence-close type="button" className="icon-button" aria-label="Close evidence upload" onClick={onClose} disabled={accepting}>
+            <X size={20} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="readiness-popup-body">
+          {!draft ? (
+            <div className="evidence-drop-zone">
+              <UploadCloud size={48} aria-hidden="true" />
+              {reviewableFileTypes.length ? <p>Supported formats: {reviewableFileTypes.join(", ")}.</p> : null}
+              <p className="hint">Image paste and PNG/JPG extraction are not available. DOCX extraction is also unavailable.</p>
+              {pasteError ? <p role="alert" className="readiness-popup-error">{pasteError}</p> : null}
+              {error ? <p role="alert" className="readiness-popup-error">{error}</p> : null}
+              {!reviewableFileTypes.length ? <p role="alert" className="readiness-popup-error">No reviewable evidence file format is currently available.</p> : null}
+              <label className="button button-secondary">
+                {uploading ? "Creating draft..." : "Browse file"}
+                <input
+                  type="file"
+                  accept={inputAccept}
+                  onChange={handleFileChange}
+                  disabled={uploading || accepting || !reviewableFileTypes.length}
+                />
+              </label>
+              <Button variant="secondary" onClick={onClose} disabled={uploading || accepting}>Cancel</Button>
+            </div>
+          ) : (
+            <div>
+              <div className="evidence-draft-header">
+                <Badge tone="neutral">{draft.evidenceType.replaceAll("_", " ")}</Badge>
+                <small>{draft.originalFilename} · {draft.contentType}</small>
+              </div>
+              <p className="hint">Review is required. Nothing is persisted until you explicitly accept this draft.</p>
+              <dl className="evidence-draft-meta">
+                <div><dt>Filename</dt><dd>{draft.originalFilename}</dd></div>
+                <div><dt>Evidence type</dt><dd>{draft.evidenceType.replaceAll("_", " ")}</dd></div>
+                <div><dt>Extraction</dt><dd>{draft.extractionMethod.replaceAll("_", " ")}</dd></div>
+              </dl>
+              {error ? <p role="alert" className="readiness-popup-error">{error}</p> : null}
+              {draft.validationResults.errors && draft.validationResults.errors.length ? (
+                <p role="alert" className="readiness-popup-error">Validation errors: {draft.validationResults.errors.join(", ")}</p>
+              ) : null}
+              {draft.validationResults.warnings && draft.validationResults.warnings.length ? (
+                <p className="readiness-popup-error">Warnings: {draft.validationResults.warnings.join(", ")}</p>
+              ) : null}
+              {draft.validationResults.conflicts && draft.validationResults.conflicts.length ? (
+                <p role="alert" className="readiness-popup-error">Conflicts: {draft.validationResults.conflicts.join(", ")}</p>
+              ) : null}
+              {!draft.requiresManualFields && draft.proposedFacts.length === 0 ? (
+                <p role="alert" className="readiness-popup-error">No extractable facts were produced from this file.</p>
+              ) : null}
+              {isFinancialFacts ? (
+                <div className="evidence-manual-fields" data-testid="financial-fact-editor">
+                  <p className="hint">
+                    This evidence type has no safe automatic extraction. Add one row per fact
+                    yourself; nothing is accepted until every row is complete and valid.
+                  </p>
+                  <h3 className="evidence-fact-rows-heading">Proposed Financial Facts</h3>
+                  <div className="table-frame">
+                    <table className="evidence-facts-table evidence-fact-rows-table">
+                      <thead>
+                        <tr>
+                          <th>Metric</th><th>Value</th><th>Period end</th><th>Period type</th>
+                          <th>Reporting basis</th><th>Unit</th><th>Source</th><th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {factRows.map((row, index) => {
+                          const rowErrors = factRowErrorsByIndex[index] ?? [];
+                          const rowInvalid = rowErrors.length > 0;
+                          return (
+                            <tr key={index} className={rowInvalid ? "evidence-fact-row-invalid" : undefined}>
+                              <td>
+                                <select
+                                  aria-label={`Metric for row ${index + 1}`}
+                                  value={row.metric}
+                                  disabled={accepting}
+                                  onChange={(event) => updateFactRow(index, { metric: event.target.value })}
+                                >
+                                  <option value="">Select metric</option>
+                                  {allowedMetrics.map((metric) => (
+                                    <option key={metric} value={metric}>{metric.replaceAll("_", " ")}</option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td>
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  aria-label={`Value for row ${index + 1}`}
+                                  value={row.value}
+                                  disabled={accepting}
+                                  onChange={(event) => updateFactRow(index, { value: event.target.value })}
+                                />
+                              </td>
+                              <td>
+                                <input
+                                  type="date"
+                                  aria-label={`Period end for row ${index + 1}`}
+                                  value={row.periodEnd}
+                                  disabled={accepting}
+                                  onChange={(event) => updateFactRow(index, { periodEnd: event.target.value })}
+                                />
+                              </td>
+                              <td>
+                                <select
+                                  aria-label={`Period type for row ${index + 1}`}
+                                  value={row.periodType}
+                                  disabled={accepting}
+                                  onChange={(event) => updateFactRow(index, { periodType: event.target.value as FinancialFactRow["periodType"] })}
+                                >
+                                  <option value="">Select period type</option>
+                                  <option value="QUARTERLY">Quarterly</option>
+                                  <option value="ANNUAL">Annual</option>
+                                </select>
+                              </td>
+                              <td>
+                                <input
+                                  type="text"
+                                  aria-label={`Reporting basis for row ${index + 1}`}
+                                  value={row.reportingBasis ?? ""}
+                                  disabled={accepting}
+                                  onChange={(event) => updateFactRow(index, { reportingBasis: event.target.value })}
+                                />
+                              </td>
+                              <td>
+                                <input
+                                  type="text"
+                                  aria-label={`Unit for row ${index + 1}`}
+                                  placeholder="e.g. INR crore"
+                                  value={row.unit}
+                                  disabled={accepting}
+                                  onChange={(event) => updateFactRow(index, { unit: event.target.value })}
+                                />
+                              </td>
+                              <td>
+                                <input
+                                  type="text"
+                                  aria-label={`Source for row ${index + 1}`}
+                                  value={row.sourceUrl}
+                                  disabled={accepting}
+                                  onChange={(event) => updateFactRow(index, { sourceUrl: event.target.value })}
+                                />
+                              </td>
+                              <td className="evidence-fact-remove-cell">
+                                <button
+                                  type="button"
+                                  className="icon-button"
+                                  aria-label={`Remove row ${index + 1}`}
+                                  disabled={accepting || factRows.length <= 1}
+                                  onClick={() => removeFactRow(index)}
+                                >
+                                  &times;
+                                </button>
+                              </td>
+                              {rowInvalid ? (
+                                <td colSpan={8} style={{ border: "none", padding: 0 }}>
+                                  <span className="evidence-fact-row-error" role="alert">{rowErrors.join(" ")}</span>
+                                </td>
+                              ) : null}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <Button
+                    variant="secondary"
+                    className="evidence-fact-add-row"
+                    onClick={addFactRow}
+                    disabled={accepting}
+                  >
+                    + Add fact
+                  </Button>
+                </div>
+              ) : draft.requiresManualFields && isRestrictedEventType ? (
+                <div className="evidence-manual-fields">
+                  <p className="hint">
+                    This evidence type has no safe automatic extraction. Supply the fields below
+                    yourself; nothing is accepted until every required field is filled in. Only
+                    canonical {requirementId} event types are selectable below -- arbitrary text
+                    cannot be submitted as the event type.
+                  </p>
+                  {draft.manualFieldSchema.map((field) => {
+                    const label = field.replace(/([A-Z])/g, " $1").replace(/^./, (c) => c.toUpperCase());
+                    const value = manualFields[field] ?? "";
+                    const setValue = (next: string) => setManualFields((current) => ({ ...current, [field]: next }));
+                    if (field === "eventType") {
+                      return (
+                        <label key={field} className="evidence-manual-field">
+                          <span>{label}</span>
+                          <select value={value} onChange={(event) => setValue(event.target.value)} disabled={accepting} aria-label={field}>
+                            <option value="">Select an event type</option>
+                            {allowedEventTypes.map((option) => (
+                              <option key={option} value={option}>{option.replaceAll("_", " ")}</option>
+                            ))}
+                          </select>
+                        </label>
+                      );
+                    }
+                    if (field === "impact") {
+                      return (
+                        <label key={field} className="evidence-manual-field">
+                          <span>{label}</span>
+                          <select value={value} onChange={(event) => setValue(event.target.value)} disabled={accepting} aria-label={field}>
+                            <option value="">Select an impact</option>
+                            {eventImpactValues.map((option) => (
+                              <option key={option} value={option}>{option.replaceAll("_", " ")}</option>
+                            ))}
+                          </select>
+                        </label>
+                      );
+                    }
+                    if (field === "timeHorizon") {
+                      return (
+                        <label key={field} className="evidence-manual-field">
+                          <span>{label}</span>
+                          <select value={value} onChange={(event) => setValue(event.target.value)} disabled={accepting} aria-label={field}>
+                            <option value="">Select a time horizon</option>
+                            {timeHorizonValues.map((option) => (
+                              <option key={option} value={option}>{option.replaceAll("_", " ")}</option>
+                            ))}
+                          </select>
+                        </label>
+                      );
+                    }
+                    const inputType = field === "eventDate" ? "datetime-local" : "text";
+                    return (
+                      <label key={field} className="evidence-manual-field">
+                        <span>{label}</span>
+                        <input
+                          type={inputType}
+                          value={value}
+                          onChange={(event) => setValue(event.target.value)}
+                          disabled={accepting}
+                          aria-label={field}
+                        />
+                      </label>
+                    );
+                  })}
+                </div>
+              ) : draft.requiresManualFields ? (
+                <div className="evidence-manual-fields">
+                  <p className="hint">
+                    This evidence type has no safe automatic extraction. Supply the fields below
+                    yourself; nothing is accepted until every required field is filled in.
+                  </p>
+                  {draft.manualFieldSchema.map((field) => (
+                    <label key={field} className="evidence-manual-field">
+                      <span>{field.replace(/([A-Z])/g, " $1").replace(/^./, (c) => c.toUpperCase())}</span>
+                      <input
+                        type="text"
+                        value={manualFields[field] ?? ""}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setManualFields((current) => ({ ...current, [field]: value }));
+                        }}
+                        disabled={accepting}
+                        aria-label={field}
+                      />
+                    </label>
+                  ))}
+                </div>
+              ) : null}
+              {!isFinancialFacts && !draft.requiresManualFields && draft.proposedFacts.length ? <div className="table-frame"><table className="evidence-facts-table">
+                <thead>
+                  <tr><th>Field</th><th>Proposed value</th><th>Source / provenance</th><th>Evidence text</th><th>Confidence</th><th>Your correction</th></tr>
+                </thead>
+                <tbody>
+                  {draft.proposedFacts.map((fact, index) => (
+                    <tr key={`${fact.field}-${index}`}>
+                      <td>{fact.field}{fact.validationError ? <small className="readiness-popup-error">{fact.validationError}</small> : null}</td>
+                      <td>{fact.value}</td>
+                      <td>{fact.sourceLocator ?? fact.rawSourceLabel ?? draft.originalFilename}</td>
+                      <td>{fact.evidenceText ?? "-"}</td>
+                      <td>{Math.round(fact.confidence * 100)}%</td>
+                      <td>
+                        <input
+                          type="text"
+                          value={corrections[fact.field] ?? fact.value}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setCorrections((current) => {
+                              const next = { ...current };
+                              if (value === fact.value) delete next[fact.field];
+                              else next[fact.field] = value;
+                              return next;
+                            });
+                          }}
+                          disabled={accepting}
+                          aria-label={`Correction for ${fact.field}`}
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table></div> : null}
+              {hasConflicts ? <label className="evidence-conflict-consent">
+                <input type="checkbox" checked={reconcileConflicts} onChange={(event) => setReconcileConflicts(event.target.checked)} disabled={accepting} />
+                I reviewed these conflicts and want the server to reconcile them explicitly.
+              </label> : null}
+              <div className="evidence-actions">
+                <Button onClick={handleAccept} disabled={accepting || !canAccept}>
+                  {accepting ? "Accepting..." : "Accept evidence"}
+                </Button>
+                <Button variant="secondary" onClick={resetDraft} disabled={accepting}>
+                  Choose another file
+                </Button>
+                <Button variant="secondary" onClick={onClose} disabled={accepting}>Cancel</Button>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>,
+    document.body
   );
 }

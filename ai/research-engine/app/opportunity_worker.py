@@ -26,8 +26,14 @@ logger = logging.getLogger(__name__)
 
 
 class OpportunityCycleWorker:
-    def __init__(self, repository, runner, *, owner_id=None, lease_seconds=None, poll_seconds=None):
+    def __init__(self, repository, runner, *, owner_id=None, lease_seconds=None, poll_seconds=None, market=None):
         self.repository, self.runner = repository, runner
+        # Durable run/lease singleton-slot namespace. Equity keeps the
+        # historical default ('NSE'); any other worker (e.g. ETF Radar) must
+        # pass a distinct market so its active-cycle slot and lease never
+        # collide with Equity's -- this class itself has no Equity-specific
+        # behavior beyond this default.
+        self.market = market or "NSE"
         self.queue = asyncio.Queue(maxsize=1)
         self.run_lock = asyncio.Lock()
         self.task = None
@@ -91,7 +97,12 @@ class OpportunityCycleWorker:
                                  datetime.fromisoformat(value['updated_at']) + timedelta(microseconds=1))
         value['updated_at'] = self.last_event_at.isoformat()
         with self.repository._persistence_worker_lock:
-            self.repository.persistence.record_opportunity_job(value)
+            try:
+                self.repository.persistence.record_opportunity_job(value, market=self.market)
+            except TypeError:
+                # Backwards compatibility for minimal test doubles that only
+                # implement the original single-argument signature.
+                self.repository.persistence.record_opportunity_job(value)
 
     def _job_for_run(self, run):
         jobs = self._locked(self._store.opportunity_jobs)
@@ -108,7 +119,7 @@ class OpportunityCycleWorker:
         self.queue = asyncio.Queue(maxsize=1)
         with self.repository._persistence_worker_lock:
             pending = self.repository.persistence.opportunity_jobs()
-        active_run = self._locked(self._store.active_cycle_run) if self._resumable_supported() else None
+        active_run = self._locked(self._store.active_cycle_run, self.market) if self._resumable_supported() else None
         for value in pending:
             if value['status'] in {'ACCEPTED', 'RUNNING'}:
                 if active_run is not None and value['cycle_id'] == active_run['cycle_id']:
@@ -172,6 +183,8 @@ class OpportunityCycleWorker:
         value = {**self._job_for_run(run), 'resumed': True}
         logger.info("opportunity_cycle_resume_enqueued cycleId=%s status=%s resumeCount=%s",
                     run['cycle_id'], run['status'], run.get('resume_count'))
+        # This is the pre-claim count. claim_cycle_run increments it atomically
+        # when _run_one takes ownership; enqueueing alone is not a recovery.
         self.active = value
         self.queue.put_nowait(value)
 
@@ -181,7 +194,7 @@ class OpportunityCycleWorker:
             return
         if self._recovery_paused:
             return
-        run = self._locked(self._store.active_cycle_run)
+        run = self._locked(self._store.active_cycle_run, self.market)
         if run is None or run.get('owner_id') == self.owner_id:
             return
         if self._is_cycle_cancelled(run['cycle_id']):
@@ -199,7 +212,7 @@ class OpportunityCycleWorker:
             # or start a new cycle. Return a coalesced rejection so the
             # caller knows the cycle exists but is not being progressed.
             if self._resumable_supported():
-                active_run = self._locked(self._store.active_cycle_run)
+                active_run = self._locked(self._store.active_cycle_run, self.market)
                 if active_run is not None:
                     return {**self._job_for_run(active_run), 'coalesced': True,
                             'paused': True, 'cancelled': self._is_cycle_cancelled(active_run['cycle_id'])}
@@ -229,7 +242,7 @@ class OpportunityCycleWorker:
         parameters = {**parameters, 'correlation_id': correlation_id}
         cycle_id = str(uuid4())
         if self._resumable_supported():
-            run, created = self._locked(self._store.create_cycle_run, cycle_id, parameters)
+            run, created = self._locked(self._store.create_cycle_run, cycle_id, parameters, market=self.market)
             if not created:
                 # The single active production cycle already exists (this pod
                 # has not claimed it yet, or another replica owns it).
@@ -303,6 +316,9 @@ class OpportunityCycleWorker:
                 return
             checkpoint = CycleCheckpoint(self._store, cycle_id, self.owner_id,
                                          run_blocking=getattr(self.repository, '_run_blocking_persistence', None))
+            claimed_run = self._locked(self._store.cycle_run, cycle_id)
+            logger.info("opportunity_cycle_claimed cycleId=%s owner=%s resumeCount=%s",
+                        cycle_id, self.owner_id, claimed_run.get('resume_count'))
             heartbeat = asyncio.create_task(self._heartbeat(cycle_id), name=f'opportunity-lease-{cycle_id}')
             # Two-phase cancellation: if CANCEL_REQUESTED (not yet terminal),
             # the owner KEEPS draining -- the orchestrator's admission loop
@@ -351,18 +367,16 @@ class OpportunityCycleWorker:
                 value.get('result_cycle_id'), value.get('universe_count'),
             )
         except asyncio.CancelledError:
-            if resumable and self._closing:
-                # Graceful shutdown: if the cycle has been cancel-requested,
-                # coerce it to terminal CANCELLED now (drain is done). Otherwise
-                # keep the SAME cycle resumable by the next worker.
-                if self._is_cycle_cancelled(cycle_id):
-                    with suppress(Exception):
-                        self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id)
+            if resumable and self._is_cycle_cancelled(cycle_id):
+                if self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id):
                     value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
-                else:
-                    value = {**value, 'status': 'RUNNING', 'error_code': 'WORKER_STOPPED_RESUMABLE'}
-                    with suppress(Exception):
-                        self._locked(self._store.release_cycle_run, cycle_id, self.owner_id)
+                    self.record(value)
+            elif resumable and self._closing:
+                # Graceful shutdown without cancellation keeps the SAME cycle
+                # resumable by the next worker.
+                value = {**value, 'status': 'RUNNING', 'error_code': 'WORKER_STOPPED_RESUMABLE'}
+                with suppress(Exception):
+                    self._locked(self._store.release_cycle_run, cycle_id, self.owner_id)
             else:
                 value = {**value, 'status': 'FAILED', 'error_code': 'WORKER_STOPPED'}
                 if resumable:
@@ -386,6 +400,15 @@ class OpportunityCycleWorker:
             if resumable:
                 self._fail_run(cycle_id, 'UNIVERSE_UNAVAILABLE')
         except Exception as exc:
+            # The cycle entry point signals persisted cancellation this way.
+            # Require both the exact internal signal and durable intent; an
+            # unrelated RuntimeError must still be a genuine worker failure.
+            if (type(exc) is RuntimeError and exc.args == ('CYCLE_CANCELLED',)
+                    and resumable and self._is_cycle_cancelled(cycle_id)):
+                if self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id):
+                    value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
+                    self.record(value)
+                return
             # Persist safe failure metadata, never provider/auth exception text.
             logger.exception(
                 "opportunity_cycle_failed cycleId=%s correlationId=%s errorType=%s",

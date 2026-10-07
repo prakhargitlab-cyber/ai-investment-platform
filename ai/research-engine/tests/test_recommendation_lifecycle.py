@@ -204,10 +204,15 @@ def test_backtest_point_in_time_returns_and_missing_future():
     assert result['metrics']['1W']['average_return'] == pytest.approx(10)
     assert result['metrics']['1M']['average_return'] == pytest.approx(-10)
     assert result['metrics']['1M']['max_adverse_excursion'] == pytest.approx(-20)
-    assert result['metrics']['1Y']['average_return'] is None
-    assert result['samples']['1Y'][0]['status'] == 'FUTURE_PRICE_UNAVAILABLE'
+    # A short-term recommendation never receives a misleading 1Y validation.
+    # Its next due bucket at this as-of time is the 91-day evaluation.
+    assert '1Y' not in result['metrics']
+    assert result['samples']['3M'][0]['status'] == 'NOT_MATURED'
     prices[UUID(int=1)][0] = observation(0, 100, retrieved=1)
-    assert evaluate_backtest([r], prices, start=NOW, end=NOW, horizon='SHORT_TERM', now=NOW+timedelta(days=40))['samples']['1W'][0]['status'] == 'ENTRY_PRICE_UNAVAILABLE'
+    # Entry price retrieved AFTER the recommendation's own generation time is
+    # genuinely unavailable as of T; the 1W target has already passed (matured),
+    # so this is a real market-data gap: MISSING_MARKET_DATA.
+    assert evaluate_backtest([r], prices, start=NOW, end=NOW, horizon='SHORT_TERM', now=NOW+timedelta(days=40))['samples']['1W'][0]['status'] == 'MISSING_MARKET_DATA'
 
 
 @pytest.mark.parametrize('key', ['publishedAt', 'publicAvailabilityAt', 'discoveredAt', 'computedAt', 'retrieved_at', 'calculated_at'])
@@ -220,9 +225,19 @@ def test_backtest_excludes_future_evidence_and_future_recommendation():
     r = RecommendationEngineV1().evaluate(snapshot()) | {'recommendation_id': str(uuid4())}
     r['evidence_snapshot']['computedAt'] = (NOW+timedelta(days=1)).isoformat()
     result = evaluate_backtest([r], {}, start=NOW, end=NOW, horizon='SHORT_TERM', now=NOW+timedelta(days=40))
-    assert result['recommendation_count'] == 0 and result['excluded_unavailable_evidence'] == 1
+    # recommendation_count now reconciles with the FULL input (every row is
+    # accounted for in exactly one status bucket), not just the narrow cohort
+    # that went on to per-horizon evaluation -- this one row is genuinely
+    # excluded for insufficient evidence, which still shows up distinctly.
+    assert result['recommendation_count'] == 1 and result['excluded_unavailable_evidence'] == 1
+    assert result['samples']['1W'][0]['status'] == 'INSUFFICIENT_EVIDENCE'
     r['generated_at'] = (NOW+timedelta(days=1)).isoformat()
-    assert evaluate_backtest([r], {}, start=NOW, end=NOW, horizon='SHORT_TERM', now=NOW+timedelta(days=40))['recommendation_count'] == 0
+    # Now evidence is no longer "future" relative to the (moved) generation
+    # time, but the recommendation itself falls outside the selected
+    # [start, end] window -- a different, equally real exclusion reason.
+    moved = evaluate_backtest([r], {}, start=NOW, end=NOW, horizon='SHORT_TERM', now=NOW+timedelta(days=40))
+    assert moved['recommendation_count'] == 1
+    assert moved['samples']['1W'][0]['status'] == 'OUTSIDE_EVALUATION_WINDOW'
 
 
 def test_backtest_daily_closes_are_persisted_outcome_evidence(monkeypatch):

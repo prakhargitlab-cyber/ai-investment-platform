@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-type Tone = "neutral" | "positive" | "negative" | "warning" | "info";
+export type Tone = "neutral" | "positive" | "negative" | "warning" | "info";
 
 export function Card({
   children,

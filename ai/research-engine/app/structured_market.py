@@ -71,6 +71,21 @@ class YahooFinanceProvider:
         self.use_yfinance = client is None or ticker_factory is not None
         # The shared pool serializes access to each mutable ticker and bounds
         # retention. No context means no reuse; new contexts always retry.
+        #
+        # Backpressure for the real synchronous-work thread dispatched below
+        # (see _collect_resolved / _dispatch_yfinance_in_thread). asyncio-level
+        # cancellation of the *owning coroutine* (e.g. an ensure_timeout_seconds
+        # drain-and-abandon) cannot stop the underlying OS thread -- it keeps
+        # running the synchronous yfinance call to completion regardless. This
+        # semaphore is acquired before a thread is dispatched and released only
+        # by that thread itself once its synchronous call actually returns
+        # (never by the coroutine's own cancellation/cleanup), so an abandoned
+        # straggler keeps holding its slot until it genuinely finishes. A new
+        # dispatch therefore waits for a real free slot instead of launching an
+        # unbounded number of concurrently-alive synchronous operations whenever
+        # owners are cancelled faster than their threads actually drain.
+        self._thread_dispatch_semaphore = asyncio.Semaphore(
+            max(1, settings.structured_provider_max_concurrent_threads))
 
     async def collect(self, instrument: dict[str, Any], *, acquisition_context: object | None = None) -> StructuredMarketSnapshot:
         return await self._collect(instrument, acquisition_context=acquisition_context)
@@ -241,9 +256,39 @@ class YahooFinanceProvider:
     async def _collect_resolved(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False,
                                  acquisition_context: object | None = None) -> StructuredMarketSnapshot:
         if self.use_yfinance:
-            return await asyncio.to_thread(self._collect_resolved_yfinance, resolution, baseline_only=baseline_only,
-                                            acquisition_context=acquisition_context)
+            return await self._dispatch_yfinance_in_thread(resolution, baseline_only=baseline_only,
+                                                             acquisition_context=acquisition_context)
         return await self._collect_resolved_http(resolution, baseline_only=baseline_only)
+
+    async def _dispatch_yfinance_in_thread(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False,
+                                            acquisition_context: object | None = None) -> StructuredMarketSnapshot:
+        """Run the synchronous yfinance call in a thread, bounded by
+        _thread_dispatch_semaphore (see its docstring in __init__).
+
+        The semaphore is released from inside the thread's own finally block,
+        via call_soon_threadsafe, so release happens exactly once the
+        synchronous call genuinely returns -- not when the awaiting coroutine
+        here is cancelled. A cancellation of THIS coroutine still raises
+        CancelledError at the `await` below in the usual way; it does not
+        release the semaphore early and does not stop the thread.
+        """
+        await self._thread_dispatch_semaphore.acquire()
+        loop = asyncio.get_running_loop()
+        released = False
+
+        def release_once():
+            nonlocal released
+            if not released:
+                released = True
+                self._thread_dispatch_semaphore.release()
+
+        def run_and_release():
+            try:
+                return self._collect_resolved_yfinance(resolution, baseline_only=baseline_only,
+                                                        acquisition_context=acquisition_context)
+            finally:
+                loop.call_soon_threadsafe(release_once)
+        return await asyncio.to_thread(run_and_release)
 
     async def collect_verified(
         self, resolution: StructuredInstrumentResolution

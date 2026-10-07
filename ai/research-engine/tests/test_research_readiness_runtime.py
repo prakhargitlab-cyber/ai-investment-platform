@@ -788,20 +788,18 @@ async def test_partially_overlapping_requirement_groups_only_wait_on_the_overlap
 
 @pytest.mark.asyncio
 async def test_orchestration_wait_expiry_does_not_duplicate_scheduling() -> None:
-    """Stage2 Final Fix -- Item 5: correlate orchestration_wait_expired with
-    duplicate scheduling, without changing the 25s timeout itself.
+    """With the timeout-ownership fix, a background-cycle ensure() call whose
+    observation budget (ensure_timeout_seconds) elapses no longer blocks
+    indefinitely on the underlying task. Instead it cancels the owned task,
+    drains it under a hard deadline, and returns a bounded ACQUISITION_TIMEOUT
+    failure result.
 
-    A background-cycle ensure(wait_for_completion=True) call that outlasts
-    the observational wait budget only LOGS orchestration_wait_expired and
-    then keeps awaiting the SAME already-running task -- it never cancels or
-    reschedules it. A second, overlapping ensure() call for the same
-    instrument arriving while that wait is still pending (i.e. exactly the
-    window in which orchestration_wait_expired can fire) must still join the
-    existing single-flight task (ResearchReadinessRuntime._flights) rather
-    than triggering a second acquisition/provider pass. This is a focused
-    trace-by-test, per Item 5's "if they do not [cause duplication], make NO
-    production change and prove it" instruction -- no production code is
-    changed for this item.
+    A second, overlapping ensure() call for the same instrument arriving
+    after the first timed out must start a FRESH acquisition (the first
+    flight was cancelled/done and reaped from _flights by the done-callback)
+    -- it must NOT join a cancelled/stale flight, and must NOT skip acquiring
+    work that the first call never completed. This proves the timeout fix
+    returns bounded control to the scheduler instead of pinning workers.
     """
     source = StateDataSource({"CURRENT_NEWS"})
     executor = UpdatingExecutor(source)
@@ -818,23 +816,34 @@ async def test_orchestration_wait_expiry_does_not_duplicate_scheduling() -> None
         wait_for_completion=True,
     ))
     await executor.started.wait()
-    # Let the tiny ensure_timeout_seconds elapse so orchestration_wait_expired
-    # fires for the still-in-flight first call, before issuing the second,
-    # overlapping ensure() call.
+    # Let the tiny ensure_timeout_seconds elapse so the timeout path fires for
+    # the still-in-flight first call (task cancelled + drained) before issuing
+    # the second, overlapping ensure() call.
     await asyncio.sleep(0.05)
-    second = asyncio.create_task(runtime.ensure(
+    # The first call must have hit the timeout path and returned a bounded
+    # ACQUISITION_TIMEOUT failure (NOT blocked forever on the task).
+    assert first.done(), "first ensure() must return (not block) after timeout"
+    first_result = await first
+    assert "CURRENT_NEWS" in first_result.failures
+    assert "ACQUISITION_TIMEOUT" in first_result.failures["CURRENT_NEWS"]
+    assert first_result.reused_single_flight is False
+    # The first call's task was cancelled and reaped from _flights by the
+    # done-callback, so no live flight remains.
+    assert INSTRUMENT_ID not in runtime._flights
+
+    # Now release and issue a second call with a longer timeout -- it must
+    # start a fresh acquisition (not join the cancelled flight) and complete
+    # successfully.
+    executor.release.set()
+    runtime.ensure_timeout_seconds = 5.0
+    second_result = await runtime.ensure(
         INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=["CURRENT_NEWS"],
         wait_for_completion=True,
-    ))
-    await asyncio.sleep(0)
-    executor.release.set()
-    first_result, second_result = await asyncio.gather(first, second)
-
-    # Exactly one underlying acquisition pass, despite the wait-expiry log
-    # having fired for the first call before the second one arrived.
-    assert executor.primary_calls == [{"CURRENT_NEWS"}]
-    assert first_result.reused_single_flight is False
-    assert second_result.reused_single_flight is True
+    )
+    assert executor.primary_calls == [{"CURRENT_NEWS"}, {"CURRENT_NEWS"}]
+    assert second_result.reused_single_flight is False
+    assert second_result.failures == {}
+    assert "CURRENT_NEWS" not in source.missing
 
 
 class BudgetExecutor:

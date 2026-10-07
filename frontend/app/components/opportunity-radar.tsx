@@ -2,6 +2,9 @@
 
 import { useEffect, useState } from "react";
 import { request } from "../lib/portfolio-api";
+import { investorLabel } from "../lib/investor-labels";
+
+export { investorLabel } from "../lib/investor-labels";
 
 export type Opportunity = {
   global_instrument_id: string; company_name?: string; symbol?: string; current_price: number | null;
@@ -71,30 +74,52 @@ export function price(value: number | null | undefined): string {
 function range(low: number | null, high: number | null): string {
   return low == null || high == null ? "Insufficient evidence" : `${price(low)} – ${price(high)}`;
 }
-function label(value: string | undefined) { return value?.replaceAll("_", " ") ?? "Unavailable"; }
+
+function compactPrice(value: number | null | undefined): string {
+  return value == null ? "—" : price(value);
+}
+
+function compactRange(low: number | null, high: number | null): string {
+  return low == null || high == null ? "—" : range(low, high);
+}
 
 export function OpportunityCard({ item, horizon, held, watchlisted }: {
   item: Opportunity; horizon: "short" | "long"; held: boolean; watchlisted: boolean;
 }) {
+  const action = horizon === "short" ? item.current_short_action : item.current_long_action;
+  const entryRange = horizon === "short"
+    ? compactRange(item.short_entry_low, item.short_entry_high)
+    : compactRange(item.long_entry_low, item.long_entry_high);
+  const target = horizon === "short" ? compactPrice(item.short_target_1) : compactPrice(item.long_target);
+  const timeHorizon = horizon === "short" ? item.short_horizon : item.long_horizon;
+  const missingPriceLevels = horizon === "short"
+    ? [item.current_price, item.short_entry_low, item.short_entry_high, item.short_target_1].some((value) => value == null)
+    : [item.current_price, item.long_entry_low, item.long_entry_high, item.long_target].some((value) => value == null);
   return <article className="opportunity-card">
-    <h4>{item.company_name ?? item.symbol} <small>{item.symbol}</small></h4>
-    <p>{price(item.current_price)} {held ? " · Held" : ""}{watchlisted ? " · Watchlisted" : ""}</p>
-    <p>Opportunity {item.opportunity_score?.toFixed(1) ?? "Unavailable"} · Confidence {item.opportunity_confidence.toFixed(1)}% · Coverage {item.score_coverage.toFixed(1)}%</p>
-    <p>New investor: {label(item.new_investor_action)}<br />Existing holder: {label(item.existing_holder_action)}</p>
-    <strong>{label(horizon === "short" ? item.current_short_action : item.current_long_action)}</strong>
-    <dl>{horizon === "short" ? <>
-      <dt>Entry range</dt><dd>{range(item.short_entry_low, item.short_entry_high)}</dd>
-      <dt>Target 1</dt><dd>{price(item.short_target_1)}</dd><dt>Target 2</dt><dd>{price(item.short_target_2)}</dd>
-      <dt>Invalidation</dt><dd>{price(item.short_invalidation)}</dd><dt>Horizon</dt><dd>{item.short_horizon}</dd>
-    </> : <>
-      <dt>Accumulation range</dt><dd>{range(item.long_entry_low, item.long_entry_high)}</dd>
-      <dt>Fair value</dt><dd>{price(item.long_fair_value)}</dd><dt>Target</dt><dd>{price(item.long_target)}</dd>
-      <dt>Invalidation</dt><dd>{price(item.long_invalidation)}</dd><dt>Horizon</dt><dd>{item.long_horizon}</dd>
-    </>}</dl>
-    <p><strong>Why</strong></p><ul>{item.top_positive_reasons.slice(0, 4).map(r => <li key={r}>{label(r)}</li>)}</ul>
-    <p><strong>Risks</strong></p><ul>{item.top_negative_reasons.slice(0, 3).map(r => <li key={r}>{label(r)}</li>)}</ul>
-    <details><summary>Data: {label(item.data_state)}</summary>
-      <p>Missing: {item.missing_areas.join(", ") || "None reported"}</p><p>Stale: {item.stale_areas.join(", ") || "None reported"}</p>
+    <header className="opportunity-card-header">
+      <div><h4>{item.company_name ?? item.symbol}</h4><small>{item.symbol}</small></div>
+      <div className="opportunity-card-flags">{held ? <span>Held</span> : null}{watchlisted ? <span>Watchlisted</span> : null}</div>
+    </header>
+    <p className="opportunity-action">{investorLabel(action)}</p>
+    <dl className="opportunity-primary-metrics">
+      <div><dt>Current price</dt><dd>{compactPrice(item.current_price)}</dd></div>
+      <div><dt>{horizon === "short" ? "Entry range" : "Accumulation range"}</dt><dd>{entryRange}</dd></div>
+      <div><dt>Target</dt><dd>{target}</dd></div>
+      <div><dt>Horizon</dt><dd>{timeHorizon}</dd></div>
+    </dl>
+    <p className="opportunity-quality">
+      Opportunity {item.opportunity_score?.toFixed(1) ?? "Unavailable"} · Confidence {item.opportunity_confidence.toFixed(1)}% · Evidence quality {item.score_coverage.toFixed(1)}%
+      {missingPriceLevels ? " · Insufficient evidence for some price levels" : ""}
+    </p>
+    <p className="opportunity-investor-actions">New investor: {investorLabel(item.new_investor_action)} · Existing holder: {investorLabel(item.existing_holder_action)}</p>
+    <div className="opportunity-rationale">
+      <section><h5>Why</h5>{item.top_positive_reasons.length ? <ul>{item.top_positive_reasons.slice(0, 4).map(r => <li key={r}>{investorLabel(r)}</li>)}</ul> : <p>No verified positive factor.</p>}</section>
+      <section><h5>Risks</h5>{item.top_negative_reasons.length ? <ul>{item.top_negative_reasons.slice(0, 3).map(r => <li key={r}>{investorLabel(r)}</li>)}</ul> : <p>No specific risk factor reported.</p>}</section>
+    </div>
+    <details><summary>Evidence details · {investorLabel(item.data_state)}</summary>
+      {horizon === "short" ? <p>Second target: {compactPrice(item.short_target_2)} · Invalidation: {compactPrice(item.short_invalidation)}</p>
+        : <p>Fair value: {compactPrice(item.long_fair_value)} · Invalidation: {compactPrice(item.long_invalidation)}</p>}
+      <p>Missing: {item.missing_areas.map(investorLabel).join(", ") || "None reported"}</p><p>Stale: {item.stale_areas.map(investorLabel).join(", ") || "None reported"}</p>
     </details>
   </article>;
 }
@@ -120,7 +145,7 @@ function ExpandableSection({ title, items, horizon, heldIds, watchlistedIds }: {
     <>
       <h3>{title}</h3>
       <div className="opportunity-cards">{items.slice(0, visible).map(card)}</div>
-      {!items.length && <p>No qualifying {title === "TOP SHORT-TERM OPPORTUNITIES" ? "short-term" : "long-term"} opportunities.</p>}
+      {!items.length && <p>No qualifying {title === "Top short-term opportunities" ? "short-term" : "long-term"} opportunities.</p>}
       {items.length > INITIAL_DISPLAY && expanded && (
         <button type="button" className="opportunity-show-more"
           onClick={() => setVisible(v => v + INITIAL_DISPLAY)}>
@@ -169,8 +194,8 @@ export function PreviousRecommendationsList({ items }: { items: Opportunity[] })
   return (
     <>
       <ul>{visible.map(item =>
-        <li key={item.global_instrument_id}>{item.company_name ?? item.symbol} · Short: {label(item.current_short_action)} ({label(item.short_term_state)}) · Long: {label(item.current_long_action)} ({label(item.long_term_state)})
-          <p>{item.lifecycle_reasons?.map(label).join(" · ")}{item.evaluation_status ? ` · ${label(item.evaluation_status)}` : ""}</p>
+        <li key={item.global_instrument_id}>{item.company_name ?? item.symbol} · Short: {investorLabel(item.current_short_action)} ({investorLabel(item.short_term_state)}) · Long: {investorLabel(item.current_long_action)} ({investorLabel(item.long_term_state)})
+          <p>{item.lifecycle_reasons?.map(investorLabel).join(" · ")}{item.evaluation_status ? ` · ${investorLabel(item.evaluation_status)}` : ""}</p>
         </li>
       )}</ul>
       <div className="pagination-controls" role="navigation" aria-label="Previous recommendations pages">
@@ -193,15 +218,15 @@ export function PreviousRecommendationsList({ items }: { items: Opportunity[] })
 export function RadarContent({ data, heldIds = [], watchlistedIds = [] }: { data: Radar; heldIds?: string[]; watchlistedIds?: string[] }) {
   return <>
     <p>{data.generated_at ? `Last cycle: ${new Date(data.generated_at).toLocaleString()}` : "No persisted opportunity cycle yet."}</p>
-    <h3>BEST BUY TODAY</h3>
-    {data.best_buy_today ? <p>{data.best_buy_today.company_name ?? data.best_buy_today.symbol} · {price(data.best_buy_today.current_price)} · {label(data.best_buy_today.new_investor_action)}</p> : <p>No qualifying buy candidate.</p>}
+    <h3>Best buy today</h3>
+    {data.best_buy_today ? <p>{data.best_buy_today.company_name ?? data.best_buy_today.symbol} · {price(data.best_buy_today.current_price)} · {investorLabel(data.best_buy_today.new_investor_action)}</p> : <p>No qualifying buy candidate.</p>}
     <ExpandableSection
-      title="TOP SHORT-TERM OPPORTUNITIES" items={data.top_short_term} horizon="short"
+      title="Top short-term opportunities" items={data.top_short_term} horizon="short"
       heldIds={heldIds} watchlistedIds={watchlistedIds} />
     <ExpandableSection
-      title="TOP LONG-TERM OPPORTUNITIES" items={data.top_long_term} horizon="long"
+      title="Top long-term opportunities" items={data.top_long_term} horizon="long"
       heldIds={heldIds} watchlistedIds={watchlistedIds} />
-    <h3>PREVIOUS RECOMMENDATIONS</h3>
+    <h3>Previous recommendations</h3>
     {!data.previous_recommendations || !data.previous_recommendations.length ? <p>No previous recommendations.</p> :
       <PreviousRecommendationsList items={data.previous_recommendations} />}
   </>;
@@ -216,7 +241,7 @@ export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[
     return () => { active = false; };
   }, []);
   return <section className="opportunity-radar" aria-label="Global opportunity radar">
-    <h2>GLOBAL OPPORTUNITY RADAR</h2>
+    <h2>Global opportunity radar</h2>
     {error ? <p role="alert">Opportunity radar unavailable.</p> : data ? <RadarContent data={data} heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <p>Loading persisted opportunities…</p>}
   </section>;
 }

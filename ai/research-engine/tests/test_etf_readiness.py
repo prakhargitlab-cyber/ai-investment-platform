@@ -15,6 +15,7 @@ from app.etf_evidence import (
     EtfAuthority, EtfMetric
 )
 from app.persistence import SqliteResearchPersistence
+from app.models import DailyMarketBar, SourceMode
 
 
 NOW = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
@@ -502,3 +503,56 @@ class TestEtfRequirementRole:
 
         news_status = next(s for s in statuses if s.requirement == "CURRENT_NEWS")
         assert news_status.role == "CONTEXTUAL"
+
+
+class TestDerivedSupportingRequirementsAreVisible:
+    """Regression guard: ETC3_SUPPORTING previously named HISTORICAL_RETURNS,
+    VOLATILITY, DRAWDOWN, INDEX_MOMENTUM, CONCENTRATION, INDEX_VALUATION and
+    INDEX_CONSTITUENTS, but evaluate_etf_readiness() silently dropped every
+    one of them (EtfMetric(metric) raised ValueError, caught and ignored).
+    They must now appear in the returned statuses with a real, non-silent
+    disposition."""
+
+    def _minimal_mandatory_evidence(self, store):
+        listing = EtfListing(instrument_id=ID, isin="IN0000000001", symbol="NIFTYBEES",
+            name="Nifty BeES ETF", underlying_reference="Nifty 50", provenance=provenance())
+        store.save_etf_evidence(listing)
+        price = EtfFact(instrument_id=ID, metric=EtfMetric.MARKET_PRICE, value=Decimal("100"), unit="INR",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(price)
+        volume = EtfFact(instrument_id=ID, metric=EtfMetric.TRADING_VOLUME, value=Decimal("500000"), unit="shares",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(volume)
+
+    def test_no_price_history_reports_missing_not_absent(self, store):
+        self._minimal_mandatory_evidence(store)
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        by_requirement = {s.requirement: s for s in statuses}
+        for requirement in ("HISTORICAL_RETURNS", "VOLATILITY", "DRAWDOWN", "INDEX_MOMENTUM"):
+            assert requirement in by_requirement, f"{requirement} vanished from readiness output"
+            assert by_requirement[requirement].status == EtfReadinessStatus.MISSING
+
+    def test_no_holdings_snapshot_reports_concentration_missing(self, store):
+        self._minimal_mandatory_evidence(store)
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        by_requirement = {s.requirement: s for s in statuses}
+        assert by_requirement["CONCENTRATION"].status == EtfReadinessStatus.MISSING
+
+    def test_unimplemented_requirements_are_explicit_not_fabricated(self, store):
+        self._minimal_mandatory_evidence(store)
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        by_requirement = {s.requirement: s for s in statuses}
+        for requirement in ("INDEX_VALUATION", "INDEX_CONSTITUENTS"):
+            assert by_requirement[requirement].status == EtfReadinessStatus.NOT_IMPLEMENTED
+
+    def test_fresh_price_history_makes_historical_metrics_ready(self, store):
+        self._minimal_mandatory_evidence(store)
+        for i in range(260):
+            bar = DailyMarketBar(global_instrument_id=ID, trading_date=NOW.date() - timedelta(days=260 - i),
+                close=Decimal("100") + Decimal(i) * Decimal("0.05"), currency="INR", provider="NSE",
+                source_mode=SourceMode.REAL, source_url="https://nsearchives.nseindia.com/bar", retrieved_at=NOW)
+            store.upsert_daily_market_bar(bar)
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        by_requirement = {s.requirement: s for s in statuses}
+        for requirement in ("HISTORICAL_RETURNS", "VOLATILITY", "DRAWDOWN", "INDEX_MOMENTUM"):
+            assert by_requirement[requirement].status in {EtfReadinessStatus.READY_FRESH, EtfReadinessStatus.READY_STALE}

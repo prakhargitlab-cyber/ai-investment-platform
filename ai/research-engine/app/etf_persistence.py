@@ -3,6 +3,8 @@
 PostgreSQL obtains these tables exclusively from research-service Flyway V20.
 JSON payloads retain optional provenance without coercing unknowns to zero.
 """
+import json
+
 from app.etf_evidence import (
     EtfFact, EtfNavObservation, EtfHoldingsSnapshot, EtfListing, EtfAcquisitionAttempt,
     evidence_id, evidence_precedence,
@@ -47,6 +49,11 @@ CREATE TABLE IF NOT EXISTS etf_acquisition_attempts (
     provider TEXT NOT NULL, attempted_at TEXT NOT NULL, outcome TEXT NOT NULL, payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_etf_attempt_lookup ON etf_acquisition_attempts (instrument_id, metric, attempted_at);
+CREATE TABLE IF NOT EXISTS etf_radar_cycles (
+    cycle_id TEXT PRIMARY KEY, radar_version TEXT NOT NULL, correlation_id TEXT,
+    as_of TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_etf_radar_cycles_as_of ON etf_radar_cycles (as_of);
 """
 
 
@@ -133,6 +140,81 @@ class EtfPersistenceMixin:
                 item.provenance.retrieved_at, evidence_id(item)), reverse=True):
             selected.setdefault((listing.exchange, listing.isin), listing)
         return [selected[key] for key in sorted(selected)]
+
+    def save_etf_radar_cycle(self, cycle_id, radar_version, correlation_id, as_of, payload: dict) -> None:
+        """`payload` is the already-JSON-safe dict from
+        app.etf_opportunity_cycle.etf_cycle_result_to_dict -- this method
+        performs no further serialization logic of its own."""
+        from datetime import datetime, timezone
+        with self._connection:
+            self._connection.execute(
+                """INSERT INTO etf_radar_cycles (cycle_id,radar_version,correlation_id,as_of,payload,created_at)
+                VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
+                (str(cycle_id), radar_version, correlation_id, as_of.isoformat() if hasattr(as_of, "isoformat") else as_of,
+                 json.dumps(payload), datetime.now(timezone.utc).isoformat()))
+
+    def latest_etf_radar_cycle(self) -> dict | None:
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT payload FROM etf_radar_cycles ORDER BY as_of DESC, cycle_id DESC LIMIT 1").fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def etf_radar_cycle(self, cycle_id) -> dict | None:
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT payload FROM etf_radar_cycles WHERE cycle_id=?", (str(cycle_id),)).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def etf_portfolio_recommendation_signals(self, *, instrument_ids=None) -> list[dict]:
+        """GLOBAL ETF Radar intelligence for a set of globalInstrumentIds,
+        read from the most recently persisted ETF Radar cycle only (DB-only,
+        never acquires or re-runs anything).
+
+        Mirrors the Equity contract (`portfolio_recommendation_signals`):
+        this is the single, shared, reusable projection of ETF intelligence
+        -- a portfolio holding looks itself up here by globalInstrumentId
+        rather than this method ever being told which user/portfolio is
+        asking, so two users holding the same ETF are served the identical
+        row from the identical cycle, with zero duplication.
+
+        Returns ONLY global fields (score/recommendation/confidence/data
+        completeness/radar version/as-of/cycle id) -- nothing about any
+        user's quantity, cost, position size, gain/loss, or account/broker
+        ever flows through this method, because it never receives that data
+        in the first place.
+
+        An ETF with no matching candidate in the latest cycle (never
+        radar-evaluated yet, or dropped before evaluation) is simply absent
+        from the result -- never a fabricated or zeroed-out entry.
+        """
+        requested = None if instrument_ids is None else {str(value) for value in instrument_ids}
+        if requested == set():
+            return []
+        cycle = self.latest_etf_radar_cycle()
+        if cycle is None:
+            return []
+        result = []
+        for candidate in cycle.get("candidates", []):
+            global_instrument_id = candidate.get("global_instrument_id")
+            if global_instrument_id is None:
+                continue
+            if requested is not None and global_instrument_id not in requested:
+                continue
+            rule_engine_result = candidate.get("rule_engine_result") or {}
+            result.append({
+                "global_instrument_id": global_instrument_id,
+                "symbol": candidate.get("symbol"),
+                "recommendation": candidate.get("recommendation"),
+                "score": rule_engine_result.get("overall_score"),
+                "confidence": rule_engine_result.get("confidence"),
+                "data_completeness": rule_engine_result.get("data_completeness"),
+                "disposition": candidate.get("disposition"),
+                "radar_version": cycle.get("radar_version"),
+                "cycle_id": cycle.get("cycle_id"),
+                "as_of": cycle.get("as_of"),
+                "source": "ETF_RADAR_CURRENT_CYCLE",
+            })
+        return sorted(result, key=lambda row: row["global_instrument_id"])
 
     def etf_attempts(self, instrument_id=None):
         with self._connection:

@@ -347,6 +347,36 @@ export type PortfolioPosition = {
   quote?: Quote | null;
 };
 
+export type RadarPortfolioRecommendation = "BUY" | "STRONG_BUY" | "HOLD" | "PARTIAL_EXIT" | "FULL_EXIT";
+
+export type PortfolioRadarSignal = {
+  globalInstrumentId: string;
+  shortTermRecommendation: RadarPortfolioRecommendation | null;
+  longTermRecommendation: RadarPortfolioRecommendation | null;
+  shortTermAction?: string | null;
+  longTermAction?: string | null;
+  newInvestorAction?: string | null;
+  recommendationAt: string;
+  evaluatedAt: string;
+  recommendationId: string;
+  cycleId: string;
+  source: "RECOMMENDATION_CURRENT_STATE";
+};
+
+export type EtfPortfolioRadarSignal = {
+  globalInstrumentId: string;
+  symbol: string | null;
+  recommendation: string | null;
+  score: number | null;
+  confidence: string | null;
+  dataCompleteness: number | null;
+  disposition: string | null;
+  radarVersion: string | null;
+  cycleId: string | null;
+  asOf: string | null;
+  source: "ETF_RADAR_CURRENT_CYCLE";
+};
+
 export type Allocation = {
   country: Record<string, number>;
   currency: Record<string, number>;
@@ -852,6 +882,7 @@ export type PortfolioResearchSummary = {
 
 type ApiErrorBody = {
   message?: string;
+  detail?: string;
   correlationId?: string;
 };
 
@@ -880,7 +911,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
 
     const failure: ApiFailure = {
-      message: body.message ?? "The request could not be completed.",
+      message: body.message ?? body.detail ?? "The request could not be completed.",
       correlationId: body.correlationId ?? response.headers.get("X-Correlation-Id") ?? undefined,
       status: response.status
     };
@@ -915,6 +946,156 @@ export const authApi = {
     })
 };
 
+export const MANUAL_EVIDENCE_TYPES = [
+  "SHAREHOLDING",
+  "CURRENT_NEWS",
+  "ORDER_BOOK_CAPEX_GUIDANCE",
+  "GOVERNANCE_HISTORY",
+  "BUSINESS_QUALITY_FACTS",
+  "GROWTH_FACTS",
+  "BALANCE_SHEET_FACTS",
+  "QUARTERLY_FINANCIALS"
+] as const;
+export type ManualEvidenceType = (typeof MANUAL_EVIDENCE_TYPES)[number];
+
+// Evidence types backed by a repeating structured-row schema (one
+// FinancialFact per row) rather than flat scalar fields -- see
+// FinancialFactRow below. VALUATION_INPUTS is NOT a member: the backend
+// does not support it (see app.manual_evidence.EvidenceType), so it never
+// appears in supportedEvidenceTypes and Upload Evidence stays hidden for it.
+export const FINANCIAL_FACT_EVIDENCE_TYPES = [
+  "BUSINESS_QUALITY_FACTS",
+  "GROWTH_FACTS",
+  "BALANCE_SHEET_FACTS",
+  "QUARTERLY_FINANCIALS"
+] as const;
+export type FinancialFactEvidenceType = (typeof FINANCIAL_FACT_EVIDENCE_TYPES)[number];
+
+export function isFinancialFactEvidenceType(evidenceType: ManualEvidenceType): evidenceType is FinancialFactEvidenceType {
+  return (FINANCIAL_FACT_EVIDENCE_TYPES as readonly string[]).includes(evidenceType);
+}
+
+// Evidence types backed by the canonical ResearchEvent model (the same
+// research_events table/persistence path CURRENT_NEWS already uses) whose
+// eventType is restricted to a canonical, per-requirement subset rather
+// than any ResearchEventType -- see allowedEventTypesByEvidenceType below.
+// CURRENT_NEWS is deliberately NOT a member: its existing free-text
+// eventType field is unchanged (it accepts any ResearchEventType, matching
+// its pre-existing, already-tested behavior).
+export const RESTRICTED_EVENT_TYPE_EVIDENCE_TYPES = [
+  "ORDER_BOOK_CAPEX_GUIDANCE",
+  "GOVERNANCE_HISTORY"
+] as const;
+export type RestrictedEventTypeEvidenceType = (typeof RESTRICTED_EVENT_TYPE_EVIDENCE_TYPES)[number];
+
+export function isRestrictedEventTypeEvidenceType(
+  evidenceType: ManualEvidenceType
+): evidenceType is RestrictedEventTypeEvidenceType {
+  return (RESTRICTED_EVENT_TYPE_EVIDENCE_TYPES as readonly string[]).includes(evidenceType);
+}
+
+export type EvidenceFileType = "CSV" | "PDF" | "TXT";
+
+export type EvidenceFileTypes = {
+  supportedFileTypes: EvidenceFileType[];
+  supportedEvidenceTypes: ManualEvidenceType[];
+  // Canonical metric names accept() will actually validate against, per
+  // FinancialFact-backed evidence type -- the server's own
+  // ALLOWED_METRICS_BY_EVIDENCE_TYPE (app.manual_evidence), not a
+  // hand-maintained frontend duplicate. Absent for evidence types with no
+  // such restricted metric set (SHAREHOLDING, CURRENT_NEWS) and absent
+  // entirely on older backends that predate this field.
+  allowedMetricsByEvidenceType?: Partial<Record<FinancialFactEvidenceType, string[]>>;
+  // Canonical ResearchEventType values accept() will actually validate
+  // against, per restricted-event-type evidence type -- the server's own
+  // ALLOWED_EVENT_TYPES_BY_EVIDENCE_TYPE (app.manual_evidence). Absent for
+  // evidence types with no such restriction (SHAREHOLDING, CURRENT_NEWS,
+  // the FinancialFact family) and absent entirely on older backends that
+  // predate this field.
+  allowedEventTypesByEvidenceType?: Partial<Record<RestrictedEventTypeEvidenceType, string[]>>;
+  // The full canonical EventImpact / TimeHorizon value sets, sourced from
+  // the server's own enums (app.models) rather than a frontend duplicate.
+  // Absent on older backends that predate this field.
+  eventImpactValues?: string[];
+  timeHorizonValues?: string[];
+};
+
+// One row of the backend's canonical FinancialFact manual-evidence schema
+// (see app.manual_evidence._validate_financial_fact_rows /
+// _build_financial_facts). Field names match the backend's corrections.facts
+// row contract EXACTLY -- these are not frontend-invented names.
+export type FinancialFactRow = {
+  metric: string;
+  value: string;
+  periodEnd: string;
+  periodType: "QUARTERLY" | "ANNUAL" | "";
+  reportingBasis?: string;
+  unit: string;
+  sourceUrl: string;
+};
+
+export type ProposedFact = {
+  field: string;
+  value: string;
+  sourceLocator?: string | null;
+  evidenceText?: string | null;
+  rawSourceLabel?: string | null;
+  metricBasis?: string | null;
+  confidence: number;
+  validationError?: string | null;
+};
+
+export type ValidationResults = {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+  conflicts: string[];
+};
+
+export type EvidenceDraft = {
+  draftId: string;
+  evidenceType: ManualEvidenceType;
+  contentHash: string;
+  originalFilename: string;
+  contentType: string;
+  instrumentId?: string | null;
+  reportingPeriod?: string | null;
+  proposedFacts: ProposedFact[];
+  validationResults: ValidationResults;
+  extractionMethod: string;
+  createdAt: string;
+  status: string;
+  // Types like CURRENT_NEWS have no safe deterministic auto-extraction, so
+  // the draft carries no proposedFacts at all: the user must explicitly
+  // supply these canonical fields (see manualFieldSchema) as `corrections`
+  // at accept() time instead of correcting extracted facts.
+  requiresManualFields: boolean;
+  manualFieldSchema: string[];
+};
+
+export type EvidenceAcceptRequest = {
+  // Flat scalar map for SHAREHOLDING (field corrections) and CURRENT_NEWS /
+  // other no-auto-extraction scalar types (the whole submission), OR
+  // { facts: FinancialFactRow[] } for the FinancialFact-backed types --
+  // the backend's corrections["facts"] row-list contract. Never both.
+  corrections?: Record<string, string | number | boolean | null> | { facts: FinancialFactRow[] } | null;
+  reconcileWithConflicts?: boolean;
+};
+
+export type EvidenceAcceptResult = {
+  draftId: string;
+  snapshotId: string;
+  contentHash: string;
+  evidenceType: ManualEvidenceType;
+  extractionMethod: string;
+  reportingPeriod?: string | null;
+  corrections: Record<string, string | number | boolean | null>;
+  validationResults: ValidationResults;
+  conflictsReconciled: boolean;
+  persisted: boolean;
+  readiness: ResearchReadiness;
+};
+
 export const portfolioApi = {
   listPortfolios: () => request<PortfolioListItem[]>("/api/v1/portfolios"),
   getDashboard: () => request<PortfolioDashboard>("/api/v1/portfolios/dashboard"),
@@ -938,6 +1119,46 @@ export const portfolioApi = {
   getPortfolio: (portfolioId: string) => request<Portfolio>(`/api/v1/portfolios/${portfolioId}`),
   getPositions: (portfolioId: string) =>
     request<PortfolioPosition[]>(`/api/v1/portfolios/${portfolioId}/positions`),
+  getPortfolioRadarSignals: (globalInstrumentIds: string[]) => {
+    const params = new URLSearchParams();
+    [...new Set(globalInstrumentIds)].forEach((globalInstrumentId) => {
+      params.append("global_instrument_id", globalInstrumentId);
+    });
+    return request<PortfolioRadarSignal[]>(
+      `/api/v1/research/recommendations/current?${params.toString()}`
+    );
+  },
+  // ETF counterpart of getPortfolioRadarSignals above -- a SEPARATE bulk
+  // call against the ETF-only projection (/api/v1/research/etf-recommendations/current),
+  // never mixed into the Equity one. Field names are translated from the
+  // backend's raw snake_case (same rationale as etf-radar.tsx) to this
+  // file's existing camelCase convention, since every other type here does.
+  getEtfPortfolioRadarSignals: (globalInstrumentIds: string[]) => {
+    const params = new URLSearchParams();
+    [...new Set(globalInstrumentIds)].forEach((globalInstrumentId) => {
+      params.append("global_instrument_id", globalInstrumentId);
+    });
+    return request<Array<{
+      global_instrument_id: string; symbol: string | null; recommendation: string | null;
+      score: number | null; confidence: string | null; data_completeness: number | null;
+      disposition: string | null; radar_version: string | null; cycle_id: string | null;
+      as_of: string | null; source: "ETF_RADAR_CURRENT_CYCLE";
+    }>>(`/api/v1/research/etf-recommendations/current?${params.toString()}`).then((rows) =>
+      rows.map((row): EtfPortfolioRadarSignal => ({
+        globalInstrumentId: row.global_instrument_id,
+        symbol: row.symbol,
+        recommendation: row.recommendation,
+        score: row.score,
+        confidence: row.confidence,
+        dataCompleteness: row.data_completeness,
+        disposition: row.disposition,
+        radarVersion: row.radar_version,
+        cycleId: row.cycle_id,
+        asOf: row.as_of,
+        source: row.source,
+      }))
+    );
+  },
   refreshPrices: (portfolioId: string) =>
     request<{ portfolioId: string; refreshed: number; failed: number; skipped: number; completedAt: string }>(
       `/api/v1/portfolios/${portfolioId}/prices/refresh`, { method: "POST" }
@@ -968,7 +1189,31 @@ export const portfolioApi = {
     body.append("file", file);
     if (portfolioName?.trim()) body.append("portfolioName", portfolioName.trim());
     return request<PortfolioImportResult>(`/api/v1/portfolios/imports/${brokerType.toLowerCase()}/confirm`, { method: "POST", body });
-  }
+  },
+  getEvidenceFileTypes: () =>
+    request<EvidenceFileTypes>("/api/v1/research/evidence/file-types"),
+  uploadEvidence: (globalInstrumentId: string, evidenceType: ManualEvidenceType, file: File) => {
+    const params = new URLSearchParams({
+      global_instrument_id: globalInstrumentId,
+      evidence_type: evidenceType
+    });
+    const formData = new FormData();
+    formData.append("file", file);
+    return request<EvidenceDraft>(
+      `/api/v1/research/evidence/draft?${params.toString()}`,
+      { method: "POST", body: formData }
+    );
+  },
+  getEvidenceDraft: (draftId: string) =>
+    request<EvidenceDraft>(`/api/v1/research/evidence/draft/${draftId}`),
+  acceptEvidence: (draftId: string, payload?: EvidenceAcceptRequest) =>
+    request<EvidenceAcceptResult>(
+      `/api/v1/research/evidence/draft/${draftId}/accept`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload ?? {})
+      }
+    )
 };
 
 export const brokerApi = {

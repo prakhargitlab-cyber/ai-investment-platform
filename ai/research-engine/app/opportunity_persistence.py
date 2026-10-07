@@ -241,6 +241,19 @@ def _decode_scan_row(row):
     )
 
 
+def _portfolio_recommendation(action, new_investor_action):
+    """Map persisted rule-engine actions to the portfolio display contract."""
+    if action in {'BUY', 'ACCUMULATE', 'TOP_UP'}:
+        return 'STRONG_BUY' if new_investor_action == 'STRONG_BUY_CANDIDATE' else 'BUY'
+    if action in {'WAIT', 'HOLD', 'HOLD_NO_NEW_MONEY'}:
+        return 'HOLD'
+    if action in {'PARTIAL_EXIT', 'REDUCE'}:
+        return 'PARTIAL_EXIT'
+    if action in {'EXIT', 'EXIT_REVIEW'}:
+        return 'FULL_EXIT'
+    return None
+
+
 class OpportunityPersistenceMixin:
     def opportunity_rotation_after(self):
         """Read only the latest published cursor, without hydrating evidence/history."""
@@ -260,13 +273,16 @@ class OpportunityPersistenceMixin:
                     and value.get('status', 'COMPLETED') == 'COMPLETED'):
                 return value.get('rotation_after')
 
-    def record_opportunity_job(self, value):
+    def record_opportunity_job(self, value, market='NSE'):
         # Existing immutable JSON publication log also stores separate job events.
         # Each event has its own storage PK; cycle_id in the payload is the request ID.
+        # `market` is a free-text namespace tag only (e.g. 'ETF' for ETF Radar
+        # cycles) -- it does not affect how this log is read back, which is
+        # always keyed by cycle_id/record_kind, never filtered by market.
         payload = {**value, 'record_kind': 'CYCLE_JOB'}
         with self._connection:
             self._connection.execute('INSERT INTO global_opportunity_top_selection (cycle_id,generated_at,market,payload) VALUES (?,?,?,?)',
-                (str(uuid4()), value['updated_at'], 'NSE', json.dumps(payload, sort_keys=True)))
+                (str(uuid4()), value['updated_at'], market, json.dumps(payload, sort_keys=True)))
 
     def opportunity_jobs(self):
         latest = {}
@@ -288,7 +304,49 @@ class OpportunityPersistenceMixin:
                 'parameters': json.loads(run['parameters']),
             })
             job.update({key: run[key] for key in ('status', 'updated_at', 'error_code')})
+        # The durable checkpoint is the source of truth for business counters;
+        # immutable job events remain useful for activity/status history only.
+        for cycle_id, job in latest.items():
+            snapshot = getattr(self, "cycle_status_snapshot", lambda _id: {})(cycle_id)
+            if snapshot:
+                job["authoritative_progress"] = snapshot
         return list(latest.values())
+
+    def opportunity_job(self, cycle_id):
+        """Return one cycle's status without rebuilding every cycle snapshot."""
+        cycle_id = str(cycle_id)
+        job = None
+        for row in self._connection.execute(
+            'SELECT payload FROM global_opportunity_top_selection ORDER BY generated_at DESC, cycle_id DESC'
+        ).fetchall():
+            value = decode(row)
+            if value.get('record_kind') == 'CYCLE_JOB' and value.get('cycle_id') == cycle_id:
+                job = dict(value)
+                break
+
+        # Match opportunity_jobs(): durable cancellation state supersedes a
+        # stale/missing immutable job event, without changing event history.
+        row = self._connection.execute(
+            "SELECT cycle_id, status, updated_at, error_code, parameters FROM global_opportunity_cycle_run "
+            "WHERE cycle_id = ? AND status IN ('CANCEL_REQUESTED','CANCELLED')",
+            (cycle_id,),
+        ).fetchone()
+        if row is not None:
+            run = dict(row)
+            if job is None:
+                job = {
+                    'cycle_id': run['cycle_id'],
+                    'record_kind': 'CYCLE_JOB',
+                    'parameters': json.loads(run['parameters']),
+                }
+            job.update({key: run[key] for key in ('status', 'updated_at', 'error_code')})
+
+        if job is None:
+            return None
+        snapshot = getattr(self, "cycle_status_snapshot", lambda _id: {})(cycle_id)
+        if snapshot:
+            job["authoritative_progress"] = snapshot
+        return job
 
     def recommendation_history(self, instrument_id=None):
         sql = 'SELECT payload FROM stock_recommendation_history'
@@ -298,9 +356,101 @@ class OpportunityPersistenceMixin:
             params = (str(instrument_id),)
         return [decode(r) for r in self._connection.execute(sql + ' ORDER BY generated_at, recommendation_id', params).fetchall()]
 
+    def radar_recommendation_history(self, instrument_id=None):
+        """Return immutable original Radar suggestions for point-in-time tests.
+
+        Later BUY/PARTIAL_EXIT/SELL lifecycle events live in
+        global_stock_suggestion_history and the mutable current projection. A
+        backtest must instead read the original suggestion's persisted type,
+        action, date, price, and evidence from global_stock_suggestion.
+        """
+        sql = '''SELECT s.suggestion_id, s.global_instrument_id, s.symbol,
+                        s.company_name, s.horizon, s.initial_action,
+                        s.suggested_at, s.suggested_price, s.evidence_snapshot,
+                        s.opportunity_score, s.confidence, s.coverage,
+                        scan.market
+                 FROM global_stock_suggestion s
+                 JOIN global_market_scan scan ON scan.scan_id = s.scan_id'''
+        params = ()
+        if instrument_id is not None:
+            sql += ' WHERE s.global_instrument_id = ?'
+            params = (str(instrument_id),)
+        rows = self._connection.execute(
+            sql + ' ORDER BY s.suggested_at, s.suggestion_id', params).fetchall()
+        return [{
+            'recommendation_id': row['suggestion_id'],
+            'suggestion_id': row['suggestion_id'],
+            'global_instrument_id': row['global_instrument_id'],
+            'symbol': row['symbol'],
+            'company_name': row['company_name'],
+            'horizon': row['horizon'],
+            'recommendation_type': row['horizon'],
+            'action': row['initial_action'],
+            'initial_action': row['initial_action'],
+            'generated_at': row['suggested_at'],
+            'price_at_recommendation': row['suggested_price'],
+            'evidence_snapshot': _decode_json(row['evidence_snapshot']) or {},
+            'opportunity_score': row['opportunity_score'],
+            'confidence': row['confidence'],
+            'coverage': row['coverage'],
+            'market': row['market'],
+            'persistence_source': 'GLOBAL_STOCK_SUGGESTION',
+        } for row in rows]
+
     def recommendation_states(self):
         return [decode(r) for r in self._connection.execute(
             'SELECT payload FROM recommendation_current_state ORDER BY global_instrument_id').fetchall()]
+
+    def portfolio_recommendation_signals(self, *, instrument_ids=None):
+        """Return current published Radar actions for a set of instruments.
+
+        recommendation_current_state is advanced atomically by a successful,
+        non-controlled production publication. Cycle job events (RUNNING,
+        FAILED, or CANCELLED) are deliberately outside this query and cannot
+        replace the last authoritative state.
+        """
+        requested = None if instrument_ids is None else sorted({str(value) for value in instrument_ids})
+        if requested == []:
+            return []
+        sql = '''SELECT state.global_instrument_id,
+                        state.updated_at AS evaluated_at,
+                        state.payload AS state_payload,
+                        history.recommendation_id,
+                        history.generated_at AS recommendation_at,
+                        history.payload AS recommendation_payload,
+                        snapshot.cycle_id
+                 FROM recommendation_current_state state
+                 JOIN stock_recommendation_history history
+                   ON history.recommendation_id = state.latest_recommendation_id
+                 JOIN global_opportunity_snapshot snapshot
+                   ON snapshot.snapshot_id = history.snapshot_id'''
+        params = ()
+        if requested is not None:
+            sql += ' WHERE state.global_instrument_id IN (' + ','.join('?' for _ in requested) + ')'
+            params = tuple(requested)
+        rows = self._connection.execute(
+            sql + ' ORDER BY state.global_instrument_id', params).fetchall()
+        result = []
+        for row in rows:
+            state = _decode_json(row['state_payload']) or {}
+            recommendation = _decode_json(row['recommendation_payload']) or {}
+            short_action = state.get('current_short_action')
+            long_action = state.get('current_long_action')
+            new_investor_action = recommendation.get('new_investor_action')
+            result.append({
+                'globalInstrumentId': row['global_instrument_id'],
+                'shortTermRecommendation': _portfolio_recommendation(short_action, new_investor_action),
+                'longTermRecommendation': _portfolio_recommendation(long_action, new_investor_action),
+                'shortTermAction': short_action,
+                'longTermAction': long_action,
+                'newInvestorAction': new_investor_action,
+                'recommendationAt': row['recommendation_at'],
+                'evaluatedAt': row['evaluated_at'],
+                'recommendationId': row['recommendation_id'],
+                'cycleId': row['cycle_id'],
+                'source': 'RECOMMENDATION_CURRENT_STATE',
+            })
+        return result
 
     def opportunity_current(self):
         # The flag already lives in the versioned payload: no schema change needed.

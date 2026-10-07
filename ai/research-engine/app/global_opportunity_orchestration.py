@@ -454,6 +454,9 @@ class GlobalOpportunityOrchestrator:
                         "baseline_acquisition_progress: completed=%d/%d failed=%d active=%d/%d",
                         completed, total, failed, len(pending), max_workers,
                     )
+                    if callable(getattr(type(self.readiness), 'retention_stats', None)):
+                        logger.info("baseline_acquisition_retention completed=%d compactOutcomes=%d activeCandidates=%d runtime=%s",
+                                    completed, len(results), len(pending), self.readiness.retention_stats())
         except BaseException:
             # On shutdown/cancellation (or lost cycle ownership), cancel in-flight
             # workers and drain them so no acquisition task is orphaned and no
@@ -776,6 +779,7 @@ class GlobalOpportunityOrchestrator:
         deep_pool_eligible_count = 0
         deep_candidate_count = 0
         deep_attempted_count = 0
+        deep_durable_completed_count = 0
         deep_ready_count = 0
         deep_readiness_failed_count = 0
         deep_acquisition_timeout_count = 0
@@ -1150,6 +1154,19 @@ class GlobalOpportunityOrchestrator:
                 inflight.pop(item_key, None)
                 return head.result()
 
+            if checkpoint is not None:
+                # Durable truthful resume state: count candidates that are
+                # ALREADY final/restorable per the persisted checkpoint, before
+                # this process touches any of them. This is the K in the
+                # K/N recovery invariant -- it must never be re-derived from
+                # iteration order alone, or a restart would appear to regress
+                # progress even though no completed work is re-executed.
+                deep_durable_completed_count = sum(
+                    1 for c in deep_candidates
+                    if checkpoint.restorable(PHASE_DEEP, c.global_instrument_id) is not None)
+                if deep_durable_completed_count:
+                    logger.info("stage2_deep_resume_state cycleId=%s correlationId=%s durableCompleted=%d/%d",
+                                checkpoint.cycle_id, correlation_id, deep_durable_completed_count, len(deep_candidates))
             _cycle_timing_recorder = cycle_timing.CycleTimingRecorder(
                 cycle_id=str(correlation_id) if correlation_id else None)
             _cycle_timing_token = cycle_timing.bind_recorder(_cycle_timing_recorder)
@@ -1411,6 +1428,7 @@ class GlobalOpportunityOrchestrator:
                         if checkpoint is not None and body_completed:
                             await self._checkpoint_deep_outcome(checkpoint, key, diagnostics, rules, by_id,
                                                                 investigation_matrix)
+                            deep_durable_completed_count += 1
                         if key in repairing and body_completed:
                             repairing.discard(key)
                             if key in rules:
@@ -1419,8 +1437,10 @@ class GlobalOpportunityOrchestrator:
                         ensure_result = readiness_result = None
                         enriched = refreshed = plan = matrix = None
                         if deep_attempted_count % 10 == 0 or deep_attempted_count == len(deep_candidates):
+                            _deep_progress_completed = (deep_durable_completed_count if checkpoint is not None
+                                                        else deep_attempted_count)
                             logger.info("stage2_deep_progress: completed=%d/%d active=%d/%d",
-                                        deep_attempted_count, len(deep_candidates), _running(), stage2_concurrency)
+                                        _deep_progress_completed, len(deep_candidates), _running(), stage2_concurrency)
             finally:
                 # Crash/cancellation/ownership loss: never orphan look-ahead
                 # acquisitions (provider calls) or leave them un-awaited.
@@ -1446,13 +1466,20 @@ class GlobalOpportunityOrchestrator:
                 cycle_timing.unbind_recorder(_cycle_timing_token)
                 _timing_report = _cycle_timing_recorder.report()
                 logger.info(
-                    "stage2_timing_report cycle_id=%s stage2WallClockMs=%s maxConcurrentMandatoryInvestigations=%s "
+                    # NOTE: this recorder's report()['cycle_id'] field holds the
+                    # CORRELATION id (CycleTimingRecorder is constructed with
+                    # cycle_id=str(correlation_id)), never the durable API
+                    # cycle/job id. Logged explicitly as correlationId here, with
+                    # the real durable cycleId alongside it, so this line cannot
+                    # be mistaken for a queryable /status cycle id again.
+                    "stage2_timing_report cycleId=%s correlationId=%s stage2WallClockMs=%s maxConcurrentMandatoryInvestigations=%s "
                     "trackedOperations=%s droppedOperations=%s aggregatePdfQueueWaitMs=%s aggregateProviderWaitMs=%s "
                     "aggregatePersistenceWaitMs=%s aggregateSingleFlightWaitMs=%s aggregateSearchProviderMs=%s aggregateCurrentNewsThrottleMs=%s "
                     "aggregateNewsWorkerLockWaitMs=%s "
                     "slowestOperationsJson=%s "
                     "persistenceOperationTimingJson=%s",
-                    _timing_report["cycle_id"], _timing_report["stage2_wall_clock_ms"],
+                    checkpoint.cycle_id if checkpoint is not None else None, _timing_report["cycle_id"],
+                    _timing_report["stage2_wall_clock_ms"],
                     _timing_report["max_concurrent_mandatory_investigations"], _timing_report["tracked_operation_count"],
                     _timing_report["dropped_operation_count"], _timing_report["aggregate_pdf_queue_wait_ms"],
                     _timing_report["aggregate_provider_wait_ms"], _timing_report["aggregate_persistence_wait_ms"],

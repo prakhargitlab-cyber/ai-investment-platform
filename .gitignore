@@ -88,3 +88,7 @@ smtp.password
 kafka-deployment.txt
 services/running-broker-jar-inspect/
 /artifacts/
+
+# Scratch debug helpers and TS incremental-build cache
+.tmp_show.py
+*.tsbuildinfo

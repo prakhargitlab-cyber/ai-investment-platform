@@ -433,6 +433,39 @@ class CycleRunPersistenceMixin:
             rows = self._connection.execute(sql, params).fetchall()
         return {(r["phase"], r["global_instrument_id"]): _row(r) for r in rows}
 
+    def cycle_status_snapshot(self, cycle_id: str) -> dict[str, Any]:
+        """Reconstruct business counters from this cycle's durable rows.
+
+        The snapshot is deliberately derived from checkpoint state and payloads,
+        never from a worker's lifetime counters.  A new process can therefore
+        expose the same progress before it resumes work.
+        """
+        run = self.cycle_run(cycle_id) or {}
+        selection = run.get("selection") or {}
+        admitted = list(dict.fromkeys(selection.get("deep_ids") or selection.get("shortlist_ids") or []))
+        rows = self.cycle_progress(cycle_id, PHASE_DEEP)
+        admitted_set = set(map(str, admitted))
+        scoped = [row for (phase, key), row in rows.items() if not admitted_set or key in admitted_set]
+        terminal = [row for row in scoped if CandidateState(row["state"]) in FINAL_STATES
+                     or CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE
+                     and int(row.get("attempts") or 0) >= DEFAULT_MAX_ATTEMPTS]
+        technical = [row for row in scoped if CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE]
+        ready = eligible = failed = 0
+        for row in terminal:
+            diagnostic = ((row.get("payload") or {}).get("diagnostic") or {})
+            disposition = row.get("disposition") or diagnostic.get("disposition")
+            ready += int(disposition in {"ANALYZED", "RANK_FILTERED"})
+            failed += int(CandidateState(row["state"]) == CandidateState.EVIDENCE_UNAVAILABLE)
+            eligible += int(bool(diagnostic.get("rank_eligible")))
+        return {
+            "deep_completed": len(terminal),
+            "deep_denominator": len(admitted),
+            "ready": ready,
+            "failed": failed,
+            "technical": len(technical),
+            "eligible": eligible,
+        }
+
 
 class CycleCheckpoint:
     """Orchestrator-facing handle for one owned, resumable cycle.

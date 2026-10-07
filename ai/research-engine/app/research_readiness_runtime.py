@@ -699,6 +699,8 @@ class RepositoryResearchReadinessAdapter:
                         if snapshot.source_provider.upper() == "NSE"
                         else ResearchSourceTier.APPROVED_EXTERNAL_TOOL
                         if snapshot.source_provider.upper() == "YAHOO_FINANCE_MCP"
+                        else ResearchSourceTier.USER_UPLOAD
+                        if snapshot.source_provider.upper() == "USER_UPLOAD"
                         else ResearchSourceTier.LICENSED_STRUCTURED
                     ),
                     retrieved_at=snapshot.retrieved_at,
@@ -887,6 +889,13 @@ class ExistingResearchCapabilityExecutor:
         self.orchestrator = orchestrator
         self.market_data_population_jobs = market_data_population_jobs
         self.official_financial_provider = official_financial_provider
+
+    def retention_stats(self):
+        provider = getattr(self.orchestrator, 'structured_provider', None)
+        contexts = getattr(provider, 'ticker_contexts', None)
+        if contexts is None:
+            return {}
+        return {f'yahoo_{key}': value for key, value in contexts.retention_stats().items()}
 
     async def acquire_official_financials(self, global_instrument_id: UUID) -> None:
         """Structured NSE acquisition only; document fallback belongs to execute_primary."""
@@ -1359,6 +1368,15 @@ class ResearchReadinessRuntime:
         # per instrument was a correctness/performance bug, not just an
         # implementation detail.
         self._flights: dict[UUID, list[_EnsureFlight]] = {}
+        # Previously a hard cap on concurrent in-flight ensure() flights retained
+        # per instrument (8). REMOVED: the old hard-cap eviction blindly
+        # cancelled the oldest ACTIVE flight when the cap was reached, which
+        # violated single-flight correctness by terminating shared/overlapping
+        # work that followers were shield-joining. Active-flight count is now
+        # naturally bounded by legitimate concurrency and requirement sets,
+        # not by a numerical cap. The done-callback (cleanup) remains the sole
+        # reaper for settled entries. Retained only for backward compatibility.
+        self._max_flights_per_instrument = 8
         # Bounded per-instrument cache of the most recent durability-check
         # ResearchReadinessResult, reused only for evidence_only=True reads.
         # This collapses the repeated sufficiency pre-checks in deep_investigation
@@ -1380,6 +1398,31 @@ class ResearchReadinessRuntime:
         #     entry, so the final authoritative verification (investigate
         #     L589) and post-mutation re-reads always hit the DB.
         self._evidence_readiness_cache: dict[UUID, tuple[ResearchReadinessResult, int]] = {}
+        # Hard cap on the number of instruments retained in the
+        # evidence-only cache. The cache is cleared on every durable read and is
+        # per-instrument, but a flow that exits early (e.g. on acquisition
+        # timeout before the final durable read) can leave evidence_only entries
+        # behind; across the FULL 2432-admitted universe this would accumulate
+        # one entry per instrument holding a live ResearchReadinessResult. Cap it
+        # so the cache stays bounded at O(stage2_concurrency) instruments rather
+        # than O(admitted). Eviction drops the LEAST-recently-written entry,
+        # which (per the invariants above) is always durability-stale for the
+        # current flow, so evicting it cannot affect a same-flow reuse.
+        self._max_evidence_readiness_cache_size = 64
+
+    def retention_stats(self):
+        """Separate active work from completed reuse state without retaining it."""
+        stats = {
+            'active_flights': sum(not flight.task.done() for flights in self._flights.values() for flight in flights),
+            'completed_flights': sum(flight.task.done() for flights in self._flights.values() for flight in flights),
+            'readiness_cache_entries': len(self._evidence_readiness_cache),
+        }
+        if callable(getattr(type(self.executor), 'retention_stats', None)):
+            stats.update(self.executor.retention_stats())
+        documents = getattr(self.repository, 'documents', None)
+        if callable(getattr(type(documents), 'stats', None)):
+            stats.update({f'documents_{key}': value for key, value in documents.stats().items()})
+        return stats
 
     async def read(
         self,
@@ -1426,6 +1469,11 @@ class ResearchReadinessRuntime:
                 generation = getattr(self.repository, "_readiness_mutation_generation", 0)
                 now_compatible = now is None or now == cached_result.generated_at
                 if cached_generation == generation and now_compatible:
+                    # True LRU: move this entry to the end (most-recently-used)
+                    # so eviction drops the genuinely least-recently-used entry,
+                    # not just the least-recently-inserted one.
+                    del self._evidence_readiness_cache[global_instrument_id]
+                    self._evidence_readiness_cache[global_instrument_id] = (cached_result, cached_generation)
                     return cached_result
         if callable(getattr(self.repository, "market_session_data", None)):
             profile = self.repository.profile(global_instrument_id)
@@ -1440,6 +1488,13 @@ class ResearchReadinessRuntime:
         if evidence_only:
             generation = getattr(self.repository, "_readiness_mutation_generation", 0)
             self._evidence_readiness_cache[global_instrument_id] = (result, generation)
+            # Bound the cache: evict the least-recently-written entries beyond the
+            # cap. See the invariant comment at the declaration -- this only ever
+            # drops durability-stale entries for prior instruments, so it cannot
+            # affect correctness of the current flow's evidence_only reuse.
+            if len(self._evidence_readiness_cache) > self._max_evidence_readiness_cache_size:
+                for _key in list(self._evidence_readiness_cache.keys())[:-self._max_evidence_readiness_cache_size]:
+                    self._evidence_readiness_cache.pop(_key, None)
         else:
             # Durable reads supersede any cached evidence-only snapshot so a
             # classification from a previous flow/window can never leak past a
@@ -1561,7 +1616,19 @@ class ResearchReadinessRuntime:
             )
         )
         flight = _EnsureFlight(task, target_ids)
-        self._flights.setdefault(global_instrument_id, []).append(flight)
+        flights = self._flights.setdefault(global_instrument_id, [])
+        # Defense-in-depth against unbounded _flights growth: evict only
+        # already-settled (done/cancelled) entries that the cleanup callback
+        # may not have reaped yet (e.g. under the timeout path). The hard cap
+        # must NEVER evict a legitimately ACTIVE flight merely because a size
+        # limit was reached: an active overlapping flight may be shared by
+        # shield-joining followers, and cancelling it would break single-flight
+        # correctness. Active non-overlapping flights are left untouched so
+        # disjoint requirements may execute concurrently. The active-flight count
+        # is naturally bounded by legitimate concurrency and requirement sets,
+        # not by a hard numerical cap.
+        flights[:] = [f for f in flights if not f.task.done()]
+        flights.append(flight)
 
         def cleanup(completed: asyncio.Task[_PlanExecutionResult]) -> None:
             flights = self._flights.get(global_instrument_id)
@@ -1627,22 +1694,95 @@ class ResearchReadinessRuntime:
             try:
                 done, _ = await asyncio.wait({task}, timeout=self.ensure_timeout_seconds)
                 if not done:
-                    logger.info("orchestration_wait_expired globalInstrumentId=%s budgetSeconds=%s acquisitionState=RUNNING inFlight=%s",
-                                plan.global_instrument_id, self.ensure_timeout_seconds,
-                                [capability for capability in progress.executed_capabilities
+                    # OOM/stall root-cause fix: the prior code fell through to
+                    # `result = await task` here, which BLOCKED INDEFINITELY on the
+                    # still-running _execute_plan_until_ready/_execute_plan task.
+                    # When a provider call (STRUCTURED_MARKET,
+                    # HISTORICAL_MARKET_DATA via refresh_targeted_categories /
+                    # _ensure_historical_prices) never completes, that await never
+                    # returns: the owning deep-acquisition worker coroutine is
+                    # pinned alive forever holding the full task closure
+                    # (progress, failures, executed_capabilities, _assess_memo,
+                    # provider response objects, document bytes) in memory. Across
+                    # 8 concurrent stage-2 workers each blocked on an un-cancellable
+                    # provider call, plus the _flights dict + _evidence_readiness_cache
+                    # accumulating one entry per candidate, this produced the
+                    # observed monotonic climb 507 -> 1162 MiB and the 50/2432
+                    # stall (all 8 workers blocked, no slots free, no new admissions).
+                    #
+                    # Ownership semantics after timeout: the timeout is an
+                    # OBSERVATION budget for the background cycle owner, NOT the
+                    # task's lifetime. The owner cancels the task, drains it under
+                    # a hard deadline, and returns a bounded failure result -- the
+                    # remaining work is reclassified as a retryable acquisition
+                    # timeout rather than left running. The task's done-callback
+                    # (registered in ensure()) removes it from _flights as soon as
+                    # it finishes, so no flight reference is retained past drain.
+                    in_flight = [capability for capability in progress.executed_capabilities
                                  if capability not in progress.completed_capabilities
                                  and capability.rsplit(':', 1)[-1] not in progress.failures
-                                 and capability.rsplit(':', 1)[-1] not in progress.satisfied_requirement_ids])
+                                 and capability.rsplit(':', 1)[-1] not in progress.satisfied_requirement_ids]
+                    logger.info("orchestration_wait_expired globalInstrumentId=%s budgetSeconds=%s acquisitionState=RUNNING inFlight=%s",
+                                plan.global_instrument_id, self.ensure_timeout_seconds, in_flight)
+                    # Hard deadline: the cancelled task must unwind its provider
+                    # calls, but it MUST NOT be awaited without bound. The
+                    # ensure_timeout_seconds window is the observation budget that
+                    # already elapsed; cap the drain at a small multiple so a
+                    # shielded/hung provider call cannot pin the worker forever.
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(task, return_exceptions=True),
+                            timeout=max(self.ensure_timeout_seconds, 5.0),
+                        )
+                    except asyncio.TimeoutError:
+                        # Even the hard-deadline drain exceeded the budget: the
+                        # task is still winding down but MUST NOT be awaited again
+                        # here (that is exactly the unbounded-block foot-gun this
+                        # rewrite removes). Drop the local reference; the done-
+                        # callback will eventually reap the _EnsureFlight entry.
+                        logger.warning(
+                            "orchestration_drain_timeout globalInstrumentId=%s budgetSeconds=%s "
+                            "inFlight=%s abandonedAfterHardDeadline=true",
+                            plan.global_instrument_id, self.ensure_timeout_seconds, in_flight)
+                    # Build a bounded failure result mirroring the interactive
+                    # TimeoutError path so the caller never observes an unbounded
+                    # wait -- only the durable evidence state committed before the
+                    # budget expired.
+                    result = _PlanExecutionResult(
+                        tuple(progress.executed_capabilities),
+                        {target.requirement_id: _combined_failure_reason(
+                            progress.failures.get(target.requirement_id), "ACQUISITION_TIMEOUT")
+                         for target in plan.targets},
+                    )
+                    logger.info("acquisition_timeout_result globalInstrumentId=%s executed=%d failures=%d",
+                                plan.global_instrument_id, len(result.executed_capabilities), len(result.failures))
+                    return result
                 result = await task
                 logger.info("acquisition_completed globalInstrumentId=%s failures=%d",
                             plan.global_instrument_id, len(result.failures))
                 return result
             finally:
                 # Runtime shutdown owns cancellation of its registered flight.
-                # Never orphan a child plan when that owner is cancelled.
+                # Never orphan a child plan when that owner is cancelled. The
+                # done-callback in ensure() removes the _EnsureFlight entry once
+                # the task settles, so _flights cannot accumulate entries for
+                # tasks this path has already cancelled/drain-abandoned.
                 if not task.done():
                     task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                    try:
+                        # The timeout branch above already attempted a full
+                        # ensure_timeout_seconds drain; if we reach here the task
+                        # is still unwinding. Give it a short bounded window for
+                        # cooperative cleanup, then drop the local reference --
+                        # the done-callback will reap the _EnsureFlight entry when
+                        # the task eventually settles.
+                        await asyncio.wait_for(
+                            asyncio.gather(task, return_exceptions=True),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
         # Deadline for interactive plan execution (initial planning and the
         # final durable read are outside it), computed once so
         # every target attempted inside a sequential per-target acquisition
@@ -2295,6 +2435,10 @@ def _copy_evidence(
 
 def _financial_source(fact: FinancialFact) -> tuple[str, ResearchSourceTier]:
     provider = fact.source_provider.strip().upper()
+    if fact.source_tier == FactSourceTier.USER_UPLOAD:
+        # Dedicated, honest tier -- never the APPROVED_SECONDARY catch-all,
+        # which would mis-report manual evidence as equivalent to Yahoo.
+        return "USER_UPLOAD", ResearchSourceTier.USER_UPLOAD
     if fact.source_tier == FactSourceTier.OFFICIAL_NSE:
         return "NSE", ResearchSourceTier.OFFICIAL
     if fact.source_tier == FactSourceTier.OFFICIAL_REGULATORY:
@@ -2331,6 +2475,24 @@ def _document_source(
 def _event_source(
     event: ResearchEvent, requirement_id: str
 ) -> tuple[str, ResearchSourceTier]:
+    # Manual-evidence events (CURRENT_NEWS, ORDER_BOOK_CAPEX_GUIDANCE,
+    # GOVERNANCE_HISTORY) are built with raw_evidence_reference ==
+    # f"manual-evidence:{content_hash}" -- a literal convention used
+    # EXCLUSIVELY by app.manual_evidence (verified: no automated pipeline
+    # writes this prefix; app.extraction uses the raw article text and
+    # app.yahoo_mcp_acquisition uses the article headline). Without this
+    # branch such an event fell through source_classification == OTHER
+    # into the generic "REPUTABLE_NEWS"/APPROVED_SECONDARY default below --
+    # the SAME authority rank as an actual automated reputable-news event --
+    # even though ProviderAuthorityRegistry.default() already declares a
+    # dedicated, lowest-authority USER_UPLOAD provider for CURRENT_NEWS,
+    # ORDER_BOOK_CAPEX_GUIDANCE and GOVERNANCE_HISTORY. This closes that
+    # gap so a manually uploaded event is correctly ranked below every
+    # automated tier (OFFICIAL/REGULATORY/APPROVED_SECONDARY/
+    # APPROVED_EXTERNAL_TOOL) and can only ever fill a genuine gap, never
+    # outrank or silently shadow stronger automated evidence.
+    if (event.raw_evidence_reference or "").startswith("manual-evidence:"):
+        return "USER_UPLOAD", ResearchSourceTier.USER_UPLOAD
     # independence_key is a fixed-width CHAR(64) SHA-256 hex digest (see
     # YahooMcpResultPersister._persist_article), not a readable "PROVIDER:..."
     # string, so provenance is verified by recomputing the same

@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from app.etf_evidence import EtfMetric, etf_freshness, ETF_MAX_AGE, EtfAcquisitionOutcome, EtfListing
 from app.etf_domain import EtfSubtype
+from app.etf_metrics import EtfMetricId, compute_etf_deterministic_metrics
 
 if TYPE_CHECKING:
     from app.models import EtfResearchProfile
@@ -263,6 +264,97 @@ def _check_supporting_ready(store: SqliteResearchPersistence, instrument_id, met
     )
 
 
+# Derived price-history metrics (HISTORICAL_RETURNS/VOLATILITY/DRAWDOWN/
+# INDEX_MOMENTUM) have no EtfMetric/EtfFact evidence model of their own --
+# they are computed deterministically from DailyMarketBar, never acquired
+# or manually uploaded. "Fresh" here means the underlying bar series itself
+# was updated recently, not a fixed per-metric provider contract.
+_DERIVED_METRIC_MAX_AGE_DAYS = 5
+
+# Requirements named in ETC3_SUPPORTING for which no trusted data source is
+# defined anywhere in the repository yet. These are reported as
+# NOT_IMPLEMENTED (visibly, in the returned status list) rather than
+# fabricated or silently dropped.
+_NOT_IMPLEMENTED_SUPPORTING = frozenset({"INDEX_VALUATION", "INDEX_CONSTITUENTS"})
+
+
+def _derived_metric_status(requirement: str, metric_value, *, now: datetime) -> EtfRequirementStatus:
+    if metric_value is None or metric_value.insufficient_history or metric_value.value is None:
+        return EtfRequirementStatus(
+            requirement=requirement, role="SUPPORTING", applicability="APPLICABLE",
+            status=EtfReadinessStatus.MISSING,
+            reason=(metric_value.reason if metric_value is not None else None) or "INSUFFICIENT_PRICE_HISTORY",
+        )
+    age_days = (now.date() - metric_value.as_of_date).days
+    if age_days < 0:
+        status, freshness = EtfReadinessStatus.TECHNICAL_FAILURE, "FUTURE_DATED"
+    elif age_days <= _DERIVED_METRIC_MAX_AGE_DAYS:
+        status, freshness = EtfReadinessStatus.READY_FRESH, "FRESH"
+    else:
+        status, freshness = EtfReadinessStatus.READY_STALE, "STALE"
+    return EtfRequirementStatus(
+        requirement=requirement, role="SUPPORTING", applicability="APPLICABLE", status=status,
+        evidence_id="DAILY_MARKET_BARS", provider="DAILY_MARKET_BARS",
+        as_of_date=metric_value.as_of_date, freshness=freshness,
+    )
+
+
+def _etf_deterministic_metrics(store: SqliteResearchPersistence, instrument_id):
+    bars = [bar for bar in store.load_daily_market_bars({instrument_id}) if bar.global_instrument_id == instrument_id]
+    return compute_etf_deterministic_metrics(instrument_id, bars)
+
+
+def _check_historical_returns_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+    """HISTORICAL_RETURNS is ready once at least the shortest (1M) period return is computable."""
+    metrics = _etf_deterministic_metrics(store, instrument_id)
+    return _derived_metric_status("HISTORICAL_RETURNS", metrics.get(EtfMetricId.RETURN_1M), now=datetime.now(timezone.utc))
+
+
+def _check_volatility_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+    metrics = _etf_deterministic_metrics(store, instrument_id)
+    return _derived_metric_status("VOLATILITY", metrics.get(EtfMetricId.ANNUALIZED_VOLATILITY), now=datetime.now(timezone.utc))
+
+
+def _check_drawdown_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+    metrics = _etf_deterministic_metrics(store, instrument_id)
+    return _derived_metric_status("DRAWDOWN", metrics.get(EtfMetricId.MAX_DRAWDOWN), now=datetime.now(timezone.utc))
+
+
+def _check_momentum_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+    metrics = _etf_deterministic_metrics(store, instrument_id)
+    return _derived_metric_status("INDEX_MOMENTUM", metrics.get(EtfMetricId.MOMENTUM_50_200), now=datetime.now(timezone.utc))
+
+
+def _check_concentration_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+    """CONCENTRATION is derived from the same UNDERLYING_HOLDINGS snapshot and
+    freshness policy already used elsewhere -- not a separate evidence model."""
+    snapshots = store.etf_holdings(instrument_id)
+    if not snapshots:
+        return EtfRequirementStatus(requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
+            status=EtfReadinessStatus.MISSING)
+    snapshot = snapshots[0]
+    if not any(holding.weight_percentage is not None for holding in snapshot.holdings):
+        return EtfRequirementStatus(requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
+            status=EtfReadinessStatus.MISSING, reason="HOLDINGS_LACK_WEIGHTS")
+    freshness = etf_freshness(snapshot, EtfMetric.UNDERLYING_HOLDINGS, now=datetime.now(timezone.utc))
+    return EtfRequirementStatus(
+        requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
+        status=EtfReadinessStatus.READY_FRESH if freshness == "FRESH"
+               else EtfReadinessStatus.READY_STALE if freshness == "STALE" else EtfReadinessStatus.MISSING,
+        evidence_id=snapshot.provenance.provider, provider=snapshot.provenance.provider,
+        as_of_date=snapshot.as_of_date, freshness=freshness,
+    )
+
+
+_DERIVED_METRIC_CHECKS = {
+    "HISTORICAL_RETURNS": _check_historical_returns_ready,
+    "VOLATILITY": _check_volatility_ready,
+    "DRAWDOWN": _check_drawdown_ready,
+    "INDEX_MOMENTUM": _check_momentum_ready,
+    "CONCENTRATION": _check_concentration_ready,
+}
+
+
 def _check_contextual_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
     """Check if CURRENT_NEWS is ready."""
     # CURRENT_NEWS for ETFs follows stock readiness behavior
@@ -309,14 +401,25 @@ def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id) -> t
     volume_status = _check_trading_volume_ready(store, instrument_id)
     statuses.append(volume_status)
 
-    # Check supporting requirements
+    # Check supporting requirements. Every name in ETC3_SUPPORTING must be
+    # handled by exactly one of: a direct EtfMetric/EtfFact check, a derived
+    # price-history check, or an explicit NOT_IMPLEMENTED declaration -- a
+    # requirement that silently matches none of these previously vanished
+    # from the returned status list instead of being reported as missing.
     for metric in ETC3_SUPPORTING:
         try:
             m = EtfMetric(metric)
-            status = _check_supporting_ready(store, instrument_id, m)
-            statuses.append(status)
+            statuses.append(_check_supporting_ready(store, instrument_id, m))
+            continue
         except ValueError:
             pass
+        if metric in _DERIVED_METRIC_CHECKS:
+            statuses.append(_DERIVED_METRIC_CHECKS[metric](store, instrument_id))
+        elif metric in _NOT_IMPLEMENTED_SUPPORTING:
+            statuses.append(EtfRequirementStatus(requirement=metric, role="SUPPORTING", applicability="APPLICABLE",
+                status=EtfReadinessStatus.NOT_IMPLEMENTED, reason="NO_TRUSTED_DATA_SOURCE_DEFINED"))
+        else:
+            raise AssertionError(f"ETC3_SUPPORTING requirement {metric!r} has no readiness check wired up")
 
     # Check contextual requirements
     contextual_status = _check_contextual_ready(store, instrument_id)

@@ -510,8 +510,19 @@ aiServices:
     # request stays conservative at the aiServiceDefaults 256Mi; only the limit
     # is raised. This is a safety net, not the primary fix.
     resources:
+      requests:
+        cpu: 500m
+        memory: 256Mi
       limits:
+        cpu: "2"
         memory: 1536Mi
+    probes:
+      startup:
+        path: /health
+      readiness:
+        path: /health
+      liveness:
+        path: /health/live
   - name: valuation-engine
     image: ai-investment/valuation-engine
     tag: latest

@@ -31,10 +31,16 @@ class AuthLifecycleIntegrationTest {
     @Autowired AppUserRepository users;
     @Autowired EmailVerificationTokenRepository tokens;
     @Autowired PasswordResetTokenRepository resetTokens;
+    @Autowired AppUserRoleAuditRepository roleAudit;
+    @Autowired AppUserRoleRepository userRoles;
     @Autowired EntityManager entityManager;
 
     @BeforeEach
     void clearData() {
+        // Delete dependents before app_users to satisfy the FKs Flyway V4 added
+        // (app_user_role_audit -> app_users, app_user_roles -> app_users).
+        roleAudit.deleteAll();
+        userRoles.deleteAll();
         tokens.deleteAll();
         resetTokens.deleteAll();
         users.deleteAll();

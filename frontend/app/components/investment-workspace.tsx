@@ -91,7 +91,9 @@ import {
 import { shouldOfferManualEvidenceUpload } from "../lib/manual-evidence-capability";
 import { Badge, Button, Card, EmptyState, ErrorState, Field, MetricCard, Skeleton } from "./ui";
 
-type View = "dashboard" | "portfolio" | "research" | "backtesting" | "brokers" | "settings";
+import { AdminUsers } from "./admin-users";
+
+type View = "dashboard" | "portfolio" | "research" | "backtesting" | "brokers" | "settings" | "admin";
 type Theme = "system" | "light" | "dark";
 type SortKey = "company" | "ticker" | "marketValue" | "profitLoss" | "allocation";
 type ResearchSectionId = "overview" | "growth" | "orders" | "capex" | "customers" | "guidance" | "news" | "sources";
@@ -110,7 +112,8 @@ const navItems: Array<{ id: View; label: string; icon: typeof Gauge }> = [
   { id: "research", label: "Research", icon: Search },
   { id: "backtesting", label: "Backtesting", icon: LineChart },
   { id: "brokers", label: "Brokers", icon: WalletCards },
-  { id: "settings", label: "Settings", icon: Settings }
+  { id: "settings", label: "Settings", icon: Settings },
+  { id: "admin", label: "Users & Roles", icon: Settings }
 ];
 
 function formatMoney(amount?: number, currency?: string) {
@@ -1577,7 +1580,7 @@ export function InvestmentWorkspace() {
         </div>
 
         <nav aria-label="Primary">
-          {navItems.map((item) => {
+          {navItems.filter(item => item.id !== "admin" || authenticatedUser.roles?.includes("ADMIN")).map((item) => {
             const Icon = item.icon;
             return (
               <button
@@ -1591,7 +1594,7 @@ export function InvestmentWorkspace() {
                 type="button"
               >
                 <Icon size={18} aria-hidden="true" />
-                {item.label}
+                {item.id === "admin" ? <>Administration ΓåÆ {item.label}</> : item.label}
               </button>
             );
           })}
@@ -1655,13 +1658,13 @@ export function InvestmentWorkspace() {
         <div className="content">
           <section className="page-header">
             <div>
-              <p className="eyebrow">{view === "research" ? "Research intelligence" : "Brokers & Portfolios"}</p>
+              <p className="eyebrow">{view === "admin" ? "Administration" : view === "research" ? "Research intelligence" : "Brokers & Portfolios"}</p>
               <h1>{view === "dashboard" ? "Portfolio command center" : navItems.find((item) => item.id === view)?.label}</h1>
               <p>
                 Backend: <code>{frontendConfig.apiBaseUrl || "same-origin gateway"}</code>
               </p>
             </div>
-            {view === "research" ? (
+            {view === "research" || view === "admin" ? (
               null
             ) : (
               <PortfolioSelector
@@ -1694,6 +1697,7 @@ export function InvestmentWorkspace() {
 
           {view !== "research" && watchlistActionError ? <p role="alert">{watchlistActionError}</p> : null}
           {view === "backtesting" ? <Backtesting /> : null}
+          {view === "admin" ? <AdminUsers operatorId={authenticatedUser.userId} roles={authenticatedUser.roles ?? []} /> : null}
           {loading ? <LoadingView /> : null}
           {view === "dashboard" && (loading || error) ? <RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
 

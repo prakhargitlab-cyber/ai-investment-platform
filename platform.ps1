@@ -1109,6 +1109,17 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
 
     try {
         $radarCheckPodName = Get-PostgresPodName -Namespace $Namespace
+        # Stage 2E: Never trigger automatic Radar for a restored database.
+        # Check restore history before claiming the fresh provisioning marker.
+        if (Test-DatabaseRestoreRecorded `
+                -Namespace $Namespace `
+                -PodName $radarCheckPodName `
+                -DatabaseUser $DatabaseConfig.Username `
+                -DatabaseName $DatabaseConfig.Name) {
+
+            Write-Host "Initial Radar skipped: database has a durable restore record." -ForegroundColor Yellow
+            return
+        }
         $freshProvisioningClaimed = Use-FreshProvisioningMarker -Namespace $Namespace -PodName $radarCheckPodName -DatabaseUser $DatabaseConfig.Username -DatabaseName $DatabaseConfig.Name
         $researchSchema = Resolve-ResearchDatabaseSchemaName -Namespace $Namespace
 

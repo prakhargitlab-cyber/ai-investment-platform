@@ -78,3 +78,16 @@ role-admin:
   role: ${ROLE_ADMIN_ROLE:ADMIN}
   operator: ${ROLE_ADMIN_OPERATOR:}
   reason: ${ROLE_ADMIN_REASON:}
+---
+spring:
+  config:
+    activate:
+      on-profile: "first-admin-bootstrap"
+  main:
+    web-application-type: none
+    banner-mode: off
+  flyway:
+    enabled: false
+first-admin-bootstrap:
+  email: ${FIRST_ADMIN_BOOTSTRAP_EMAIL:}
+  password: ${FIRST_ADMIN_BOOTSTRAP_PASSWORD:}

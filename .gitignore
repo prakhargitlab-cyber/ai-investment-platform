@@ -92,3 +92,7 @@ services/running-broker-jar-inspect/
 # Scratch debug helpers and TS incremental-build cache
 .tmp_show.py
 *.tsbuildinfo
+
+# On-demand PostgreSQL backups may contain password hashes, emails, and
+# other sensitive data. Never commit them.
+/backups/

@@ -1,0 +1,85 @@
+# REVIEW TEMPLATE ONLY. Do not apply or unsuspend without explicit approval.
+# No original bootstrap Job was present in the isolated worktree.
+# Operator must identify the real approved executor, not the target account or an alias
+# invented to bypass RoleAdminService.rejectSelfManagement. A distinct executor is required.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: admin-bootstrap-approval-required
+  namespace: ai-investment
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: role-admin-cli
+          image: APPROVAL_REQUIRED_UPDATED_AUTH_IMAGE_BY_DIGEST
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              for value in "$ROLE_ADMIN_OPERATOR" "$ROLE_ADMIN_REASON" "$SPRING_DATASOURCE_URL" "$SPRING_DATASOURCE_USERNAME" "$AUTH_ISSUER"; do
+                case "$value" in
+                  ""|*APPROVAL_REQUIRED*) echo "Bootstrap approval fields are incomplete" >&2; exit 2 ;;
+                esac
+              done
+              exec java -jar /app/app.jar --spring.profiles.active=role-admin-cli --spring.main.web-application-type=none --spring.flyway.enabled=false --spring.jpa.hibernate.ddl-auto=validate
+          env:
+            - name: ROLE_ADMIN_ACTION
+              value: GRANT
+            - name: ROLE_ADMIN_EMAIL
+              value: prakhar.gitlab@gmail.com
+            - name: ROLE_ADMIN_ROLE
+              value: ADMIN
+            - name: ROLE_ADMIN_OPERATOR
+              value: APPROVAL_REQUIRED_ACTUAL_DISTINCT_OPERATOR_IDENTITY
+            - name: ROLE_ADMIN_REASON
+              value: APPROVAL_REQUIRED_CHANGE_TICKET_AND_BOOTSTRAP_JUSTIFICATION
+            - name: SPRING_DATASOURCE_URL
+              value: APPROVAL_REQUIRED_EXISTING_AUTH_DATABASE_JDBC_URL
+            - name: SPRING_DATASOURCE_USERNAME
+              value: APPROVAL_REQUIRED_EXISTING_DATABASE_USERNAME
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: approval-required-existing-db-secret
+                  key: approval-required-existing-db-password-key
+            - name: AUTH_ISSUER
+              value: APPROVAL_REQUIRED_MATCH_DEPLOYED_AUTH_ISSUER
+            - name: AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: approval-required-existing-jwt-secret
+                  key: approval-required-existing-jwt-secret-key
+            - name: AUTH_DEV_LOGIN_ENABLED
+              value: "false"
+            - name: AUTH_EMAIL_MODE
+              value: DISABLED
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,12 +1,16 @@
-"""Run with a local Next server on 127.0.0.1:3107, Python Playwright and Edge.
+"""Run against a production Next server, Python Playwright and Edge.
+ADMIN_TEST_BASE_URL defaults to http://127.0.0.1:3107. Set
+ADMIN_TEST_EXPECT_INSECURE=true to verify the application UUID fallback over HTTP.
 All API requests are intercepted; no live database or backend is contacted.
 """
 import asyncio
 import json
+import os
+import re
 from urllib.parse import urlparse, parse_qs
 from playwright.async_api import async_playwright, expect
 
-BASE = "http://127.0.0.1:3107"
+BASE = os.environ.get("ADMIN_TEST_BASE_URL", "http://127.0.0.1:3107")
 ADMIN_PATH = "/api/v1/auth/admin/users"
 
 async def main():
@@ -17,9 +21,10 @@ async def main():
             identity = dict(userId="operator", displayName="Operator", email="operator@example.test", roles=["USER", "ADMIN"] if is_admin else ["USER"])
             await context.add_init_script("localStorage.setItem('aip.accessToken','fixture-token'); localStorage.setItem('aip.user'," + json.dumps(json.dumps(identity)) + ");")
             page = await context.new_page()
-            calls, changes, errors = [], [], []
+            calls, changes, errors, assets = [], [], [], []
             state = {"admin": False, "deny": False}
             page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on("response", lambda response: assets.append((response.url, response.status)) if "/_next/static/" in response.url else None)
             target = dict(userId="target", email="target@example.test", displayName="Target User", status="ACTIVE", emailVerifiedAt="2026-10-01T00:00:00Z", createdAt="2026-10-01T00:00:00Z", lastLoginAt=None, roles=["USER"])
 
             def paged(items):
@@ -29,6 +34,7 @@ async def main():
                 parsed = urlparse(r.request.url)
                 path = parsed.path
                 calls.append(path)
+                assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", r.request.headers.get("x-correlation-id", "")), "Missing or invalid request correlation ID"
                 data, status = [], 200
                 if path.startswith(ADMIN_PATH):
                     assert r.request.headers.get("authorization") == "Bearer fixture-token"
@@ -59,6 +65,9 @@ async def main():
             # Intercept every API, including any background workspace requests.
             await context.route("**/api/**", route)
             await page.goto(BASE)
+            capabilities = await page.evaluate("({secure:isSecureContext, native:typeof crypto.randomUUID})")
+            if os.environ.get("ADMIN_TEST_EXPECT_INSECURE") == "true":
+                assert capabilities == {"secure": False, "native": "undefined"}, capabilities
             await expect(page.get_by_role("button", name="Logout", exact=True)).to_be_visible()
             menu = page.get_by_role("button", name="Administration → Users & Roles", exact=True)
             if not is_admin:
@@ -97,8 +106,12 @@ async def main():
                 await expect(page.get_by_role("button", name="Grant ADMIN", exact=True)).to_have_count(0)
             # Existing workspace reads localStorage in its initial render; a seeded
             # authenticated session differs from the server's signed-out markup.
-            unexpected = [error for error in errors if not error.startswith("Hydration failed because the server rendered HTML didn't match the client.")]
+            unexpected = [error for error in errors if not (error.startswith("Hydration failed because the server rendered HTML didn't match the client.") or error.startswith("Minified React error #418;"))]
             assert not unexpected, unexpected
+            assert any(".js" in url for url, status in assets), "No production JavaScript loaded"
+            assert any(".css" in url for url, status in assets), "No production CSS loaded"
+            assert all(status == 200 for url, status in assets), assets
+            print(f"PASS: {BASE} {'ADMIN' if is_admin else 'USER'} {capabilities}; {len(calls)} mocked requests with UUID v4 correlation IDs; {len(errors)} known hydration errors; {len(assets)} static assets HTTP 200")
             await context.close()
         await browser.close()
     print("PASS: USER menu hidden; ADMIN search/details; required reason; cancel/confirm grant/revoke; authenticated API transport; audit; denied-access cleanup. All APIs mocked.")

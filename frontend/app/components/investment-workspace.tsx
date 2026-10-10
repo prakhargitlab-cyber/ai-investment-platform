@@ -1594,7 +1594,7 @@ export function InvestmentWorkspace() {
                 type="button"
               >
                 <Icon size={18} aria-hidden="true" />
-                {item.id === "admin" ? <>Administration ΓåÆ {item.label}</> : item.label}
+                {item.id === "admin" ? <>Administration &rarr; {item.label}</> : item.label}
               </button>
             );
           })}

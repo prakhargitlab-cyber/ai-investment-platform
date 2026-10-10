@@ -89,7 +89,7 @@ where table_name like 'flyway_schema_history%';
         $line = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $parts = $line -split '\|'
-        if ($parts.Count -ne 2) { continue }
+        if ($parts.Count -ne 2) { throw "Malformed table enumeration" }
         $schema = $parts[0].Trim()
         $table = $parts[1].Trim()
         $versionSql = "select version from $schema.$table where success = true order by installed_rank desc limit 1;"
@@ -135,7 +135,7 @@ where table_schema not in ('pg_catalog', 'information_schema')
         $line = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $parts = $line -split '\|'
-        if ($parts.Count -ne 2) { continue }
+        if ($parts.Count -ne 2) { throw "Malformed table enumeration" }
         $schema = $parts[0].Trim()
         $table = $parts[1].Trim()
 
@@ -145,8 +145,7 @@ where table_schema not in ('pg_catalog', 'information_schema')
         # caller reuses this helper against a different, less trusted
         # source of schema/table names.
         if ($schema -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$' -or $table -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}$') {
-            Write-Warning "Skipping row-count snapshot for unsafe identifier pair ('$schema'.'$table')."
-            continue
+            throw "Unsafe table identifier: $schema.$table"
         }
 
         $countSql = "select count(*) from `"$schema`".`"$table`";"
@@ -154,49 +153,19 @@ where table_schema not in ('pg_catalog', 'information_schema')
             "psql", "-U", $DatabaseUser, "-d", $DatabaseName, "-At", "-c", $countSql
         )
         if ($countResult.ExitCode -ne 0) {
-            Write-Warning "Unable to count rows in '$schema.$table' for the backup manifest's row-count snapshot: $($countResult.Output)"
-            continue
+            throw "Unable to count rows in $schema.$table"
         }
-        $count = 0
-        if ([int64]::TryParse($countResult.Output.Trim(), [ref]$count)) {
+        $count = 0L
+        if ([int64]::TryParse($countResult.Output.Trim(), [ref]$count) -and $count -ge 0) {
             $rowCounts["$schema.$table"] = $count
-        }
+        } else { throw "Invalid row count for $schema.$table" }
     }
     return $rowCounts
 }
 
 function Invoke-SynchronizedDumpWithRowCounts {
-    # Runs pg_dump and a full per-table row-count snapshot against the
-    # EXACT SAME PostgreSQL snapshot, so the row counts recorded in the
-    # backup manifest are guaranteed consistent with what pg_dump actually
-    # wrote into the archive -- never an independently-sampled live count
-    # taken at some other, later point in time (which could race with
-    # concurrent writes against a database that is NOT scaled down during
-    # an on-demand backup).
-    #
-    # Snapshot lifetime (fully contained in the generated script below,
-    # a single psql session/transaction, run once via one kubectl exec):
-    #   1. BEGIN ISOLATION LEVEL REPEATABLE READ opens a transaction whose
-    #      snapshot is fixed at its first query.
-    #   2. SELECT pg_export_snapshot() (that first query) fixes the
-    #      snapshot and exports its identifier for another process to use.
-    #   3. \! pg_dump --snapshot=<id> runs pg_dump as a subprocess of the
-    #      SAME psql client process, against that exact exported snapshot,
-    #      without ending the holding session/transaction. A `\!` shell
-    #      command's own exit status is not visible to psql's
-    #      ON_ERROR_STOP, so success is confirmed explicitly via a
-    #      touch-on-success flag file, checked after psql exits.
-    #   4. Still inside the SAME open transaction (same snapshot), one
-    #      SELECT per table counts its rows -- guaranteed to see exactly
-    #      what pg_dump dumped, not whatever became live afterward.
-    #   5. COMMIT releases the snapshot. The holding transaction only ever
-    #      reads, so COMMIT vs. ROLLBACK is immaterial.
-    # `\set ON_ERROR_STOP on` means any SQL failure (the snapshot export,
-    # or any single table's count) aborts the whole script immediately
-    # rather than silently continuing on to COMMIT as if it had succeeded.
-    # Every enumerated table must report a count, or this throws: no
-    # table's failed count, and no unsafe/unsupported identifier, is ever
-    # silently skipped.
+    # The exporter transaction stays open while the shell child runs pg_dump.
+    # psql variables do not expand in \!: pass the snapshot via \setenv.
     param(
         [Parameter(Mandatory = $true)][string]$Namespace,
         [Parameter(Mandatory = $true)][string]$PodName,
@@ -219,7 +188,6 @@ function Invoke-SynchronizedDumpWithRowCounts {
     }
 
     $tableKeys = New-Object System.Collections.Generic.List[string]
-    $countSelects = New-Object System.Collections.Generic.List[string]
     foreach ($line in ($tablesResult.Output -split "`n")) {
         $line = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -236,62 +204,49 @@ function Invoke-SynchronizedDumpWithRowCounts {
         Test-SafeIdentifier -Value $schema -FieldName "Table schema"
         Test-SafeIdentifier -Value $table -FieldName "Table name"
         $tableKeys.Add("$schema.$table")
-        $countSelects.Add("SELECT '$schema.$table|' || count(*) FROM `"$schema`".`"$table`";")
     }
 
     if ($tableKeys.Count -eq 0) {
         throw "No application tables were found in database '$DatabaseName'; refusing to produce a backup with no verifiable row-count snapshot."
     }
 
-    $okFlag = "/tmp/platform-backup-pgdump-ok-$BackupId.flag"
-    $sqlScript = @"
-\set ON_ERROR_STOP on
-BEGIN ISOLATION LEVEL REPEATABLE READ;
-SELECT pg_export_snapshot() AS snap
-\gset
-\! pg_dump --snapshot=':snap' -Fc -U $DatabaseUser -d $DatabaseName -f $RemoteDumpPath && touch $okFlag
-$($countSelects -join "`n")
-COMMIT;
-"@
+    $shScript = New-SynchronizedSnapshotScript -DatabaseUser $DatabaseUser -DatabaseName $DatabaseName -RemoteDumpPath $RemoteDumpPath
 
-    $shScript = "psql -U $DatabaseUser -d $DatabaseName -At <<'PLATFORM_SQL_EOF'`n$sqlScript`nPLATFORM_SQL_EOF`ntest -f $okFlag"
-
-    try {
-        $result = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @("sh", "-c", $shScript)
-        if ($result.ExitCode -ne 0) {
-            throw "Synchronized backup capture (pg_dump + row-count snapshot under one PostgreSQL snapshot) failed: $($result.Output)"
-        }
-
-        $outputLines = @($result.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        $tableRowCounts = [ordered]@{}
-        foreach ($line in $outputLines) {
-            $sep = $line.LastIndexOf('|')
-            if ($sep -lt 0) {
-                throw "Unexpected row-count output line from the synchronized backup capture (missing '|'): '$line'"
-            }
-            $key = $line.Substring(0, $sep)
-            $valueText = $line.Substring($sep + 1)
-            $value = 0L
-            if (-not [long]::TryParse($valueText, [ref]$value)) {
-                throw "Unexpected row-count output line from the synchronized backup capture (non-numeric count): '$line'"
-            }
-            $tableRowCounts[$key] = $value
-        }
-
-        foreach ($key in $tableKeys) {
-            if (-not $tableRowCounts.Contains($key)) {
-                throw "The synchronized row-count capture did not report a count for table '$key'; refusing to treat this backup's row-count snapshot as complete."
-            }
-        }
-        if ($tableRowCounts.Count -ne $tableKeys.Count) {
-            throw "The synchronized row-count capture reported $($tableRowCounts.Count) table(s) but $($tableKeys.Count) were enumerated; refusing to treat this backup's row-count snapshot as complete."
-        }
-
-        return $tableRowCounts
+    # PS5 native argument marshalling corrupts embedded quotes/newlines.
+    # Transport UTF-8 as base64, then decode in the pod; no binary dump is piped.
+    $encodedScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($shScript.Replace("`r`n", "`n")))
+    $result = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @("sh", "-c", "printf %s $encodedScript | base64 -d | sh")
+    if ($result.ExitCode -ne 0) {
+        throw "Synchronized backup capture (pg_dump + row-count snapshot under one PostgreSQL snapshot) failed: $($result.Output)"
     }
-    finally {
-        Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @("rm", "-f", $okFlag) | Out-Null
+
+    $outputLines = @($result.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $tableRowCounts = [ordered]@{}
+    foreach ($line in $outputLines) {
+        $sep = $line.LastIndexOf('|')
+        if ($sep -lt 0) {
+            throw "Unexpected row-count output line from the synchronized backup capture (missing '|'): '$line'"
+        }
+        $key = $line.Substring(0, $sep)
+        $valueText = $line.Substring($sep + 1)
+        $value = 0L
+        if (-not [long]::TryParse($valueText, [ref]$value) -or $value -lt 0) {
+            throw "Unexpected row-count output line from the synchronized backup capture (non-numeric count): '$line'"
+        }
+        if ($tableRowCounts.Contains($key)) { throw "Duplicate table count: $key" }
+        $tableRowCounts[$key] = $value
     }
+
+    foreach ($key in $tableKeys) {
+        if (-not $tableRowCounts.Contains($key)) {
+            throw "The synchronized row-count capture did not report a count for table '$key'; refusing to treat this backup's row-count snapshot as complete."
+        }
+    }
+    if ($tableRowCounts.Count -ne $tableKeys.Count) {
+        throw "The synchronized row-count capture reported $($tableRowCounts.Count) table(s) but $($tableKeys.Count) were enumerated; refusing to treat this backup's row-count snapshot as complete."
+    }
+
+    return $tableRowCounts
 }
 
 function Get-PostgresServerVersion {
@@ -477,3 +432,39 @@ function Assert-ValidManifest {
         if ($db.fileName -match '[\\/]' -or $db.fileName -match '\.\.') { throw "Database '$($db.name)': manifest 'fileName' ('$($db.fileName)') is not a safe bare filename." }
     }
 }
+
+. (Join-Path $PSScriptRoot "SnapshotScript.ps1")
+
+function Resolve-RowCountsTrustworthy {
+    param([Parameter(Mandatory = $true)]$ManifestDatabase)
+    if ($ManifestDatabase.tableRowCountsCaptureMethod -ne 'SYNCHRONIZED_PG_EXPORT_SNAPSHOT') { return $false }
+    $counts = $ManifestDatabase.tableRowCounts
+    if ($null -eq $counts) { return $false }
+    $properties = @($counts.PSObject.Properties | Where-Object MemberType -eq NoteProperty)
+    if ($properties.Count -eq 0) { return $false }
+    foreach ($property in $properties) {
+        $value = 0L
+        if ($property.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,62}\.[A-Za-z_][A-Za-z0-9_]{0,62}$' -or
+            $null -eq $property.Value -or -not [long]::TryParse([string]$property.Value, [ref]$value) -or $value -lt 0) { return $false }
+    }
+    return $true
+}
+
+function Use-FreshProvisioningMarker {
+    param([string]$Namespace, [string]$PodName, [string]$DatabaseUser, [string]$DatabaseName)
+    Test-SafeIdentifier $DatabaseName 'Database name'
+    $sql = "UPDATE platform_bootstrap.provisioning SET consumed_at = clock_timestamp() WHERE database_name = '$DatabaseName' AND consumed_at IS NULL AND created_at > clock_timestamp() - interval '1 hour' RETURNING 'claimed';"
+    $result = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @('psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', $DatabaseUser, '-d', 'postgres', '-c', $sql)
+    return ($result.ExitCode -eq 0 -and $result.Output.Trim() -ceq 'claimed')
+}
+
+function Revoke-FreshProvisioningMarker {
+    param([string]$Namespace, [string]$PodName, [string]$DatabaseUser, [string]$DatabaseName)
+    Test-SafeIdentifier $DatabaseName 'Database name'
+    # Old installations have no marker. Errors must still stop a restore.
+    $sql = "DO " + '$body$' + " BEGIN IF to_regclass('platform_bootstrap.provisioning') IS NOT NULL THEN UPDATE platform_bootstrap.provisioning SET consumed_at = clock_timestamp() WHERE database_name = '$DatabaseName'; END IF; END " + '$body$' + ';'
+    $result = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @('psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', $DatabaseUser, '-d', 'postgres', '-c', $sql)
+    if ($result.ExitCode -ne 0) { throw 'Unable to revoke provisioning marker before restore' }
+}
+
+Export-ModuleMember -Function Get-PostgresPodName, Invoke-PodExec, Copy-FromPostgresPod, Copy-ToPostgresPod, Get-FileSha256, Get-FlywaySchemaVersions, Get-TableRowCounts, Invoke-SynchronizedDumpWithRowCounts, Get-PostgresServerVersion, Get-CurrentGitCommit, New-BackupId, Get-BackupsRoot, Read-BackupManifest, Resolve-BackupDirectory, Test-SafeBackupId, Test-SafeIdentifier, Get-DatabaseExistence, Assert-ValidManifest, Resolve-RowCountsTrustworthy, Use-FreshProvisioningMarker, Revoke-FreshProvisioningMarker, New-SynchronizedSnapshotScript

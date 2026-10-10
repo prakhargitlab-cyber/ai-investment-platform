@@ -1,3 +1,5 @@
+Import-Module (Join-Path $PSScriptRoot "PostgresBackupCommon.psm1")
+
 # .\platform.ps1 restore -Backup latest
 # .\platform.ps1 restore -Backup 2026-10-10_153000_ab12cd
 # .\platform.ps1 restore -Backup latest -TargetDatabase investment_test_restore -AuthorizeDestructiveRestore
@@ -227,6 +229,7 @@ function Invoke-PlatformRestore {
             # them; --no-owner --no-privileges prevents blindly copying
             # source-cluster role/ownership/privilege assignments onto the
             # target cluster.
+            Revoke-FreshProvisioningMarker -Namespace $Namespace -PodName $podName -DatabaseUser $dbUser -DatabaseName $effectiveTargetDb
             $restoreResult = Invoke-PodExec -Namespace $Namespace -PodName $podName -Arguments @(
                 "pg_restore", "--clean", "--if-exists", "--no-owner", "--no-privileges",
                 "-U", $dbUser, "-d", $effectiveTargetDb, $remoteRestorePath
@@ -260,13 +263,18 @@ function Invoke-PlatformRestore {
         # recorded by an earlier, independently-sampled live query (not
         # guaranteed to match the dump's snapshot), is never compared: a
         # coincidental match there would be false confidence, not proof.
-        $rowCountsTrustworthy = ($expectedRowCounts -and $captureMethod -eq "SYNCHRONIZED_PG_EXPORT_SNAPSHOT")
+        $rowCountsTrustworthy = (Resolve-RowCountsTrustworthy -ManifestDatabase $manifest.databases[0])
         $rowCountMismatches = @()
 
         if ($rowCountsTrustworthy) {
+            foreach ($tableKey in $restoredRowCounts.Keys) {
+                if ($tableKey -notin $expectedRowCounts.PSObject.Properties.Name) {
+                    $rowCountMismatches += "  Unexpected restored table: $tableKey"
+                }
+            }
             foreach ($tableKey in $expectedRowCounts.PSObject.Properties.Name) {
                 $expected = [int64]$expectedRowCounts.$tableKey
-                $actual = if ($restoredRowCounts.ContainsKey($tableKey)) { [int64]$restoredRowCounts[$tableKey] } else { $null }
+                $actual = if ($restoredRowCounts.Contains($tableKey)) { [int64]$restoredRowCounts[$tableKey] } else { $null }
                 if ($null -eq $actual -or $actual -ne $expected) {
                     $rowCountMismatches += "  $tableKey : expected $expected, got $(if ($null -eq $actual) { 'MISSING' } else { $actual })"
                 }

@@ -1,3 +1,5 @@
+Import-Module (Join-Path $PSScriptRoot "PostgresBackupCommon.psm1")
+
 # .\platform.ps1 backup
 #
 # Creates exactly one on-demand PostgreSQL backup of the "investment"

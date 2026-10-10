@@ -1,34 +1,7 @@
-# Pure, side-effect-free eligibility decision for the one-time initial
-# Opportunity Radar cycle (platform.ps1's Invoke-InitialOpportunityCycleAfterCleanDeploy).
-#
-# This module intentionally contains NO database/network I/O so it can be
-# unit tested (see scripts/database/tests/RadarBootstrapEligibility.Tests.ps1)
-# without a live PostgreSQL connection. The caller is responsible for
-# reliably gathering the input signals (table existence + row counts for
-# both the Radar cycle-run table and the auth user table) and for acting on
-# the returned decision.
-#
-# Positive-freshness requirement: the initial cycle is eligible to run ONLY
-# when BOTH of the following were reliably, positively confirmed:
-#   1. <research-schema>.global_opportunity_cycle_run exists and has zero
-#      rows (no Radar cycle of ANY status -- ACCEPTED/RUNNING/PUBLISHED/
-#      CANCEL_REQUESTED/COMPLETED/FAILED/CANCELLED -- has ever been
-#      attempted).
-#   2. auth.app_users exists and has zero rows (no user account -- and
-#      therefore no first-ADMIN -- has ever been created; this is the same
-#      "has this system ever been used" signal FirstAdminBootstrapService
-#      itself relies on for its own freshness decision).
-# Any of the following makes the database NOT positively fresh, and the
-# initial cycle is skipped: either table missing, either row count
-# unreadable, OR either row count greater than zero. A missing schema/table
-# is never interpreted as evidence of freshness -- it is treated the same
-# as "cannot determine," because by the time this runs, research-service's
-# and auth-service's own Flyway migrations are expected to have already
-# created both tables; a missing table at this point means something is
-# uncertain, not that the database is new.
-
 function Resolve-OpportunityRadarBootstrapEligibility {
     param(
+        [bool]$FreshProvisioningClaimed,
+        [bool]$FirstAdminCreatedThisStartup,
         [Parameter(Mandatory = $true)][bool]$CycleTableProbeSucceeded,
         [bool]$CycleTableExists,
         [bool]$CycleRowCountProbeSucceeded,
@@ -79,7 +52,7 @@ function Resolve-OpportunityRadarBootstrapEligibility {
         }
     }
 
-    if ($UserRowCount -gt 0) {
+    if ($UserRowCount -gt 0 -and -not ($UserRowCount -eq 1 -and $FreshProvisioningClaimed -and $FirstAdminCreatedThisStartup)) {
         return [ordered]@{
             Eligible    = $false
             Decision    = "SKIP_EXISTING_APPLICATION_DATA_FOUND"
@@ -88,10 +61,21 @@ function Resolve-OpportunityRadarBootstrapEligibility {
         }
     }
 
+    if (-not $FreshProvisioningClaimed -or $CycleRowCount -lt 0 -or $UserRowCount -lt 0) {
+        return [ordered]@{
+            Eligible = $false
+            Decision = "SKIP_NO_FRESH_PROVISIONING_PROOF"
+            WriteMarker = $false
+            Reason = "No newly initialized database provisioning token was claimed, or counts were invalid."
+        }
+    }
+
     return [ordered]@{
         Eligible    = $true
         Decision    = "ELIGIBLE_GENUINELY_FRESH"
         WriteMarker = $false
-        Reason      = "Both the Radar cycle-run table and the auth user table exist and are empty. The database is positively confirmed genuinely fresh."
+        Reason      = "A new provisioning token was claimed; the cycle table is empty and users are empty or contain only the first admin just created by this startup."
     }
 }
+
+Export-ModuleMember -Function Resolve-OpportunityRadarBootstrapEligibility

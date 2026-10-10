@@ -100,8 +100,8 @@ $OpportunityBootstrapMarkerFile = Join-Path $RuntimeDir "initial-opportunity-cyc
 
 # On-demand PostgreSQL backup/restore (Feature: manual backup/restore).
 # Modular scripts under scripts/database/; never auto-invoked.
-. (Join-Path $ProjectRoot "scripts\database\PostgresBackupCommon.psm1")
-. (Join-Path $ProjectRoot "scripts\database\RadarBootstrapEligibility.psm1")
+Import-Module (Join-Path $ProjectRoot "scripts\database\PostgresBackupCommon.psm1") -Force
+Import-Module (Join-Path $ProjectRoot "scripts\database\RadarBootstrapEligibility.psm1") -Force
 . (Join-Path $ProjectRoot "scripts\database\backup.ps1")
 . (Join-Path $ProjectRoot "scripts\database\list-backups.ps1")
 . (Join-Path $ProjectRoot "scripts\database\verify-backup.ps1")
@@ -1088,16 +1088,16 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
     # different machine/checkout) must never cause an expensive initial
     # Radar cycle to run again against data that already has one. Before
     # relying on the marker's absence, positively confirm the database is
-    # genuinely fresh. This is a fail-CLOSED check: any existing Radar
-    # cycle (of any status), any existing application data (any user
-    # account), a missing table, or an unreliable/failed query all skip
-    # the automatic initial cycle -- none of them fall through to running
-    # it. A missing schema/table is never treated as proof of freshness.
-    # This never blocks ordinary platform startup: skipping the automatic
-    # initial cycle is not a failure of '.\platform.ps1 up', and existing
-    # research-engine scheduler behavior is completely unchanged either way.
+    # genuinely fresh. Require an initdb-only durable provisioning token,
+    # claimed atomically at most once within one hour of provisioning.
+    # Flyway/seed/reference rows are not evidence of prior use. Existing
+    # cycles and users still deny startup, except the single ADMIN account
+    # whose creation this invocation positively confirmed. Missing tables,
+    # unreadable counts, or a missing/consumed marker always deny eligibility.
+    # The separate research-engine scheduler is unchanged.
     Write-Step "Positively verifying database freshness before the automatic initial opportunity cycle"
 
+    $freshProvisioningClaimed = $false
     $cycleTableProbeSucceeded = $false
     $cycleTableExists = $false
     $cycleRowCountProbeSucceeded = $false
@@ -1109,6 +1109,7 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
 
     try {
         $radarCheckPodName = Get-PostgresPodName -Namespace $Namespace
+        $freshProvisioningClaimed = Use-FreshProvisioningMarker -Namespace $Namespace -PodName $radarCheckPodName -DatabaseUser $DatabaseConfig.Username -DatabaseName $DatabaseConfig.Name
         $researchSchema = Resolve-ResearchDatabaseSchemaName -Namespace $Namespace
 
         # One round trip: positively confirm existence of BOTH the Radar
@@ -1123,8 +1124,8 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
             if ($existsParts.Count -eq 2) {
                 $cycleTableProbeSucceeded = $true
                 $userTableProbeSucceeded = $true
-                $cycleTableExists = ($existsParts[0].Trim() -eq "t")
-                $userTableExists = ($existsParts[1].Trim() -eq "t")
+                $cycleTableExists = ($existsParts[0].Trim() -eq "true")
+                $userTableExists = ($existsParts[1].Trim() -eq "true")
             }
         }
 
@@ -1154,7 +1155,7 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
         Write-Warning "Unable to check database state for initial opportunity cycle eligibility: $($_.Exception.Message)"
     }
 
-    $eligibility = Resolve-OpportunityRadarBootstrapEligibility `
+    $eligibility = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $freshProvisioningClaimed -FirstAdminCreatedThisStartup ([bool]$script:FirstAdminCreatedThisStartup) `
         -CycleTableProbeSucceeded $cycleTableProbeSucceeded -CycleTableExists $cycleTableExists `
         -CycleRowCountProbeSucceeded $cycleRowCountProbeSucceeded -CycleRowCount $cycleRowCount `
         -UserTableProbeSucceeded $userTableProbeSucceeded -UserTableExists $userTableExists `
@@ -1169,7 +1170,7 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
         return
     }
 
-    Write-Host "Database positively confirmed genuinely fresh (no existing Radar cycle, no existing user account); proceeding to the universe-readiness-gated initial cycle." -ForegroundColor Green
+    Write-Host "New provisioning marker claimed, no existing Radar cycle, and user state verified; proceeding to the universe-readiness-gated initial cycle." -ForegroundColor Green
 
     # Kubernetes readiness is not sufficient here. portfolio-service can be Ready
     # while CanonicalIdentityBootstrap is still populating the active NSE equity
@@ -1336,6 +1337,7 @@ except Exception as exc:
 }
 
 function Invoke-FirstAdminBootstrapIfNeeded {
+    $script:FirstAdminCreatedThisStartup = $false
     # Feature: automatic first-ADMIN initialization.
     #
     # Safe to call on every `up`: the decision (create vs. skip vs. fail
@@ -1453,6 +1455,7 @@ function Invoke-FirstAdminBootstrapIfNeeded {
         switch ($podExitCode) {
             "0" {
                 if ($logs -match "first_admin_bootstrap_outcome=CREATED") {
+                    $script:FirstAdminCreatedThisStartup = $true
                     Write-Host ""
                     Write-Host "============================================================" -ForegroundColor Yellow
                     Write-Host " FIRST ADMIN ACCOUNT CREATED - SAVE THIS PASSWORD NOW" -ForegroundColor Yellow

@@ -37,6 +37,14 @@ spec:
       storage: {{ .Values.devDependencies.postgres.persistence.size | quote }}
 ---
 {{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-fresh-provisioning
+data:
+  10-fresh-provisioning.sql: |
+{{ .Files.Get "files/fresh-provisioning.sql" | indent 4 }}
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -85,15 +93,21 @@ spec:
               port: postgres
             periodSeconds: 10
             failureThreshold: 3
-          {{- if .Values.devDependencies.postgres.persistence.enabled }}
           volumeMounts:
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          {{- if .Values.devDependencies.postgres.persistence.enabled }}
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
           {{- end }}
           resources:
             {{- toYaml .Values.devDependencies.postgres.resources | nindent 12 }}
-      {{- if .Values.devDependencies.postgres.persistence.enabled }}
       volumes:
+        - name: postgres-init
+          configMap:
+            name: postgres-fresh-provisioning
+      {{- if .Values.devDependencies.postgres.persistence.enabled }}
         - name: postgres-data
           persistentVolumeClaim:
             claimName: {{ default "postgres-data-dev" .Values.devDependencies.postgres.persistence.existingClaim }}

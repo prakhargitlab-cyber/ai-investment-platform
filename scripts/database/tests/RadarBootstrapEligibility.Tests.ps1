@@ -1,22 +1,47 @@
 # Pester v5 tests for Resolve-OpportunityRadarBootstrapEligibility
 # (scripts/database/RadarBootstrapEligibility.psm1).
 #
-# These are pure unit tests: no database, pod, or Kubernetes access is
-# required or performed. They were written but NOT executed in this
-# environment -- no PowerShell interpreter (pwsh/powershell) is available
-# anywhere this work was done. Run with: Invoke-Pester -Path <this file>
-# on a Windows machine with Pester 5+ installed before relying on this.
+# Pure eligibility tests; no database or Kubernetes access.
 
 BeforeAll {
     $modulePath = Join-Path $PSScriptRoot "..\RadarBootstrapEligibility.psm1"
-    . $modulePath
+    Import-Module $modulePath -Force
 }
 
 Describe "Resolve-OpportunityRadarBootstrapEligibility" {
 
+    It "denies empty tables without a provisioning marker" {
+        $result = Resolve-OpportunityRadarBootstrapEligibility -CycleTableProbeSucceeded $true -CycleTableExists $true `
+            -CycleRowCountProbeSucceeded $true -CycleRowCount 0 -UserTableProbeSucceeded $true -UserTableExists $true `
+            -UserRowCountProbeSucceeded $true -UserRowCount 0
+        $result.Eligible | Should -BeFalse
+        $result.Decision | Should -Be 'SKIP_NO_FRESH_PROVISIONING_PROOF'
+    }
+
+    It "allows exactly the admin created by this startup with a new provisioning marker" {
+        $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true -FirstAdminCreatedThisStartup $true `
+            -CycleTableProbeSucceeded $true -CycleTableExists $true -CycleRowCountProbeSucceeded $true -CycleRowCount 0 `
+            -UserTableProbeSucceeded $true -UserTableExists $true -UserRowCountProbeSucceeded $true -UserRowCount 1
+        $result.Eligible | Should -BeTrue
+    }
+
+    It "denies additional users even after first-admin creation" {
+        $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true -FirstAdminCreatedThisStartup $true `
+            -CycleTableProbeSucceeded $true -CycleTableExists $true -CycleRowCountProbeSucceeded $true -CycleRowCount 0 `
+            -UserTableProbeSucceeded $true -UserTableExists $true -UserRowCountProbeSucceeded $true -UserRowCount 2
+        $result.Eligible | Should -BeFalse
+    }
+
+    It "denies negative counts" {
+        $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
+            -CycleTableProbeSucceeded $true -CycleTableExists $true -CycleRowCountProbeSucceeded $true -CycleRowCount -1 `
+            -UserTableProbeSucceeded $true -UserTableExists $true -UserRowCountProbeSucceeded $true -UserRowCount 0
+        $result.Eligible | Should -BeFalse
+    }
+
     Context "Genuinely fresh database" {
         It "is eligible when both tables exist and both row counts are zero" {
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $true -CycleTableExists $true `
                 -CycleRowCountProbeSucceeded $true -CycleRowCount 0 `
                 -UserTableProbeSucceeded $true -UserTableExists $true `
@@ -30,7 +55,7 @@ Describe "Resolve-OpportunityRadarBootstrapEligibility" {
 
     Context "Restored / populated database (existing Radar cycle)" {
         It "skips and writes the marker when any cycle row exists, regardless of status" {
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $true -CycleTableExists $true `
                 -CycleRowCountProbeSucceeded $true -CycleRowCount 3 `
                 -UserTableProbeSucceeded $true -UserTableExists $true `
@@ -44,7 +69,7 @@ Describe "Resolve-OpportunityRadarBootstrapEligibility" {
 
     Context "Populated database without any completed/existing cycle row (existing application data only)" {
         It "skips and writes the marker when a user account exists even with zero cycle rows" {
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $true -CycleTableExists $true `
                 -CycleRowCountProbeSucceeded $true -CycleRowCount 0 `
                 -UserTableProbeSucceeded $true -UserTableExists $true `
@@ -58,7 +83,7 @@ Describe "Resolve-OpportunityRadarBootstrapEligibility" {
 
     Context "Query failure (indeterminate database state)" {
         It "skips WITHOUT writing the marker when the existence probe itself failed" {
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $false -CycleTableExists $false `
                 -CycleRowCountProbeSucceeded $false -CycleRowCount $null `
                 -UserTableProbeSucceeded $false -UserTableExists $false `
@@ -70,7 +95,7 @@ Describe "Resolve-OpportunityRadarBootstrapEligibility" {
         }
 
         It "skips WITHOUT writing the marker when tables exist but the row-count probe failed" {
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $true -CycleTableExists $true `
                 -CycleRowCountProbeSucceeded $false -CycleRowCount $null `
                 -UserTableProbeSucceeded $true -UserTableExists $true `
@@ -84,7 +109,7 @@ Describe "Resolve-OpportunityRadarBootstrapEligibility" {
 
     Context "Schema/table missing" {
         It "skips WITHOUT writing the marker when the Radar cycle table does not exist, and does NOT treat this as fresh" {
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $true -CycleTableExists $false `
                 -CycleRowCountProbeSucceeded $false -CycleRowCount $null `
                 -UserTableProbeSucceeded $true -UserTableExists $true `
@@ -96,7 +121,7 @@ Describe "Resolve-OpportunityRadarBootstrapEligibility" {
         }
 
         It "skips WITHOUT writing the marker when the auth user table does not exist" {
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $true -CycleTableExists $true `
                 -CycleRowCountProbeSucceeded $false -CycleRowCount $null `
                 -UserTableProbeSucceeded $true -UserTableExists $false `
@@ -110,7 +135,7 @@ Describe "Resolve-OpportunityRadarBootstrapEligibility" {
         It "never returns Eligible = true merely because a table is absent" {
             # Defends specifically against "a missing research schema must
             # not automatically be interpreted as a fresh database."
-            $result = Resolve-OpportunityRadarBootstrapEligibility `
+            $result = Resolve-OpportunityRadarBootstrapEligibility -FreshProvisioningClaimed $true `
                 -CycleTableProbeSucceeded $true -CycleTableExists $false `
                 -CycleRowCountProbeSucceeded $false -CycleRowCount $null `
                 -UserTableProbeSucceeded $true -UserTableExists $false `

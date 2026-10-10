@@ -22,8 +22,10 @@
 
     # On-demand PostgreSQL backup/restore (Feature: manual backup/restore).
     [string]$Backup,
+    [string]$TargetDatabase,
     [switch]$AuthorizeDestructiveRestore,
-    [switch]$SkipSafetyBackup
+    [switch]$SkipSafetyBackup,
+    [switch]$ConfirmSafetyBackup
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +51,7 @@ $ProgressPreference = "SilentlyContinue"
 #   .\platform.ps1 backup-verify -Backup latest
 #   .\platform.ps1 restore -Backup latest
 #   .\platform.ps1 restore -Backup 2026-10-10_153000_ab12cd -AuthorizeDestructiveRestore
+#   .\platform.ps1 restore -Backup latest -TargetDatabase investment_test_restore -AuthorizeDestructiveRestore
 #
 # LOCAL behavior:
 # - Creates/starts the k3d cluster.
@@ -332,6 +335,48 @@ function New-OrReplaceLiteralSecret {
     $tempFile = Join-Path $RuntimeDir "$Name.secret.json"
     try {
         Set-Content -Path $tempFile -Value $manifest -Encoding UTF8
+        kubectl apply -f $tempFile | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to apply Kubernetes secret '$Name'."
+        }
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function New-OrReplaceSecretFromDataValues {
+    # Like New-OrReplaceLiteralSecret, but never passes a secret value as a
+    # literal on the kubectl command line (where it would be visible to
+    # other processes on the same machine, e.g. via Task Manager/WMI, for
+    # the duration of the call). Instead, this builds the Secret's base64
+    # "data" map directly in PowerShell and applies it the same way
+    # New-OrReplaceLiteralSecret applies its rendered manifest: written to
+    # a temp file, applied with `kubectl apply -f`, then deleted. Used
+    # specifically for values that must never appear as a process
+    # argument, such as the generated first-ADMIN bootstrap password.
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][hashtable]$Literals
+    )
+
+    $data = [ordered]@{}
+    foreach ($key in $Literals.Keys) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes([string]$Literals[$key])
+        $data[$key] = [Convert]::ToBase64String($bytes)
+    }
+
+    $secret = [ordered]@{
+        apiVersion = "v1"
+        kind       = "Secret"
+        type       = "Opaque"
+        metadata   = @{ name = $Name; namespace = $Namespace }
+        data       = $data
+    }
+
+    $tempFile = Join-Path $RuntimeDir "$Name.secret.json"
+    try {
+        $secret | ConvertTo-Json -Depth 6 | Set-Content -Path $tempFile -Encoding UTF8
         kubectl apply -f $tempFile | Out-Host
         if ($LASTEXITCODE -ne 0) {
             throw "Unable to apply Kubernetes secret '$Name'."
@@ -1012,6 +1057,40 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
         return
     }
 
+    # The local marker file alone is not a reliable signal: a restored,
+    # already-populated database (or simply a marker file missing on a
+    # different machine/checkout) must never cause an expensive initial
+    # Radar cycle to run again against data that already has one. Before
+    # relying on the marker's absence, check the database itself for any
+    # already-completed cycle. If this check cannot be performed reliably
+    # (e.g. the schema does not exist yet on a genuinely fresh database,
+    # or the pod is not reachable), fail OPEN -- fall through to the
+    # existing universe-readiness-gated logic below exactly as if this
+    # check did not exist, rather than blocking platform startup on a
+    # diagnostic query. This does not change scheduler behavior: it only
+    # ever short-circuits the one-time initial-cycle submission below.
+    try {
+        $radarCheckPodName = Get-PostgresPodName -Namespace $Namespace
+        $completedCycleResult = Invoke-PodExec -Namespace $Namespace -PodName $radarCheckPodName -Arguments @(
+            "psql", "-U", $DatabaseConfig.Username, "-d", $DatabaseConfig.Name, "-At", "-c",
+            "select count(*) from research.global_opportunity_cycle_run where status = 'COMPLETED';"
+        )
+        if ($completedCycleResult.ExitCode -eq 0) {
+            $completedCycleCount = 0
+            if ([int]::TryParse($completedCycleResult.Output.Trim(), [ref]$completedCycleCount) -and $completedCycleCount -gt 0) {
+                Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
+                Write-Host "Database already shows a completed opportunity cycle (for example, from a restored backup); writing the local marker and skipping the initial cycle. Future cycles remain scheduler-owned." -ForegroundColor DarkGray
+                return
+            }
+        }
+        else {
+            Write-Warning "Unable to query the database for an existing completed opportunity cycle (psql exit $($completedCycleResult.ExitCode)); this is expected on a genuinely fresh database before research-engine's schema is migrated. Falling through to the universe-readiness-gated check below."
+        }
+    }
+    catch {
+        Write-Warning "Unable to check the database for an existing completed opportunity cycle ($($_.Exception.Message)); falling through to the universe-readiness-gated check below."
+    }
+
     # Kubernetes readiness is not sufficient here. portfolio-service can be Ready
     # while CanonicalIdentityBootstrap is still populating the active NSE equity
     # universe. Starting the production cycle before that bootstrap is populated
@@ -1189,19 +1268,23 @@ function Invoke-FirstAdminBootstrapIfNeeded {
     # without this script re-deriving or guessing any of it, and (b) supply
     # a freshly generated password through a short-lived Secret, never as a
     # literal value or command-line argument.
+    #
+    # Every outcome other than a confirmed CREATED or a confirmed
+    # ADMIN_ALREADY_PRESENT is a hard failure: missing auth-service
+    # resources, a Job that never completes, an unrecognized exit code, and
+    # even exit code 0 without a recognized outcome string in the logs must
+    # never be silently treated as a successful bootstrap.
     Write-Step "Checking for first-ADMIN bootstrap"
 
     $deploymentJsonRaw = kubectl get deployment auth-service -n $Namespace --ignore-not-found -o json 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($deploymentJsonRaw | Out-String).Trim())) {
-        Write-Warning "auth-service Deployment not found; skipping first-ADMIN bootstrap."
-        return
+        throw "First-ADMIN bootstrap cannot proceed: the auth-service Deployment was not found in namespace '$Namespace'. Refusing to continue '.\platform.ps1 up' with an unknown ADMIN-provisioning outcome."
     }
 
     $deployment = $deploymentJsonRaw | ConvertFrom-Json
     $container = @($deployment.spec.template.spec.containers | Where-Object { $_.name -eq "auth-service" })[0]
     if (-not $container) {
-        Write-Warning "auth-service container not found in the Deployment spec; skipping first-ADMIN bootstrap."
-        return
+        throw "First-ADMIN bootstrap cannot proceed: no 'auth-service' container was found in the auth-service Deployment spec. Refusing to continue '.\platform.ps1 up' with an unknown ADMIN-provisioning outcome."
     }
 
     $email = if ($FirstAdminEmail) { $FirstAdminEmail }
@@ -1209,100 +1292,121 @@ function Invoke-FirstAdminBootstrapIfNeeded {
              else { "prakhar.gitlab@gmail.com" }
 
     # Generated locally, kept only in memory, never written to a persistent
-    # file and never embedded as a literal in the submitted Job manifest.
+    # file and never embedded as a literal in the submitted Job manifest or
+    # on any command line (New-OrReplaceSecretFromDataValues builds the
+    # Secret's base64 "data" directly and applies it via a temp-file
+    # manifest, exactly like New-OrReplaceLiteralSecret does for its own
+    # rendered manifest -- it just never puts the value on a kubectl
+    # argument in the first place).
     $passwordBytes = New-Object byte[] 24
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($passwordBytes)
     $generatedPassword = ([Convert]::ToBase64String($passwordBytes) -replace '[+/=]', '9') + "Aa1!"
 
     $secretName = "first-admin-bootstrap-credentials"
     $jobName = "first-admin-bootstrap"
+    $jobFile = Join-Path $RuntimeDir "first-admin-bootstrap-job.json"
+    $secretCreated = $false
+    $jobSubmitted = $false
 
-    New-OrReplaceLiteralSecret $secretName @{
-        FIRST_ADMIN_BOOTSTRAP_EMAIL    = $email
-        FIRST_ADMIN_BOOTSTRAP_PASSWORD = $generatedPassword
-    }
+    try {
+        New-OrReplaceSecretFromDataValues $secretName @{
+            FIRST_ADMIN_BOOTSTRAP_EMAIL    = $email
+            FIRST_ADMIN_BOOTSTRAP_PASSWORD = $generatedPassword
+        }
+        $secretCreated = $true
 
-    kubectl delete job $jobName -n $Namespace --ignore-not-found | Out-Null
+        kubectl delete job $jobName -n $Namespace --ignore-not-found | Out-Null
 
-    $jobEnv = @($container.env | Where-Object { $_.name -notin @("FIRST_ADMIN_BOOTSTRAP_EMAIL", "FIRST_ADMIN_BOOTSTRAP_PASSWORD") })
-    $jobEnv += [ordered]@{ name = "FIRST_ADMIN_BOOTSTRAP_EMAIL"; valueFrom = @{ secretKeyRef = @{ name = $secretName; key = "FIRST_ADMIN_BOOTSTRAP_EMAIL" } } }
-    $jobEnv += [ordered]@{ name = "FIRST_ADMIN_BOOTSTRAP_PASSWORD"; valueFrom = @{ secretKeyRef = @{ name = $secretName; key = "FIRST_ADMIN_BOOTSTRAP_PASSWORD" } } }
+        $jobEnv = @($container.env | Where-Object { $_.name -notin @("FIRST_ADMIN_BOOTSTRAP_EMAIL", "FIRST_ADMIN_BOOTSTRAP_PASSWORD") })
+        $jobEnv += [ordered]@{ name = "FIRST_ADMIN_BOOTSTRAP_EMAIL"; valueFrom = @{ secretKeyRef = @{ name = $secretName; key = "FIRST_ADMIN_BOOTSTRAP_EMAIL" } } }
+        $jobEnv += [ordered]@{ name = "FIRST_ADMIN_BOOTSTRAP_PASSWORD"; valueFrom = @{ secretKeyRef = @{ name = $secretName; key = "FIRST_ADMIN_BOOTSTRAP_PASSWORD" } } }
 
-    $job = [ordered]@{
-        apiVersion = "batch/v1"
-        kind       = "Job"
-        metadata   = @{ name = $jobName; namespace = $Namespace }
-        spec       = @{
-            backoffLimit            = 0
-            ttlSecondsAfterFinished = 300
-            activeDeadlineSeconds   = 120
-            template                = @{
-                spec = @{
-                    restartPolicy = "Never"
-                    containers    = @(
-                        @{
-                            name            = "first-admin-bootstrap"
-                            image           = $container.image
-                            imagePullPolicy = $container.imagePullPolicy
-                            command         = @("/bin/sh", "-c")
-                            args            = @("exec java -jar /app/app.jar --spring.profiles.active=first-admin-bootstrap --spring.main.web-application-type=none")
-                            env             = $jobEnv
-                        }
-                    )
+        $job = [ordered]@{
+            apiVersion = "batch/v1"
+            kind       = "Job"
+            metadata   = @{ name = $jobName; namespace = $Namespace }
+            spec       = @{
+                backoffLimit            = 0
+                ttlSecondsAfterFinished = 300
+                activeDeadlineSeconds   = 120
+                template                = @{
+                    spec = @{
+                        restartPolicy = "Never"
+                        containers    = @(
+                            @{
+                                name            = "first-admin-bootstrap"
+                                image           = $container.image
+                                imagePullPolicy = $container.imagePullPolicy
+                                command         = @("/bin/sh", "-c")
+                                args            = @("exec java -jar /app/app.jar --spring.profiles.active=first-admin-bootstrap --spring.main.web-application-type=none")
+                                env             = $jobEnv
+                            }
+                        )
+                    }
                 }
             }
         }
-    }
 
-    $jobFile = Join-Path $RuntimeDir "first-admin-bootstrap-job.json"
-    try {
-        $job | ConvertTo-Json -Depth 20 | Set-Content -Path $jobFile -Encoding UTF8
-        kubectl apply -f $jobFile | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "Unable to submit the first-ADMIN bootstrap Job." }
-    }
-    finally {
-        Remove-Item $jobFile -Force -ErrorAction SilentlyContinue
-    }
+        try {
+            $job | ConvertTo-Json -Depth 20 | Set-Content -Path $jobFile -Encoding UTF8
+            kubectl apply -f $jobFile | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "Unable to submit the first-ADMIN bootstrap Job." }
+            $jobSubmitted = $true
+        }
+        finally {
+            Remove-Item $jobFile -Force -ErrorAction SilentlyContinue
+        }
 
-    kubectl wait --for=condition=complete --timeout=90s "job/$jobName" -n $Namespace 2>$null | Out-Null
+        kubectl wait --for=condition=complete --timeout=90s "job/$jobName" -n $Namespace 2>$null | Out-Null
 
-    $podName = (kubectl get pods -n $Namespace -l "job-name=$jobName" -o jsonpath='{.items[0].metadata.name}' 2>$null)
-    $logs = $null
-    $podExitCode = $null
-    if (-not [string]::IsNullOrWhiteSpace($podName)) {
+        $podName = (kubectl get pods -n $Namespace -l "job-name=$jobName" -o jsonpath='{.items[0].metadata.name}' 2>$null)
+        if ([string]::IsNullOrWhiteSpace($podName)) {
+            throw "First-ADMIN bootstrap Job '$jobName' produced no pod. The ADMIN-provisioning outcome is unknown; refusing to treat this as success."
+        }
+
         $logs = kubectl logs $podName -n $Namespace 2>$null
         $podExitCode = kubectl get pod $podName -n $Namespace -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>$null
-    }
+        if ([string]::IsNullOrWhiteSpace($podExitCode)) {
+            throw "First-ADMIN bootstrap Job '$jobName' pod '$podName' has no terminated exit code (it may still be running or was never scheduled). The ADMIN-provisioning outcome is unknown; refusing to treat this as success."
+        }
 
-    kubectl delete job $jobName -n $Namespace --ignore-not-found | Out-Null
-    kubectl delete secret $secretName -n $Namespace --ignore-not-found | Out-Null
-
-    switch ($podExitCode) {
-        "0" {
-            if ($logs -match "first_admin_bootstrap_outcome=CREATED") {
-                Write-Host ""
-                Write-Host "============================================================" -ForegroundColor Yellow
-                Write-Host " FIRST ADMIN ACCOUNT CREATED - SAVE THIS PASSWORD NOW" -ForegroundColor Yellow
-                Write-Host "============================================================" -ForegroundColor Yellow
-                Write-Host " Email    : $email"
-                Write-Host " Password : $generatedPassword"
-                Write-Host " This password will not be shown again. Only its hash is stored." -ForegroundColor Yellow
-                Write-Host "============================================================" -ForegroundColor Yellow
-                Write-Host ""
+        switch ($podExitCode) {
+            "0" {
+                if ($logs -match "first_admin_bootstrap_outcome=CREATED") {
+                    Write-Host ""
+                    Write-Host "============================================================" -ForegroundColor Yellow
+                    Write-Host " FIRST ADMIN ACCOUNT CREATED - SAVE THIS PASSWORD NOW" -ForegroundColor Yellow
+                    Write-Host "============================================================" -ForegroundColor Yellow
+                    Write-Host " Email    : $email"
+                    Write-Host " Password : $generatedPassword"
+                    Write-Host " This password will not be shown again. Only its hash is stored." -ForegroundColor Yellow
+                    Write-Host "============================================================" -ForegroundColor Yellow
+                    Write-Host ""
+                }
+                elseif ($logs -match "first_admin_bootstrap_outcome=ADMIN_ALREADY_PRESENT") {
+                    Write-Host "An ADMIN account already exists; first-ADMIN bootstrap made no changes." -ForegroundColor DarkGray
+                }
+                else {
+                    throw "First-ADMIN bootstrap Job exited 0 but its logs contain neither 'first_admin_bootstrap_outcome=CREATED' nor 'first_admin_bootstrap_outcome=ADMIN_ALREADY_PRESENT'. The ADMIN-provisioning outcome is ambiguous; refusing to treat exit code 0 alone as proof of success."
+                }
             }
-            else {
-                Write-Host "An ADMIN account already exists; first-ADMIN bootstrap made no changes." -ForegroundColor DarkGray
+            "3" {
+                throw "Accounts exist but none holds ADMIN. Automatic first-ADMIN bootstrap refused to act (fail-closed). Use the role-admin-cli profile after explicit authorized review (see docs/auth/admin-role-provisioning.md), then re-run '.\platform.ps1 up'."
+            }
+            default {
+                throw "First-ADMIN bootstrap did not complete cleanly (pod exit code: '$podExitCode'). Refusing to treat this as success; review the output above, resolve the underlying issue, and retry with '.\platform.ps1 up'."
             }
         }
-        "3" {
-            Write-Warning "Accounts exist but none holds ADMIN. Automatic first-ADMIN bootstrap refused to act (fail-closed). Use the role-admin-cli profile after explicit authorized review (see docs/auth/admin-role-provisioning.md)."
-        }
-        default {
-            Write-Warning "First-ADMIN bootstrap did not complete cleanly (pod exit code: '$podExitCode'). The platform deployment will continue; review the output above and retry with '.\platform.ps1 up' once resolved."
-        }
     }
-
-    $generatedPassword = $null
+    finally {
+        if ($jobSubmitted -or (kubectl get job $jobName -n $Namespace --ignore-not-found -o name 2>$null)) {
+            kubectl delete job $jobName -n $Namespace --ignore-not-found | Out-Null
+        }
+        if ($secretCreated -or (kubectl get secret $secretName -n $Namespace --ignore-not-found -o name 2>$null)) {
+            kubectl delete secret $secretName -n $Namespace --ignore-not-found | Out-Null
+        }
+        $generatedPassword = $null
+    }
 }
 
 function Stop-LegacyFrontendPortForward {
@@ -1637,8 +1741,13 @@ switch ($Command) {
     }
     "restore"       {
         if (-not $Backup) { throw "Specify -Backup latest or -Backup <id>." }
+        # research-engine writes to its own "research" schema in the same
+        # database and must be scaled down/up alongside the Java services
+        # that write to it -- there is no separate special case for it.
+        $restoreDatabaseWriterServices = @($DatabaseJavaServices) + @("research-engine")
         Invoke-PlatformRestore -ProjectRoot $ProjectRoot -Namespace $Namespace -ClusterName $ClusterName `
-            -DatabaseConfig $DatabaseConfig -Backup $Backup -DatabaseJavaServices $DatabaseJavaServices `
-            -AuthorizeDestructiveRestore:$AuthorizeDestructiveRestore -SkipSafetyBackup:$SkipSafetyBackup
+            -DatabaseConfig $DatabaseConfig -Backup $Backup -DatabaseWriterServices $restoreDatabaseWriterServices `
+            -TargetDatabase $TargetDatabase -AuthorizeDestructiveRestore:$AuthorizeDestructiveRestore `
+            -SkipSafetyBackup:$SkipSafetyBackup -ConfirmSafetyBackup:$ConfirmSafetyBackup
     }
 }

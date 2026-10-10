@@ -19,6 +19,7 @@ function Invoke-PlatformBackupVerify {
 
     try {
         $manifest = Read-BackupManifest -BackupDir $backupDir
+        Assert-ValidManifest -Manifest $manifest
     }
     catch {
         Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
@@ -26,6 +27,7 @@ function Invoke-PlatformBackupVerify {
     }
 
     foreach ($db in $manifest.databases) {
+        Test-SafeIdentifier -Value $db.name -FieldName "Manifest database name"
         $filePath = Join-Path $backupDir $db.fileName
         if (-not (Test-Path $filePath)) {
             $failures.Add("Missing dump file for database '$($db.name)': $filePath")
@@ -66,9 +68,9 @@ function Invoke-PlatformBackupVerify {
         }
     }
 
-    if (-not $manifest.backupId -or -not $manifest.createdAtUtc -or -not $manifest.databases -or $manifest.databases.Count -eq 0) {
-        $failures.Add("manifest.json is missing required fields (backupId/createdAtUtc/databases)")
-    }
+    # Manifest structure/field validity is already enforced above via
+    # Assert-ValidManifest (which throws, and is caught, before reaching
+    # this point) -- no separate ad-hoc field check is needed here.
 
     Write-Host ""
     if ($failures.Count -eq 0) {

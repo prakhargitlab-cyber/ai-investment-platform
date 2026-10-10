@@ -34,6 +34,16 @@ function Invoke-PlatformBackup {
     $localDumpPath = Join-Path $tempDir $localDumpFileName
 
     try {
+        # Confirmed from the application's own configuration (not just this
+        # runtime check): infrastructure/helm/ai-investment-platform's
+        # java-services.yaml (JDBC URL) and ai-services.yaml
+        # (AIP_RESEARCH_DATABASE_NAME) both derive every service's database
+        # name from the single $.Values.database.name value ("investment"
+        # in both values.yaml and values-dev.yaml). No service is
+        # configured against a different database. This runtime check
+        # remains as a defense-in-depth safety net for any database created
+        # outside that configuration (e.g. manually, or by a future change
+        # not yet reflected here).
         Write-Step "Checking for additional PostgreSQL databases beyond '$dbName'"
         $otherDatabases = @()
         $otherDbResult = Invoke-PodExec -Namespace $Namespace -PodName $podName -Arguments @(
@@ -50,13 +60,9 @@ function Invoke-PlatformBackup {
             Write-Warning "Unable to confirm whether additional PostgreSQL databases exist beyond '$dbName' (psql exit $($otherDbResult.ExitCode)): $($otherDbResult.Output)"
         }
 
-        Write-Step "Running pg_dump inside the PostgreSQL pod (custom format)"
-        $dumpResult = Invoke-PodExec -Namespace $Namespace -PodName $podName -Arguments @(
-            "pg_dump", "-Fc", "-U", $dbUser, "-d", $dbName, "-f", $remoteDumpPath
-        )
-        if ($dumpResult.ExitCode -ne 0) {
-            throw "pg_dump failed inside the PostgreSQL pod: $($dumpResult.Output)"
-        }
+        Write-Step "Running pg_dump and capturing a synchronized per-table row-count snapshot (same PostgreSQL snapshot, so counts never drift from what pg_dump actually wrote)"
+        $tableRowCounts = Invoke-SynchronizedDumpWithRowCounts -Namespace $Namespace -PodName $podName `
+            -DatabaseUser $dbUser -DatabaseName $dbName -RemoteDumpPath $remoteDumpPath -BackupId $backupId
 
         Write-Step "Copying the dump out of the cluster (binary-safe)"
         Copy-FromPostgresPod -Namespace $Namespace -PodName $podName -RemotePath $remoteDumpPath -LocalPath $localDumpPath
@@ -83,10 +89,9 @@ function Invoke-PlatformBackup {
         $checksum = Get-FileSha256 -Path $localDumpPath
         $sizeBytes = (Get-Item $localDumpPath).Length
 
-        Write-Step "Collecting backup metadata (including per-table row counts for later restore verification)"
+        Write-Step "Collecting remaining backup metadata"
         $serverVersion = Get-PostgresServerVersion -Namespace $Namespace -PodName $podName -DatabaseUser $dbUser
         $flywayVersions = Get-FlywaySchemaVersions -Namespace $Namespace -PodName $podName -DatabaseName $dbName -DatabaseUser $dbUser
-        $tableRowCounts = Get-TableRowCounts -Namespace $Namespace -PodName $podName -DatabaseName $dbName -DatabaseUser $dbUser
         $gitCommit = Get-CurrentGitCommit -ProjectRoot $ProjectRoot
         $kubeContext = (kubectl config current-context 2>$null)
 
@@ -108,6 +113,7 @@ function Invoke-PlatformBackup {
                     sizeBytes     = $sizeBytes
                     sha256        = $checksum
                     tableRowCounts = $tableRowCounts
+                    tableRowCountsCaptureMethod = "SYNCHRONIZED_PG_EXPORT_SNAPSHOT"
                 }
             )
             verificationStatus   = "ARCHIVE_INTEGRITY_VERIFIED"

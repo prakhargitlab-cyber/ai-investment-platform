@@ -251,8 +251,19 @@ function Invoke-PlatformRestore {
         Write-Step "Verifying restored data via per-table row-count comparison (full-restore verification -- distinct from, and in addition to, the archive-integrity check performed earlier)"
         $restoredRowCounts = Get-TableRowCounts -Namespace $Namespace -PodName $podName -DatabaseName $effectiveTargetDb -DatabaseUser $dbUser
         $expectedRowCounts = $manifest.databases[0].tableRowCounts
+        $captureMethod = $manifest.databases[0].tableRowCountsCaptureMethod
+        # Only a row-count snapshot captured under the synchronized
+        # pg_export_snapshot() method (Invoke-SynchronizedDumpWithRowCounts)
+        # is trustworthy for a strict comparison -- it is guaranteed
+        # consistent with exactly what pg_dump wrote. A backup whose
+        # manifest predates that method, or whose tableRowCounts was
+        # recorded by an earlier, independently-sampled live query (not
+        # guaranteed to match the dump's snapshot), is never compared: a
+        # coincidental match there would be false confidence, not proof.
+        $rowCountsTrustworthy = ($expectedRowCounts -and $captureMethod -eq "SYNCHRONIZED_PG_EXPORT_SNAPSHOT")
         $rowCountMismatches = @()
-        if ($expectedRowCounts) {
+
+        if ($rowCountsTrustworthy) {
             foreach ($tableKey in $expectedRowCounts.PSObject.Properties.Name) {
                 $expected = [int64]$expectedRowCounts.$tableKey
                 $actual = if ($restoredRowCounts.ContainsKey($tableKey)) { [int64]$restoredRowCounts[$tableKey] } else { $null }
@@ -260,6 +271,9 @@ function Invoke-PlatformRestore {
                     $rowCountMismatches += "  $tableKey : expected $expected, got $(if ($null -eq $actual) { 'MISSING' } else { $actual })"
                 }
             }
+        }
+        elseif ($expectedRowCounts) {
+            Write-Warning "This backup's manifest has a recorded per-table row-count snapshot, but it was not captured under a synchronized PostgreSQL snapshot (capture method: '$captureMethod'). It is not guaranteed to match what pg_dump actually wrote, so it is not used for comparison. Verification status below reflects this."
         }
         else {
             Write-Warning "This backup's manifest has no recorded per-table row counts (it predates that feature); skipping row-count comparison. Verification status below reflects this."
@@ -269,12 +283,15 @@ function Invoke-PlatformRestore {
             throw "Full-restore verification failed: restored row counts do not match the backup manifest for $($rowCountMismatches.Count) table(s):`n$($rowCountMismatches -join "`n")"
         }
 
-        $fullRestoreVerified = [bool]$expectedRowCounts
+        $fullRestoreVerified = $rowCountsTrustworthy
 
         Write-Host ""
         Write-Host "Restore completed successfully into '$effectiveTargetDb'." -ForegroundColor Green
         if ($fullRestoreVerified) {
-            Write-Host "Verification        : FULL_RESTORE_VERIFIED (Flyway history present + all recorded table row counts match the backup manifest)" -ForegroundColor Green
+            Write-Host "Verification        : FULL_RESTORE_VERIFIED (Flyway history present + all synchronized-snapshot table row counts match the backup manifest)" -ForegroundColor Green
+        }
+        elseif ($expectedRowCounts) {
+            Write-Host "Verification        : FLYWAY_HISTORY_VERIFIED_ONLY (this backup's row-count snapshot was not captured under a synchronized PostgreSQL snapshot and was not compared)" -ForegroundColor Yellow
         }
         else {
             Write-Host "Verification        : FLYWAY_HISTORY_VERIFIED_ONLY (this backup's manifest predates row-count snapshots; row counts were not compared)" -ForegroundColor Yellow

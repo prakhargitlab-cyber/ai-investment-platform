@@ -165,6 +165,135 @@ where table_schema not in ('pg_catalog', 'information_schema')
     return $rowCounts
 }
 
+function Invoke-SynchronizedDumpWithRowCounts {
+    # Runs pg_dump and a full per-table row-count snapshot against the
+    # EXACT SAME PostgreSQL snapshot, so the row counts recorded in the
+    # backup manifest are guaranteed consistent with what pg_dump actually
+    # wrote into the archive -- never an independently-sampled live count
+    # taken at some other, later point in time (which could race with
+    # concurrent writes against a database that is NOT scaled down during
+    # an on-demand backup).
+    #
+    # Snapshot lifetime (fully contained in the generated script below,
+    # a single psql session/transaction, run once via one kubectl exec):
+    #   1. BEGIN ISOLATION LEVEL REPEATABLE READ opens a transaction whose
+    #      snapshot is fixed at its first query.
+    #   2. SELECT pg_export_snapshot() (that first query) fixes the
+    #      snapshot and exports its identifier for another process to use.
+    #   3. \! pg_dump --snapshot=<id> runs pg_dump as a subprocess of the
+    #      SAME psql client process, against that exact exported snapshot,
+    #      without ending the holding session/transaction. A `\!` shell
+    #      command's own exit status is not visible to psql's
+    #      ON_ERROR_STOP, so success is confirmed explicitly via a
+    #      touch-on-success flag file, checked after psql exits.
+    #   4. Still inside the SAME open transaction (same snapshot), one
+    #      SELECT per table counts its rows -- guaranteed to see exactly
+    #      what pg_dump dumped, not whatever became live afterward.
+    #   5. COMMIT releases the snapshot. The holding transaction only ever
+    #      reads, so COMMIT vs. ROLLBACK is immaterial.
+    # `\set ON_ERROR_STOP on` means any SQL failure (the snapshot export,
+    # or any single table's count) aborts the whole script immediately
+    # rather than silently continuing on to COMMIT as if it had succeeded.
+    # Every enumerated table must report a count, or this throws: no
+    # table's failed count, and no unsafe/unsupported identifier, is ever
+    # silently skipped.
+    param(
+        [Parameter(Mandatory = $true)][string]$Namespace,
+        [Parameter(Mandatory = $true)][string]$PodName,
+        [Parameter(Mandatory = $true)][string]$DatabaseUser,
+        [Parameter(Mandatory = $true)][string]$DatabaseName,
+        [Parameter(Mandatory = $true)][string]$RemoteDumpPath,
+        [Parameter(Mandatory = $true)][string]$BackupId
+    )
+
+    Test-SafeIdentifier -Value $DatabaseUser -FieldName "Database user"
+    Test-SafeIdentifier -Value $DatabaseName -FieldName "Database name"
+    Test-SafeBackupId -BackupId $BackupId
+
+    $tablesResult = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @(
+        "psql", "-U", $DatabaseUser, "-d", $DatabaseName, "-At", "-c",
+        "select table_schema, table_name from information_schema.tables where table_schema not in ('pg_catalog','information_schema') and table_type = 'BASE TABLE' order by 1, 2;"
+    )
+    if ($tablesResult.ExitCode -ne 0) {
+        throw "Unable to enumerate application tables before the synchronized backup capture: $($tablesResult.Output)"
+    }
+
+    $tableKeys = New-Object System.Collections.Generic.List[string]
+    $countSelects = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($tablesResult.Output -split "`n")) {
+        $line = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $parts = $line -split '\|'
+        if ($parts.Count -ne 2) {
+            throw "Unexpected output while enumerating application tables for the synchronized backup capture: '$line'"
+        }
+        $schema = $parts[0].Trim()
+        $table = $parts[1].Trim()
+        # Do not silently skip an unsupported/unsafe table identifier --
+        # refuse the whole backup instead, per the explicit requirement
+        # that failed table counts and unsupported identifiers are never
+        # dropped quietly.
+        Test-SafeIdentifier -Value $schema -FieldName "Table schema"
+        Test-SafeIdentifier -Value $table -FieldName "Table name"
+        $tableKeys.Add("$schema.$table")
+        $countSelects.Add("SELECT '$schema.$table|' || count(*) FROM `"$schema`".`"$table`";")
+    }
+
+    if ($tableKeys.Count -eq 0) {
+        throw "No application tables were found in database '$DatabaseName'; refusing to produce a backup with no verifiable row-count snapshot."
+    }
+
+    $okFlag = "/tmp/platform-backup-pgdump-ok-$BackupId.flag"
+    $sqlScript = @"
+\set ON_ERROR_STOP on
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_export_snapshot() AS snap
+\gset
+\! pg_dump --snapshot=':snap' -Fc -U $DatabaseUser -d $DatabaseName -f $RemoteDumpPath && touch $okFlag
+$($countSelects -join "`n")
+COMMIT;
+"@
+
+    $shScript = "psql -U $DatabaseUser -d $DatabaseName -At <<'PLATFORM_SQL_EOF'`n$sqlScript`nPLATFORM_SQL_EOF`ntest -f $okFlag"
+
+    try {
+        $result = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @("sh", "-c", $shScript)
+        if ($result.ExitCode -ne 0) {
+            throw "Synchronized backup capture (pg_dump + row-count snapshot under one PostgreSQL snapshot) failed: $($result.Output)"
+        }
+
+        $outputLines = @($result.Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $tableRowCounts = [ordered]@{}
+        foreach ($line in $outputLines) {
+            $sep = $line.LastIndexOf('|')
+            if ($sep -lt 0) {
+                throw "Unexpected row-count output line from the synchronized backup capture (missing '|'): '$line'"
+            }
+            $key = $line.Substring(0, $sep)
+            $valueText = $line.Substring($sep + 1)
+            $value = 0L
+            if (-not [long]::TryParse($valueText, [ref]$value)) {
+                throw "Unexpected row-count output line from the synchronized backup capture (non-numeric count): '$line'"
+            }
+            $tableRowCounts[$key] = $value
+        }
+
+        foreach ($key in $tableKeys) {
+            if (-not $tableRowCounts.Contains($key)) {
+                throw "The synchronized row-count capture did not report a count for table '$key'; refusing to treat this backup's row-count snapshot as complete."
+            }
+        }
+        if ($tableRowCounts.Count -ne $tableKeys.Count) {
+            throw "The synchronized row-count capture reported $($tableRowCounts.Count) table(s) but $($tableKeys.Count) were enumerated; refusing to treat this backup's row-count snapshot as complete."
+        }
+
+        return $tableRowCounts
+    }
+    finally {
+        Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @("rm", "-f", $okFlag) | Out-Null
+    }
+}
+
 function Get-PostgresServerVersion {
     param(
         [Parameter(Mandatory = $true)][string]$Namespace,

@@ -101,6 +101,7 @@ $OpportunityBootstrapMarkerFile = Join-Path $RuntimeDir "initial-opportunity-cyc
 # On-demand PostgreSQL backup/restore (Feature: manual backup/restore).
 # Modular scripts under scripts/database/; never auto-invoked.
 . (Join-Path $ProjectRoot "scripts\database\PostgresBackupCommon.psm1")
+. (Join-Path $ProjectRoot "scripts\database\RadarBootstrapEligibility.psm1")
 . (Join-Path $ProjectRoot "scripts\database\backup.ps1")
 . (Join-Path $ProjectRoot "scripts\database\list-backups.ps1")
 . (Join-Path $ProjectRoot "scripts\database\verify-backup.ps1")
@@ -1047,6 +1048,31 @@ function Remove-OldApplicationImages {
 }
 
 
+function Resolve-ResearchDatabaseSchemaName {
+    # Reads the schema name research-engine is actually configured with
+    # (AIP_RESEARCH_DATABASE_SCHEMA on the deployed Deployment) rather than
+    # assuming the chart default, so the Radar freshness check always
+    # queries the schema that is genuinely in use. Falls back to the
+    # chart's documented default ("research") if the Deployment cannot be
+    # read or the value is missing/unsafe -- this is only ever used to
+    # pick WHICH table to probe; the freshness decision itself remains
+    # fail-closed regardless of which schema name is probed.
+    param([Parameter(Mandatory = $true)][string]$Namespace)
+    $defaultSchema = "research"
+    try {
+        $schema = kubectl get deployment research-engine -n $Namespace -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="AIP_RESEARCH_DATABASE_SCHEMA")].value}' 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($schema)) {
+            $schema = $schema.Trim()
+            Test-SafeIdentifier -Value $schema -FieldName "Research database schema"
+            return $schema
+        }
+    }
+    catch {
+        Write-Warning "Unable to resolve the configured research database schema name from the research-engine Deployment ($($_.Exception.Message)); using the default '$defaultSchema'."
+    }
+    return $defaultSchema
+}
+
 function Invoke-InitialOpportunityCycleAfterCleanDeploy {
     # A clean removes this marker. Therefore only the first successful full `up`
     # after a clean explicitly requests an initial production opportunity cycle.
@@ -1057,39 +1083,93 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
         return
     }
 
-    # The local marker file alone is not a reliable signal: a restored,
+    # The local marker file alone is never a reliable signal: a restored,
     # already-populated database (or simply a marker file missing on a
     # different machine/checkout) must never cause an expensive initial
     # Radar cycle to run again against data that already has one. Before
-    # relying on the marker's absence, check the database itself for any
-    # already-completed cycle. If this check cannot be performed reliably
-    # (e.g. the schema does not exist yet on a genuinely fresh database,
-    # or the pod is not reachable), fail OPEN -- fall through to the
-    # existing universe-readiness-gated logic below exactly as if this
-    # check did not exist, rather than blocking platform startup on a
-    # diagnostic query. This does not change scheduler behavior: it only
-    # ever short-circuits the one-time initial-cycle submission below.
+    # relying on the marker's absence, positively confirm the database is
+    # genuinely fresh. This is a fail-CLOSED check: any existing Radar
+    # cycle (of any status), any existing application data (any user
+    # account), a missing table, or an unreliable/failed query all skip
+    # the automatic initial cycle -- none of them fall through to running
+    # it. A missing schema/table is never treated as proof of freshness.
+    # This never blocks ordinary platform startup: skipping the automatic
+    # initial cycle is not a failure of '.\platform.ps1 up', and existing
+    # research-engine scheduler behavior is completely unchanged either way.
+    Write-Step "Positively verifying database freshness before the automatic initial opportunity cycle"
+
+    $cycleTableProbeSucceeded = $false
+    $cycleTableExists = $false
+    $cycleRowCountProbeSucceeded = $false
+    $cycleRowCount = $null
+    $userTableProbeSucceeded = $false
+    $userTableExists = $false
+    $userRowCountProbeSucceeded = $false
+    $userRowCount = $null
+
     try {
         $radarCheckPodName = Get-PostgresPodName -Namespace $Namespace
-        $completedCycleResult = Invoke-PodExec -Namespace $Namespace -PodName $radarCheckPodName -Arguments @(
+        $researchSchema = Resolve-ResearchDatabaseSchemaName -Namespace $Namespace
+
+        # One round trip: positively confirm existence of BOTH the Radar
+        # cycle-run table and the auth user table before trusting either.
+        $existsResult = Invoke-PodExec -Namespace $Namespace -PodName $radarCheckPodName -Arguments @(
             "psql", "-U", $DatabaseConfig.Username, "-d", $DatabaseConfig.Name, "-At", "-c",
-            "select count(*) from research.global_opportunity_cycle_run where status = 'COMPLETED';"
+            "select (select exists (select 1 from information_schema.tables where table_schema = '$researchSchema' and table_name = 'global_opportunity_cycle_run'))::text || '|' || " +
+            "(select exists (select 1 from information_schema.tables where table_schema = 'auth' and table_name = 'app_users'))::text;"
         )
-        if ($completedCycleResult.ExitCode -eq 0) {
-            $completedCycleCount = 0
-            if ([int]::TryParse($completedCycleResult.Output.Trim(), [ref]$completedCycleCount) -and $completedCycleCount -gt 0) {
-                Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
-                Write-Host "Database already shows a completed opportunity cycle (for example, from a restored backup); writing the local marker and skipping the initial cycle. Future cycles remain scheduler-owned." -ForegroundColor DarkGray
-                return
+        if ($existsResult.ExitCode -eq 0) {
+            $existsParts = $existsResult.Output.Trim() -split '\|'
+            if ($existsParts.Count -eq 2) {
+                $cycleTableProbeSucceeded = $true
+                $userTableProbeSucceeded = $true
+                $cycleTableExists = ($existsParts[0].Trim() -eq "t")
+                $userTableExists = ($existsParts[1].Trim() -eq "t")
             }
         }
-        else {
-            Write-Warning "Unable to query the database for an existing completed opportunity cycle (psql exit $($completedCycleResult.ExitCode)); this is expected on a genuinely fresh database before research-engine's schema is migrated. Falling through to the universe-readiness-gated check below."
+
+        if ($cycleTableProbeSucceeded -and $userTableProbeSucceeded -and $cycleTableExists -and $userTableExists) {
+            $countResult = Invoke-PodExec -Namespace $Namespace -PodName $radarCheckPodName -Arguments @(
+                "psql", "-U", $DatabaseConfig.Username, "-d", $DatabaseConfig.Name, "-At", "-c",
+                "select (select count(*) from `"$researchSchema`".global_opportunity_cycle_run)::text || '|' || (select count(*) from `"auth`".app_users)::text;"
+            )
+            if ($countResult.ExitCode -eq 0) {
+                $countParts = $countResult.Output.Trim() -split '\|'
+                if ($countParts.Count -eq 2) {
+                    $parsedCycleCount = 0L
+                    $parsedUserCount = 0L
+                    if ([long]::TryParse($countParts[0].Trim(), [ref]$parsedCycleCount)) {
+                        $cycleRowCountProbeSucceeded = $true
+                        $cycleRowCount = $parsedCycleCount
+                    }
+                    if ([long]::TryParse($countParts[1].Trim(), [ref]$parsedUserCount)) {
+                        $userRowCountProbeSucceeded = $true
+                        $userRowCount = $parsedUserCount
+                    }
+                }
+            }
         }
     }
     catch {
-        Write-Warning "Unable to check the database for an existing completed opportunity cycle ($($_.Exception.Message)); falling through to the universe-readiness-gated check below."
+        Write-Warning "Unable to check database state for initial opportunity cycle eligibility: $($_.Exception.Message)"
     }
+
+    $eligibility = Resolve-OpportunityRadarBootstrapEligibility `
+        -CycleTableProbeSucceeded $cycleTableProbeSucceeded -CycleTableExists $cycleTableExists `
+        -CycleRowCountProbeSucceeded $cycleRowCountProbeSucceeded -CycleRowCount $cycleRowCount `
+        -UserTableProbeSucceeded $userTableProbeSucceeded -UserTableExists $userTableExists `
+        -UserRowCountProbeSucceeded $userRowCountProbeSucceeded -UserRowCount $userRowCount
+
+    if (-not $eligibility.Eligible) {
+        Write-Host "Initial opportunity cycle skipped ($($eligibility.Decision)): $($eligibility.Reason)" -ForegroundColor Yellow
+        Write-Host "Ordinary platform startup continues; the research-engine scheduler's own behavior is unaffected." -ForegroundColor DarkGray
+        if ($eligibility.WriteMarker) {
+            Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
+        }
+        return
+    }
+
+    Write-Host "Database positively confirmed genuinely fresh (no existing Radar cycle, no existing user account); proceeding to the universe-readiness-gated initial cycle." -ForegroundColor Green
 
     # Kubernetes readiness is not sufficient here. portfolio-service can be Ready
     # while CanonicalIdentityBootstrap is still populating the active NSE equity

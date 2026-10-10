@@ -56,6 +56,9 @@ function Invoke-PlatformRestore {
     $dbUser = $DatabaseConfig.Username
     $effectiveTargetDb = if ($TargetDatabase) { $TargetDatabase } else { $DatabaseConfig.Name }
     Test-SafeIdentifier -Value $effectiveTargetDb -FieldName "Target database"
+    if ($effectiveTargetDb -in @('postgres','template0','template1')) {
+        throw "Refusing application restore into reserved database '$effectiveTargetDb'; restore/provisioning control state must remain outside application restores."
+    }
     Test-SafeIdentifier -Value $dbUser -FieldName "Database user"
 
     # Maintenance mode (scaling application writers to 0) only ever
@@ -127,12 +130,16 @@ function Invoke-PlatformRestore {
         throw "Target database '$effectiveTargetDb' already contains application schema objects (reliably detected; this applies regardless of the database's name). Refusing to overwrite without -AuthorizeDestructiveRestore."
     }
 
+    $maintenanceStateFile = Join-Path (Join-Path $ProjectRoot ".tmp") "restore-maintenance-state.json"
+    if ($isProductionTarget -and (Test-Path $maintenanceStateFile)) {
+        throw "Existing maintenance state at '$maintenanceStateFile'. Recover explicitly before another configured-target restore; saved replica counts must not be overwritten."
+    }
+
     if (-not (Read-Host "Type RESTORE to confirm overwriting '$effectiveTargetDb' in namespace '$Namespace' with backup '$backupId'").Equals("RESTORE")) {
         Write-Host "Restore cancelled; no changes were made." -ForegroundColor Yellow
         return
     }
 
-    $maintenanceStateFile = Join-Path (Join-Path $ProjectRoot ".tmp") "restore-maintenance-state.json"
     $originalReplicas = @{}
     $maintenanceModeEntered = $false
 
@@ -142,8 +149,7 @@ function Invoke-PlatformRestore {
             foreach ($service in $DatabaseWriterServices) {
                 $replicas = kubectl get deployment $service -n $Namespace -o jsonpath='{.spec.replicas}' 2>$null
                 if ($LASTEXITCODE -ne 0 -or -not $replicas) {
-                    Write-Warning "Deployment '$service' not found or has no replica count; assuming it is not running and skipping it."
-                    continue
+                    throw "Unable to reliably read writer replicas for deployment '$service'; refusing restore."
                 }
                 $originalReplicas[$service] = [int]$replicas
             }
@@ -159,7 +165,7 @@ function Invoke-PlatformRestore {
                 }
             }
             foreach ($service in $originalReplicas.Keys) {
-                kubectl wait --for=delete pod -l "app=$service" -n $Namespace --timeout=120s 2>$null | Out-Null
+                kubectl wait --for=delete pod -l "app.kubernetes.io/component=$service" -n $Namespace --timeout=120s 2>$null | Out-Null
                 if ($LASTEXITCODE -ne 0) {
                     throw "Timed out waiting for all pod(s) of service '$service' to terminate after scaling to 0 replicas. Database-writing pods may still be running; refusing to proceed with a destructive restore."
                 }
@@ -169,7 +175,7 @@ function Invoke-PlatformRestore {
             # code: confirm no non-terminated pod for any of these
             # services remains, rather than trusting a single signal.
             foreach ($service in $originalReplicas.Keys) {
-                $remaining = kubectl get pod -n $Namespace -l "app=$service" -o jsonpath='{.items[?(@.status.phase!="Succeeded" && @.status.phase!="Failed")].metadata.name}' 2>$null
+                $remaining = kubectl get pod -n $Namespace -l "app.kubernetes.io/component=$service" --field-selector "status.phase!=Succeeded,status.phase!=Failed" -o jsonpath='{.items[*].metadata.name}' 2>$null
                 if ($LASTEXITCODE -ne 0) {
                     throw "Unable to reliably confirm that service '$service' has no running pods (kubectl exit $LASTEXITCODE). Refusing to proceed with a destructive restore."
                 }
@@ -222,9 +228,8 @@ function Invoke-PlatformRestore {
         Write-Step "Restoring '$($manifest.databases[0].fileName)' into '$effectiveTargetDb'"
         $dumpFile = Join-Path $backupDir $manifest.databases[0].fileName
         $remoteRestorePath = "/tmp/platform-restore-$backupId.dump"
-        Copy-ToPostgresPod -Namespace $Namespace -PodName $podName -LocalPath $dumpFile -RemotePath $remoteRestorePath
-
         try {
+            Copy-ToPostgresPod -Namespace $Namespace -PodName $podName -LocalPath $dumpFile -RemotePath $remoteRestorePath
             # --clean --if-exists drops existing objects before recreating
             # them; --no-owner --no-privileges prevents blindly copying
             # source-cluster role/ownership/privilege assignments onto the
@@ -249,6 +254,12 @@ function Invoke-PlatformRestore {
         $restoredVersions = Get-FlywaySchemaVersions -Namespace $Namespace -PodName $podName -DatabaseName $effectiveTargetDb -DatabaseUser $dbUser
         if ($restoredVersions.Count -eq 0) {
             throw "Restore completed but no Flyway schema history could be read back from '$effectiveTargetDb'. Treating this as a failed restore."
+        }
+
+        foreach ($schema in $manifest.flywaySchemaVersions.PSObject.Properties.Name) {
+            if (-not $restoredVersions.Contains($schema) -or $restoredVersions[$schema] -ne $manifest.flywaySchemaVersions.$schema) {
+                throw "Restored Flyway version mismatch or missing history for schema '$schema'."
+            }
         }
 
         Write-Step "Verifying restored data via per-table row-count comparison (full-restore verification -- distinct from, and in addition to, the archive-integrity check performed earlier)"
@@ -326,9 +337,9 @@ function Invoke-PlatformRestore {
             Write-Host "============================================================" -ForegroundColor Red
             Write-Host " RESTORE FAILED -- SYSTEM LEFT IN A DOCUMENTED MAINTENANCE STATE" -ForegroundColor Red
             Write-Host "============================================================" -ForegroundColor Red
-            Write-Host "Database-connected service(s) ($($originalReplicas.Keys -join ', ')) were scaled to 0 replicas" -ForegroundColor Red
-            Write-Host "and were NOT automatically resumed, because this restore failed or only partially" -ForegroundColor Red
-            Write-Host "completed. Resuming writers against a possibly inconsistent database could cause" -ForegroundColor Red
+            Write-Host "Shutdown was requested for database-connected service(s) ($($originalReplicas.Keys -join ', '))." -ForegroundColor Red
+            Write-Host "Some may still be running if shutdown failed. None were automatically resumed; restore" -ForegroundColor Red
+            Write-Host "failed or only partially completed. Resuming writers against inconsistent data could cause" -ForegroundColor Red
             Write-Host "further damage." -ForegroundColor Red
             Write-Host ""
             Write-Host "Maintenance state recorded at: $maintenanceStateFile"

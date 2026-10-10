@@ -163,3 +163,23 @@ Describe 'Durable provisioning marker claim' {
         }
     }
 }
+
+Describe 'Durable restore record for automatic ADMIN denial' {
+    It 'allows the first-install path when no restore ledger exists' {
+        Mock Invoke-PodExec -ModuleName PostgresBackupCommon { [pscustomobject]@{ExitCode=0; Output='f'} }
+        Test-DatabaseRestoreRecorded -Namespace isolated -PodName fixture -DatabaseUser tester -DatabaseName fixture | Should -BeFalse
+    }
+    It 'detects a restored database' {
+        Mock Invoke-PodExec -ModuleName PostgresBackupCommon { [pscustomobject]@{ExitCode=0; Output='t'} }
+        Test-DatabaseRestoreRecorded -Namespace isolated -PodName fixture -DatabaseUser tester -DatabaseName fixture | Should -BeTrue
+        Should -Invoke Invoke-PodExec -ModuleName PostgresBackupCommon -Times 2 -Exactly
+    }
+    It 'fails closed on a query error' {
+        Mock Invoke-PodExec -ModuleName PostgresBackupCommon { [pscustomobject]@{ExitCode=1; Output=''} }
+        { Test-DatabaseRestoreRecorded -Namespace isolated -PodName fixture -DatabaseUser tester -DatabaseName fixture } | Should -Throw '*automatic bootstrap denied*'
+    }
+    It 'fails closed on malformed output' {
+        Mock Invoke-PodExec -ModuleName PostgresBackupCommon { [pscustomobject]@{ExitCode=0; Output='unknown'} }
+        { Test-DatabaseRestoreRecorded -Namespace isolated -PodName fixture -DatabaseUser tester -DatabaseName fixture } | Should -Throw '*automatic bootstrap denied*'
+    }
+}

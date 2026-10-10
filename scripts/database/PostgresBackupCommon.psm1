@@ -256,7 +256,7 @@ function Get-PostgresServerVersion {
         [Parameter(Mandatory = $true)][string]$DatabaseUser
     )
     $result = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @(
-        "psql", "-U", $DatabaseUser, "-At", "-c", "show server_version;"
+        "psql", "-U", $DatabaseUser, "-d", "postgres", "-At", "-c", "show server_version;"
     )
     if ($result.ExitCode -ne 0) {
         throw "Unable to read PostgreSQL server version: $($result.Output)"
@@ -424,7 +424,13 @@ function Assert-ValidManifest {
     if (-not $Manifest.createdAtUtc) { throw "manifest.createdAtUtc is missing." }
     try { [datetime]$Manifest.createdAtUtc | Out-Null } catch { throw "manifest.createdAtUtc ('$($Manifest.createdAtUtc)') is not a valid timestamp." }
     if (-not $Manifest.databases -or @($Manifest.databases).Count -eq 0) { throw "manifest.databases is empty." }
+    if (-not $Manifest.postgresServerVersion) { throw 'manifest.postgresServerVersion is missing.' }
+    if ($null -eq $Manifest.flywaySchemaVersions) { throw 'manifest.flywaySchemaVersions is missing.' }
+    if (@($Manifest.databases).Count -ne 1) { throw 'Exactly one database per backup is supported.' }
     foreach ($db in @($Manifest.databases)) {
+        if ($db.tableRowCountsCaptureMethod -eq 'SYNCHRONIZED_PG_EXPORT_SNAPSHOT' -and -not (Resolve-RowCountsTrustworthy -ManifestDatabase $db)) {
+            throw 'Synchronized manifest has missing or invalid tableRowCounts.'
+        }
         if (-not $db.name) { throw "A database entry in the manifest is missing 'name'." }
         if (-not $db.fileName) { throw "Database '$($db.name)': manifest entry is missing 'fileName'." }
         if ($null -eq $db.sizeBytes -or [int64]$db.sizeBytes -le 0) { throw "Database '$($db.name)': manifest 'sizeBytes' is missing or not positive." }
@@ -439,6 +445,7 @@ function Resolve-RowCountsTrustworthy {
     param([Parameter(Mandatory = $true)]$ManifestDatabase)
     if ($ManifestDatabase.tableRowCountsCaptureMethod -ne 'SYNCHRONIZED_PG_EXPORT_SNAPSHOT') { return $false }
     $counts = $ManifestDatabase.tableRowCounts
+    if ($counts -is [System.Collections.IDictionary]) { $counts = [pscustomobject]$counts }
     if ($null -eq $counts) { return $false }
     $properties = @($counts.PSObject.Properties | Where-Object MemberType -eq NoteProperty)
     if ($properties.Count -eq 0) { return $false }
@@ -461,10 +468,25 @@ function Use-FreshProvisioningMarker {
 function Revoke-FreshProvisioningMarker {
     param([string]$Namespace, [string]$PodName, [string]$DatabaseUser, [string]$DatabaseName)
     Test-SafeIdentifier $DatabaseName 'Database name'
-    # Old installations have no marker. Errors must still stop a restore.
-    $sql = "DO " + '$body$' + " BEGIN IF to_regclass('platform_bootstrap.provisioning') IS NOT NULL THEN UPDATE platform_bootstrap.provisioning SET consumed_at = clock_timestamp() WHERE database_name = '$DatabaseName'; END IF; END " + '$body$' + ';'
+    # The negative restore record is outside application dumps and also covers
+    # old installations that never had a fresh-provisioning marker.
+    # Record intent before pg_restore: partial failures must block bootstrap too.
+    $sql = "CREATE SCHEMA IF NOT EXISTS platform_restore; CREATE TABLE IF NOT EXISTS platform_restore.databases (database_name text PRIMARY KEY, restored_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO platform_restore.databases(database_name) VALUES ('$DatabaseName') ON CONFLICT (database_name) DO UPDATE SET restored_at=clock_timestamp(); DO " + '$body$' + " BEGIN IF to_regclass('platform_bootstrap.provisioning') IS NOT NULL THEN UPDATE platform_bootstrap.provisioning SET consumed_at = clock_timestamp() WHERE database_name = '$DatabaseName'; END IF; END " + '$body$' + ';'
     $result = Invoke-PodExec -Namespace $Namespace -PodName $PodName -Arguments @('psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', $DatabaseUser, '-d', 'postgres', '-c', $sql)
     if ($result.ExitCode -ne 0) { throw 'Unable to revoke provisioning marker before restore' }
 }
 
-Export-ModuleMember -Function Get-PostgresPodName, Invoke-PodExec, Copy-FromPostgresPod, Copy-ToPostgresPod, Get-FileSha256, Get-FlywaySchemaVersions, Get-TableRowCounts, Invoke-SynchronizedDumpWithRowCounts, Get-PostgresServerVersion, Get-CurrentGitCommit, New-BackupId, Get-BackupsRoot, Read-BackupManifest, Resolve-BackupDirectory, Test-SafeBackupId, Test-SafeIdentifier, Get-DatabaseExistence, Assert-ValidManifest, Resolve-RowCountsTrustworthy, Use-FreshProvisioningMarker, Revoke-FreshProvisioningMarker, New-SynchronizedSnapshotScript
+function Test-DatabaseRestoreRecorded {
+    param([string]$Namespace, [string]$PodName, [string]$DatabaseUser, [string]$DatabaseName)
+    Test-SafeIdentifier $DatabaseName 'Database name'
+    $connection = @{Namespace=$Namespace; PodName=$PodName}
+    $base = @('psql','-X','-qAt','-v','ON_ERROR_STOP=1','-U',$DatabaseUser,'-d','postgres','-c')
+    $exists = Invoke-PodExec @connection -Arguments ($base + "select to_regclass('platform_restore.databases') is not null;")
+    if ($exists.ExitCode -ne 0 -or $exists.Output.Trim() -notin @('t','f')) { throw 'Unable to read durable restore state; automatic bootstrap denied.' }
+    if ($exists.Output.Trim() -eq 'f') { return $false }
+    $result = Invoke-PodExec @connection -Arguments ($base + "select exists(select 1 from platform_restore.databases where database_name='$DatabaseName');")
+    if ($result.ExitCode -ne 0 -or $result.Output.Trim() -notin @('t','f')) { throw 'Unable to read durable restore state; automatic bootstrap denied.' }
+    return ($result.Output.Trim() -eq 't')
+}
+
+Export-ModuleMember -Function Test-DatabaseRestoreRecorded, Get-PostgresPodName, Invoke-PodExec, Copy-FromPostgresPod, Copy-ToPostgresPod, Get-FileSha256, Get-FlywaySchemaVersions, Get-TableRowCounts, Invoke-SynchronizedDumpWithRowCounts, Get-PostgresServerVersion, Get-CurrentGitCommit, New-BackupId, Get-BackupsRoot, Read-BackupManifest, Resolve-BackupDirectory, Test-SafeBackupId, Test-SafeIdentifier, Get-DatabaseExistence, Assert-ValidManifest, Resolve-RowCountsTrustworthy, Use-FreshProvisioningMarker, Revoke-FreshProvisioningMarker, New-SynchronizedSnapshotScript

@@ -1116,8 +1116,8 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
         # cycle-run table and the auth user table before trusting either.
         $existsResult = Invoke-PodExec -Namespace $Namespace -PodName $radarCheckPodName -Arguments @(
             "psql", "-U", $DatabaseConfig.Username, "-d", $DatabaseConfig.Name, "-At", "-c",
-            "select (select exists (select 1 from information_schema.tables where table_schema = '$researchSchema' and table_name = 'global_opportunity_cycle_run'))::text || '|' || " +
-            "(select exists (select 1 from information_schema.tables where table_schema = 'auth' and table_name = 'app_users'))::text;"
+            ("select (select exists (select 1 from information_schema.tables where table_schema = '$researchSchema' and table_name = 'global_opportunity_cycle_run'))::text || '|' || " +
+            "(select exists (select 1 from information_schema.tables where table_schema = 'auth' and table_name = 'app_users'))::text;")
         )
         if ($existsResult.ExitCode -eq 0) {
             $existsParts = $existsResult.Output.Trim() -split '\|'
@@ -1338,6 +1338,11 @@ except Exception as exc:
 
 function Invoke-FirstAdminBootstrapIfNeeded {
     $script:FirstAdminCreatedThisStartup = $false
+    $bootstrapPod = Get-PostgresPodName -Namespace $Namespace
+    if (Test-DatabaseRestoreRecorded -Namespace $Namespace -PodName $bootstrapPod -DatabaseUser $DatabaseConfig.Username -DatabaseName $DatabaseConfig.Name) {
+        Write-Host "Automatic first-ADMIN bootstrap skipped: this database has a durable restore record." -ForegroundColor Yellow
+        return
+    }
     # Feature: automatic first-ADMIN initialization.
     #
     # Safe to call on every `up`: the decision (create vs. skip vs. fail

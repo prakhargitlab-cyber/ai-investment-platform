@@ -50,6 +50,14 @@ function Invoke-PlatformBackupVerify {
         $failures.Add("checksums.sha256 file is missing")
     }
 
+    if (Test-Path $checksumsFile) {
+        $expectedChecksums = @($manifest.databases | ForEach-Object { "$($_.sha256)  $($_.fileName)" })
+        $actualChecksums = @(Get-Content $checksumsFile | Where-Object { $_.Trim() })
+        if ($expectedChecksums.Count -ne $actualChecksums.Count -or @(Compare-Object $expectedChecksums $actualChecksums).Count -gt 0) {
+            $failures.Add('checksums.sha256 does not match the manifest')
+        }
+    }
+
     if ($failures.Count -eq 0) {
         $podName = Get-PostgresPodName -Namespace $Namespace
         foreach ($db in $manifest.databases) {

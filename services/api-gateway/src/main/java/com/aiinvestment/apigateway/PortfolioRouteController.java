@@ -133,7 +133,7 @@ public class PortfolioRouteController {
         return forward(request, companyServiceBaseUrl, true);
     }
 
-    @RequestMapping({"/api/v1/research/**", "/api/v1/research"})
+    @RequestMapping({"/api/v1/research/**", "/api/v1/research", "/api/v1/etf-radar", "/api/v1/etf-radar/**"})
     public ResponseEntity<byte[]> routeResearch(HttpServletRequest request) throws IOException {
         // Root cause (runtime defect closure): this route used to call the
         // String-based forward(), which reads the raw request body via

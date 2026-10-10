@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet("up", "deploy", "down", "clean", "status", "url", "components")]
+    [ValidateSet("up", "deploy", "down", "clean", "status", "url", "components", "backup", "backups", "backup-verify", "restore")]
     [string]$Command = "up",
 
     # For `deploy`, choose individual components. Example:
@@ -15,7 +15,15 @@
     [switch]$KeepOldImages,
     [switch]$ForceClean,
     [switch]$NoBrowser,
-    [switch]$EnableIbkr
+    [switch]$EnableIbkr,
+
+    # First-ADMIN bootstrap (Feature: automatic first-ADMIN initialization).
+    [string]$FirstAdminEmail,
+
+    # On-demand PostgreSQL backup/restore (Feature: manual backup/restore).
+    [string]$Backup,
+    [switch]$AuthorizeDestructiveRestore,
+    [switch]$SkipSafetyBackup
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +44,11 @@ $ProgressPreference = "SilentlyContinue"
 #   .\platform.ps1 url
 #   .\platform.ps1 down
 #   .\platform.ps1 clean
+#   .\platform.ps1 backup
+#   .\platform.ps1 backups
+#   .\platform.ps1 backup-verify -Backup latest
+#   .\platform.ps1 restore -Backup latest
+#   .\platform.ps1 restore -Backup 2026-10-10_153000_ab12cd -AuthorizeDestructiveRestore
 #
 # LOCAL behavior:
 # - Creates/starts the k3d cluster.
@@ -57,6 +70,12 @@ $ProgressPreference = "SilentlyContinue"
 # - "clean" is intentionally destructive: it deletes the local k3d cluster,
 #   its Kubernetes/Helm/PVC runtime state, and all host Docker application image
 #   tags for this platform. Use -ForceClean to skip the confirmation prompt.
+# - A genuinely fresh "up" automatically provisions the first ADMIN account
+#   (see Invoke-FirstAdminBootstrapIfNeeded); it is a no-op whenever an ADMIN
+#   already exists, and fails closed (with a clear warning) if accounts exist
+#   but none holds ADMIN, rather than silently creating a second one.
+# - "backup"/"backups"/"backup-verify"/"restore" are manual, on-demand only.
+#   Nothing in this script schedules or auto-triggers a backup or a restore.
 # -----------------------------------------------------------------------------
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -75,6 +94,19 @@ $ApplicationUrlFile = Join-Path $RuntimeDir "application-url.txt"
 $ImageTagFile = Join-Path $RuntimeDir "last-image-tag.txt"
 $LegacyPortForwardPidFile = Join-Path $RuntimeDir "frontend-port-forward.pid"
 $OpportunityBootstrapMarkerFile = Join-Path $RuntimeDir "initial-opportunity-cycle-triggered.txt"
+
+# On-demand PostgreSQL backup/restore (Feature: manual backup/restore).
+# Modular scripts under scripts/database/; never auto-invoked.
+. (Join-Path $ProjectRoot "scripts\database\PostgresBackupCommon.psm1")
+. (Join-Path $ProjectRoot "scripts\database\backup.ps1")
+. (Join-Path $ProjectRoot "scripts\database\list-backups.ps1")
+. (Join-Path $ProjectRoot "scripts\database\verify-backup.ps1")
+. (Join-Path $ProjectRoot "scripts\database\restore.ps1")
+
+$DatabaseConfig = @{
+    Name     = "investment"
+    Username = "investment"
+}
 
 $JavaServices = @(
     "api-gateway",
@@ -1144,6 +1176,135 @@ except Exception as exc:
     throw "Unable to submit the initial opportunity cycle after canonical universe readiness. The bootstrap marker was not written, so a later full 'up' can retry safely."
 }
 
+function Invoke-FirstAdminBootstrapIfNeeded {
+    # Feature: automatic first-ADMIN initialization.
+    #
+    # Safe to call on every `up`: the decision (create vs. skip vs. fail
+    # closed) is made inside one locked transaction in the auth-service
+    # "first-admin-bootstrap" Spring profile (FirstAdminBootstrapService),
+    # using the same auth.role_admin_lock row RoleAdminService already uses.
+    # This function only has to (a) run that profile once as a disposable
+    # Job cloned from the already-deployed auth-service container spec, so
+    # it inherits the exact running image and database/JWT configuration
+    # without this script re-deriving or guessing any of it, and (b) supply
+    # a freshly generated password through a short-lived Secret, never as a
+    # literal value or command-line argument.
+    Write-Step "Checking for first-ADMIN bootstrap"
+
+    $deploymentJsonRaw = kubectl get deployment auth-service -n $Namespace --ignore-not-found -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($deploymentJsonRaw | Out-String).Trim())) {
+        Write-Warning "auth-service Deployment not found; skipping first-ADMIN bootstrap."
+        return
+    }
+
+    $deployment = $deploymentJsonRaw | ConvertFrom-Json
+    $container = @($deployment.spec.template.spec.containers | Where-Object { $_.name -eq "auth-service" })[0]
+    if (-not $container) {
+        Write-Warning "auth-service container not found in the Deployment spec; skipping first-ADMIN bootstrap."
+        return
+    }
+
+    $email = if ($FirstAdminEmail) { $FirstAdminEmail }
+             elseif ($env:AIP_FIRST_ADMIN_EMAIL) { $env:AIP_FIRST_ADMIN_EMAIL }
+             else { "prakhar.gitlab@gmail.com" }
+
+    # Generated locally, kept only in memory, never written to a persistent
+    # file and never embedded as a literal in the submitted Job manifest.
+    $passwordBytes = New-Object byte[] 24
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($passwordBytes)
+    $generatedPassword = ([Convert]::ToBase64String($passwordBytes) -replace '[+/=]', '9') + "Aa1!"
+
+    $secretName = "first-admin-bootstrap-credentials"
+    $jobName = "first-admin-bootstrap"
+
+    New-OrReplaceLiteralSecret $secretName @{
+        FIRST_ADMIN_BOOTSTRAP_EMAIL    = $email
+        FIRST_ADMIN_BOOTSTRAP_PASSWORD = $generatedPassword
+    }
+
+    kubectl delete job $jobName -n $Namespace --ignore-not-found | Out-Null
+
+    $jobEnv = @($container.env | Where-Object { $_.name -notin @("FIRST_ADMIN_BOOTSTRAP_EMAIL", "FIRST_ADMIN_BOOTSTRAP_PASSWORD") })
+    $jobEnv += [ordered]@{ name = "FIRST_ADMIN_BOOTSTRAP_EMAIL"; valueFrom = @{ secretKeyRef = @{ name = $secretName; key = "FIRST_ADMIN_BOOTSTRAP_EMAIL" } } }
+    $jobEnv += [ordered]@{ name = "FIRST_ADMIN_BOOTSTRAP_PASSWORD"; valueFrom = @{ secretKeyRef = @{ name = $secretName; key = "FIRST_ADMIN_BOOTSTRAP_PASSWORD" } } }
+
+    $job = [ordered]@{
+        apiVersion = "batch/v1"
+        kind       = "Job"
+        metadata   = @{ name = $jobName; namespace = $Namespace }
+        spec       = @{
+            backoffLimit            = 0
+            ttlSecondsAfterFinished = 300
+            activeDeadlineSeconds   = 120
+            template                = @{
+                spec = @{
+                    restartPolicy = "Never"
+                    containers    = @(
+                        @{
+                            name            = "first-admin-bootstrap"
+                            image           = $container.image
+                            imagePullPolicy = $container.imagePullPolicy
+                            command         = @("/bin/sh", "-c")
+                            args            = @("exec java -jar /app/app.jar --spring.profiles.active=first-admin-bootstrap --spring.main.web-application-type=none")
+                            env             = $jobEnv
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    $jobFile = Join-Path $RuntimeDir "first-admin-bootstrap-job.json"
+    try {
+        $job | ConvertTo-Json -Depth 20 | Set-Content -Path $jobFile -Encoding UTF8
+        kubectl apply -f $jobFile | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "Unable to submit the first-ADMIN bootstrap Job." }
+    }
+    finally {
+        Remove-Item $jobFile -Force -ErrorAction SilentlyContinue
+    }
+
+    kubectl wait --for=condition=complete --timeout=90s "job/$jobName" -n $Namespace 2>$null | Out-Null
+
+    $podName = (kubectl get pods -n $Namespace -l "job-name=$jobName" -o jsonpath='{.items[0].metadata.name}' 2>$null)
+    $logs = $null
+    $podExitCode = $null
+    if (-not [string]::IsNullOrWhiteSpace($podName)) {
+        $logs = kubectl logs $podName -n $Namespace 2>$null
+        $podExitCode = kubectl get pod $podName -n $Namespace -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>$null
+    }
+
+    kubectl delete job $jobName -n $Namespace --ignore-not-found | Out-Null
+    kubectl delete secret $secretName -n $Namespace --ignore-not-found | Out-Null
+
+    switch ($podExitCode) {
+        "0" {
+            if ($logs -match "first_admin_bootstrap_outcome=CREATED") {
+                Write-Host ""
+                Write-Host "============================================================" -ForegroundColor Yellow
+                Write-Host " FIRST ADMIN ACCOUNT CREATED - SAVE THIS PASSWORD NOW" -ForegroundColor Yellow
+                Write-Host "============================================================" -ForegroundColor Yellow
+                Write-Host " Email    : $email"
+                Write-Host " Password : $generatedPassword"
+                Write-Host " This password will not be shown again. Only its hash is stored." -ForegroundColor Yellow
+                Write-Host "============================================================" -ForegroundColor Yellow
+                Write-Host ""
+            }
+            else {
+                Write-Host "An ADMIN account already exists; first-ADMIN bootstrap made no changes." -ForegroundColor DarkGray
+            }
+        }
+        "3" {
+            Write-Warning "Accounts exist but none holds ADMIN. Automatic first-ADMIN bootstrap refused to act (fail-closed). Use the role-admin-cli profile after explicit authorized review (see docs/auth/admin-role-provisioning.md)."
+        }
+        default {
+            Write-Warning "First-ADMIN bootstrap did not complete cleanly (pod exit code: '$podExitCode'). The platform deployment will continue; review the output above and retry with '.\platform.ps1 up' once resolved."
+        }
+    }
+
+    $generatedPassword = $null
+}
+
 function Stop-LegacyFrontendPortForward {
     # Cleanup only. New platform runs never create a direct frontend port-forward
     # because it bypasses the API Gateway and breaks same-origin /api requests.
@@ -1245,6 +1406,7 @@ function Start-Platform {
     Apply-LocalRuntimeNormalization
     Wait-ForDeployments -AllEnabled
     Assert-ImmutableDeploymentImages -Names $selected
+    Invoke-FirstAdminBootstrapIfNeeded
     Invoke-InitialOpportunityCycleAfterCleanDeploy
 
     $url = Resolve-ApplicationUrl
@@ -1455,11 +1617,28 @@ function Clean-Platform {
 }
 
 switch ($Command) {
-    "up"         { Start-Platform }
-    "deploy"     { Deploy-SelectedComponents }
-    "components" { Show-Components }
-    "down"       { Stop-Platform }
-    "clean"      { Clean-Platform }
-    "status"     { Show-Status }
-    "url"        { Show-ApplicationUrl | Out-Null }
+    "up"            { Start-Platform }
+    "deploy"        { Deploy-SelectedComponents }
+    "components"    { Show-Components }
+    "down"          { Stop-Platform }
+    "clean"         { Clean-Platform }
+    "status"        { Show-Status }
+    "url"           { Show-ApplicationUrl | Out-Null }
+    "backup"        {
+        Invoke-PlatformBackup -ProjectRoot $ProjectRoot -Namespace $Namespace -ClusterName $ClusterName -DatabaseConfig $DatabaseConfig | Out-Null
+    }
+    "backups"       {
+        Get-PlatformBackups -ProjectRoot $ProjectRoot
+    }
+    "backup-verify" {
+        if (-not $Backup) { throw "Specify -Backup latest or -Backup <id>." }
+        $ok = Invoke-PlatformBackupVerify -ProjectRoot $ProjectRoot -Namespace $Namespace -Backup $Backup
+        if (-not $ok) { exit 1 }
+    }
+    "restore"       {
+        if (-not $Backup) { throw "Specify -Backup latest or -Backup <id>." }
+        Invoke-PlatformRestore -ProjectRoot $ProjectRoot -Namespace $Namespace -ClusterName $ClusterName `
+            -DatabaseConfig $DatabaseConfig -Backup $Backup -DatabaseJavaServices $DatabaseJavaServices `
+            -AuthorizeDestructiveRestore:$AuthorizeDestructiveRestore -SkipSafetyBackup:$SkipSafetyBackup
+    }
 }

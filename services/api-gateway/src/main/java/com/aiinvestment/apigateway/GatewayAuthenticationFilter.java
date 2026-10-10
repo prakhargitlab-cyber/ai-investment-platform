@@ -44,6 +44,10 @@ public class GatewayAuthenticationFilter extends OncePerRequestFilter {
         }
         try {
             JwtClaims claims = new HmacJwtService(properties.jwtSecret()).verify(authorization.substring("Bearer ".length()), properties.issuer());
+            if (isAdminPath(request) && !claims.roles().contains("ADMIN")) {
+                response.sendError(HttpServletResponse.SC_FORBIDDEN, "Administrator access required");
+                return;
+            }
             UUID userId = localOrExternalUserId(claims);
             request.setAttribute(ATTR_USER_ID, userId.toString());
             request.setAttribute(ATTR_ISSUER, claims.issuer());
@@ -70,9 +74,15 @@ public class GatewayAuthenticationFilter extends OncePerRequestFilter {
             return false;
         }
         String path = request.getRequestURI();
+        if (isAdminPath(request)) return true;
         return path.startsWith("/api/")
                 && !path.startsWith("/api/v1/auth/")
                 && !path.startsWith("/api/auth-service/");
+    }
+
+    private boolean isAdminPath(HttpServletRequest request) {
+        String path = request.getRequestURI();
+        return path.equals("/api/v1/auth/admin") || path.startsWith("/api/v1/auth/admin/");
     }
 
     public static boolean isInternalIdentityHeader(String name) {

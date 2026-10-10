@@ -62,3 +62,19 @@ spring:
       on-profile: "LOCAL | DEV"
 auth:
   dev-login-enabled: ${AUTH_DEV_LOGIN_ENABLED:true}
+---
+spring:
+  config:
+    activate:
+      on-profile: "role-admin-cli"
+  main:
+    web-application-type: none
+    banner-mode: off
+  flyway:
+    enabled: false
+role-admin:
+  action: ${ROLE_ADMIN_ACTION:}
+  email: ${ROLE_ADMIN_EMAIL:}
+  role: ${ROLE_ADMIN_ROLE:ADMIN}
+  operator: ${ROLE_ADMIN_OPERATOR:}
+  reason: ${ROLE_ADMIN_REASON:}

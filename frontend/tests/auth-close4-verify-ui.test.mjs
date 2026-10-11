@@ -7,7 +7,7 @@ const workspace = readFileSync(new URL("../app/components/investment-workspace.t
 const resetPage = readFileSync(new URL("../app/reset-password/page.tsx", import.meta.url), "utf8");
 
 test("verification success is an exclusive public confirmation with a scheduled sign-in redirect", () => {
-  const success = verifyPage.match(/if \(state === "SUCCESS"\)[\s\S]*?\n  }\n\n  if \(state === "INVALID"\)/)?.[0] ?? "";
+  const success = verifyPage.match(/if \(state === "SUCCESS"\)[\s\S]*?\r?\n  }\r?\n\r?\n  if \(state === "INVALID"\)/)?.[0] ?? "";
   assert.match(success, /Email verified successfully\./);
   assert.match(success, /Redirecting you to sign in\.\.\./);
   assert.match(success, /Sign in now/);
@@ -16,7 +16,7 @@ test("verification success is an exclusive public confirmation with a scheduled 
 });
 
 test("invalid verification links expose only recovery actions", () => {
-  const invalid = verifyPage.match(/if \(state === "INVALID"\)[\s\S]*?\n  }\n\n  return/ )?.[0] ?? "";
+  const invalid = verifyPage.match(/if \(state === "INVALID"\)[\s\S]*?\r?\n  }\r?\n\r?\n  return/ )?.[0] ?? "";
   assert.match(invalid, /Verification link expired/);
   assert.match(invalid, /This verification link is invalid or expired\./);
   assert.match(invalid, /Resend verification email/);
@@ -35,7 +35,7 @@ test("pending registration keeps resend available without normal-mode manual tok
 });
 
 test("logout clears authenticated state and returns to the canonical login route", () => {
-  const logout = workspace.match(/function logout\(\) \{[\s\S]*?\n  }\n\n  if \(authLoading\)/)?.[0] ?? "";
+  const logout = workspace.match(/function logout\(\) \{[\s\S]*?\r?\n  }\r?\n\r?\n  if \(authLoading\)/)?.[0] ?? "";
   assert.match(logout, /removeItem\("aip\.accessToken"\)/);
   assert.match(logout, /removeItem\("aip\.user"\)/);
   assert.match(logout, /window\.history\.replaceState\(\{\}, "", "\/"\)/);

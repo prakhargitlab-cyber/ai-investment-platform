@@ -221,7 +221,8 @@ def run_etf_radar_cycle(rows: list[dict], store, *, now: datetime | None = None,
 
 async def run_etf_radar_cycle_async(repository, portfolio_orchestrator, *, top_n: int | None = 10,
                                      candidate_ids: list | None = None, correlation_id: str | None = None,
-                                     cycle_id: UUID | None = None, checkpoint=None, **_ignored_resumable_extras):
+                                     cycle_id: UUID | None = None, checkpoint=None,
+                                     identity_headers: dict | None = None, **_ignored_resumable_extras):
     """Async entry point for the generic OpportunityCycleWorker (market='ETF').
 
     Mirrors the exact body the synchronous API endpoint used to run inline:
@@ -242,10 +243,14 @@ async def run_etf_radar_cycle_async(repository, portfolio_orchestrator, *, top_n
     already-persisted evidence.
     """
     if candidate_ids is not None:
+        # Bounded diagnostic path: rows are built from the given ids
+        # directly, with no portfolio-service call at all -- there is
+        # nothing here for identity_headers to apply to, and this path is
+        # deliberately left unchanged.
         rows = [{'globalInstrumentId': str(instrument_id), 'assetType': 'ETF', 'exchange': 'NSE', 'status': 'ACTIVE'}
                 for instrument_id in candidate_ids]
     else:
-        rows = await portfolio_orchestrator.active_global_etfs(correlation_id=correlation_id)
+        rows = await portfolio_orchestrator.active_global_etfs(correlation_id=correlation_id, identity_headers=identity_headers)
     with repository._persistence_worker_lock:
         result = run_etf_radar_cycle(rows, repository.persistence, cycle_id=cycle_id,
             correlation_id=correlation_id, top_n=top_n)

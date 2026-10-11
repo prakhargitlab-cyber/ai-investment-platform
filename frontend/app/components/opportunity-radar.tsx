@@ -173,6 +173,11 @@ function ExpandableSection({ title, items, horizon, heldIds, watchlistedIds }: {
 const RECOMMENDATIONS_PAGE_SIZE = 10;
 
 export function PreviousRecommendationsList({ items }: { items: Opportunity[] }) {
+  const listKey = JSON.stringify(items.map(item => item.global_instrument_id).sort());
+  return <PreviousRecommendationsPage key={listKey} items={items} />;
+}
+
+function PreviousRecommendationsPage({ items }: { items: Opportunity[] }) {
   const [page, setPage] = useState(1);
   const total = items.length;
   // Deterministic ordering: sort by global_instrument_id so page boundaries
@@ -185,12 +190,6 @@ export function PreviousRecommendationsList({ items }: { items: Opportunity[] })
   const visible = sorted.slice(start, end);
   const hasNext = end < total;
   const hasPrev = page > 1;
-
-  // Reset to page 1 when the list identity (length or content) changes.
-  const listKey = `${total}:${items.map(i => i.global_instrument_id).join(",")}`;
-  useEffect(() => {
-    if (page !== 1) setPage(1);
-  }, [listKey]);
 
   return (
     <>
@@ -256,52 +255,84 @@ type EquityActiveCycle = {
 const EQUITY_ACTIVE_CYCLE_STORAGE_KEY = "aip.opportunityRadar.activeCycleId";
 
 function equityCounters(progress: EquityAuthoritativeProgress | null): RadarProgressCounter[] {
-  if (!progress) return [];
+  // RADAR UI + API ROUTING closure, item C/D -- every field the spec asks
+  // for is listed, even when this backend genuinely has no trustworthy
+  // value for it: the panel renders "Unavailable" for a null value rather
+  // than hiding the row (see radar-progress.tsx).
+  //
+  // "Total universe"/"Pod restarts" are not in
+  // app.cycle_checkpoint.cycle_status_snapshot's returned shape at all
+  // (deep_completed/deep_denominator/ready/failed/technical/eligible only)
+  // and there is no Kubernetes-restart data source wired into this backend
+  // -- both stay Unavailable; the smallest addition that would populate
+  // Total universe is persisting len(baseline_scan.candidates) into the
+  // cycle's checkpoint selection alongside deep_ids/shortlist_ids.
+  //
+  // The current-results API has no cycle identity. Its action totals cannot
+  // be attributed to this tracked cycle, even after a successful refetch.
   return [
-    { label: "Deep attempted", value: progress.deep_denominator ?? null },
-    { label: "Deep completed", value: progress.deep_completed ?? null },
-    { label: "Eligible", value: progress.eligible ?? null },
-    { label: "Ready", value: progress.ready ?? null },
-    { label: "Readiness failed", value: progress.failed ?? null },
-    { label: "Technical failures", value: progress.technical ?? null },
+    { label: "Deep admitted", value: progress?.deep_denominator ?? null },
+    { label: "Deep completed", value: progress?.deep_completed ?? null },
+    { label: "Eligible", value: progress?.eligible ?? null },
+    { label: "Ready", value: progress?.ready ?? null },
+    { label: "Readiness failed", value: progress?.failed ?? null },
+    { label: "Technical failures", value: progress?.technical ?? null },
+    { label: "Total universe", value: null },
+    { label: "Pod restarts", value: null },
+    { label: "BUY count", value: null },
+    // Combines PARTIAL_EXIT and SELL (app.opportunity_persistence's own
+    // exit_cards grouping) -- the backend does not expose a SELL-only
+    // count, so this is labeled for what it actually is rather than
+    // mislabeled "SELL count".
+    { label: "Exit (Sell/Partial) count", value: null },
+    // Equity's public action vocabulary (STRONG_BUY/BUY/PARTIAL_EXIT/SELL)
+    // has no AVOID or HOLD/neutral category at all -- not a transient gap,
+    // genuinely not supported for this radar type.
+    { label: "AVOID count", value: null },
+    { label: "HOLD/neutral count", value: null },
   ];
 }
 
 function equityPercent(progress: EquityAuthoritativeProgress | null): number | null {
-  if (!progress || !progress.deep_denominator) return null;
-  return (((progress.deep_completed ?? 0) / progress.deep_denominator) * 100);
+  if (!progress || !progress.deep_denominator || progress.deep_completed == null) return null;
+  return ((progress.deep_completed / progress.deep_denominator) * 100);
 }
 
 export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[]; watchlistedIds: string[] }) {
   const [data, setData] = useState<Radar | null>(null);
   const [error, setError] = useState(false);
   const [activeCycle, setActiveCycle] = useState<EquityActiveCycle | null>(null);
+  useEffect(() => {
+    let active = true;
+    // Read the browser-owned store after hydration; cancel recovery on unmount.
+    Promise.resolve().then(() => {
+      if (!active) return;
+      try {
+        const storedCycleId = window.sessionStorage.getItem(EQUITY_ACTIVE_CYCLE_STORAGE_KEY);
+        if (storedCycleId) setActiveCycle(previous => previous ?? { cycleId: storedCycleId, status: "RUNNING", startedAt: null, updatedAt: null, errorCode: null, progress: null, pollError: false });
+      } catch { /* Storage may be disabled. */ }
+    });
+    return () => { active = false; };
+  }, []);
+  const cycleId = activeCycle?.cycleId;
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let active = true;
     request<Radar>("/api/v1/research/opportunities/current").then(normalizeRadar).then(value => { if (active) setData(value); }).catch(() => { if (active) setError(true); });
-    let storedCycleId: string | null = null;
-    try { storedCycleId = window.sessionStorage.getItem(EQUITY_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
-    if (storedCycleId) {
-      setActiveCycle({ cycleId: storedCycleId, status: "RUNNING", startedAt: null, updatedAt: null, errorCode: null, progress: null, pollError: false });
-    }
     return () => { active = false; };
   }, []);
 
   useEffect(() => {
-    if (!activeCycle || isTerminalRadarStatus(activeCycle.status)) {
-      try { if (!activeCycle) window.sessionStorage.removeItem(EQUITY_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
-      return;
-    }
+    if (!cycleId) return;
     let active = true;
     const poll = () => {
       request<{ status: string; updated_at?: string; error_code?: string; authoritative_progress?: EquityAuthoritativeProgress }>(
-        `/api/v1/research/opportunities/cycles/${activeCycle.cycleId}/status`
+        `/api/v1/research/opportunities/cycles/${cycleId}/status`
       )
         .then((value) => {
           if (!active) return;
-          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+          setActiveCycle((previous) => previous && previous.cycleId === cycleId
             ? { ...previous, status: value.status, updatedAt: value.updated_at ?? previous.updatedAt,
                 startedAt: previous.startedAt ?? value.updated_at ?? null,
                 errorCode: value.error_code ?? previous.errorCode,
@@ -320,15 +351,14 @@ export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[
         })
         .catch(() => {
           if (!active) return;
-          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+          setActiveCycle((previous) => previous && previous.cycleId === cycleId
             ? { ...previous, pollError: true } : previous);
           pollTimer.current = setTimeout(poll, 2500);
         });
     };
     poll();
     return () => { active = false; if (pollTimer.current) clearTimeout(pollTimer.current); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCycle?.cycleId]);
+  }, [cycleId]);
 
   const runCycle = () => {
     // Deliberately sends no analysis_scope (defaults to the existing safe
@@ -354,7 +384,8 @@ export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[
     </button>
     {activeCycle ? (
       <RadarProgressPanel radarType="Equity" cycleId={activeCycle.cycleId} status={activeCycle.status}
-        startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={equityCounters(activeCycle.progress)}
+        startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt}
+        counters={equityCounters(activeCycle.progress)}
         percent={equityPercent(activeCycle.progress)} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
     ) : null}
     {error ? <p role="alert">Opportunity radar unavailable.</p> : data ? <RadarContent data={data} heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <p>Loading persisted opportunities…</p>}

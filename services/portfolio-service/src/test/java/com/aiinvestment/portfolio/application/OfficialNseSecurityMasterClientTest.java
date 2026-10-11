@@ -1,5 +1,6 @@
 package com.aiinvestment.portfolio.application;
 
+import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 
@@ -7,7 +8,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -107,5 +110,47 @@ class OfficialNseSecurityMasterClientTest {
         try (var stream = OfficialNseSecurityMasterClientTest.class.getResourceAsStream(FIXTURE_PATH)) {
             return new String(Objects.requireNonNull(stream, FIXTURE_PATH).readAllBytes(), StandardCharsets.UTF_8);
         }
+    }
+
+    // --- NSE transport-fix regression coverage: HTTP/1.1 and headers, mirroring the identical,
+    // already-proven fix applied to the sibling ETF client (same NSE host, same symptom class).
+
+    @Test
+    void productionConstructorConfiguresHttp11AndExistingTimeoutsAndRedirects() throws Exception {
+        var client = new OfficialNseSecurityMasterClient("https://example.invalid/EQUITY_L.csv");
+        var httpField = OfficialNseSecurityMasterClient.class.getDeclaredField("http");
+        httpField.setAccessible(true);
+        HttpClient http = (HttpClient) httpField.get(client);
+
+        assertThat(http.version()).isEqualTo(HttpClient.Version.HTTP_1_1);
+        assertThat(http.connectTimeout()).contains(Duration.ofSeconds(5));
+        assertThat(http.followRedirects()).isEqualTo(HttpClient.Redirect.NORMAL);
+    }
+
+    @Test
+    void sendsBrowserStyleHeadersOnEveryRequest() throws Exception {
+        AtomicReference<Headers> seenHeaders = new AtomicReference<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress(0), 0);
+        String csv = fixture();
+        server.createContext("/EQUITY_L.csv", exchange -> {
+            seenHeaders.set(exchange.getRequestHeaders());
+            byte[] body = csv.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/csv; charset=UTF-8");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+        try {
+            assertThat(client(server).listedEquities()).isNotEmpty();
+        } finally {
+            server.stop(0);
+        }
+
+        Headers headers = seenHeaders.get();
+        assertThat(headers.getFirst("User-Agent")).contains("Mozilla/5.0");
+        assertThat(headers.getFirst("Accept")).contains("text/csv");
+        assertThat(headers.getFirst("Accept-Language")).contains("en-US");
+        assertThat(headers.getFirst("Referer")).isEqualTo("https://www.nseindia.com/");
     }
 }

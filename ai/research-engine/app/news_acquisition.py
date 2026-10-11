@@ -217,9 +217,9 @@ async def acquire_news(repository, company, *, providers, industry=None, now=Non
                 # the search provider -- see _MAX_CONSECUTIVE_DEGRADED_QUERIES
                 # above) and are kept unchanged, just timed so they no
                 # longer read as unattributed.
-                _throttle_started = time.monotonic()
+                _throttle_started = time.perf_counter()
                 await sleep(repository.settings.market_data_population_request_interval_seconds)
-                cycle_timing.record_current_news_throttle_elapsed((time.monotonic() - _throttle_started) * 1000)
+                cycle_timing.record_current_news_throttle_elapsed((time.perf_counter() - _throttle_started) * 1000)
         failed=bool(codes)
         state=('PARTIAL' if failed else 'SUCCESS_WITH_RESULTS' if count else 'SUCCESS_EMPTY') if completed else 'FAILED'
         outcomes.append(ProviderOutcome(provider=provider.provider_name,outcome=state,candidate_count=count,

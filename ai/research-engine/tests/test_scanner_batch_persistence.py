@@ -65,6 +65,8 @@ def test_postgres_inherits_parameterized_bounded_batch_reads():
             queries.append((sql, params))
             return self
         def fetchall(self): return []
+        def commit(self): pass
+        def rollback(self): pass
     store = PostgresResearchPersistence.__new__(PostgresResearchPersistence)
     store._connection = _PostgresConnectionAdapter(Connection())
     ids = {UUID(int=n) for n in range(1, 1002)}

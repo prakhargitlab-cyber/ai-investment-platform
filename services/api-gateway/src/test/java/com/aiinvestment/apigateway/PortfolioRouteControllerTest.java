@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PortfolioRouteControllerTest {
 
@@ -199,6 +200,50 @@ class PortfolioRouteControllerTest {
     }
 
     @Test
+    void etfRadarRoutesAreMappedToTheResearchEngineController() throws Exception {
+        // RADAR UI + API ROUTING closure -- the confirmed root cause of the
+        // reported 404 on /api/v1/etf-radar/cycles: that path had no
+        // @RequestMapping at all on this controller (research-engine mounts
+        // ETF Radar endpoints as a sibling of /api/v1/research/**, not a
+        // child of it). This asserts the fix without a full Spring MVC
+        // dispatch context, matching browserResetPasswordRoutesAreMappedToTheFrontendController's
+        // existing reflection-based pattern above.
+        Method routeResearch = PortfolioRouteController.class.getDeclaredMethod("routeResearch", jakarta.servlet.http.HttpServletRequest.class);
+        RequestMapping mapping = routeResearch.getAnnotation(RequestMapping.class);
+
+        assertThat(mapping.value()).contains("/api/v1/etf-radar/**", "/api/v1/etf-radar");
+        // Equity Radar's own cycle endpoints already live under
+        // /api/v1/research/opportunities/** and must stay routed there --
+        // this fix must never introduce a second, duplicate mapping for them.
+        assertThat(mapping.value()).contains("/api/v1/research/**", "/api/v1/research");
+    }
+
+    @Test
+    void etfRadarCycleCreationIsForwardedToResearchEngineByteExact() throws Exception {
+        // End-to-end confirmation (mirrors researchSearchPreservesEncodedCompanyNamesWithoutDoubleEncoding
+        // below): a POST to /api/v1/etf-radar/cycles reaches the research-engine
+        // backend through the SAME byte-exact forwarding /api/v1/research/**
+        // already uses -- no duplicate endpoint, no new forwarding path.
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            seenMethod.set(exchange.getRequestMethod());
+            writeResponse(exchange, 202, "application/json", "{\"cycle_id\":\"test\"}".getBytes(StandardCharsets.UTF_8));
+        });
+        String local = "http://127.0.0.1:" + server.getAddress().getPort();
+        var controller = new PortfolioRouteController(local, local, local, local, local, local, local);
+        var request = new MockHttpServletRequest("POST", "/api/v1/etf-radar/cycles");
+        request.setContent("{\"top_n\":10}".getBytes(StandardCharsets.UTF_8));
+        request.setContentType("application/json");
+        addTrustedIdentity(request);
+        ResponseEntity<byte[]> response = controller.routeResearch(request);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(seenPath.get()).isEqualTo("/api/v1/etf-radar/cycles");
+        assertThat(seenMethod.get()).isEqualTo("POST");
+    }
+
+    @Test
     void researchSearchPreservesEncodedCompanyNamesWithoutDoubleEncoding() throws Exception {
         AtomicReference<String> query = new AtomicReference<>();
         startServer(exchange -> {
@@ -214,7 +259,116 @@ class PortfolioRouteControllerTest {
         assertThat(query.get()).isEqualTo(request.getQueryString());
     }
 
-    private PortfolioRouteController controllerForServer() {
+    @Test
+    void marketUniverseRoutesAreMappedToThePortfolioServiceController() throws Exception {
+        // Root cause closure: PortfolioRouteController routed /api/v1/portfolios/** and
+        // /api/v1/instruments/** to portfolio-service, but had no mapping at all for
+        // /api/v1/market-universe/**, where the already-deployed NSE ETF preview/apply
+        // endpoints live -- a request to either 404'd before ever reaching the gateway's
+        // auth/forwarding logic. This asserts the fix the same way
+        // etfRadarRoutesAreMappedToTheResearchEngineController does above, and additionally
+        // confirms the existing /api/v1/portfolios/** and /api/v1/instruments/** mappings
+        // on this SAME method are untouched by the change (no accidental removal).
+        Method route = PortfolioRouteController.class.getDeclaredMethod("route", jakarta.servlet.http.HttpServletRequest.class);
+        RequestMapping mapping = route.getAnnotation(RequestMapping.class);
+
+        assertThat(mapping.value()).contains("/api/v1/market-universe", "/api/v1/market-universe/**");
+        assertThat(mapping.value()).contains(
+                "/api/v1/portfolios", "/api/v1/portfolios/**",
+                "/api/v1/instruments", "/api/v1/instruments/**");
+    }
+
+    @Test
+    void etfPreviewRouteForwardsGetToPortfolioServiceByteExact() throws Exception {
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        byte[] previewResponse = "{\"sourceAvailable\":true,\"missingEtfs\":[]}".getBytes(StandardCharsets.UTF_8);
+        startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            seenMethod.set(exchange.getRequestMethod());
+            writeResponse(exchange, 200, "application/json", previewResponse);
+        });
+        PortfolioRouteController controller = controllerForServer();
+        MockHttpServletRequest request = new MockHttpServletRequest(
+                "GET", "/api/v1/market-universe/india/nse-etf/preview");
+        addTrustedIdentity(request);
+
+        ResponseEntity<byte[]> response = controller.route(request);
+
+        assertThat(seenPath.get()).isEqualTo("/api/v1/market-universe/india/nse-etf/preview");
+        assertThat(seenMethod.get()).isEqualTo("GET");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isEqualTo(previewResponse);
+    }
+
+    @Test
+    void etfApplyRouteForwardsPostToPortfolioServiceByteExact() throws Exception {
+        // Mocks the downstream portfolio-service only (a local HttpServer standing in for
+        // it) -- this never invokes the real /apply endpoint or mutates anything, per the
+        // task's "do not invoke /apply" constraint. It only confirms the gateway forwards
+        // the POST to portfolio-service byte-exactly, the same way portfolioMultipartForwardingPreservesTheExactBodyAndContentType
+        // already confirms for the existing /api/v1/portfolios/** route on this same method.
+        AtomicReference<String> seenPath = new AtomicReference<>();
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        AtomicReference<byte[]> seenBody = new AtomicReference<>();
+        byte[] applyResponse = "{\"status\":\"COMPLETED\"}".getBytes(StandardCharsets.UTF_8);
+        startServer(exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            seenMethod.set(exchange.getRequestMethod());
+            seenBody.set(exchange.getRequestBody().readAllBytes());
+            writeResponse(exchange, 200, "application/json", applyResponse);
+        });
+        PortfolioRouteController controller = controllerForServer();
+        MockHttpServletRequest request = new MockHttpServletRequest(
+                "POST", "/api/v1/market-universe/india/nse-etf/apply");
+        request.setContentType("application/json");
+        request.setContent(new byte[0]);
+        addTrustedIdentity(request);
+
+        ResponseEntity<byte[]> response = controller.route(request);
+
+        assertThat(seenPath.get()).isEqualTo("/api/v1/market-universe/india/nse-etf/apply");
+        assertThat(seenMethod.get()).isEqualTo("POST");
+        assertThat(seenBody.get()).isEmpty();
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isEqualTo(applyResponse);
+    }
+
+    @Test
+    void marketUniverseRouteRejectsSpoofedIdentityHeadersWithoutTrustedAttributes() throws Exception {
+        // Fail-closed confirmation: a caller cannot grant itself ADMIN access to the new
+        // market-universe route by sending the trusted identity headers directly -- those
+        // headers are always stripped from the inbound request (GatewayAuthenticationFilter
+        // .isInternalIdentityHeader) and the outbound identity is built ONLY from request
+        // ATTRIBUTES that GatewayAuthenticationFilter itself sets after verifying a real
+        // bearer token (see addTrustedIdentity/requiredAttribute). A request with spoofed
+        // headers but no such attributes must be rejected before any forwarding happens --
+        // the downstream portfolio-service must never even see the request.
+        AtomicReference<Boolean> downstreamWasCalled = new AtomicReference<>(false);
+        startServer(exchange -> {
+            downstreamWasCalled.set(true);
+            writeResponse(exchange, 200, "application/json", "{}".getBytes(StandardCharsets.UTF_8));
+        });
+        PortfolioRouteController controller = controllerForServer();
+        MockHttpServletRequest request = new MockHttpServletRequest(
+                "POST", "/api/v1/market-universe/india/nse-etf/apply");
+        request.setContentType("application/json");
+        request.setContent(new byte[0]);
+        request.addHeader("X-AIP-User-Id", "00000000-0000-0000-0000-000000000999");
+        request.addHeader("X-AIP-User-Issuer", "spoofed");
+        request.addHeader("X-AIP-User-Subject", "attacker");
+        request.addHeader("X-AIP-User-Roles", "ADMIN");
+        // Deliberately NOT calling addTrustedIdentity(request): no GatewayAuthenticationFilter
+        // attributes are set, exactly as would be the case for a request that skipped real
+        // bearer-token verification.
+
+        assertThatThrownBy(() -> controller.route(request))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Missing trusted gateway identity");
+        assertThat(downstreamWasCalled.get()).isFalse();
+    }
+
+        private PortfolioRouteController controllerForServer() {
         return new PortfolioRouteController(
                 "http://127.0.0.1:" + server.getAddress().getPort(),
                 "http://broker-service",

@@ -438,7 +438,11 @@ test("CURRENT_NEWS and other no-auto-extraction types get a manual fields form, 
 test("review shows filename, evidence type, provenance, facts, corrections and validation", () => {
   assert.match(workspace, /<dt>Filename<\/dt>/);
   assert.match(workspace, /<dt>Evidence type<\/dt>/);
-  assert.match(workspace, /<th>Source \/ provenance<\/th>/);
+  // FINAL CLOSURE item 3 -- "Source / provenance" moved from its own
+  // plain column into a collapsed per-row <details> disclosure, so it
+  // no longer renders as a <th>.
+  assert.match(workspace, /<dt>Source \/ provenance<\/dt>/);
+  assert.match(workspace, /<th>Details<\/th>/);
   assert.match(workspace, /draft\.proposedFacts\.map/);
   assert.match(workspace, /<th>Your correction<\/th>/);
   assert.match(workspace, /draft\.validationResults\.errors/);
@@ -470,6 +474,7 @@ test("evidence dialog remains accessible and styled", () => {
   assert.match(styles, /\.evidence-upload-popup/);
   assert.match(styles, /\.evidence-facts-table/);
   assert.match(styles, /\.evidence-conflict-consent/);
+  assert.match(styles, /\.evidence-fact-details-cell/);
 });
 
 // ---------------------------------------------------------------------------
@@ -640,7 +645,10 @@ test("O. SHAREHOLDING manual-evidence behavior is unchanged by the FinancialFact
   );
   // SHAREHOLDING still renders the proposed-facts correction table, never
   // the financial-fact row editor.
-  assert.match(dialogSource, /!isFinancialFacts && !draft\.requiresManualFields && draft\.proposedFacts\.length/);
+  assert.match(
+    dialogSource,
+    /!isFinancialFacts && !draft\.requiresManualFields && \(draft\.proposedFacts\.length \|\| missingShareholdingCategoryRows\.length\)/
+  );
 });
 
 test("P. CURRENT_NEWS manual-evidence behavior is unchanged by the FinancialFact editor", () => {
@@ -831,8 +839,211 @@ test("HH. CURRENT_NEWS field suggestions pre-fill the editable manual-fields for
     workspace,
     /setManualFields\(draft\?\.fieldSuggestions \? \{ \.\.\.draft\.fieldSuggestions \} : \{\}\);/
   );
-  assert.match(workspace, /\[draft\?\.draftId\]\);/);
+  assert.match(workspace, /\[draft\]\);/);
   // The Review screen tells the user suggested fields were pre-filled
   // and must be reviewed -- it never claims they were auto-accepted.
   assert.match(workspace, /pre-filled from the uploaded\s*\n\s*file as a non-binding suggestion/);
+});
+
+test("II. SHAREHOLDING supplementary evidence (fieldSuggestions) is shown read-only in Review even when requiresManualFields=false", () => {
+  // The frontend/contract gap this closes: fieldSuggestions was
+  // previously rendered ONLY inside the requiresManualFields branch
+  // (used by CURRENT_NEWS etc.), so a SHAREHOLDING draft -- which
+  // always has requiresManualFields=false -- had genuinely no
+  // rendering path for its shareholderCount/sourcePeriodText
+  // suggestions at all, however correctly the backend computed them.
+  // TASK F widened this gate to also show VALUATION_INPUTS's unsupported
+  // revenue/TTM observations (isFinancialFacts) via this SAME read-only
+  // component -- SHAREHOLDING (!requiresManualFields, !isFinancialFacts)
+  // keeps exactly the behavior this test protects.
+  assert.match(
+    dialogSource,
+    /\{\(!draft\.requiresManualFields \|\| isFinancialFacts\) && draft\.fieldSuggestions && Object\.keys\(draft\.fieldSuggestions\)\.length > 0 \? \(/
+  );
+  assert.match(dialogSource, /data-testid="evidence-supplementary-fields"/);
+  assert.match(dialogSource, /Supplementary evidence \(reference only\)/);
+  assert.match(dialogSource, /Object\.entries\(draft\.fieldSuggestions\)\.map\(\(\[key, value\]\) => \(/);
+  assert.match(dialogSource, /supplementaryFieldLabel\(key\)/);
+});
+
+test("JJ. supplementary field labels are human-readable for shareholderCount and sourcePeriodText", () => {
+  assert.match(workspace, /shareholderCount:\s*"Shareholder count"/);
+  assert.match(workspace, /sourcePeriodText:\s*"Source period text/);
+  assert.match(workspace, /function supplementaryFieldLabel\(key: string\): string \{/);
+});
+
+test("KK. supplementary evidence is kept entirely separate from proposedFacts/corrections and never gates acceptance", () => {
+  // It must never appear inside the proposedFacts table, never be
+  // written into `corrections`, and `canAccept` for a non-manual-field,
+  // non-financial-facts draft must still be driven only by
+  // proposedFacts.length/validationResults -- never by fieldSuggestions.
+  const supplementaryBlock = dialogSource.slice(
+    dialogSource.indexOf('data-testid="evidence-supplementary-fields"') - 400,
+    dialogSource.indexOf('data-testid="evidence-supplementary-fields"') + 900
+  );
+  assert.doesNotMatch(supplementaryBlock, /setCorrections/);
+  assert.doesNotMatch(supplementaryBlock, /proposedFacts\.map/);
+  const canAcceptBlock = dialogSource.slice(dialogSource.indexOf("const canAccept = Boolean("), dialogSource.indexOf("if (typeof document === \"undefined\")"));
+  assert.doesNotMatch(canAcceptBlock, /fieldSuggestions/);
+  // Shareholder count specifically must never be persisted as an
+  // ownership percentage -- it is read from fieldSuggestions.shareholderCount,
+  // never from a shareholding: proposedFact.
+  assert.doesNotMatch(workspace, /shareholding:shareholderCount/);
+});
+
+test("LL. TASK E2 -- a SHAREHOLDING category the interpreter never resolved renders as an EDITABLE row, not a read-only note", () => {
+  assert.match(workspace, /const missingShareholdingCategoryRows = isShareholding && draft\?\.fieldClassification/);
+  assert.match(
+    dialogSource,
+    /missingShareholdingCategoryRows\.map\(\(\{ fieldKey, category, status \}\) => \(/
+  );
+  assert.match(dialogSource, /data-testid=\{`evidence-missing-category-row-\$\{category\}`\}/);
+  // Typing into it writes the SAME `corrections` state every other
+  // editable field here uses -- no parallel persistence mechanism.
+  const block = dialogSource.slice(
+    dialogSource.indexOf("missingShareholdingCategoryRows.map"),
+    dialogSource.indexOf("missingShareholdingCategoryRows.map") + 1400
+  );
+  assert.match(block, /setCorrections/);
+  assert.match(block, /corrections\[fieldKey\] \?\? ""/);
+});
+
+test("MM. the missing-category correction input starts BLANK, never pre-filled with a guessed value", () => {
+  const block = dialogSource.slice(
+    dialogSource.indexOf("missingShareholdingCategoryRows.map"),
+    dialogSource.indexOf("missingShareholdingCategoryRows.map") + 1400
+  );
+  assert.match(block, /value=\{corrections\[fieldKey\] \?\? ""\}/);
+  assert.doesNotMatch(block, /value=\{corrections\[fieldKey\] \?\? fact\.value\}/);
+});
+
+test("LL2. missing-category rows are only added for categories with no existing proposedFacts entry, and never auto-select one", () => {
+  assert.match(
+    workspace,
+    /\.filter\(\(\[category, status\]\) => status !== "EXTRACTED"\s*\n\s*&& !draft\.proposedFacts\.some\(\(fact\) => fact\.field === `shareholding:\$\{category\}`\)\)/
+  );
+});
+
+test("NN. category and status labels are human-readable for PROMOTER/FII_FPI/DII/PUBLIC_RETAIL and MISSING/AMBIGUOUS/INVALID", () => {
+  assert.match(workspace, /PROMOTER:\s*"Promoters"/);
+  assert.match(workspace, /FII_FPI:\s*"FII \/ FPI"/);
+  assert.match(workspace, /DII:\s*"DII"/);
+  assert.match(workspace, /PUBLIC_RETAIL:\s*"Public \/ Retail"/);
+  assert.match(workspace, /MISSING:\s*"not found in the document"/);
+  assert.match(workspace, /AMBIGUOUS:\s*"label matched more than one category/);
+  assert.match(workspace, /INVALID:\s*"row recognized but its value could not be confidently read"/);
+});
+
+test("OO. fieldClassification is declared on EvidenceDraft in the API contract", () => {
+  assert.match(api, /fieldClassification\?:\s*Record<string, string>\s*\|\s*null;/);
+});
+
+test("PP. SHAREHOLDING Review shows an editable Reporting period field reusing the corrections payload", () => {
+  assert.match(dialogSource, /data-testid="evidence-period-correction"/);
+  assert.match(dialogSource, /Reporting period/);
+  assert.match(dialogSource, /corrections\.reportingPeriod \?\? originalReportingPeriodText/);
+  assert.match(dialogSource, /next\.reportingPeriod = value/);
+  // Only rendered for SHAREHOLDING drafts.
+  const block = dialogSource.slice(
+    dialogSource.indexOf('data-testid="evidence-period-correction"') - 1200,
+    dialogSource.indexOf('data-testid="evidence-period-correction"')
+  );
+  assert.match(block, /isShareholding \? \(/);
+});
+
+test("QQ. the Reporting period field is prefilled from draft.reportingPeriod, not guessed", () => {
+  assert.match(
+    workspace,
+    /const originalReportingPeriodText = draft\?\.reportingPeriod \? draft\.reportingPeriod\.slice\(0, 10\) : "";/
+  );
+});
+
+test("RR. the facts table shows a Status column for SHAREHOLDING distinguishing Extracted from Corrected", () => {
+  assert.match(dialogSource, /\{isShareholding \? <th>Status<\/th> : null\}/);
+  assert.match(
+    dialogSource,
+    /\{isShareholding \? <td>\{fact\.provenance === "OCR_EXTRACTED" \? "Extracted" : "Corrected"\}<\/td> : null\}/
+  );
+});
+
+test("SS. the Proposed value column shows the ORIGINAL extracted value even if a correction attempt already partially applied", () => {
+  // fact.originalValue (set server-side only once a correction has
+  // already been applied to a previously-extracted fact) takes
+  // precedence over fact.value so Review never loses the original
+  // source value behind an in-progress correction.
+  assert.match(dialogSource, /<td>\{fact\.originalValue \?\? fact\.value\}<\/td>/);
+});
+
+test("TT. ProposedFact.provenance/originalValue are declared on the API contract", () => {
+  assert.match(api, /provenance\?:\s*"OCR_EXTRACTED" \| "USER_CORRECTED" \| "USER_ENTERED";/);
+  assert.match(api, /originalValue\?:\s*string \| null;/);
+});
+
+// TASK F -- VALUATION_INPUTS automatic extraction + Review closure --------
+
+test("UU. ProposedFact carries periodEnd/periodType/unit for prefilling the FinancialFact editor", () => {
+  assert.match(
+    api,
+    /periodEnd\?:\s*string \| null;\s*periodType\?:\s*string \| null;\s*unit\?:\s*string \| null;/
+  );
+});
+
+test("VV. factRows are prefilled from draft.proposedFacts when the backend already extracted supported facts (VALUATION_INPUTS)", () => {
+  // Reuses the backend's own ProposedFact.field/value/periodEnd/periodType/
+  // unit/sourceLocator -- never re-derives or guesses a shape of its own.
+  assert.match(
+    workspace,
+    /isFinancialFactEvidenceType\(draft\.evidenceType\) && draft\.proposedFacts\.length > 0/
+  );
+  assert.match(
+    workspace,
+    /setFactRows\(draft\.proposedFacts\.map\(\(fact\) => \(\{/
+  );
+  assert.match(workspace, /metric: fact\.field,/);
+  assert.match(workspace, /periodEnd: fact\.periodEnd \?\? "",/);
+  assert.match(workspace, /periodType: \(fact\.periodType as FinancialFactRow\["periodType"\]\) \?\? "",/);
+  assert.match(workspace, /unit: fact\.unit \?\? "",/);
+  assert.match(workspace, /sourceUrl: fact\.sourceLocator \?\? "",/);
+});
+
+test("WW. the prefilled-state hint tells the user rows were recognized, instead of claiming no automatic extraction exists", () => {
+  // The old hint ("no safe automatic extraction") is now only shown when
+  // the backend genuinely returned nothing (e.g. BALANCE_SHEET_FACTS and
+  // friends, still fully manual) -- VALUATION_INPUTS with prefilled rows
+  // gets a truthful alternative instead of a now-inaccurate claim.
+  assert.match(
+    dialogSource,
+    /draft\.proposedFacts\.length > 0\s*\n\s*\? "Confidently recognized rows are prefilled below/
+  );
+  assert.match(dialogSource, /This evidence type has no safe automatic extraction/);
+});
+
+test("XX. the financial-fact editor renders compact responsive cards, not a wide multi-column table", () => {
+  assert.match(dialogSource, /financial-fact-cards/);
+  assert.match(dialogSource, /financial-fact-card-grid/);
+  // Source/provenance is collapsed behind the SAME expandable-details
+  // pattern already used for SHAREHOLDING's facts table.
+  assert.match(dialogSource, /<details className="evidence-fact-details">\s*\n\s*<summary>Source &amp; provenance<\/summary>/);
+  assert.match(dialogSource, /aria-label=\{`Source for row/);
+});
+
+test("YY. a validation error on a fact row is only shown once that row is touched or Accept has been attempted", () => {
+  assert.match(workspace, /const \[touchedFactRows, setTouchedFactRows\] = useState<Set<number>>\(new Set\(\)\);/);
+  assert.match(
+    dialogSource,
+    /const rowTouched = touchedFactRows\.has\(index\) \|\| Object\.values\(row\)\.some\(\(value\) => value\.trim\(\) !== ""\);/
+  );
+  assert.match(dialogSource, /const rowInvalid = rowErrors\.length > 0 && rowTouched;/);
+  // Every editable field marks its own row touched on change, so a row
+  // the user starts filling in gets its errors as soon as it's non-empty.
+  assert.match(dialogSource, /markTouched\(\); updateFactRow\(index, \{ metric: event\.target\.value \}\); \}/);
+  // Attempting to accept surfaces every row's errors, even untouched ones.
+  assert.match(
+    workspace,
+    /setTouchedFactRows\(new Set\(factRows\.map\(\(_, index\) => index\)\)\);/
+  );
+});
+
+test("ZZ. touched-row state resets when a new draft loads, same as factRows itself", () => {
+  assert.match(workspace, /setTouchedFactRows\(new Set\(\)\);\s*\n\s*setReconcileConflicts\(false\);/);
 });

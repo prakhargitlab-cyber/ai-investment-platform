@@ -277,6 +277,15 @@ class DocumentExtractor:
                 metadata=metadata,
                 provenance=provenance,
             )
+        # Word-level OCR bounding boxes (see app.spatial_table_reconstruction),
+        # carried through metadata rather than a new ExtractedDocument field
+        # so every existing caller of DocumentExtractor/ExtractedDocument
+        # (PDF/CSV/TXT/DOCX extraction, every other evidence interpreter)
+        # is completely unaffected. An interpreter that wants spatial table
+        # reconstruction opts in by reading metadata["ocrWords"]; everything
+        # else keeps working off ExtractedDocument.text exactly as before.
+        if result.words:
+            metadata["ocrWords"] = result.words
         return ExtractedDocument(
             text=result.text or "", extraction_method="IMAGE_OCR",
             metadata=metadata,

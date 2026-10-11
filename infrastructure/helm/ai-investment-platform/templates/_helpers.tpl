@@ -35,6 +35,18 @@ app.kubernetes.io/part-of: ai-investment-platform
 {{- if $registry -}}{{ $registry }}/{{ .image }}:{{ $tag }}{{- else -}}{{ .image }}:{{ $tag }}{{- end -}}
 {{- end -}}
 
+{{- /*
+  aip.imageExplicitTag renders registry/image:tag using the given tag verbatim,
+  with NO fallback to global.imageTag (unlike aip.image, which always prefers
+  global.imageTag over any caller-supplied tag whenever it is set). Used only by
+  the single call site that honors a per-workload workloadOverrides.<name>.imageTagOverride
+  (see java-services.yaml); every other caller is unchanged and keeps using aip.image.
+*/ -}}
+{{- define "aip.imageExplicitTag" -}}
+{{- $registry := .root.Values.global.imageRegistry -}}
+{{- if $registry -}}{{ $registry }}/{{ .image }}:{{ .tag }}{{- else -}}{{ .image }}:{{ .tag }}{{- end -}}
+{{- end -}}
+
 {{- define "aip.podLabels" -}}
 {{ include "aip.selectorLabels" (dict "root" .root "component" .component) }}
 {{- with .root.Values.global.podLabels }}

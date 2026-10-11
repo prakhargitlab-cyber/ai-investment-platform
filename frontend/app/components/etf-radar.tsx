@@ -165,38 +165,42 @@ export function EtfRadar() {
   const [data, setData] = useState<EtfCycleResult | null>(null);
   const [status, setStatus] = useState<EtfRadarStatus>("loading");
   const [activeCycle, setActiveCycle] = useState<EtfActiveCycle | null>(null);
+  useEffect(() => {
+    let active = true;
+    // Read the browser-owned store after hydration; cancel recovery on unmount.
+    Promise.resolve().then(() => {
+      if (!active) return;
+      try {
+        const storedCycleId = window.sessionStorage.getItem(ETF_ACTIVE_CYCLE_STORAGE_KEY);
+        if (storedCycleId) setActiveCycle(previous => previous ?? { cycleId: storedCycleId, status: "RUNNING", startedAt: null, updatedAt: null, errorCode: null, pollError: false });
+      } catch { /* Storage may be disabled. */ }
+    });
+    return () => { active = false; };
+  }, []);
+  const cycleId = activeCycle?.cycleId;
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let active = true;
-    setStatus("loading");
     request<EtfCycleResult>("/api/v1/etf-radar/current")
       .then((value) => { if (active) { setData(value); setStatus("ready"); } })
       .catch((failure: { status?: number }) => {
         if (!active) return;
         if (failure?.status === 404) { setData(null); setStatus("empty"); } else setStatus("error");
       });
-    let storedCycleId: string | null = null;
-    try { storedCycleId = window.sessionStorage.getItem(ETF_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
-    if (storedCycleId) {
-      setActiveCycle({ cycleId: storedCycleId, status: "RUNNING", startedAt: null, updatedAt: null, errorCode: null, pollError: false });
-    }
     return () => { active = false; };
   }, []);
 
   useEffect(() => {
-    if (!activeCycle || isTerminalRadarStatus(activeCycle.status)) {
-      try { if (!activeCycle) window.sessionStorage.removeItem(ETF_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
-      return;
-    }
+    if (!cycleId) return;
     let active = true;
     const poll = () => {
       request<{ status: string; updated_at?: string; created_at?: string; error_code?: string }>(
-        `/api/v1/etf-radar/cycles/${activeCycle.cycleId}/status`
+        `/api/v1/etf-radar/cycles/${cycleId}/status`
       )
         .then((value) => {
           if (!active) return;
-          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+          setActiveCycle((previous) => previous && previous.cycleId === cycleId
             ? { ...previous, status: value.status, updatedAt: value.updated_at ?? previous.updatedAt,
                 startedAt: previous.startedAt ?? value.created_at ?? null,
                 errorCode: value.error_code ?? previous.errorCode, pollError: false }
@@ -216,7 +220,7 @@ export function EtfRadar() {
           if (!active) return;
           // A transient poll failure must never leave the panel stuck
           // silently forever: surface it, but keep polling.
-          setActiveCycle((previous) => previous && previous.cycleId === activeCycle.cycleId
+          setActiveCycle((previous) => previous && previous.cycleId === cycleId
             ? { ...previous, pollError: true } : previous);
           pollTimer.current = setTimeout(poll, 2500);
         });
@@ -225,8 +229,7 @@ export function EtfRadar() {
     return () => { active = false; if (pollTimer.current) clearTimeout(pollTimer.current); };
     // Re-run whenever the tracked cycle_id changes; status itself is
     // updated inside the closure above, not via this dependency.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCycle?.cycleId]);
+  }, [cycleId]);
 
   const runCycle = () => {
     request<{ cycle_id: string; status: string; updated_at?: string }>(
@@ -241,9 +244,43 @@ export function EtfRadar() {
   };
 
   const running = !!activeCycle && !isTerminalRadarStatus(activeCycle.status);
-  const counters: RadarProgressCounter[] = []; // ETF Radar's cycle is single-pass/bounded and does not expose
-  // per-instrument progress counters (see app/etf_opportunity_cycle.py) -- an
-  // indeterminate bar plus the lifecycle status is the truthful presentation.
+  // ETF Radar's cycle is single-pass/bounded with no per-candidate
+  // checkpointing (see run_etf_radar_cycle_async's own docstring: no
+  // BASELINE/DEEP split like Equity's Stage2) -- the status endpoint never
+  // carries a live authoritative_progress for it, so WHILE RUNNING an
+  // indeterminate bar plus the lifecycle status remains the only truthful
+  // presentation. This stays genuinely empty until terminal; it is never
+  // populated with a fabricated 0/0 snapshot.
+  //
+  // Once COMPLETED, though, the persisted EtfCycleResult.candidates tuple
+  // (not .ranked, which is truncated to top_n) already covers every row
+  // the cycle admitted/evaluated, with a real per-candidate disposition
+  // and, for EVALUATED rows, a real recommendation -- a genuinely complete,
+  // trustworthy final breakdown, not a provisional or partial one.
+  const terminalData = activeCycle?.status === "COMPLETED" && data?.cycle_id === activeCycle.cycleId ? data : null;
+  const counters: RadarProgressCounter[] = !terminalData ? [] : [
+    { label: "Total universe", value: terminalData.candidates.length },
+    { label: "Evaluated candidates", value: terminalData.candidates.filter((c) => c.disposition === "EVALUATED").length },
+    { label: "Technical failures", value: terminalData.candidates.filter((c) => c.disposition === "TECHNICAL_FAILURE").length },
+    // Readiness exclusions (insufficient evidence) kept separate from
+    // eligibility filtering (ineligible/unsupported fund type), per
+    // app/etf_opportunity_cycle.py's own admission-outcome vocabulary.
+    { label: "Readiness excluded", value: terminalData.candidates.filter((c) => c.disposition === "INSUFFICIENT_DATA").length },
+    { label: "Eligibility filtered", value: terminalData.candidates.filter((c) => c.disposition === "INELIGIBLE" || c.disposition === "UNSUPPORTED").length },
+    { label: "Cancelled", value: terminalData.candidates.filter((c) => c.disposition === "CANCELLED").length },
+    { label: "Pod restarts", value: null },
+    // AVOID is a real category in EtfRecommendation (see app/etf_rule_engine.py)
+    // -- "where supported" from the RADAR UI + API ROUTING spec, and ETF is
+    // the radar that supports it.
+    { label: "AVOID count", value: terminalData.candidates.filter((c) => c.recommendation === "AVOID").length },
+    // ETF's recommendation vocabulary (STRONG_OPPORTUNITY/OPPORTUNITY/WATCH/
+    // AVOID/INSUFFICIENT_DATA) has no literal BUY/SELL/HOLD category --
+    // mapping WATCH to "HOLD" or OPPORTUNITY to "BUY" would be inventing a
+    // correspondence the backend never states, so these stay Unavailable.
+    { label: "BUY count", value: null },
+    { label: "SELL count", value: null },
+    { label: "HOLD/neutral count", value: null },
+  ];
 
   return (
     <section className="opportunity-radar etf-radar" aria-label="ETF radar">

@@ -22,6 +22,27 @@ class GatewayAuthenticationFilterTest {
             new GatewayAuthenticationFilter(new GatewayAuthProperties(ISSUER, SECRET));
 
     @Test
+    void adminAuthSubtreeRequiresVerifiedAdminButPublicLoginRemainsPublic() throws Exception {
+        for (String method : List.of("GET", "PUT", "DELETE")) {
+            for (String role : List.of("USER", "ADMIN")) {
+                MockHttpServletRequest request = new MockHttpServletRequest(method, "/api/v1/auth/admin/users");
+                request.addHeader("Authorization", "Bearer " + new HmacJwtService(SECRET).issue(new JwtClaims(
+                        ISSUER, "user-a", "a@example.test", "A", List.of(role), Instant.now().plusSeconds(300))));
+                request.addHeader("X-AIP-User-Roles", "ADMIN");
+                MockHttpServletResponse response = new MockHttpServletResponse();
+                filter.doFilter(request, response, new MockFilterChain());
+                assertThat(response.getStatus()).isEqualTo(role.equals("ADMIN") ? 200 : 403);
+            }
+        }
+        MockHttpServletResponse missing = new MockHttpServletResponse();
+        filter.doFilter(new MockHttpServletRequest("GET", "/api/v1/auth/admin/users"), missing, new MockFilterChain());
+        assertThat(missing.getStatus()).isEqualTo(401);
+        MockHttpServletResponse login = new MockHttpServletResponse();
+        filter.doFilter(new MockHttpServletRequest("POST", "/api/v1/auth/login"), login, new MockFilterChain());
+        assertThat(login.getStatus()).isEqualTo(200);
+    }
+
+    @Test
     void privateApiRequiresBearerToken() throws Exception {
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/portfolios");
         MockHttpServletResponse response = new MockHttpServletResponse();

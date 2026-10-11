@@ -328,14 +328,29 @@ async def test_yahoo_nav_quote_timestamp_is_not_accepted_as_nav_date(store):
 
 
 def test_migration_adds_only_etf_tables_and_matches_sqlite_schema():
-    path = Path(__file__).resolve().parents[3] / "services/research-service/src/main/resources/db/migration/V20__etf_evidence.sql"
-    migration = path.read_text()
-    assert SQLITE_SCHEMA.replace("IF NOT EXISTS ", "") in migration
-    statements = [line.strip() for line in migration.splitlines() if line.strip() and not line.startswith("--")]
-    assert not any(line.startswith(("ALTER", "DROP", "DELETE", "UPDATE")) for line in statements)
-    # 6 ETF-1/2/3 evidence tables plus etf_radar_cycles (ETF Radar cycle
-    # persistence, added alongside app.etf_opportunity_cycle).
-    assert migration.count("CREATE TABLE etf_") == 7
+    # etf_radar_cycles lives in its own V23 migration, not V20: see V23's own
+    # header comment ("Moved out of V20 because applied Flyway migrations are
+    # immutable."). So SQLITE_SCHEMA (the single dev/test schema string,
+    # which still declares all 7 ETF tables together) is checked statement-
+    # by-statement against the UNION of V20 + V23's real-Postgres SQL,
+    # rather than assuming every statement still lives in one file.
+    migration_dir = Path(__file__).resolve().parents[3] / "services/research-service/src/main/resources/db/migration"
+    v20 = (migration_dir / "V20__etf_evidence.sql").read_text()
+    v23 = (migration_dir / "V23__etf_radar_cycles.sql").read_text()
+    combined = v20 + "\n" + v23
+    normalized_combined = " ".join(combined.split())
+    for statement in SQLITE_SCHEMA.replace("IF NOT EXISTS ", "").strip().split(";"):
+        statement = statement.strip()
+        if statement:
+            normalized_statement = " ".join(statement.split()) + ";"
+            assert normalized_statement in normalized_combined, \
+                f"SQLITE_SCHEMA statement missing from V20/V23 (whitespace-normalized): {normalized_statement}"
+    for migration, label in ((v20, "V20"), (v23, "V23")):
+        statements = [line.strip() for line in migration.splitlines() if line.strip() and not line.startswith("--")]
+        assert not any(line.startswith(("ALTER", "DROP", "DELETE", "UPDATE")) for line in statements), label
+    # 6 ETF-1/2/3 evidence tables (V20) plus etf_radar_cycles (V23, moved out
+    # for migration immutability) = 7 total, across the two files.
+    assert v20.count("CREATE TABLE etf_") + v23.count("CREATE TABLE etf_") == 7
 
 
 def test_attempt_and_evidence_atomic_rollback(store, monkeypatch):

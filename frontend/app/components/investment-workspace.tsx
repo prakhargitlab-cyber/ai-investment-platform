@@ -499,7 +499,7 @@ export function InvestmentWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [accessToken, authenticatedUser?.userId]);
+  }, [accessToken, authenticatedUser]);
 
   useEffect(() => {
     console.info("[AIP_MARKET_ENSURE]", { event: "EFFECT", authReady: marketEnsureAuthReady });
@@ -837,7 +837,7 @@ export function InvestmentWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [accessToken, selectedPortfolioId, portfolioHistoryRange]);
+  }, [accessToken, authenticatedUser, selectedPortfolioId, portfolioHistoryRange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -868,7 +868,7 @@ export function InvestmentWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [accessToken]);
+  }, [accessToken, authenticatedUser]);
 
   const sortedPositions = useMemo(() => {
     const normalizedSearch = searchText.trim().toLowerCase();
@@ -3315,6 +3315,43 @@ function shareholdingPercentage(value: string | undefined): string {
   return Number.isFinite(percentage) ? `${percentage.toFixed(2)}%` : "—";
 }
 
+// Human-readable labels for EvidenceDraft.fieldSuggestions keys when
+// shown as read-only supplementary evidence on the Review screen (see
+// UploadEvidenceDialog below) -- falls back to a humanized version
+// of the raw key for any suggestion key not explicitly named here, so a
+// future evidence-interpreter addition is never silently hidden for
+// lacking a label entry.
+const SUPPLEMENTARY_FIELD_LABELS: Record<string, string> = {
+  shareholderCount: "Shareholder count",
+  sourcePeriodText: "Source period text (as printed)",
+};
+
+function supplementaryFieldLabel(key: string): string {
+  return SUPPLEMENTARY_FIELD_LABELS[key]
+    ?? key.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+}
+
+// Human-readable labels for the SHAREHOLDING category keys that appear
+// in EvidenceDraft.fieldClassification (see ManualEvidenceDraft
+// .field_classification / classify_shareholding_fields).
+const SHAREHOLDING_CATEGORY_LABELS: Record<string, string> = {
+  PROMOTER: "Promoters",
+  FII_FPI: "FII / FPI",
+  DII: "DII",
+  PUBLIC_RETAIL: "Public / Retail",
+};
+
+// What to tell the user about a category classified as anything other
+// than EXTRACTED -- distinguishing "nothing found" from "something was
+// found but could not be safely resolved," per TASK E item 4 ("display
+// ambiguous candidates without auto-selecting"). Never auto-fills or
+// guesses a value; purely descriptive.
+const SHAREHOLDING_CLASSIFICATION_HINTS: Record<string, string> = {
+  MISSING: "not found in the document",
+  AMBIGUOUS: "label matched more than one category -- not auto-resolved",
+  INVALID: "row recognized but its value could not be confidently read",
+};
+
 function ShareholdingPatternTable({ snapshots }: { snapshots: NonNullable<PortfolioResearchCompany["shareholdingSnapshots"]> }) {
   const periods = [...snapshots].slice(0, 4).sort((left, right) =>
     new Date(left.periodEnd).getTime() - new Date(right.periodEnd).getTime());
@@ -3793,7 +3830,7 @@ function ResearchView({
         setWatchlistDetailError(getApiFailure(error).message);
         setWatchlistDetailLoading(false);
       });
-  }, [researchDetail?.watchlistInstrumentId, researchDetail?.researchInstrumentId, detailRegion, watchlistDetailRetryKey]);
+  }, [researchDetail, detailRegion, watchlistDetailRetryKey]);
   const filteredEvents = (summary?.recentEvents ?? []).filter((event) => {
     return (!eventType || event.eventType === eventType) && (!impact || event.impact === impact);
   });
@@ -4927,8 +4964,24 @@ function UploadEvidenceDialog({
   const [corrections, setCorrections] = useState<Record<string, string>>({});
   const [manualFields, setManualFields] = useState<Record<string, string>>({});
   const [factRows, setFactRows] = useState<FinancialFactRow[]>([]);
+  // FINAL CLOSURE item 6 -- tracks which fact rows the user has
+  // actually interacted with, so validation errors are not shown for
+  // untouched empty optional rows (only after a field is touched, or
+  // after an accept attempt via acceptAttempted below).
+  const [touchedFactRows, setTouchedFactRows] = useState<Set<number>>(new Set());
   const [reconcileConflicts, setReconcileConflicts] = useState(false);
   const isFinancialFacts = Boolean(draft && isFinancialFactEvidenceType(draft.evidenceType));
+  // TASK E2 -- SHAREHOLDING-specific Review additions: an editable
+  // reporting-period correction and editable rows for the primary
+  // ownership categories the interpreter did not resolve at all.
+  const isShareholding = draft?.evidenceType === "SHAREHOLDING";
+  const originalReportingPeriodText = draft?.reportingPeriod ? draft.reportingPeriod.slice(0, 10) : "";
+  const missingShareholdingCategoryRows = isShareholding && draft?.fieldClassification
+    ? Object.entries(draft.fieldClassification)
+        .filter(([category, status]) => status !== "EXTRACTED"
+          && !draft.proposedFacts.some((fact) => fact.field === `shareholding:${category}`))
+        .map(([category, status]) => ({ fieldKey: `shareholding:${category}`, category, status }))
+    : [];
   const allowedMetrics = draft ? allowedMetricsByEvidenceType[draft.evidenceType] ?? [] : [];
   // ORDER_BOOK_CAPEX_GUIDANCE / GOVERNANCE_HISTORY: same manual-fields
   // shape as CURRENT_NEWS, but eventType is a restricted dropdown driven by
@@ -5012,13 +5065,30 @@ function UploadEvidenceDialog({
     // editable input either way and can freely overwrite or clear it;
     // nothing here is submitted until they explicitly review and accept.
     setManualFields(draft?.fieldSuggestions ? { ...draft.fieldSuggestions } : {});
-    // A financial-fact draft always starts with one empty, editable row --
-    // there is no safe auto-extraction into structured facts (see
-    // EMPTY_FINANCIAL_FACT_ROW), never a fabricated prefilled value.
-    setFactRows(draft && isFinancialFactEvidenceType(draft.evidenceType) ? [{ ...EMPTY_FINANCIAL_FACT_ROW }] : []);
+    // TASK F -- VALUATION_INPUTS is the one FinancialFact-backed type
+    // with confidently auto-extracted rows (see
+    // app.manual_evidence._extract_valuation_inputs): prefill factRows
+    // from draft.proposedFacts when there are any, so the user corrects/
+    // completes rather than retyping everything from a blank row. Every
+    // OTHER FinancialFact evidence type still has no safe auto-extraction
+    // and keeps starting from one empty, editable row.
+    if (draft && isFinancialFactEvidenceType(draft.evidenceType) && draft.proposedFacts.length > 0) {
+      setFactRows(draft.proposedFacts.map((fact) => ({
+        metric: fact.field,
+        value: fact.value,
+        periodEnd: fact.periodEnd ?? "",
+        periodType: (fact.periodType as FinancialFactRow["periodType"]) ?? "",
+        reportingBasis: "",
+        unit: fact.unit ?? "",
+        sourceUrl: fact.sourceLocator ?? "",
+      })));
+    } else {
+      setFactRows(draft && isFinancialFactEvidenceType(draft.evidenceType) ? [{ ...EMPTY_FINANCIAL_FACT_ROW }] : []);
+    }
+    setTouchedFactRows(new Set());
     setReconcileConflicts(false);
     setPasteError(null);
-  }, [draft?.draftId]);
+  }, [draft]);
 
   const updateFactRow = (index: number, patch: Partial<FinancialFactRow>) => {
     setFactRows((current) => current.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)));
@@ -5073,6 +5143,12 @@ function UploadEvidenceDialog({
   };
 
   const handleAccept = () => {
+    if (isFinancialFacts) {
+      // Surface every row's errors on an accept attempt, even a row the
+      // user never touched -- "or the user attempts acceptance" from the
+      // FINAL CLOSURE requirement.
+      setTouchedFactRows(new Set(factRows.map((_, index) => index)));
+    }
     const payload: EvidenceAcceptRequest = {};
     if (isFinancialFacts) {
       // The backend's corrections["facts"] row-list contract -- exact
@@ -5200,120 +5276,157 @@ function UploadEvidenceDialog({
               {!draft.requiresManualFields && draft.proposedFacts.length === 0 ? (
                 <p role="alert" className="readiness-popup-error">No extractable facts were produced from this file.</p>
               ) : null}
+              {(!draft.requiresManualFields || isFinancialFacts) && draft.fieldSuggestions && Object.keys(draft.fieldSuggestions).length > 0 ? (
+                // Read-only supplementary evidence (e.g. SHAREHOLDING's
+                // shareholderCount / sourcePeriodText) recognized by the
+                // interpreter alongside the canonical proposedFacts above
+                // but with no field in the domain model -- shown for
+                // reference only. Kept entirely separate from
+                // proposedFacts/corrections: never contributes to
+                // `canAccept`, is never sent as a correction, and is
+                // never persisted as a canonical fact (shareholder count
+                // in particular must never be mistaken for an ownership
+                // percentage).
+                <div className="evidence-supplementary-fields" data-testid="evidence-supplementary-fields">
+                  <h3 className="evidence-supplementary-heading">Supplementary evidence (reference only)</h3>
+                  <p className="hint">
+                    Recognized alongside the proposed values below but not itself a canonical
+                    fact -- shown for reference only, never required to accept.
+                  </p>
+                  <dl className="evidence-supplementary-list">
+                    {Object.entries(draft.fieldSuggestions).map(([key, value]) => (
+                      <div className="evidence-supplementary-row" key={key}>
+                        <dt>{supplementaryFieldLabel(key)}</dt>
+                        <dd>{value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              ) : null}
               {isFinancialFacts ? (
                 <div className="evidence-manual-fields" data-testid="financial-fact-editor">
                   <p className="hint">
-                    This evidence type has no safe automatic extraction. Add one row per fact
-                    yourself; nothing is accepted until every row is complete and valid.
+                    {draft.proposedFacts.length > 0
+                      ? "Confidently recognized rows are prefilled below -- review, correct, or complete any that are missing before accepting."
+                      : "This evidence type has no safe automatic extraction. Add one row per fact yourself; nothing is accepted until every row is complete and valid."}
                   </p>
                   <h3 className="evidence-fact-rows-heading">Proposed Financial Facts</h3>
-                  <div className="table-frame">
-                    <table className="evidence-facts-table evidence-fact-rows-table">
-                      <thead>
-                        <tr>
-                          <th>Metric</th><th>Value</th><th>Period end</th><th>Period type</th>
-                          <th>Reporting basis</th><th>Unit</th><th>Source</th><th></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {factRows.map((row, index) => {
-                          const rowErrors = factRowErrorsByIndex[index] ?? [];
-                          const rowInvalid = rowErrors.length > 0;
-                          return (
-                            <tr key={index} className={rowInvalid ? "evidence-fact-row-invalid" : undefined}>
-                              <td>
-                                <select
-                                  aria-label={`Metric for row ${index + 1}`}
-                                  value={row.metric}
-                                  disabled={accepting}
-                                  onChange={(event) => updateFactRow(index, { metric: event.target.value })}
-                                >
-                                  <option value="">Select metric</option>
-                                  {allowedMetrics.map((metric) => (
-                                    <option key={metric} value={metric}>{metric.replaceAll("_", " ")}</option>
-                                  ))}
-                                </select>
-                              </td>
-                              <td>
-                                <input
-                                  type="text"
-                                  inputMode="decimal"
-                                  aria-label={`Value for row ${index + 1}`}
-                                  value={row.value}
-                                  disabled={accepting}
-                                  onChange={(event) => updateFactRow(index, { value: event.target.value })}
-                                />
-                              </td>
-                              <td>
-                                <input
-                                  type="date"
-                                  aria-label={`Period end for row ${index + 1}`}
-                                  value={row.periodEnd}
-                                  disabled={accepting}
-                                  onChange={(event) => updateFactRow(index, { periodEnd: event.target.value })}
-                                />
-                              </td>
-                              <td>
-                                <select
-                                  aria-label={`Period type for row ${index + 1}`}
-                                  value={row.periodType}
-                                  disabled={accepting}
-                                  onChange={(event) => updateFactRow(index, { periodType: event.target.value as FinancialFactRow["periodType"] })}
-                                >
-                                  <option value="">Select period type</option>
-                                  <option value="QUARTERLY">Quarterly</option>
-                                  <option value="ANNUAL">Annual</option>
-                                </select>
-                              </td>
-                              <td>
-                                <input
-                                  type="text"
-                                  aria-label={`Reporting basis for row ${index + 1}`}
-                                  value={row.reportingBasis ?? ""}
-                                  disabled={accepting}
-                                  onChange={(event) => updateFactRow(index, { reportingBasis: event.target.value })}
-                                />
-                              </td>
-                              <td>
-                                <input
-                                  type="text"
-                                  aria-label={`Unit for row ${index + 1}`}
-                                  placeholder="e.g. INR crore"
-                                  value={row.unit}
-                                  disabled={accepting}
-                                  onChange={(event) => updateFactRow(index, { unit: event.target.value })}
-                                />
-                              </td>
-                              <td>
-                                <input
-                                  type="text"
-                                  aria-label={`Source for row ${index + 1}`}
-                                  value={row.sourceUrl}
-                                  disabled={accepting}
-                                  onChange={(event) => updateFactRow(index, { sourceUrl: event.target.value })}
-                                />
-                              </td>
-                              <td className="evidence-fact-remove-cell">
-                                <button
-                                  type="button"
-                                  className="icon-button"
-                                  aria-label={`Remove row ${index + 1}`}
-                                  disabled={accepting || factRows.length <= 1}
-                                  onClick={() => removeFactRow(index)}
-                                >
-                                  &times;
-                                </button>
-                              </td>
-                              {rowInvalid ? (
-                                <td colSpan={8} style={{ border: "none", padding: 0 }}>
-                                  <span className="evidence-fact-row-error" role="alert">{rowErrors.join(" ")}</span>
-                                </td>
-                              ) : null}
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
+                  {/* FINAL CLOSURE item 8 -- a compact, responsive card per
+                      row (metric/value/period/basis/correction together)
+                      replaces the wide 8-column table, which forced
+                      horizontal scrolling at normal desktop width. Source/
+                      provenance moves into a collapsed-by-default
+                      disclosure, same pattern as the SHAREHOLDING facts
+                      table above. */}
+                  <div className="financial-fact-cards">
+                    {factRows.map((row, index) => {
+                      const rowErrors = factRowErrorsByIndex[index] ?? [];
+                      const rowTouched = touchedFactRows.has(index) || Object.values(row).some((value) => value.trim() !== "");
+                      const rowInvalid = rowErrors.length > 0 && rowTouched;
+                      const markTouched = () => setTouchedFactRows((current) => (current.has(index) ? current : new Set(current).add(index)));
+                      return (
+                        <div key={index} className={`financial-fact-card${rowInvalid ? " evidence-fact-row-invalid" : ""}`}>
+                          <div className="financial-fact-card-grid">
+                            <label className="financial-fact-field">
+                              <span>Metric</span>
+                              <select
+                                aria-label={`Metric for row ${index + 1}`}
+                                value={row.metric}
+                                disabled={accepting}
+                                onChange={(event) => { markTouched(); updateFactRow(index, { metric: event.target.value }); }}
+                              >
+                                <option value="">Select metric</option>
+                                {allowedMetrics.map((metric) => (
+                                  <option key={metric} value={metric}>{metric.replaceAll("_", " ")}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="financial-fact-field">
+                              <span>Value</span>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                aria-label={`Value for row ${index + 1}`}
+                                value={row.value}
+                                disabled={accepting}
+                                onChange={(event) => { markTouched(); updateFactRow(index, { value: event.target.value }); }}
+                              />
+                            </label>
+                            <label className="financial-fact-field">
+                              <span>Period end</span>
+                              <input
+                                type="date"
+                                aria-label={`Period end for row ${index + 1}`}
+                                value={row.periodEnd}
+                                disabled={accepting}
+                                onChange={(event) => { markTouched(); updateFactRow(index, { periodEnd: event.target.value }); }}
+                              />
+                            </label>
+                            <label className="financial-fact-field">
+                              <span>Period type</span>
+                              <select
+                                aria-label={`Period type for row ${index + 1}`}
+                                value={row.periodType}
+                                disabled={accepting}
+                                onChange={(event) => { markTouched(); updateFactRow(index, { periodType: event.target.value as FinancialFactRow["periodType"] }); }}
+                              >
+                                <option value="">Select period type</option>
+                                <option value="QUARTERLY">Quarterly</option>
+                                <option value="ANNUAL">Annual</option>
+                              </select>
+                            </label>
+                            <label className="financial-fact-field">
+                              <span>Reporting basis</span>
+                              <input
+                                type="text"
+                                aria-label={`Reporting basis for row ${index + 1}`}
+                                value={row.reportingBasis ?? ""}
+                                disabled={accepting}
+                                onChange={(event) => { markTouched(); updateFactRow(index, { reportingBasis: event.target.value }); }}
+                              />
+                            </label>
+                            <label className="financial-fact-field">
+                              <span>Unit</span>
+                              <input
+                                type="text"
+                                aria-label={`Unit for row ${index + 1}`}
+                                placeholder="e.g. INR crore"
+                                value={row.unit}
+                                disabled={accepting}
+                                onChange={(event) => { markTouched(); updateFactRow(index, { unit: event.target.value }); }}
+                              />
+                            </label>
+                          </div>
+                          <details className="evidence-fact-details">
+                            <summary>Source &amp; provenance</summary>
+                            <label className="financial-fact-field">
+                              <span>Source</span>
+                              <input
+                                type="text"
+                                aria-label={`Source for row ${index + 1}`}
+                                value={row.sourceUrl}
+                                disabled={accepting}
+                                onChange={(event) => { markTouched(); updateFactRow(index, { sourceUrl: event.target.value }); }}
+                              />
+                            </label>
+                          </details>
+                          <div className="financial-fact-card-footer">
+                            <button
+                              type="button"
+                              className="icon-button"
+                              aria-label={`Remove row ${index + 1}`}
+                              disabled={accepting || factRows.length <= 1}
+                              onClick={() => removeFactRow(index)}
+                            >
+                              &times;
+                            </button>
+                          </div>
+                          {rowInvalid ? (
+                            <span className="evidence-fact-row-error" role="alert">{rowErrors.join(" ")}</span>
+                          ) : null}
+                        </div>
+                      );
+                    })}
                   </div>
                   <Button
                     variant="secondary"
@@ -5449,18 +5562,55 @@ function UploadEvidenceDialog({
                   ))}
                 </div>
               ) : null}
-              {!isFinancialFacts && !draft.requiresManualFields && draft.proposedFacts.length ? <div className="table-frame"><table className="evidence-facts-table">
+              {isShareholding ? (
+                // TASK E2 item 5 -- editable reporting-period correction,
+                // reusing the SAME `corrections` payload every other
+                // field here uses (see handleAccept's generic
+                // `corrected` branch below) rather than a separate
+                // mechanism. Prefilled from the extracted period;
+                // accepts an ISO date/month or the source's own period
+                // text (e.g. "Jun 2026") -- validated server-side by
+                // app.evidence_interpretation.resolve_corrected_shareholding_period,
+                // which preserves MONTH precision rather than guessing a
+                // day the user did not give.
+                <label className="evidence-manual-field evidence-period-correction" data-testid="evidence-period-correction">
+                  <span>Reporting period</span>
+                  <input
+                    type="text"
+                    value={corrections.reportingPeriod ?? originalReportingPeriodText}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setCorrections((current) => {
+                        const next = { ...current };
+                        if (value === originalReportingPeriodText) delete next.reportingPeriod;
+                        else next.reportingPeriod = value;
+                        return next;
+                      });
+                    }}
+                    disabled={accepting}
+                    aria-label="Reporting period"
+                    placeholder="YYYY-MM-DD, YYYY-MM, or e.g. Jun 2026"
+                  />
+                  <p className="hint">
+                    A month-only value (e.g. &quot;2026-06&quot; or &quot;Jun 2026&quot;) keeps MONTH precision --
+                    it is never guessed to a specific day.
+                  </p>
+                </label>
+              ) : null}
+              {!isFinancialFacts && !draft.requiresManualFields && (draft.proposedFacts.length || missingShareholdingCategoryRows.length) ? <div className="table-frame"><table className="evidence-facts-table">
                 <thead>
-                  <tr><th>Field</th><th>Proposed value</th><th>Source / provenance</th><th>Evidence text</th><th>Confidence</th><th>Your correction</th></tr>
+                  <tr>
+                    <th>Field</th><th>Proposed value</th>
+                    {isShareholding ? <th>Status</th> : null}
+                    <th>Your correction</th><th>Details</th>
+                  </tr>
                 </thead>
                 <tbody>
                   {draft.proposedFacts.map((fact, index) => (
                     <tr key={`${fact.field}-${index}`}>
                       <td>{fact.field}{fact.validationError ? <small className="readiness-popup-error">{fact.validationError}</small> : null}</td>
-                      <td>{fact.value}</td>
-                      <td>{fact.sourceLocator ?? fact.rawSourceLabel ?? draft.originalFilename}</td>
-                      <td>{fact.evidenceText ?? "-"}</td>
-                      <td>{Math.round(fact.confidence * 100)}%</td>
+                      <td>{fact.originalValue ?? fact.value}</td>
+                      {isShareholding ? <td>{fact.provenance === "OCR_EXTRACTED" ? "Extracted" : "Corrected"}</td> : null}
                       <td>
                         <input
                           type="text"
@@ -5478,6 +5628,58 @@ function UploadEvidenceDialog({
                           aria-label={`Correction for ${fact.field}`}
                         />
                       </td>
+                      <td className="evidence-fact-details-cell">
+                        {/* FINAL CLOSURE item 3 -- provenance, confidence
+                            and source text move into a secondary,
+                            collapsed-by-default disclosure so the main
+                            row (field/value/status/correction) fits at
+                            normal desktop width without horizontal
+                            scrolling. */}
+                        <details className="evidence-fact-details">
+                          <summary>Source &amp; confidence</summary>
+                          <dl>
+                            <dt>Source / provenance</dt>
+                            <dd className="evidence-fact-cell-wrap">{fact.sourceLocator ?? fact.rawSourceLabel ?? draft.originalFilename}</dd>
+                            <dt>Evidence text</dt>
+                            <dd className="evidence-fact-cell-wrap">{fact.evidenceText ?? "-"}</dd>
+                            <dt>Confidence</dt>
+                            <dd>{Math.round(fact.confidence * 100)}%</dd>
+                          </dl>
+                        </details>
+                      </td>
+                    </tr>
+                  ))}
+                  {missingShareholdingCategoryRows.map(({ fieldKey, category, status }) => (
+                    // TASK E2 item 1/2/4 -- a category the interpreter
+                    // never resolved (MISSING/AMBIGUOUS/INVALID) is still
+                    // an editable row, not just a read-only note: typing
+                    // a value here feeds the SAME `corrections` payload,
+                    // which app.manual_evidence._apply_corrections now
+                    // turns into a brand-new USER_ENTERED proposed fact
+                    // at accept() time rather than silently dropping it.
+                    <tr key={fieldKey} className="evidence-fact-row-missing" data-testid={`evidence-missing-category-row-${category}`}>
+                      <td>{fieldKey}</td>
+                      <td>&mdash;</td>
+                      <td>{SHAREHOLDING_CLASSIFICATION_HINTS[status] ?? status}</td>
+                      <td>
+                        <input
+                          type="text"
+                          value={corrections[fieldKey] ?? ""}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setCorrections((current) => {
+                              const next = { ...current };
+                              if (value.trim() === "") delete next[fieldKey];
+                              else next[fieldKey] = value;
+                              return next;
+                            });
+                          }}
+                          disabled={accepting}
+                          aria-label={`Correction for ${fieldKey}`}
+                          placeholder={`Enter ${SHAREHOLDING_CATEGORY_LABELS[category] ?? category} %`}
+                        />
+                      </td>
+                      <td className="evidence-fact-details-cell">&mdash;</td>
                     </tr>
                   ))}
                 </tbody>

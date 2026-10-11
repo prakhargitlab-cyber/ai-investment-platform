@@ -28,7 +28,11 @@ public class OfficialNseEtfSecurityListClient implements NseOfficialEtfSecurityL
 
     @Autowired
     public OfficialNseEtfSecurityListClient(@Value("${nse.official.etf-security-list-url:https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv}") String securityListUrl) {
-        this(securityListUrl, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).followRedirects(HttpClient.Redirect.NORMAL).build());
+        this(securityListUrl, HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .connectTimeout(Duration.ofSeconds(5))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build());
     }
 
     OfficialNseEtfSecurityListClient(String securityListUrl, HttpClient http) {

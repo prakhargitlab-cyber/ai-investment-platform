@@ -1081,6 +1081,19 @@ export type ProposedFact = {
   metricBasis?: string | null;
   confidence: number;
   validationError?: string | null;
+  // TASK E2 item 3/8 -- where this field's CURRENT value came from, and
+  // (when a correction has already been applied) the interpreter's own
+  // originally extracted value, kept distinct so Review can show it
+  // beside the editable correction without losing it. Both purely
+  // informational -- see ProposedFact.provenance/original_value.
+  provenance?: "OCR_EXTRACTED" | "USER_CORRECTED" | "USER_ENTERED";
+  originalValue?: string | null;
+  // TASK F -- VALUATION_INPUTS auto-extracted facts carry enough shape
+  // to prefill a FinancialFactRow (see below); null for every other
+  // evidence type's proposed facts.
+  periodEnd?: string | null;
+  periodType?: string | null;
+  unit?: string | null;
 };
 
 export type ValidationResults = {
@@ -1123,6 +1136,15 @@ export type EvidenceDraft = {
   // review and submit every manualFieldSchema field as `corrections` at
   // accept() time. null/absent when no suggestions were found.
   fieldSuggestions?: Record<string, string> | null;
+  // TASK E item 3/4 -- per-category partial-extraction status
+  // ("EXTRACTED"/"MISSING"/"AMBIGUOUS"/"INVALID") for SHAREHOLDING's
+  // four primary ownership categories (PROMOTER/FII_FPI/DII/
+  // PUBLIC_RETAIL), from app.evidence_interpretation
+  // .classify_shareholding_fields. Purely informational -- drives which
+  // categories the Review screen flags as needing attention; never a
+  // proposedFact and never required at accept(). null/absent for every
+  // other evidence type.
+  fieldClassification?: Record<string, string> | null;
 };
 
 export type EvidenceAcceptRequest = {

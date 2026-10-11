@@ -317,7 +317,8 @@ class OpportunityPersistenceMixin:
         cycle_id = str(cycle_id)
         job = None
         for row in self._connection.execute(
-            'SELECT payload FROM global_opportunity_top_selection ORDER BY generated_at DESC, cycle_id DESC'
+            'SELECT payload FROM global_opportunity_top_selection WHERE payload LIKE ? '
+            'ORDER BY generated_at DESC, cycle_id DESC', (f'%{cycle_id}%',)
         ).fetchall():
             value = decode(row)
             if value.get('record_kind') == 'CYCLE_JOB' and value.get('cycle_id') == cycle_id:

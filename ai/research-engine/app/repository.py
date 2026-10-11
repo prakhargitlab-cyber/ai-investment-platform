@@ -774,7 +774,22 @@ class ResearchRepository:
         if isinstance(self._persistence, SqliteResearchPersistence) and self._persistence.__class__.__module__ != "app.postgres_persistence":
             return operation(*args, **kwargs)
         dispatched_at = time.monotonic()
-        return await asyncio.to_thread(self._run_serialized_persistence_operation, operation, args, kwargs, dispatched_at)
+        # One shared connection is serialized anyway. Queue on the event loop,
+        # not by filling the default executor with threads waiting for its lock.
+        if not hasattr(self, '_persistence_dispatch_slot'):
+            self._persistence_dispatch_slot = asyncio.Semaphore(1)
+        async with self._persistence_dispatch_slot:
+            task = asyncio.create_task(asyncio.to_thread(
+                self._run_serialized_persistence_operation, operation, args, kwargs, dispatched_at))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Cancellation cannot stop a running DB thread. Retain the slot
+                # until it drains so queued work stays bounded and fenced.
+                try:
+                    await task
+                finally:
+                    raise
 
     def _run_serialized_persistence_operation(self, operation, args, kwargs, dispatched_at=None):
         with self._persistence_worker_lock:

@@ -283,3 +283,25 @@ def test_etf_and_equity_workers_do_not_interfere():
             await equity_worker.close()
 
     _run(scenario())
+
+
+@pytest.mark.asyncio
+async def test_etf_evaluation_and_publication_are_offloaded_and_empty_count_is_explicit():
+    import threading
+    from app.etf_opportunity_cycle import run_etf_radar_cycle_async
+    from test_global_opportunity_cycle_event_loop_offload import _thread_safe_store
+    from unittest.mock import AsyncMock
+    store = _thread_safe_store()
+    main_thread = threading.get_ident()
+    observed = []
+    async def dispatch(operation, *args, **kwargs):
+        def call():
+            observed.append(threading.get_ident())
+            return operation(*args, **kwargs)
+        return await asyncio.to_thread(call)
+    repo = SimpleNamespace(persistence=store, _persistence_worker_lock=RLock(), _run_blocking_persistence=dispatch)
+    source = SimpleNamespace(active_global_etfs=AsyncMock(return_value=[]))
+    result = await run_etf_radar_cycle_async(repo, source)
+    assert result['universe_count'] == 0
+    assert observed and main_thread not in observed
+    assert store.latest_etf_radar_cycle()['universe_count'] == 0

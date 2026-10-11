@@ -46,7 +46,6 @@ public class NseEtfUniverseController {
     public NseEtfUniversePreviewService.Preview preview(HttpServletRequest request) {
         AuthenticatedUser user = AuthenticatedUserResolver.require(request);
         requireAdmin(user);
-        users.upsert(user);
         return preview.preview();
     }
 

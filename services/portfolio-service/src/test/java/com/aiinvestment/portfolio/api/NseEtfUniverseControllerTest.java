@@ -68,8 +68,7 @@ class NseEtfUniverseControllerTest {
         mockMvc.perform(authenticatedRequest(get(PREVIEW_PATH), "ADMIN")).andExpect(status().isOk());
 
         verify(preview).preview();
-        verify(users).upsert(any());
-        verifyNoInteractions(apply);
+        verifyNoInteractions(users, apply);
     }
 
     // 4. Unauthenticated apply is rejected before any service is invoked.

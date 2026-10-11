@@ -82,6 +82,8 @@ public class GatewayAuthenticationFilter extends OncePerRequestFilter {
 
     private boolean isAdminPath(HttpServletRequest request) {
         String path = request.getRequestURI();
+        if ("DELETE".equalsIgnoreCase(request.getMethod())
+                && path.matches("/api/v1/(research/opportunities|etf-radar)/cycles/[^/]+/cancel/?")) return true;
         return path.equals("/api/v1/auth/admin") || path.startsWith("/api/v1/auth/admin/");
     }
 

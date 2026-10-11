@@ -95,7 +95,9 @@ def etf_cycle_result_to_dict(result: EtfCycleResult) -> dict:
     for a cycle result. dataclasses.asdict() handles the nested-dataclass
     structure; json.dumps's default handles the remaining leaf types
     (UUID/Decimal/datetime/Enum) that asdict leaves untouched."""
-    return json.loads(json.dumps(dataclasses.asdict(result), default=_json_default))
+    payload = json.loads(json.dumps(dataclasses.asdict(result), default=_json_default))
+    payload["universe_count"] = len(result.candidates)
+    return payload
 
 
 def _bars(store, instrument_id: UUID):
@@ -251,10 +253,14 @@ async def run_etf_radar_cycle_async(repository, portfolio_orchestrator, *, top_n
                 for instrument_id in candidate_ids]
     else:
         rows = await portfolio_orchestrator.active_global_etfs(correlation_id=correlation_id, identity_headers=identity_headers)
-    with repository._persistence_worker_lock:
-        result = run_etf_radar_cycle(rows, repository.persistence, cycle_id=cycle_id,
-            correlation_id=correlation_id, top_n=top_n)
-        payload = etf_cycle_result_to_dict(result)
-        repository.persistence.save_etf_radar_cycle(result.cycle_id, result.radar_version, result.correlation_id,
-            result.as_of, payload)
-    return {'cycle_id': str(result.cycle_id), 'universe_count': len(rows)}
+    def evaluate_and_save():
+        with repository._persistence_worker_lock:
+            result = run_etf_radar_cycle(rows, repository.persistence, cycle_id=cycle_id,
+                correlation_id=correlation_id, top_n=top_n)
+            payload = etf_cycle_result_to_dict(result)
+            repository.persistence.save_etf_radar_cycle(result.cycle_id, result.radar_version, result.correlation_id,
+                result.as_of, payload)
+        return {'cycle_id': str(result.cycle_id), 'universe_count': len(rows)}
+
+    run_blocking = getattr(repository, '_run_blocking_persistence', None)
+    return await run_blocking(evaluate_and_save) if run_blocking is not None else evaluate_and_save()

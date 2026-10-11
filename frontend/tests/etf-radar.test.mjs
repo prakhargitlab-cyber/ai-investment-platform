@@ -115,7 +115,8 @@ test('ETF radar content renders an empty-ranking message with no cards', () => {
     data: { radar_version: 'ETF_RADAR_V1', cycle_id: 'c1', correlation_id: null, as_of: '2026-09-27T12:00:00Z',
       candidates: [], ranked: [], excluded_by_reason: {} },
   }));
-  assert.match(html, /No ETF currently ranks/);
+  assert.match(html, /No ETF instruments were evaluated/);
+  assert.doesNotMatch(html, /No ETF currently ranks/);
   assert.equal((html.match(/class="opportunity-card etf-radar-card"/g) ?? []).length, 0);
 });
 

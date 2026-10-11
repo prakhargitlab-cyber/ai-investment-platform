@@ -291,7 +291,7 @@ async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4,
     # evidence; suppress all discovery eligibility. No unavailable price is invented.
     if candidate_ids is None:
         done = {s['global_instrument_id'] for s in snapshots}
-        histories = {r['recommendation_id']: r for r in repository.persistence.recommendation_history()}
+        histories = {r['recommendation_id']: r for r in (await _blocking(repository, repository.persistence.recommendation_history))}
         for state in previous_states:
             key = state['global_instrument_id']
             if key in done or not active_recommendation(state):

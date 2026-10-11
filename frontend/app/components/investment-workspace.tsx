@@ -1699,7 +1699,7 @@ export function InvestmentWorkspace() {
           {view === "backtesting" ? <Backtesting /> : null}
           {view === "admin" ? <AdminUsers operatorId={authenticatedUser.userId} roles={authenticatedUser.roles ?? []} /> : null}
           {loading ? <LoadingView /> : null}
-          {view === "dashboard" && (loading || error) ? <RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
+          {view === "dashboard" && (loading || error) ? <RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
 
           {!loading && !error ? (
             <>
@@ -1719,7 +1719,7 @@ export function InvestmentWorkspace() {
                       onAddWatchlist={(selection) => { void addRankedStockToWatchlist(selection); }}
                       savedInstrumentIds={watchlists.filter((list) => list.region === sectorPerformanceRegion && list.systemDefault).flatMap((list) => savedWatchlistIds[list.watchlistId] ?? [])}
                       watchlistBusy={watchlistMutation !== null}
-                      radar={<RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
+                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
                       performance={sectorPerformance}
                       performanceRegion={sectorPerformanceRegion}
                       performanceSector={sectorPerformanceSector}
@@ -1744,7 +1744,7 @@ export function InvestmentWorkspace() {
                       portfolio={selectedPortfolio}
                       summary={summary}
                       positions={positions}
-                      radar={<RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
+                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
                       onCreate={createPortfolio}
                       onSync={selectedPortfolio?.brokerConnectionId ? syncSelectedPortfolio : undefined}
                       onRefreshPrices={selectedPortfolio?.acquisitionSource === "MANUAL_CSV_IMPORT" ? refreshSelectedPrices : undefined}

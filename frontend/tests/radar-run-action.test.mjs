@@ -312,3 +312,51 @@ for (const [name, filename, key, endpoint] of [
     }
   });
 }
+
+
+test('phase descriptions are explicit and historical recommendations never claim today freshness', () => {
+  const { RadarContent } = loadComponent('opportunity-radar.tsx');
+  const { RadarProgressPanel } = loadComponent('radar-progress.tsx');
+  const data = { generated_at: '2026-10-05T00:00:00Z', best_buy_today: null, top_short_term: [], top_long_term: [] };
+  const html = renderToString(React.createElement(RadarContent, { data }));
+  assert.match(html, /Previous completed cycle/);
+  assert.doesNotMatch(html, /Best buy today/);
+  for (const [phase, description] of [['BASELINE', 'Baseline scanning'], ['CANDIDATE_SELECTION', 'Candidate selection'], ['DEEP', 'Deep investigation']]) {
+    const panel = renderToString(React.createElement(RadarProgressPanel, {
+      radarType: 'Equity', cycleId: 'c', status: 'RUNNING', phase, counters: [], percent: null
+    }));
+    assert.match(panel, new RegExp(description));
+    assert.match(panel, /bar-track-indeterminate/);
+    assert.doesNotMatch(panel, /80%/);
+  }
+});
+
+test('ADMIN cancellation uses DELETE request helper and exposes permission failures without deleting historical data', async () => {
+  const originalWindow = globalThis.window;
+  const calls = [];
+  let tree;
+  try {
+    globalThis.window = { sessionStorage: { getItem: () => 'c', removeItem() {} } };
+    const { OpportunityRadar } = loadComponent('opportunity-radar.tsx', { request: (url, init) => {
+      const pending = deferred(); calls.push({ url, init, ...pending }); return pending.promise;
+    } });
+    await settle(() => { tree = create(React.createElement(OpportunityRadar, { heldIds: [], watchlistedIds: [], roles: ['ADMIN'] })); });
+    await settle(() => calls[0].resolve({ generated_at: '2026-10-05', best_buy_today: null, top_short_term: [], top_long_term: [] }));
+    await settle(() => button(tree, 'Cancel Equity Radar').props.onClick());
+    assert.equal(calls[2].url, '/api/v1/research/opportunities/cycles/c/cancel');
+    assert.equal(calls[2].init.method, 'DELETE');
+    assert.equal(calls[2].init.headers, undefined);
+    await settle(() => calls[2].reject({ status: 403 }));
+    assert.match(textOf(tree), /Administrator access is required/);
+    assert.match(textOf(tree), /Previous completed cycle/);
+    await settle(() => button(tree, 'Cancel Equity Radar').props.onClick());
+    await settle(() => calls[3].resolve({ status: 'CANCEL_REQUESTED' }));
+    assert.equal(button(tree, 'Cancel Equity Radar').props.disabled, true);
+    assert.match(textOf(tree), /waiting for in-flight work to drain/);
+    await settle(() => tree.update(React.createElement(OpportunityRadar, { heldIds: [], watchlistedIds: [], roles: ['USER'] })));
+    assert.equal(button(tree, 'Cancel Equity Radar'), undefined);
+  } finally {
+    if (tree) await settle(() => tree.unmount());
+    globalThis.window = originalWindow;
+  }
+});

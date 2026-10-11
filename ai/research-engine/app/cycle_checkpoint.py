@@ -458,6 +458,10 @@ class CycleRunPersistenceMixin:
             failed += int(CandidateState(row["state"]) == CandidateState.EVIDENCE_UNAVAILABLE)
             eligible += int(bool(diagnostic.get("rank_eligible")))
         return {
+            "phase": ('DEEP' if 'deep_ids' in selection else selection.get('phase', 'BASELINE')),
+            "baseline_evaluated": selection.get('baseline_evaluated'),
+            "universe_count": selection.get('universe_count'),
+            "deep_attempted": sum(int(row.get('attempts') or 0) > 0 for row in scoped),
             "deep_completed": len(terminal),
             "deep_denominator": len(admitted),
             "ready": ready,

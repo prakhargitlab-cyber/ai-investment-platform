@@ -217,8 +217,8 @@ function PreviousRecommendationsPage({ items }: { items: Opportunity[] }) {
 
 export function RadarContent({ data, heldIds = [], watchlistedIds = [] }: { data: Radar; heldIds?: string[]; watchlistedIds?: string[] }) {
   return <>
-    <p>{data.generated_at ? `Last cycle: ${new Date(data.generated_at).toLocaleString()}` : "No persisted opportunity cycle yet."}</p>
-    <h3>Best buy today</h3>
+    <p>{data.generated_at ? `Previous completed cycle ? ${new Date(data.generated_at).toLocaleString()}` : "No persisted opportunity cycle yet."}</p>
+    <h3>Leading buy candidate from that cycle</h3>
     {data.best_buy_today ? <p>{data.best_buy_today.company_name ?? data.best_buy_today.symbol} · {price(data.best_buy_today.current_price)} · {investorLabel(data.best_buy_today.new_investor_action)}</p> : <p>No qualifying buy candidate.</p>}
     <ExpandableSection
       title="Top short-term opportunities" items={data.top_short_term} horizon="short"
@@ -233,6 +233,7 @@ export function RadarContent({ data, heldIds = [], watchlistedIds = [] }: { data
 }
 
 type EquityAuthoritativeProgress = {
+  phase?: string; baseline_evaluated?: number; universe_count?: number; deep_attempted?: number;
   deep_completed?: number; deep_denominator?: number;
   ready?: number; failed?: number; technical?: number; eligible?: number;
 };
@@ -260,24 +261,20 @@ function equityCounters(progress: EquityAuthoritativeProgress | null): RadarProg
   // value for it: the panel renders "Unavailable" for a null value rather
   // than hiding the row (see radar-progress.tsx).
   //
-  // "Total universe"/"Pod restarts" are not in
-  // app.cycle_checkpoint.cycle_status_snapshot's returned shape at all
-  // (deep_completed/deep_denominator/ready/failed/technical/eligible only)
-  // and there is no Kubernetes-restart data source wired into this backend
-  // -- both stay Unavailable; the smallest addition that would populate
-  // Total universe is persisting len(baseline_scan.candidates) into the
-  // cycle's checkpoint selection alongside deep_ids/shortlist_ids.
-  //
+  // Universe and phase counts come from the durable cycle selection.
+  // Pod restart counts are not exposed by this API.
   // The current-results API has no cycle identity. Its action totals cannot
   // be attributed to this tracked cycle, even after a successful refetch.
   return [
+    { label: "Baseline evaluated", value: progress?.baseline_evaluated ?? null },
+    { label: "Deep attempted", value: progress?.deep_attempted ?? null },
     { label: "Deep admitted", value: progress?.deep_denominator ?? null },
     { label: "Deep completed", value: progress?.deep_completed ?? null },
     { label: "Eligible", value: progress?.eligible ?? null },
     { label: "Ready", value: progress?.ready ?? null },
     { label: "Readiness failed", value: progress?.failed ?? null },
     { label: "Technical failures", value: progress?.technical ?? null },
-    { label: "Total universe", value: null },
+    { label: "Total universe", value: progress?.universe_count ?? null },
     { label: "Pod restarts", value: null },
     { label: "BUY count", value: null },
     // Combines PARTIAL_EXIT and SELL (app.opportunity_persistence's own
@@ -294,13 +291,15 @@ function equityCounters(progress: EquityAuthoritativeProgress | null): RadarProg
 }
 
 function equityPercent(progress: EquityAuthoritativeProgress | null): number | null {
-  if (!progress || !progress.deep_denominator || progress.deep_completed == null) return null;
+  if (!progress || progress.phase !== "DEEP" || !progress.deep_denominator || progress.deep_completed == null) return null;
   return ((progress.deep_completed / progress.deep_denominator) * 100);
 }
 
-export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[]; watchlistedIds: string[] }) {
+export function OpportunityRadar({ heldIds, watchlistedIds, roles = [] }: { heldIds: string[]; watchlistedIds: string[]; roles?: string[] }) {
   const [data, setData] = useState<Radar | null>(null);
   const [error, setError] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
   const [activeCycle, setActiveCycle] = useState<EquityActiveCycle | null>(null);
   useEffect(() => {
     let active = true;
@@ -375,6 +374,22 @@ export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[
       .catch(() => setError(true));
   };
 
+  const cancelCycle = async () => {
+    if (!activeCycle || cancelling) return;
+    const id = activeCycle.cycleId;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      const result = await request<{ status: string }>(
+        `/api/v1/research/opportunities/cycles/${id}/cancel`, { method: "DELETE" });
+      setActiveCycle(previous => previous?.cycleId === id ? { ...previous, status: result.status } : previous);
+    } catch (failure) {
+      const status = (failure as { status?: number }).status;
+      setCancelError(status === 401 ? "Sign in again to cancel this cycle."
+        : status === 403 ? "Administrator access is required to cancel this cycle." : "Cancellation could not be requested. Try again.");
+    } finally { setCancelling(false); }
+  };
+
   const running = !!activeCycle && !isTerminalRadarStatus(activeCycle.status);
 
   return <section className="opportunity-radar" aria-label="Global opportunity radar">
@@ -382,12 +397,16 @@ export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[
     <button type="button" className="button button-primary radar-run-action" disabled={running} onClick={runCycle}>
       {running ? "Running…" : "Run Equity Radar"}
     </button>
+    {running && roles.includes("ADMIN") ? <button type="button" disabled={cancelling || activeCycle?.status === "CANCEL_REQUESTED"}
+      onClick={() => void cancelCycle()}>{cancelling ? "Requesting cancellation?" : "Cancel Equity Radar"}</button> : null}
+    {cancelError ? <p role="alert">{cancelError}</p> : null}
     {activeCycle ? (
       <RadarProgressPanel radarType="Equity" cycleId={activeCycle.cycleId} status={activeCycle.status}
         startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt}
         counters={equityCounters(activeCycle.progress)}
-        percent={equityPercent(activeCycle.progress)} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+        phase={activeCycle.progress?.phase} percent={equityPercent(activeCycle.progress)} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
     ) : null}
-    {error ? <p role="alert">Opportunity radar unavailable.</p> : data ? <RadarContent data={data} heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <p>Loading persisted opportunities…</p>}
+    {error ? <p role="alert">Opportunity radar unavailable.</p> : null}
+    {data ? <RadarContent data={data} heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <p>Loading persisted opportunities…</p>}
   </section>;
 }

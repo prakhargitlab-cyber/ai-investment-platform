@@ -259,13 +259,29 @@ class OpportunityCycleWorker:
         self.queue.put_nowait(value)
         return dict(value)
 
+    async def _take_over_async(self):
+        if self.active is not None or not self._resumable_supported() or self._recovery_paused:
+            return
+        run = await self._blocking(self._store.active_cycle_run, self.market)
+        if run is None or run.get('owner_id') == self.owner_id:
+            return
+        if await self._blocking(self._is_cycle_cancelled, run['cycle_id']):
+            return
+        lease = run.get('lease_expires_at')
+        if run.get('owner_id') is None or lease is None or lease < datetime.now(timezone.utc).isoformat(timespec='microseconds'):
+            job = await self._blocking(self._job_for_run, run)
+            # Submission may have won while the durable reads were in flight.
+            if self.active is None and not self.queue.full():
+                self.active = {**job, 'resumed': True}
+                self.queue.put_nowait(self.active)
+
     async def _work(self):
         while True:
             try:
                 value = await asyncio.wait_for(self.queue.get(), timeout=self.poll_seconds)
             except asyncio.TimeoutError:
                 try:
-                    self._maybe_take_over()
+                    await self._take_over_async()
                 except Exception:
                     logger.exception("opportunity_cycle_takeover_check_failed")
                 continue
@@ -306,26 +322,25 @@ class OpportunityCycleWorker:
     async def _run_one(self, value):
         cycle_id = value['cycle_id']
         self._in_flight_cycle_id = cycle_id
-        resumable = self._resumable_supported() and self._locked(self._store.cycle_run, cycle_id) is not None
+        resumable = self._resumable_supported() and await self._blocking(self._store.cycle_run, cycle_id) is not None
         checkpoint = heartbeat = None
         if resumable:
-            if not self._locked(self._store.claim_cycle_run, cycle_id, self.owner_id, lease_seconds=self.lease_seconds):
+            if not await self._blocking(self._store.claim_cycle_run, cycle_id, self.owner_id, lease_seconds=self.lease_seconds):
                 # A live worker (possibly another replica) owns this cycle.
                 logger.info("opportunity_cycle_claim_skipped cycleId=%s owner=%s", cycle_id, self.owner_id)
                 self.active = None
                 return
             checkpoint = CycleCheckpoint(self._store, cycle_id, self.owner_id,
                                          run_blocking=getattr(self.repository, '_run_blocking_persistence', None))
-            claimed_run = self._locked(self._store.cycle_run, cycle_id)
+            claimed_run = await self._blocking(self._store.cycle_run, cycle_id)
             logger.info("opportunity_cycle_claimed cycleId=%s owner=%s resumeCount=%s",
                         cycle_id, self.owner_id, claimed_run.get('resume_count'))
-            heartbeat = asyncio.create_task(self._heartbeat(cycle_id), name=f'opportunity-lease-{cycle_id}')
             # Two-phase cancellation: if CANCEL_REQUESTED (not yet terminal),
             # the owner KEEPS draining -- the orchestrator's admission loop
             # checks cycle_cancellation_requested() and breaks out immediately
             # (no new candidates), but in-flight acquisition/drain continues
             # normally. Only a terminal CANCELLED run is coerced immediately.
-            if self._cancel_status(cycle_id) == 'CANCELLED':
+            if await self._blocking(self._cancel_status, cycle_id) == 'CANCELLED':
                 logger.info("opportunity_cycle_cancel_terminal cycleId=%s owner=%s", cycle_id, self.owner_id)
                 # Already terminal (another worker or a prior pass coerced it).
                 self.active = None
@@ -334,31 +349,32 @@ class OpportunityCycleWorker:
             # the drain. The status stays CANCEL_REQUESTED in the run table
             # until the orchestrator finishes and we coerce in the post-runner
             # block below (or in close()).
-            if self._is_cycle_cancelled(cycle_id):
+            if await self._blocking(self._is_cycle_cancelled, cycle_id):
                 logger.info("opportunity_cycle_cancel_drain cycleId=%s owner=%s", cycle_id, self.owner_id)
+            heartbeat = asyncio.create_task(self._heartbeat(cycle_id), name=f'opportunity-lease-{cycle_id}')
         try:
             value = {**value, 'status': 'RUNNING', 'updated_at': datetime.now(timezone.utc).isoformat()}
             value.pop('error_code', None)
-            self.record(value)
+            await self._blocking(self.record, value)
             self.active = value
             extra = {'cycle_id': cycle_id, 'checkpoint': checkpoint} if resumable else {}
             result = await self.runner(**value['parameters'], **extra)
             # Re-check cancellation after in-flight work completed: a cancel
             # request may have arrived mid-flight. Coerce to terminal CANCELLED
             # instead of publishing a successful snapshot.
-            if resumable and self._is_cycle_cancelled(cycle_id):
+            if resumable and await self._blocking(self._is_cycle_cancelled, cycle_id):
                 logger.info("opportunity_cycle_cancel_after_runner cycleId=%s owner=%s", cycle_id, self.owner_id)
                 with suppress(Exception):
-                    self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id)
+                    await self._blocking(self._store.cancel_cycle_run, cycle_id, self.owner_id)
                 value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
-                self.record(value)
+                await self._blocking(self.record, value)
                 if self.active is not None and self.active['cycle_id'] == cycle_id:
                     self.active = None
                 return
             value = {**value, 'status': 'COMPLETED', 'result_cycle_id': result['cycle_id'],
                      'universe_count': result.get('universe_count')}
             if resumable:
-                self._locked(self._store.update_cycle_run, cycle_id, self.owner_id, status='COMPLETED')
+                await self._blocking(self._store.update_cycle_run, cycle_id, self.owner_id, status='COMPLETED')
                 value.update(resumed_candidates=dict(checkpoint.restored), executed_candidates=dict(checkpoint.executed))
             logger.info(
                 "opportunity_cycle_complete cycleId=%s correlationId=%s resultCycleId=%s "
@@ -367,20 +383,20 @@ class OpportunityCycleWorker:
                 value.get('result_cycle_id'), value.get('universe_count'),
             )
         except asyncio.CancelledError:
-            if resumable and self._is_cycle_cancelled(cycle_id):
-                if self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id):
+            if resumable and await self._blocking(self._is_cycle_cancelled, cycle_id):
+                if await self._blocking(self._store.cancel_cycle_run, cycle_id, self.owner_id):
                     value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
-                    self.record(value)
+                    await self._blocking(self.record, value)
             elif resumable and self._closing:
                 # Graceful shutdown without cancellation keeps the SAME cycle
                 # resumable by the next worker.
                 value = {**value, 'status': 'RUNNING', 'error_code': 'WORKER_STOPPED_RESUMABLE'}
                 with suppress(Exception):
-                    self._locked(self._store.release_cycle_run, cycle_id, self.owner_id)
+                    await self._blocking(self._store.release_cycle_run, cycle_id, self.owner_id)
             else:
                 value = {**value, 'status': 'FAILED', 'error_code': 'WORKER_STOPPED'}
                 if resumable:
-                    self._fail_run(cycle_id, 'WORKER_STOPPED')
+                    await self._blocking(self._fail_run, cycle_id, 'WORKER_STOPPED')
             raise
         except CycleOwnershipLost:
             # Our lease expired and another worker owns the cycle now; it
@@ -398,16 +414,16 @@ class OpportunityCycleWorker:
             )
             value = {**value, 'status': 'FAILED', 'error_code': 'UNIVERSE_UNAVAILABLE'}
             if resumable:
-                self._fail_run(cycle_id, 'UNIVERSE_UNAVAILABLE')
+                await self._blocking(self._fail_run, cycle_id, 'UNIVERSE_UNAVAILABLE')
         except Exception as exc:
             # The cycle entry point signals persisted cancellation this way.
             # Require both the exact internal signal and durable intent; an
             # unrelated RuntimeError must still be a genuine worker failure.
             if (type(exc) is RuntimeError and exc.args == ('CYCLE_CANCELLED',)
-                    and resumable and self._is_cycle_cancelled(cycle_id)):
-                if self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id):
+                    and resumable and await self._blocking(self._is_cycle_cancelled, cycle_id)):
+                if await self._blocking(self._store.cancel_cycle_run, cycle_id, self.owner_id):
                     value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
-                    self.record(value)
+                    await self._blocking(self.record, value)
                 return
             # Persist safe failure metadata, never provider/auth exception text.
             logger.exception(
@@ -417,7 +433,7 @@ class OpportunityCycleWorker:
             )
             value = {**value, 'status': 'FAILED', 'error_code': 'OPPORTUNITY_CYCLE_FAILED'}
             if resumable:
-                self._fail_run(cycle_id, 'OPPORTUNITY_CYCLE_FAILED')
+                await self._blocking(self._fail_run, cycle_id, 'OPPORTUNITY_CYCLE_FAILED')
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -425,14 +441,14 @@ class OpportunityCycleWorker:
                     await heartbeat
             # A zombie owner (lease taken over, or the cycle already completed
             # by another worker) must never publish any status for it.
-            zombie = resumable and value.get('status') != 'COMPLETED' and self._superseded_or_done(cycle_id)
+            zombie = resumable and value.get('status') != 'COMPLETED' and await self._blocking(self._superseded_or_done, cycle_id)
             value['updated_at'] = datetime.now(timezone.utc).isoformat()
             try:
                 if zombie:
                     logger.warning("opportunity_cycle_status_suppressed cycleId=%s owner=%s reason=SUPERSEDED",
                                    cycle_id, self.owner_id)
                 else:
-                    self.record(value)
+                    await self._blocking(self.record, value)
             finally:
                 # Finalization can release this cycle while its old runner is
                 # draining. Do not erase a replacement already queued by submit.
@@ -454,12 +470,12 @@ class OpportunityCycleWorker:
             in_flight_cycle_id = getattr(self, '_in_flight_cycle_id', None)
             if in_flight_cycle_id is not None and self._resumable_supported():
                 cycle_id = in_flight_cycle_id
-                if self._is_cycle_cancelled(cycle_id):
+                if await self._blocking(self._is_cycle_cancelled, cycle_id):
                     with suppress(Exception):
-                        self._locked(self._store.cancel_cycle_run, cycle_id, self.owner_id)
-                    run = self._locked(self._store.cycle_run, cycle_id)
-                    job = self._job_for_run(run) if run else {}
-                    self.record({**job, 'cycle_id': cycle_id,
+                        await self._blocking(self._store.cancel_cycle_run, cycle_id, self.owner_id)
+                    run = await self._blocking(self._store.cycle_run, cycle_id)
+                    job = await self._blocking(self._job_for_run, run) if run else {}
+                    await self._blocking(self.record, {**job, 'cycle_id': cycle_id,
                                  'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED',
                                  'updated_at': datetime.now(timezone.utc).isoformat()})
             self.active = None

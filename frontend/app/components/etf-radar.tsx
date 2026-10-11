@@ -62,6 +62,7 @@ export type EtfCandidate = {
 };
 
 export type EtfCycleResult = {
+  universe_count?: number;
   radar_version: string;
   cycle_id: string;
   correlation_id: string | null;
@@ -137,7 +138,9 @@ export function EtfRadarContent({ data }: { data: EtfCycleResult }) {
       </p>
       <h3>Top ETF opportunities</h3>
       <div className="opportunity-cards">{data.ranked.map((item) => <EtfRadarCard key={item.global_instrument_id ?? item.symbol} item={item} />)}</div>
-      {!data.ranked.length ? <p>No ETF currently ranks as a qualifying opportunity.</p> : null}
+      {(data.universe_count ?? data.candidates.length) === 0
+        ? <p role="alert">No ETF instruments were evaluated. ETF universe setup or discovery needs attention.</p>
+        : !data.ranked.length ? <p>No ETF currently ranks as a qualifying opportunity.</p> : null}
     </>
   );
 }

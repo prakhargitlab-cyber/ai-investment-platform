@@ -229,10 +229,18 @@ async def opportunity_cycle_status(cycle_id: UUID):
     return value
 
 
+async def _radar_read(operation, *args, **kwargs):
+    dispatch = getattr(repository, '_run_blocking_persistence', None)
+    if dispatch is not None:
+        return await dispatch(operation, *args, **kwargs)
+    # Minimal SQLite-only test adapters are thread-affine.
+    with repository._persistence_worker_lock:
+        return operation(*args, **kwargs)
+
+
 @app.get('/api/v1/research/opportunities/current')
 async def opportunity_radar():
-    with repository._persistence_worker_lock:
-        return repository.persistence.global_opportunity_radar()
+    return await _radar_read(repository.persistence.global_opportunity_radar)
 
 
 @app.get('/api/v1/research/recommendations/current')
@@ -240,16 +248,12 @@ async def current_portfolio_recommendations(
     global_instrument_id: list[UUID] = Query(default=[]),
 ):
     """Bulk current Radar projection for portfolio holdings."""
-    with repository._persistence_worker_lock:
-        return repository.persistence.portfolio_recommendation_signals(
-            instrument_ids=global_instrument_id
-        )
+    return await _radar_read(repository.persistence.portfolio_recommendation_signals, instrument_ids=global_instrument_id)
 
 
 @app.get('/api/v1/research/opportunities/history/{instrument_id}')
 async def opportunity_history(instrument_id: UUID):
-    with repository._persistence_worker_lock:
-        return repository.persistence.recommendation_history(instrument_id)
+    return await _radar_read(repository.persistence.recommendation_history, instrument_id)
 
 
 @app.get('/api/v1/research/etf-recommendations/current')
@@ -263,10 +267,7 @@ async def current_etf_portfolio_recommendations(
     confidence/data completeness/as-of/version) -- callers supply their own
     private position data (quantity, cost, account) separately and merge
     client-side; this endpoint never receives or returns it."""
-    with repository._persistence_worker_lock:
-        return repository.persistence.etf_portfolio_recommendation_signals(
-            instrument_ids=global_instrument_id
-        )
+    return await _radar_read(repository.persistence.etf_portfolio_recommendation_signals, instrument_ids=global_instrument_id)
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +284,7 @@ async def etf_radar_current():
     """DB-only read of the most recently persisted ETF Radar cycle. Never
     triggers acquisition or a new cycle -- opening this endpoint is safe to
     call as often as the UI likes."""
-    with repository._persistence_worker_lock:
-        result = repository.persistence.latest_etf_radar_cycle()
+    result = await _radar_read(repository.persistence.latest_etf_radar_cycle)
     if result is None:
         raise HTTPException(404, 'ETF_RADAR_CYCLE_NOT_FOUND')
     return result
@@ -292,8 +292,7 @@ async def etf_radar_current():
 
 @app.get('/api/v1/etf-radar/cycles/{cycle_id}')
 async def etf_radar_cycle_status(cycle_id: UUID):
-    with repository._persistence_worker_lock:
-        result = repository.persistence.etf_radar_cycle(cycle_id)
+    result = await _radar_read(repository.persistence.etf_radar_cycle, cycle_id)
     if result is None:
         raise HTTPException(404, 'ETF_RADAR_CYCLE_NOT_FOUND')
     return result
@@ -624,17 +623,17 @@ class StockRuleEngineAnalysisRequest(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+async def health() -> dict[str, str]:
     return {"status": "ok", "service": settings.service_name}
 
 
 @app.get("/health/live")
-def liveness() -> dict[str, str]:
+async def liveness() -> dict[str, str]:
     """Cheap process liveness check for the Kubernetes liveness probe.
 
     Keep this independent of persistence, providers, readiness, and Radar
-    state.  A slow dependency or a busy event loop must make the pod
-    temporarily unready, never look dead to Kubernetes.
+    state and the shared sync-handler thread pool. The event loop must
+    remain responsive; this handler performs no blocking work.
     """
     return {"status": "ok", "service": settings.service_name}
 

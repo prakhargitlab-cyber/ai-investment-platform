@@ -52,6 +52,7 @@ export function RadarProgressPanel({
   updatedAt,
   counters,
   percent,
+  phase,
   errorCode,
   pollError,
 }: {
@@ -63,6 +64,7 @@ export function RadarProgressPanel({
   counters: RadarProgressCounter[];
   /** A genuine completed/admitted ratio (0-100), or null for indeterminate. */
   percent: number | null;
+  phase?: string;
   errorCode?: string | null;
   /** Set when the most recent status poll itself failed (transient network
    * error) -- the panel keeps showing the last known good state rather than
@@ -77,6 +79,12 @@ export function RadarProgressPanel({
         <strong>{radarType} radar · {statusLabel(status)}</strong>
         <small>Cycle {cycleId}</small>
       </div>
+      {!terminal && radarType === "Equity" && status !== "CANCEL_REQUESTED" ? <p>{phase === "DEEP"
+        ? "Deep investigation ? progress covers admitted candidates only."
+        : phase === "CANDIDATE_SELECTION" ? "Candidate selection ? selecting instruments for deep investigation."
+        : phase === "BASELINE" ? "Baseline scanning ? live baseline progress is unavailable."
+        : "Waiting for the current research phase."}</p> : null}
+      {status === "CANCEL_REQUESTED" ? <p>Cancellation requested ? waiting for in-flight work to drain.</p> : null}
       {!terminal ? (
         <div className={`bar-track${percent == null ? " bar-track-indeterminate" : ""}`} aria-hidden="true">
           <span style={percent == null ? undefined : { width: `${Math.min(Math.max(percent, 0), 100)}%` }} />

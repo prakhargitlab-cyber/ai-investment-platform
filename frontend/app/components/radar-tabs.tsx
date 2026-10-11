@@ -13,7 +13,7 @@ import { EtfRadar } from "./etf-radar";
  * mounted, so loading/error/empty/result state, and the refresh action, for
  * one radar can never leak into or be mixed with the other's.
  */
-export function RadarTabs({ heldIds, watchlistedIds }: { heldIds: string[]; watchlistedIds: string[] }) {
+export function RadarTabs({ heldIds, watchlistedIds, roles = [] }: { heldIds: string[]; watchlistedIds: string[]; roles?: string[] }) {
   const [tab, setTab] = useState<"equity" | "etf">("equity");
   return (
     <div className="radar-tabs">
@@ -37,7 +37,7 @@ export function RadarTabs({ heldIds, watchlistedIds }: { heldIds: string[]; watc
           ETF Radar
         </button>
       </div>
-      {tab === "equity" ? <OpportunityRadar heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <EtfRadar />}
+      {tab === "equity" ? <OpportunityRadar roles={roles} heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <EtfRadar />}
     </div>
   );
 }

@@ -98,7 +98,9 @@ public class PortfolioRouteController {
         "/api/v1/portfolios",
         "/api/v1/portfolios/**",
         "/api/v1/instruments",
-        "/api/v1/instruments/**"
+        "/api/v1/instruments/**",
+        "/api/v1/market-universe",
+        "/api/v1/market-universe/**"
     })
     public ResponseEntity<byte[]> route(HttpServletRequest request) throws IOException {
         return forwardBytes(request, portfolioServiceBaseUrl, true, restClient);

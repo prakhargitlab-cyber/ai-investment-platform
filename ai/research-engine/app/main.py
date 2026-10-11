@@ -186,7 +186,15 @@ def _etf_radar_worker():
     if not hasattr(app.state, 'etf_radar_worker'):
         async def etf_runner(**parameters):
             from app.etf_opportunity_cycle import run_etf_radar_cycle_async
-            return await run_etf_radar_cycle_async(repository, portfolio_orchestrator, **parameters)
+            # FIX ETF RADAR 401 -- the background worker previously called
+            # portfolio-service's instrument-enumeration endpoint
+            # (GET /api/v1/instruments?...assetType=ETF...) with no identity
+            # headers at all, unlike Equity's runner above (which has
+            # always passed _internal_service_identity(...) into
+            # run_global_opportunity_cycle), so portfolio-service rejected
+            # it with 401. Same internal service identity, same settings.
+            return await run_etf_radar_cycle_async(repository, portfolio_orchestrator, **parameters,
+                identity_headers=_internal_service_identity(portfolio_orchestrator.settings))
         app.state.etf_radar_worker = OpportunityCycleWorker(repository, etf_runner, market='ETF')
     return app.state.etf_radar_worker
 
@@ -1792,6 +1800,23 @@ def _draft_response(draft):
                 "metricBasis": f.metric_basis,
                 "confidence": f.confidence,
                 "validationError": f.validation_error,
+                # TASK E2 item 3/8 -- where this field's CURRENT value
+                # came from ("OCR_EXTRACTED"/"USER_CORRECTED"/
+                # "USER_ENTERED") and, when it differs, the interpreter's
+                # own originally extracted value -- so Review can show
+                # the original OCR/source value beside an editable,
+                # corrected one without losing it. Both are purely
+                # informational: neither is itself ever submitted as a
+                # correction or treated as accepted evidence.
+                "provenance": f.provenance,
+                "originalValue": str(f.original_value) if f.original_value is not None else None,
+                # TASK F -- VALUATION_INPUTS auto-extracted facts carry
+                # enough shape to prefill a FinancialFact editor row
+                # (metric/value/periodEnd/periodType/unit); None for
+                # every other evidence type's proposed facts.
+                "periodEnd": f.period_end,
+                "periodType": f.period_type,
+                "unit": f.unit,
             }
             for f in draft.proposed_facts
         ],
@@ -1816,4 +1841,12 @@ def _draft_response(draft):
         # `corrections` at accept() time. None when no evidence
         # interpreter produced suggestions for this draft.
         "fieldSuggestions": draft.field_suggestions,
+        # TASK E item 3/4 -- per-category partial-extraction
+        # classification ("EXTRACTED"/"MISSING"/"AMBIGUOUS"/"INVALID")
+        # for SHAREHOLDING's four primary categories, so the Review form
+        # can prefill what was extracted and prompt only for what is
+        # missing/ambiguous/invalid, instead of asking the user to
+        # re-enter correctly extracted information. None for every other
+        # evidence type (see ManualEvidenceDraft.field_classification).
+        "fieldClassification": draft.field_classification,
     }

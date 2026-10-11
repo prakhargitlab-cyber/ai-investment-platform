@@ -219,7 +219,7 @@ class YahooFinanceProvider:
         # and it previously had zero timing attribution -- any time spent
         # here was invisible, silently absorbed into the coarse
         # runtime_ensure_elapsed_ms bucket.
-        _mapping_started = time.monotonic()
+        _mapping_started = time.perf_counter()
         try:
             response = await self.client.get(self.search_url, params={"q": candidate_symbol, "quotesCount": 10, "newsCount": 0})
             response.raise_for_status()
@@ -229,7 +229,7 @@ class YahooFinanceProvider:
                         instrument.get("instrumentId"), candidate_symbol, type(exc).__name__)
             raise StructuredProviderError("STRUCTURED_PROVIDER_UNAVAILABLE") from exc
         finally:
-            cycle_timing.record_mapping_resolution_elapsed((time.monotonic() - _mapping_started) * 1000)
+            cycle_timing.record_mapping_resolution_elapsed((time.perf_counter() - _mapping_started) * 1000)
         matches = [item for item in quotes if isinstance(item, dict)
                    and str(item.get("symbol") or "").upper() == candidate_symbol]
         if len(matches) != 1:

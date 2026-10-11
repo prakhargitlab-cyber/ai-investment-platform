@@ -132,9 +132,6 @@ def test_scanned_pdf_with_no_text_layer_is_ocrd():
 def test_scanned_pdf_exceeding_max_pages_is_rejected_not_silently_truncated():
     png_bytes = _png_with_text("PAGE")
     pages = [png_bytes] * 6  # MAX_PDF_PAGES is 5
-    pdf_bytes = subprocess.run(
-        ["img2pdf", "-"] + ["-"] * 0, input=None, capture_output=True, timeout=1, check=False
-    )
     # Build a genuine multi-page PDF via img2pdf with repeated page args.
     import tempfile
     from pathlib import Path

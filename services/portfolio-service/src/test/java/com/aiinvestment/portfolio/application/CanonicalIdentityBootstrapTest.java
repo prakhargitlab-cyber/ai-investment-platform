@@ -5,6 +5,7 @@ import com.aiinvestment.shared.domain.AssetType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
@@ -79,12 +80,43 @@ class CanonicalIdentityBootstrapTest {
     private Set<UUID> canonicalIdentityMappingJobInstrumentIdsBeforeTest;
     private Set<UUID> instrumentProviderMappingIdsBeforeTest;
 
+    // Baseline for the identity-provisioning correctness review: instrument_master is exactly as
+    // shared and non-transactional across the Surefire fork as the two tables above, so this class
+    // is not entitled to assume it starts empty either (a prior investigation found it can already
+    // hold rows left by an unrelated, earlier-running integration test class; see the class-level
+    // comment above). A fingerprint -- not just the row's id -- is kept per baseline row, so a
+    // mutation of a pre-existing, unrelated instrument (not only the creation of a new one) is still
+    // caught by the post-tick comparisons below.
+    private Map<UUID, String> instrumentMasterFingerprintsBeforeTest;
+
+    private static String fingerprint(InstrumentMasterEntity master) {
+        return String.join("|", String.valueOf(master.getIsin()), String.valueOf(master.getPrimarySymbol()),
+                String.valueOf(master.getAssetType()), String.valueOf(master.getStatus()),
+                String.valueOf(master.getCurrency()), String.valueOf(master.getCountry()),
+                String.valueOf(master.getPrimaryExchange()));
+    }
+
     @BeforeEach
     void snapshotSharedReconciliationStateBeforeBootstrapTick() {
         canonicalIdentityMappingJobInstrumentIdsBeforeTest = new HashSet<>(
                 jdbc.queryForList("SELECT instrument_id FROM portfolio.canonical_identity_mapping_jobs", UUID.class));
         instrumentProviderMappingIdsBeforeTest = new HashSet<>(
                 jdbc.queryForList("SELECT mapping_id FROM portfolio.instrument_provider_mappings", UUID.class));
+        instrumentMasterFingerprintsBeforeTest = new HashMap<>();
+        masters.findAll().forEach(master ->
+                instrumentMasterFingerprintsBeforeTest.put(master.getInstrumentId(), fingerprint(master)));
+    }
+
+    /** Baseline rows (and only baseline rows) must still have the exact fingerprint they started with. */
+    private void assertNoUnrelatedInstrumentWasModified() {
+        Map<UUID, InstrumentMasterEntity> currentById = new HashMap<>();
+        masters.findAll().forEach(master -> currentById.put(master.getInstrumentId(), master));
+        instrumentMasterFingerprintsBeforeTest.forEach((id, originalFingerprint) -> {
+            InstrumentMasterEntity current = currentById.get(id);
+            assertThat(current).as("baseline instrument_master row %s must still exist", id).isNotNull();
+            assertThat(fingerprint(current)).as("baseline instrument_master row %s must be unmodified", id)
+                    .isEqualTo(originalFingerprint);
+        });
     }
 
     @AfterEach
@@ -107,7 +139,18 @@ class CanonicalIdentityBootstrapTest {
     }
 
     @Test void emptyDatabaseBootstrapPersistsOnlyIdentitiesAndIsRestartSafe() {
-        assertThat(masters.count()).isZero();
+        // No absolute-zero assumption: instrument_master is shared, non-transactional state
+        // (see the baseline fingerprint snapshot above), so only this test's own net-new rows
+        // are asserted on below.
+        long instrumentMasterCountBeforeTest = masters.count();
+        // No absolute-zero assumption here either: portfolio_positions is the same shared,
+        // non-transactional table as instrument_master above, so an earlier-running, unrelated
+        // test class in this Surefire fork can leave real rows behind. Nothing reachable from this
+        // test's own code path (CanonicalIdentityBootstrap.tick() / InstrumentMasterService /
+        // GlobalInstrumentReconciliationService) ever writes to PortfolioPositionRepository, so the
+        // correct, still-meaningful assertion is that this test's own tick() creates no new
+        // positions -- not that the shared table starts, or ends, empty.
+        long positionCountBeforeTest = positions.count();
         when(etfSecurityList.lookupByIsin(anyString())).thenReturn(NseOfficialEtfSecurityList.Lookup.noIsinMatch());
         var rows = List.of(new NseOfficialSecurityMaster.Listing("ALPHA", "INE111A01010", "Alpha Components Limited", "EQ"),
                 new NseOfficialSecurityMaster.Listing("BETA", "INE222A01010", "Beta Engineering Limited", "EQ"),
@@ -121,24 +164,125 @@ class CanonicalIdentityBootstrapTest {
         });
         CanonicalIdentityBootstrap bootstrap = new CanonicalIdentityBootstrap(official,nifty,instruments,reconciliation,store);
         try { bootstrap.tick(); } finally { bootstrap.stop(); }
-        assertThat(masters.count()).isEqualTo(3);
-        assertThat(mappings.count()).isEqualTo(6);
-        assertThat(positions.count()).isZero();
+
+        // Exactly the expected instruments were created -- scoped to this test's own fixture ISINs,
+        // not an absolute count, so a baseline row left by another class is neither hidden nor
+        // double-counted.
+        assertThat(masters.count()).isEqualTo(instrumentMasterCountBeforeTest + 3);
+        List<InstrumentMasterEntity> newMasters = masters.findAll().stream()
+                .filter(master -> !instrumentMasterFingerprintsBeforeTest.containsKey(master.getInstrumentId())).toList();
+        assertThat(newMasters).hasSize(3);
+        assertThat(newMasters.stream().map(InstrumentMasterEntity::getIsin).collect(java.util.stream.Collectors.toSet()))
+                .isEqualTo(Set.of("INE111A01010", "INE222A01010", "INE333A01010"));
+        Set<UUID> newMasterIds = newMasters.stream().map(InstrumentMasterEntity::getInstrumentId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        // Correct provider mappings: exactly two new mappings (NSE + YAHOO_FINANCE) per new
+        // instrument. Scoped to this test's own three new instrument ids, not merely "new since the
+        // mapping snapshot": CanonicalIdentityBootstrapStore.enqueue() unconditionally sweeps the
+        // ENTIRE shared instrument_master table (see the class-level comment above), so if a stray,
+        // unrelated EQUITY/NSE/IN/ACTIVE instrument_master row from another class is already present,
+        // this tick() call "adopts" it exactly as documented, and the
+        // structured.resolveGlobalIdentity(any()) stub above -- which deliberately matches any
+        // instrument id, not just this test's own -- creates a real provider mapping for it too. That
+        // adopted mapping is a genuine, if harmless, side effect of this test's own tick() call on
+        // shared state, not a contract violation on this test's own instruments, so it belongs outside
+        // this assertion's scope rather than hidden from it: restricting by instrument id only
+        // excludes ids outside newMasterIds, so an extra or missing mapping on one of the three new
+        // instruments themselves still fails this assertion exactly as before scoping was added.
+        List<InstrumentProviderMappingEntity> newMappingsForNewInstruments = mappings.findAll().stream()
+                .filter(mapping -> !instrumentProviderMappingIdsBeforeTest.contains(mapping.getMappingId()))
+                .filter(mapping -> newMasterIds.contains(mapping.getInstrumentId()))
+                .toList();
+        assertThat(newMappingsForNewInstruments).hasSize(6);
+        assertThat(newMappingsForNewInstruments.stream().map(InstrumentProviderMappingEntity::getInstrumentId)
+                .collect(java.util.stream.Collectors.toSet())).isEqualTo(newMasterIds);
+        newMasterIds.forEach(id -> assertThat(newMappingsForNewInstruments.stream()
+                        .filter(mapping -> mapping.getInstrumentId().equals(id))
+                        .map(InstrumentProviderMappingEntity::getProvider)
+                        .collect(java.util.stream.Collectors.toSet()))
+                .as("instrument %s must have exactly an NSE and a YAHOO_FINANCE mapping", id)
+                .isEqualTo(Set.of("NSE", "YAHOO_FINANCE")));
+
+        assertNoUnrelatedInstrumentWasModified();
+        assertThat(positions.count()).isEqualTo(positionCountBeforeTest);
+
+        // resolveGlobalIdentity must be called exactly once for each of this test's own three new
+        // instruments during the first tick. CanonicalIdentityBootstrapStore.enqueue()'s documented
+        // whole-table sweep (see the class-level comment above) means an already-existing, unrelated
+        // instrument_master row with a trusted NSE mapping can also be adopted into the job queue and
+        // reconciled here -- a real, if incidental, side effect of this test's own tick() call on
+        // shared state, not a violation of this test's contract. So invocations are captured and
+        // checked by argument (which instrument ids were actually resolved), not by a single total
+        // count: an unrelated id's own call is permitted only once its identity is confirmed to
+        // already exist in the pre-test baseline snapshot, never left unexplained, and it never
+        // stands in for a missing or duplicated call on one of this test's own instruments.
+        ArgumentCaptor<UUID> resolvedIdentityIdsAfterFirstTick = ArgumentCaptor.forClass(UUID.class);
+        verify(structured, atLeastOnce()).resolveGlobalIdentity(resolvedIdentityIdsAfterFirstTick.capture());
+        List<UUID> resolvedAfterFirstTick = new ArrayList<>(resolvedIdentityIdsAfterFirstTick.getAllValues());
+        newMasterIds.forEach(id -> assertThat(Collections.frequency(resolvedAfterFirstTick, id))
+                .as("instrument %s must be reconciled exactly once during the first tick", id).isEqualTo(1));
+        resolvedAfterFirstTick.stream().filter(id -> !newMasterIds.contains(id)).forEach(id ->
+                assertThat(instrumentMasterFingerprintsBeforeTest).as(
+                        "a resolveGlobalIdentity call outside this test's own three instruments must target "
+                                + "a pre-existing, already-known instrument_master row %s, never an unexplained id", id)
+                        .containsKey(id));
+
         Map<UUID,Instant> verified = new HashMap<>();
         mappings.findAll().forEach(m -> verified.put(m.getMappingId(),m.getVerifiedAt()));
         CanonicalIdentityBootstrap restarted = new CanonicalIdentityBootstrap(official,nifty,instruments,reconciliation,store);
         try { restarted.tick(); } finally { restarted.stop(); }
-        assertThat(mappings.count()).isEqualTo(6);
+
+        // Restart/repeated bootstrap must create no duplicate instruments or mappings for this
+        // test's own instruments: still exactly the same 3 new instruments and 6 new mappings
+        // (scoped to those 3 instrument ids, for the same adopted-baseline-row reason as above) as
+        // after the first tick, not one more.
+        assertThat(masters.count()).isEqualTo(instrumentMasterCountBeforeTest + 3);
+        assertThat(mappings.findAll().stream()
+                .filter(mapping -> !instrumentProviderMappingIdsBeforeTest.contains(mapping.getMappingId()))
+                .filter(mapping -> newMasterIds.contains(mapping.getInstrumentId()))
+                .count())
+                .isEqualTo(6);
+        assertNoUnrelatedInstrumentWasModified();
         mappings.findAll().forEach(m -> assertThat(m.getVerifiedAt()).isEqualTo(verified.get(m.getMappingId())));
         verify(official,times(1)).listedEquities();
-        verify(structured,times(3)).resolveGlobalIdentity(any());
+
+        // Restart tick must trigger no additional resolveGlobalIdentity invocations at all -- for
+        // this test's own three instruments (their job status is already VALIDATED, so they are no
+        // longer due) or for any unrelated adopted instrument (same reason). Re-capturing after the
+        // restart tick must therefore yield exactly the same set of resolved ids as the first capture,
+        // never a superset: any growth here, for any id, is itself the idempotency defect this test
+        // exists to catch, so it is reported as a failed assertion rather than masked.
+        ArgumentCaptor<UUID> resolvedIdentityIdsAfterRestart = ArgumentCaptor.forClass(UUID.class);
+        verify(structured, atLeastOnce()).resolveGlobalIdentity(resolvedIdentityIdsAfterRestart.capture());
+        List<UUID> resolvedAfterRestart = new ArrayList<>(resolvedIdentityIdsAfterRestart.getAllValues());
+        assertThat(resolvedAfterRestart)
+                .as("the restart tick must not cause any additional resolveGlobalIdentity invocation")
+                .containsExactlyInAnyOrderElementsOf(resolvedAfterFirstTick);
+        newMasterIds.forEach(id -> assertThat(Collections.frequency(resolvedAfterRestart, id))
+                .as("instrument %s must still have been reconciled exactly once after the restart tick", id)
+                .isEqualTo(1));
         verify(structured,never()).fetchGlobal(any());
         verify(structured,never()).fetch(any());
         assertThat(store.dueMappings(40,Instant.now())).isEmpty();
-        for (var master : masters.findAll()) {
+        // Re-canonicalizing this test's own three instruments a second time must be a complete
+        // no-op: InstrumentMasterService#canonicalizeOfficialSecurity only calls persistMapping()
+        // for the NSE provider when reusableMapping(instrumentId, "NSE") is empty, and all three
+        // already have a VERIFIED NSE mapping from the first tick, so neither a new mapping nor a
+        // verifiedAt change is expected for them. Scoped to newMasters/newMasterIds rather than
+        // masters.findAll(): this test has no contract over arbitrary shared-database content, and
+        // canonicalizeOfficialNse applies no country/exchange/asset-type/status filter of its own --
+        // re-canonicalizing an unrelated baseline instrument_master row that happens to have no NSE
+        // provider mapping at all (one never swept into the equity reconciliation queue by
+        // CanonicalIdentityBootstrapStore.enqueue() in the first place) would create a brand-new
+        // mapping with a fresh verifiedAt timestamp that this test's `verified` snapshot (taken right
+        // after the first tick, before this call) never saw -- a false failure that has nothing to do
+        // with this test's own three required instruments or its restart-safety guarantee.
+        for (var master : newMasters) {
             instruments.canonicalizeOfficialNse(master.getIsin(),master.getPrimarySymbol(),master.getCanonicalName());
         }
-        mappings.findAll().forEach(m -> assertThat(m.getVerifiedAt()).isEqualTo(verified.get(m.getMappingId())));
+        mappings.findAll().stream().filter(m -> newMasterIds.contains(m.getInstrumentId()))
+                .forEach(m -> assertThat(m.getVerifiedAt()).isEqualTo(verified.get(m.getMappingId())));
 
         var failed = instruments.canonicalizeOfficialNse("INE444A01010","DELTA","Delta Manufacturing Limited");
         doThrow(new IllegalStateException("PROVIDER_TEMPORARILY_UNAVAILABLE")).when(structured).resolveGlobalIdentity(failed.getInstrumentId());

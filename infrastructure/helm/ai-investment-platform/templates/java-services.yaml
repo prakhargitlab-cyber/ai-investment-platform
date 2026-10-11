@@ -61,7 +61,11 @@ spec:
       {{- end }}
       containers:
         - name: {{ $service.name }}
-          image: {{ include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) | quote }}
+          {{- /* workloadOverrides.<name>.imageTagOverride, when set, takes the single-field
+             precedence global.imageTag normally has (see aip.imageExplicitTag in _helpers.tpl).
+             Empty/unset for every service except where explicitly configured, so this changes
+             nothing for any workload that does not set it. */}}
+          image: {{ if $override.imageTagOverride }}{{ include "aip.imageExplicitTag" (dict "root" $ "image" $config.image "tag" $override.imageTagOverride) | quote }}{{ else }}{{ include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) | quote }}{{ end }}
           imagePullPolicy: {{ $.Values.global.imagePullPolicy | quote }}
           securityContext:
             {{- toYaml $.Values.global.containerSecurityContext | nindent 12 }}

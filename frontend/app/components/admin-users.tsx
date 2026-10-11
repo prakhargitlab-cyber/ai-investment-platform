@@ -14,9 +14,9 @@ function UsersAndRoles({ operatorId }: { operatorId: string }) {
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
-  const [users, setUsers] = useState<AdminPage<AdminUser> | null>(null);
+  const [usersResult, setUsers] = useState<{ key: string; data: AdminPage<AdminUser> } | null>(null);
   const [selected, setSelected] = useState<AdminUser | null>(null);
-  const [audit, setAudit] = useState<AdminPage<RoleAudit> | null>(null);
+  const [auditResult, setAudit] = useState<{ key: string; data: AdminPage<RoleAudit> } | null>(null);
   const [auditPage, setAuditPage] = useState(0);
   const [reason, setReason] = useState("");
   const [error, setError] = useState("");
@@ -24,6 +24,11 @@ function UsersAndRoles({ operatorId }: { operatorId: string }) {
   const [busy, setBusy] = useState(false);
   const [revision, setRevision] = useState(0);
   const [denied, setDenied] = useState(false);
+  const usersKey = JSON.stringify([search, page, revision]);
+  const auditKey = JSON.stringify([selected?.userId, auditPage, revision]);
+  const users = usersResult?.key === usersKey ? usersResult.data : null;
+  const audit = auditResult?.key === auditKey ? auditResult.data : null;
+
   function failed(failure: unknown) {
     const value = failure as { message?: string; status?: number };
     if (value.status === 403 || value.status === 401) {
@@ -35,22 +40,21 @@ function UsersAndRoles({ operatorId }: { operatorId: string }) {
   useEffect(() => {
     if (denied) return;
     let cancelled = false;
-    setUsers(null);
-    adminApi.users(search, page).then(result => { if (!cancelled) setUsers(result); })
-      .catch(failure => { if (!cancelled) failed(failure); });
+    adminApi.users(search, page).then(result => {
+      if (!cancelled) { setUsers({ key: usersKey, data: result }); }
+    }).catch(failure => { if (!cancelled) failed(failure); });
     return () => { cancelled = true; };
-  }, [search, page, revision, denied]);
+  }, [search, page, revision, denied, usersKey]);
 
   const selectedId = selected?.userId;
   useEffect(() => {
     if (!selectedId || denied) return;
     let cancelled = false;
-    setAudit(null);
     Promise.all([adminApi.user(selectedId), adminApi.audit(selectedId, auditPage)])
-      .then(([user, history]) => { if (!cancelled) { setSelected(user); setAudit(history); } })
+      .then(([user, history]) => { if (!cancelled) { setSelected(user); setAudit({ key: auditKey, data: history }); } })
       .catch(failure => { if (!cancelled) failed(failure); });
     return () => { cancelled = true; };
-  }, [selectedId, auditPage, revision, denied]);
+  }, [selectedId, auditPage, revision, denied, auditKey]);
 
   async function changeRole() {
     if (!selected || busy || !reason.trim()) return;

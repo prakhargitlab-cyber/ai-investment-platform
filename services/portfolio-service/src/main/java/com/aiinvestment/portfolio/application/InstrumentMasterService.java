@@ -155,6 +155,21 @@ public class InstrumentMasterService {
                 com.aiinvestment.shared.domain.AssetType.OTHER);
     }
 
+    /**
+     * Canonicalize an exact official NSE ETF identity (NSE's own ETF securities-available-for-
+     * trading list is the authority -- see NseOfficialEtfSecurityList#listAll). Only applies to a
+     * brand-new instrument_master row, exactly like canonicalizeOfficialInvestmentVehicle above: an
+     * existing row at this ISIN (e.g. already persisted as EQUITY) is never silently reclassified
+     * or overwritten by this call. Reclassifying an EXISTING row whose ISIN the official ETF list
+     * also covers is AuthoritativeAssetTypeReclassificationService's job, not this one -- this
+     * method is for NseEtfUniverseBootstrapService's genuinely-missing-ETF creation path only.
+     */
+    @Transactional
+    public InstrumentMasterEntity canonicalizeOfficialEtf(String isin, String symbol, String companyName) {
+        return canonicalizeOfficialSecurity(isin, symbol, companyName, "NSE_OFFICIAL_ETF_BOOTSTRAP",
+                com.aiinvestment.shared.domain.AssetType.ETF);
+    }
+
     private InstrumentMasterEntity canonicalizeOfficialSecurity(String isin, String symbol, String companyName, String source,
             com.aiinvestment.shared.domain.AssetType assetType) {
         String normalized = InstrumentMasterEntity.normalizeIsin(isin);

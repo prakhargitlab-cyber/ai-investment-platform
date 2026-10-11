@@ -31,7 +31,7 @@ import logging
 import mimetypes
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -480,6 +480,37 @@ class ProposedFact:
     metric_basis: str | None = None
     confidence: float = 0.0
     validation_error: str | None = None
+    # TASK E2 item 3/8 -- provenance of THIS field's value, distinct from
+    # ``confidence`` (which already existed): one of
+    #   "OCR_EXTRACTED" -- the interpreter's own extracted value, never
+    #                       touched by a user correction.
+    #   "USER_CORRECTED" -- an OCR-extracted value existed and the user
+    #                       changed it (``original_value`` below holds
+    #                       what the interpreter originally found).
+    #   "USER_ENTERED"   -- no value had been extracted for this field at
+    #                       all (MISSING/AMBIGUOUS/INVALID per
+    #                       field_classification) and the user supplied
+    #                       it from scratch (``original_value`` is None).
+    # The original uploaded file/evidence_text is NEVER mutated by a
+    # correction -- this only tracks where the proposed VALUE came from.
+    # All three remain USER_UPLOAD source authority; this is a finer-
+    # grained distinction within that single authority level, not a new
+    # authority tier.
+    provenance: str = "OCR_EXTRACTED"
+    # The interpreter's own originally extracted value, captured before
+    # any correction overwrote ``value`` -- None when nothing was
+    # extracted for this field (see "USER_ENTERED" above). Lets Review
+    # show the original OCR/source value beside an editable, corrected
+    # one without losing it.
+    original_value: Any | None = None
+    # TASK F -- VALUATION_INPUTS (and any future FinancialFact-backed
+    # auto-extraction) needs to prefill a factRows-shaped row on the
+    # frontend (metric/value/periodEnd/periodType/unit/sourceUrl), which
+    # has no equivalent in SHAREHOLDING's single scalar `value`. These
+    # three are None for every other evidence type's proposed facts.
+    period_end: str | None = None
+    period_type: str | None = None
+    unit: str | None = None
 
 
 @dataclass
@@ -535,6 +566,14 @@ class ManualEvidenceDraft:
     # submits every field as `corrections` at accept() time, unchanged.
     # None for evidence types with no suggestion interpreter.
     field_suggestions: dict[str, str] | None = None
+    # TASK E item 3 -- per-attribute partial-extraction classification
+    # ("EXTRACTED"/"MISSING"/"AMBIGUOUS"/"INVALID") for the primary
+    # SHAREHOLDING categories, from
+    # app.evidence_interpretation.classify_shareholding_fields. Purely
+    # informational for the Review screen (drives which fields it asks
+    # the user to complete/correct); never itself a proposed fact and
+    # never required at accept(). None for every other evidence type.
+    field_classification: dict[str, str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -594,8 +633,15 @@ class ManualEvidenceIngestor:
 
         digest = content_hash_hex(file_bytes)
 
-        # Extract text from the file depending on its type.
-        text = self._extract_text(file_bytes, mime, filename)
+        # Extract the file depending on its type -- ONE extraction call
+        # (one Tesseract/OCR pass at most) whose full result (text +
+        # metadata, e.g. OCR word boxes for an image) is reused below for
+        # both the plain-text contract every evidence type needs and
+        # SHAREHOLDING's spatial table reconstruction, which needs the
+        # original metadata too.
+        extracted_document = self._extract_document(file_bytes, mime, filename)
+        text = extracted_document.text if extracted_document is not None else None
+        extracted_metadata = extracted_document.metadata if extracted_document is not None else None
 
         # Check for duplicate content (dedup by content hash).
         duplicate_of = self._find_duplicate(digest, evidence_type_enum)
@@ -610,10 +656,17 @@ class ManualEvidenceIngestor:
         validation = ValidationResult(valid=True)
         requires_manual_fields = False
         field_suggestions: dict[str, str] | None = None
+        field_classification: dict[str, str] | None = None
 
         if evidence_type_enum == EvidenceType.SHAREHOLDING:
-            proposed_facts, reporting_period, validation, shareholding_supplementary = self._extract_shareholding(
-                text, instrument_id, digest, filename, mime
+            (
+                proposed_facts,
+                reporting_period,
+                validation,
+                shareholding_supplementary,
+                shareholding_field_classification,
+            ) = self._extract_shareholding(
+                text, instrument_id, digest, filename, mime, metadata=extracted_metadata
             )
             # Non-canonical reference metadata the table interpreter
             # recognized alongside the canonical category values (e.g.
@@ -623,6 +676,7 @@ class ManualEvidenceIngestor:
             # field_suggestions mechanism CURRENT_NEWS uses, never
             # persisted as a canonical fact, never required at accept().
             field_suggestions = shareholding_supplementary
+            field_classification = shareholding_field_classification
         elif evidence_type_enum == EvidenceType.CURRENT_NEWS:
             # No auto-extraction of CANONICAL facts: see
             # CURRENT_NEWS_MANUAL_FIELDS. The file is kept as supporting
@@ -662,6 +716,25 @@ class ManualEvidenceIngestor:
                               "it is still kept as supporting evidence, but none of its "
                               "content could be used to help you fill in the required fields"],
                 )
+        elif evidence_type_enum == EvidenceType.VALUATION_INPUTS:
+            # TASK F -- VALUATION_INPUTS is the one FINANCIAL_FACT_EVIDENCE_TYPES
+            # member with a genuinely tabular source (see
+            # _extract_valuation_inputs): auto-extract confidently
+            # recognized PAT/EPS values at a real QUARTERLY/ANNUAL period
+            # the SAME conservative, never-guess way SHAREHOLDING already
+            # does, WITHOUT expanding this to the other FinancialFact
+            # types below (GROWTH_FACTS etc remain manual-only -- their
+            # sources are not a single aligned table the same way).
+            requires_manual_fields = True
+            if not text.strip():
+                validation = ValidationResult(
+                    valid=True,
+                    warnings=["NO_TEXT_EXTRACTED: the file could not be read as text; "
+                              "it is still kept as supporting evidence, but none of its "
+                              "content could be used to help you fill in the required fact rows"],
+                )
+            else:
+                proposed_facts, field_suggestions, validation = self._extract_valuation_inputs(text, filename)
         elif evidence_type_enum in FINANCIAL_FACT_EVIDENCE_TYPES:
             # Same rationale as CURRENT_NEWS: a regex/NLP guess at numeric
             # financial facts from arbitrary prose risks silently fabricating
@@ -722,6 +795,7 @@ class ManualEvidenceIngestor:
             # per field.
             extracted_text=(text.strip() or None) if requires_manual_fields else None,
             field_suggestions=field_suggestions,
+            field_classification=field_classification,
         )
         if duplicate_of is not None:
             draft.validation_results.warnings.append(
@@ -774,20 +848,20 @@ class ManualEvidenceIngestor:
 
     # -- text extraction ---------------------------------------------------
 
-    def _extract_text(self, file_bytes: bytes, mime: str, filename: str) -> str | None:
-        """Extract text from a file based on its MIME type.
+    def _extract_document(self, file_bytes: bytes, mime: str, filename: str) -> "ExtractedDocument | None":
+        """Extract a file based on its MIME type, returning the FULL
+        app.document_extraction.ExtractedDocument (text + metadata, e.g.
+        metadata["ocrWords"] for an image) rather than text alone.
 
-        Delegates to the provider-neutral app.document_extraction.
-        DocumentExtractor -- this method is now a thin adapter that keeps
-        ManualEvidenceIngestor's existing str|None contract (None means
-        "no extraction path exists for this MIME type at all"; "" means
-        "a path exists but nothing could be extracted this time") so
-        every existing caller (ingest(), _extract_shareholding, ...) is
-        unaffected by the refactor. The actual extraction logic -- PDF/
-        DOCX/image/CSV/TXT, OCR bounds, subprocess isolation -- lives
-        entirely in DocumentExtractor now, independent of this module, so
-        it can be reused by a future LLM-based interpreter without
-        depending on ManualEvidenceIngestor or ResearchReadinessRuntime.
+        This is the single real extraction call (one Tesseract/OCR pass
+        at most) for a given upload -- ``_extract_text`` below is now a
+        thin wrapper over this, and ``ingest()`` calls THIS method once
+        and reuses its result for both the plain-text contract every
+        evidence type needs and the richer per-type interpretation (e.g.
+        SHAREHOLDING's spatial table reconstruction) that needs the
+        original metadata too. Returns None exactly when no extraction
+        path exists for this MIME type at all (unchanged from
+        ``_extract_text``'s prior None case).
         """
         from app.document_extraction import DocumentExtractor, DocumentInput, EXTRACTABLE_MIME_TYPES
 
@@ -798,7 +872,22 @@ class ManualEvidenceIngestor:
         ))
         for warning in extracted.warnings:
             logger.info("document_extraction_warning mime=%s method=%s warning=%s", mime, extracted.extraction_method, warning)
-        return extracted.text
+        return extracted
+
+    def _extract_text(self, file_bytes: bytes, mime: str, filename: str) -> str | None:
+        """Extract text from a file based on its MIME type.
+
+        Thin adapter over ``_extract_document`` that keeps
+        ManualEvidenceIngestor's existing str|None contract (None means
+        "no extraction path exists for this MIME type at all"; "" means
+        "a path exists but nothing could be extracted this time"). Kept
+        for any caller that only needs plain text; ``ingest()`` itself
+        calls ``_extract_document`` directly (see there) so a SHAREHOLDING
+        upload's OCR metadata is not thrown away before
+        ``_extract_shareholding`` ever sees it.
+        """
+        extracted = self._extract_document(file_bytes, mime, filename)
+        return extracted.text if extracted is not None else None
 
     # -- shareholding extraction --------------------------------------------
 
@@ -809,41 +898,65 @@ class ManualEvidenceIngestor:
         content_digest: str,
         filename: str,
         mime: str,
-    ) -> tuple[list[ProposedFact], datetime | None, ValidationResult, dict[str, str] | None]:
+        metadata: "dict[str, Any] | None" = None,
+    ) -> tuple[
+        list[ProposedFact], datetime | None, ValidationResult,
+        dict[str, str] | None, dict[str, str],
+    ]:
         """Extract shareholding facts from extracted text.
 
         Delegates the actual interpretation (extracted text -> candidate
         shareholding values) to app.evidence_interpretation.
         interpret_shareholding -- EVIDENCE INTERPRETATION is kept separate
         from DOCUMENT EXTRACTION (app.document_extraction, see
-        _extract_text above) and from this module's own CANDIDATE DRAFT /
-        VALIDATION responsibilities, so the same interpretation step can
-        later be reused by a future LLM-based interpreter without
-        depending on ManualEvidenceIngestor. This method remains a thin
-        adapter converting the interpreter's output into this module's
-        ProposedFact/ValidationResult contract -- zero behavior change
-        from the previous inline implementation.
+        _extract_document above) and from this module's own CANDIDATE
+        DRAFT / VALIDATION responsibilities, so the same interpretation
+        step can later be reused by a future LLM-based interpreter
+        without depending on ManualEvidenceIngestor. This method remains
+        a thin adapter converting the interpreter's output into this
+        module's ProposedFact/ValidationResult contract.
+
+        ``metadata`` is the ORIGINAL ExtractedDocument.metadata from the
+        single extraction call ``ingest()`` already made (e.g.
+        metadata["ocrWords"] for an image) -- passed through so
+        interpret_shareholding's spatial table reconstruction can
+        actually run for a real upload, rather than this method
+        re-running extraction or fabricating a second OCR representation.
+        None for a non-image evidence type or when no metadata was
+        produced; interpret_shareholding already degrades to its
+        plain-text path in that case.
         """
         from types import SimpleNamespace
 
-        from app.evidence_interpretation import interpret_shareholding
+        from app.evidence_interpretation import (
+            classify_shareholding_fields,
+            interpret_shareholding,
+        )
 
         interpretation = interpret_shareholding(
-            SimpleNamespace(text=text),
+            SimpleNamespace(text=text, metadata=metadata or {}),
             instrument_id=instrument_id,
             content_digest=content_digest,
             filename=filename,
             mime=mime,
         )
         if interpretation.errors or not interpretation.values:
-            return [], None, ValidationResult(
+            # FINAL FIX item 5 -- the LATEST recognized reporting period
+            # is an independently-recognized fact (it comes from the
+            # table's own header row, not from whether any category row
+            # happened to match) and must be preserved even when every
+            # category row failed to extract -- previously this
+            # hardcoded None here, discarding interpretation.period_end
+            # even after app.evidence_interpretation was fixed to stop
+            # discarding it itself.
+            return [], interpretation.period_end, ValidationResult(
                 valid=False,
                 errors=interpretation.errors or [
                     "NO_SHAREHOLDING_VALUES_EXTRACTED: could not find "
                     "recognizable shareholding category percentages in the document"
                 ],
                 warnings=list(interpretation.warnings),
-            ), interpretation.supplementary
+            ), interpretation.supplementary, classify_shareholding_fields(interpretation)
 
         proposed: list[ProposedFact] = []
         for value in interpretation.values:
@@ -868,7 +981,10 @@ class ManualEvidenceIngestor:
         # silently dropped and never escalated into a hard error here.
         validation.warnings = [*validation.warnings, *interpretation.warnings]
 
-        return proposed, interpretation.period_end, validation, interpretation.supplementary
+        return (
+            proposed, interpretation.period_end, validation,
+            interpretation.supplementary, classify_shareholding_fields(interpretation),
+        )
 
     def _validate_shareholding_draft(
         self, proposed: list[ProposedFact], snapshot
@@ -930,6 +1046,82 @@ class ManualEvidenceIngestor:
             errors=errors,
             warnings=warnings,
         )
+
+    # -- VALUATION_INPUTS (TASK F) --------------------------------------------
+
+    def _extract_valuation_inputs(
+        self, text: str, filename: str,
+    ) -> tuple[list[ProposedFact], dict[str, str] | None, ValidationResult]:
+        """Automatic VALUATION_INPUTS extraction from a genuinely tabular
+        source (metric rows x reporting-period columns), delegating the
+        actual interpretation to
+        app.evidence_interpretation.interpret_valuation_inputs -- same
+        separation of concerns as _extract_shareholding above.
+
+        Only PAT/EPS at a real QUARTERLY/ANNUAL period become proposed
+        facts (see ALLOWED_METRICS_BY_EVIDENCE_TYPE[VALUATION_INPUTS] --
+        revenue is a real figure in the source but not an allowed
+        VALUATION_INPUTS metric, and TTM is not a calendar period this
+        platform's periodType contract recognizes). Both are still
+        surfaced -- never silently dropped -- as read-only
+        `field_suggestions` entries (the SAME supplementary-evidence
+        mechanism SHAREHOLDING already uses for shareholderCount),
+        reusing the existing Review UI block rather than inventing a new
+        display surface.
+
+        This method NEVER sets requires_manual_fields=False: the
+        FinancialFact editor (factRows) remains the single correction/
+        completion surface and the single corrections["facts"] ->
+        accept() pathway every other FinancialFact-backed evidence type
+        already uses -- no parallel persistence mechanism. The caller
+        prefills factRows from the returned ProposedFacts; nothing here
+        is itself accepted evidence.
+        """
+        from app.evidence_interpretation import interpret_valuation_inputs
+        from types import SimpleNamespace
+
+        interpretation = interpret_valuation_inputs(SimpleNamespace(text=text))
+
+        # A source reference is a mandatory FinancialFact field (see
+        # _validate_financial_fact_rows's MISSING_SOURCE check); this
+        # provenance marker identifies the uploaded file itself -- the
+        # SAME discipline as app.manual_evidence's own
+        # SECTOR_MACRO_DOCUMENT_URL_PREFIX convention for a manual
+        # upload with no independent external source URL. The user can
+        # still edit/replace it in the factRows editor like any other
+        # field before accepting.
+        source_locator = f"manual-evidence:{filename}"
+        proposed: list[ProposedFact] = []
+        for fact in interpretation.facts:
+            proposed.append(ProposedFact(
+                field=fact.metric,
+                value=fact.value,
+                source_locator=source_locator,
+                evidence_text=fact.column_label,
+                confidence=0.85,
+                period_end=fact.period_end.isoformat(),
+                period_type=fact.period_type,
+                unit=fact.unit,
+            ))
+
+        observations: dict[str, str] = {}
+        for index, obs in enumerate(interpretation.observations):
+            key = f"unsupportedObservation{index + 1}"
+            label = obs.metric.replace("_", " ").title()
+            period_text = obs.column_label
+            value_text = f"{obs.value}{(' ' + obs.unit) if obs.unit else ''}"
+            observations[key] = f"{label} ({period_text}): {value_text} -- {obs.reason}"
+
+        errors: list[str] = []
+        warnings: list[str] = list(interpretation.warnings)
+        if not proposed and not observations:
+            errors.append(
+                "NO_VALUATION_INPUTS_VALUES_EXTRACTED: could not find a recognizable "
+                "metric/period table in the document -- add fact rows manually below"
+            )
+
+        validation = ValidationResult(valid=True, errors=errors, warnings=warnings)
+        return proposed, (observations or None), validation
 
     # -- dedup ---------------------------------------------------------------
 
@@ -1056,10 +1248,11 @@ class ManualEvidenceAcceptor:
         # individual extracted fact values; CURRENT_NEWS has no extracted
         # facts to correct -- `corrections` IS the user-supplied submission
         # (title/summary/eventDate/sourceUrl/eventType/impact/timeHorizon).
+        correction_errors: list[str] = []
         if corrections:
             draft.corrections = dict(corrections)
             if draft.evidence_type == EvidenceType.SHAREHOLDING:
-                self._apply_corrections(draft)
+                correction_errors = self._apply_corrections(draft)
 
         if draft.evidence_type == EvidenceType.CURRENT_NEWS and not draft.corrections:
             raise AcceptanceError(
@@ -1089,6 +1282,19 @@ class ManualEvidenceAcceptor:
 
         # Re-validate after corrections.
         draft.validation_results = self._revalidate(draft)
+        if correction_errors:
+            # A malformed correction (an unrecognized category key, an
+            # unparseable reportingPeriod) is NEVER silently dropped --
+            # it is folded into the same validation-error path as every
+            # other deterministic check, so accept() still refuses
+            # cleanly rather than proceeding on a correction that could
+            # not actually be applied.
+            draft.validation_results = ValidationResult(
+                valid=False,
+                errors=[*correction_errors, *draft.validation_results.errors],
+                warnings=draft.validation_results.warnings,
+                conflicts=draft.validation_results.conflicts,
+            )
         if not draft.validation_results.valid:
             raise AcceptanceError(
                 f"DRAFT_INVALID: {'; '.join(draft.validation_results.errors)}"
@@ -1323,35 +1529,158 @@ class ManualEvidenceAcceptor:
 
     # -- corrections ---------------------------------------------------------
 
-    def _apply_corrections(self, draft: ManualEvidenceDraft) -> None:
-        """Apply user corrections to the draft's proposed facts in-place."""
+    def _apply_corrections(self, draft: ManualEvidenceDraft) -> list[str]:
+        """Apply user corrections to the draft's proposed facts in-place.
+
+        TASK E2 -- extended beyond editing an ALREADY-extracted fact's
+        value (the original behavior below): a correction for a
+        SHAREHOLDING category that was never extracted at all (MISSING/
+        AMBIGUOUS/INVALID per field_classification -- see
+        app.evidence_interpretation.classify_shareholding_fields) now
+        creates a new ProposedFact rather than being silently dropped,
+        which is exactly what makes all four ownership categories
+        editable in Review regardless of what was recognized in the
+        source. A "reportingPeriod" correction is handled separately
+        (it is not a ``shareholding:<category>`` fact) and re-resolves
+        draft.reporting_period through the SAME period-normalization
+        rule extraction itself uses -- never a second date parser, never
+        inventing a day the user did not provide.
+
+        Returns correction-level error strings (an unrecognized category
+        key, an unparseable period) for the caller to fold into the
+        post-correction validation result: a correction is NEVER
+        silently dropped on failure, it surfaces as a validation error
+        instead.
+        """
+        from app.evidence_interpretation import resolve_corrected_shareholding_period
+
+        errors: list[str] = []
         for field_key, new_value in draft.corrections.items():
-            for fact in draft.proposed_facts:
-                if fact.field == field_key:
-                    fact.value = new_value
-                    fact.confidence = 1.0  # User-corrected = trusted
+            if field_key == "reportingPeriod":
+                if new_value is None or str(new_value).strip() == "":
+                    # An empty/blank period correction leaves whatever
+                    # extraction already found untouched -- it is not a
+                    # request to clear the period.
+                    continue
+                resolved = resolve_corrected_shareholding_period(str(new_value))
+                if resolved is None:
+                    errors.append(
+                        f"INVALID_REPORTING_PERIOD_CORRECTION: '{new_value}' could not be "
+                        "recognized as a SHAREHOLDING quarter-end/quarter-month period"
+                    )
+                    continue
+                draft.reporting_period = resolved
+                continue
+
+            if not field_key.startswith("shareholding:"):
+                # Not a field SHAREHOLDING's correction contract
+                # recognizes -- left alone rather than guessed at.
+                continue
+            category_str = field_key.split(":", 1)[1]
+            try:
+                ShareholdingCategory(category_str)
+            except ValueError:
+                errors.append(f"UNKNOWN_CATEGORY_CORRECTION: {field_key}")
+                continue
+
+            matched = next((f for f in draft.proposed_facts if f.field == field_key), None)
+            if matched is not None:
+                if matched.provenance == "OCR_EXTRACTED":
+                    # Capture the interpreter's original value exactly
+                    # once -- a second correction of the same field must
+                    # never overwrite it with an earlier correction.
+                    matched.original_value = matched.value
+                matched.value = new_value
+                matched.provenance = "USER_CORRECTED"
+                matched.confidence = 1.0  # User-corrected = trusted
+            else:
+                # Nothing was extracted for this category at all
+                # (MISSING/AMBIGUOUS/INVALID) -- the user is supplying it
+                # from scratch, not correcting an existing value.
+                draft.proposed_facts.append(ProposedFact(
+                    field=field_key,
+                    value=new_value,
+                    confidence=1.0,
+                    provenance="USER_ENTERED",
+                    original_value=None,
+                ))
+        return errors
 
     def _revalidate(self, draft: ManualEvidenceDraft) -> ValidationResult:
         """Re-run validation after corrections have been applied."""
         if draft.evidence_type == EvidenceType.SHAREHOLDING:
             from app.repository import _is_shareholding_quarter_period
-            snapshot_values = self._draft_facts_to_snapshot_values(draft)
+
             errors: list[str] = []
             warnings: list[str] = []
-            categories = {v.category for v in snapshot_values}
+            # TASK E2 item 7 -- validate every proposed fact WITHOUT ever
+            # raising (a user-entered/corrected value may be garbage, not
+            # just an interpreter output that is already known-good), so
+            # a bad correction becomes a reported error, never a crash.
+            # Deliberately NOT delegating to _draft_facts_to_snapshot_values
+            # here, since that helper assumes every fact already parses
+            # cleanly (true for interpreter output, not guaranteed for a
+            # fresh user correction) and both ``Decimal(str(...))`` and
+            # ``ShareholdingCategory(...)`` raise on bad input.
+            resolved: dict[ShareholdingCategory, Decimal] = {}
+            for fact in draft.proposed_facts:
+                category_str = fact.field.split(":", 1)[1] if ":" in fact.field else fact.field
+                try:
+                    category = ShareholdingCategory(category_str)
+                except ValueError:
+                    errors.append(f"UNKNOWN_CATEGORY: {fact.field}")
+                    continue
+                try:
+                    pct = fact.value if isinstance(fact.value, Decimal) else Decimal(str(fact.value))
+                except (InvalidOperation, ValueError, TypeError):
+                    errors.append(
+                        f"INVALID_PERCENTAGE: {fact.field} = {fact.value!r} is not a number"
+                    )
+                    continue
+                if pct < 0 or pct > 100:
+                    errors.append(f"INVALID_PERCENTAGE: {fact.field} = {pct}")
+                    continue
+                if category == ShareholdingCategory.PROMOTER_PLEDGE and not fact.metric_basis:
+                    errors.append(f"PROMOTER_PLEDGE_REQUIRES_METRIC_BASIS: {category}")
+                    continue
+                if category in resolved and resolved[category] != pct:
+                    # Two DIFFERENT proposed values for the SAME category
+                    # (e.g. a duplicated/garbled source row plus a user
+                    # correction that did not fully replace it) -- never
+                    # silently pick one; the user must resolve it.
+                    errors.append(
+                        f"DUPLICATE_CONFLICTING_CATEGORY: '{category.value}' has more than "
+                        f"one proposed value ({resolved[category]} vs {pct}) -- resolve "
+                        "before accepting"
+                    )
+                    continue
+                resolved[category] = pct
+
             mandatory = {"PROMOTER", "FII_FPI", "DII", "PUBLIC_RETAIL"}
-            if not {str(c) for c in categories} & mandatory:
+            if not {c.value for c in resolved} & mandatory:
                 errors.append(
                     "MISSING_MANDATORY_CATEGORIES: at least one of "
                     "PROMOTER/FII_FPI/DII/PUBLIC_RETAIL must be present"
                 )
-            for v in snapshot_values:
-                pct = v.percentage
-                if not isinstance(pct, Decimal) or pct < 0 or pct > 100:
-                    errors.append(f"INVALID_PERCENTAGE: {v.category} = {pct}")
-            for v in snapshot_values:
-                if v.category == ShareholdingCategory.PROMOTER_PLEDGE and not v.metric_basis:
-                    errors.append(f"PROMOTER_PLEDGE_REQUIRES_METRIC_BASIS: {v.category}")
+
+            # TASK E2 item 7 -- ownership-total consistency: only
+            # meaningful once ALL FOUR primary categories are present
+            # (a deliberately partial draft, which the domain contract
+            # allows -- see MINORITY/partial-extraction support above --
+            # is never penalized for omitting a category). A tolerance
+            # is used, never a hard requirement, because OTHERS/mutual
+            # funds/insurance/government categories legitimately absorb
+            # the remainder and rounding in the source is routine; this
+            # is a warning that prompts a second look, never a fabricated
+            # correction and never a hard error.
+            if mandatory <= {c.value for c in resolved}:
+                total = sum((resolved[ShareholdingCategory(c)] for c in mandatory), Decimal("0"))
+                if abs(total - Decimal("100")) > Decimal("5"):
+                    warnings.append(
+                        f"OWNERSHIP_TOTAL_IMPLAUSIBLE: PROMOTER+FII_FPI+DII+PUBLIC_RETAIL "
+                        f"sum to {total}%, which is not close to 100% -- review before accepting"
+                    )
+
             if draft.reporting_period and not _is_shareholding_quarter_period(draft.reporting_period):
                 warnings.append(
                     f"PERIOD_NOT_QUARTER_END: {draft.reporting_period.date().isoformat()}"

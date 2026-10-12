@@ -52,6 +52,8 @@ export function RadarProgressPanel({
   updatedAt,
   counters,
   percent,
+  phase,
+  acquisition,
   errorCode,
   pollError,
 }: {
@@ -63,6 +65,9 @@ export function RadarProgressPanel({
   counters: RadarProgressCounter[];
   /** A genuine completed/admitted ratio (0-100), or null for indeterminate. */
   percent: number | null;
+  phase?: string;
+  /** Durable full-universe scan counts, never the deep shortlist. */
+  acquisition?: { scanned: number | null; total: number | null };
   errorCode?: string | null;
   /** Set when the most recent status poll itself failed (transient network
    * error) -- the panel keeps showing the last known good state rather than
@@ -70,6 +75,8 @@ export function RadarProgressPanel({
   pollError?: boolean;
 }) {
   const terminal = isTerminalRadarStatus(status);
+  const acquisitionPercent = acquisition?.scanned != null && acquisition.total != null && acquisition.total > 0
+    ? (acquisition.scanned / acquisition.total) * 100 : null;
   const tone = status === "FAILED" ? "failed" : status === "CANCELLED" ? "cancelled" : status === "COMPLETED" ? "completed" : "active";
   return (
     <div className={`radar-progress-panel radar-progress-${tone}`} role="status" aria-live="polite">
@@ -77,8 +84,27 @@ export function RadarProgressPanel({
         <strong>{radarType} radar · {statusLabel(status)}</strong>
         <small>Cycle {cycleId}</small>
       </div>
-      {!terminal ? (
-        <div className={`bar-track${percent == null ? " bar-track-indeterminate" : ""}`} aria-hidden="true">
+      {!terminal && radarType === "Equity" && status !== "CANCEL_REQUESTED" ? <p>{phase === "DEEP"
+        ? "Deep investigation ? progress covers admitted candidates only."
+        : phase === "CANDIDATE_SELECTION" ? "Candidate selection ? selecting instruments for deep investigation."
+        : phase === "BASELINE" ? acquisitionPercent == null
+          ? "Baseline scanning - live full-market scan progress is unavailable."
+          : "Baseline scanning - persisted full-market scan counts are shown below."
+        : "Waiting for the current research phase."}</p> : null}
+      {status === "CANCEL_REQUESTED" ? <p>Cancellation requested ? waiting for in-flight work to drain.</p> : null}
+      {radarType === "Equity" && acquisition ? (
+        <section aria-label="Full-market baseline scan">
+          <p>Full-market baseline scan: {acquisition.scanned ?? "Unavailable"} of {acquisition.total ?? "Unavailable"} instruments scanned.</p>
+          {!terminal ? <div className={`bar-track${acquisitionPercent == null ? " bar-track-indeterminate" : ""}`}
+            role="progressbar" aria-label="Full-market baseline scan" aria-valuemin={0} aria-valuemax={100}
+            aria-valuenow={acquisitionPercent == null ? undefined : Math.min(Math.max(acquisitionPercent, 0), 100)}>
+            <span style={acquisitionPercent == null ? undefined : { width: `${Math.min(Math.max(acquisitionPercent, 0), 100)}%` }} />
+          </div> : null}
+        </section>
+      ) : null}
+      {!terminal && !(radarType === "Equity" && acquisition && phase === "BASELINE") ? (
+        <div className={`bar-track${percent == null ? " bar-track-indeterminate" : ""}`} role="progressbar" aria-label={radarType === "Equity" && phase === "DEEP" ? "Deep processing" : "Research phase progress"}
+          aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent == null ? undefined : Math.min(Math.max(percent, 0), 100)}>
           <span style={percent == null ? undefined : { width: `${Math.min(Math.max(percent, 0), 100)}%` }} />
         </div>
       ) : null}

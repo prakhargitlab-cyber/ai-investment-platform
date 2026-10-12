@@ -1,0 +1,13 @@
+DejaVuSansMono.ttf and DejaVuSansMono-Bold.ttf are vendored here so that
+tests which synthesize OCR-able test images (shareholding/valuation-inputs
+table fixtures) do not depend on a Linux-only system font path
+(/usr/share/fonts/truetype/dejavu/...), which does not exist on Windows or
+macOS and previously made these tests fail there with a hard OSError from
+PIL.ImageFont.truetype rather than exercising the OCR pipeline they are
+meant to test.
+
+Source: https://dejavu-fonts.github.io/
+License: Bitstream Vera License (public-domain DejaVu changes; see
+Debian's fonts-dejavu package copyright file for the full text) -- freely
+redistributable, including in source form, with the copyright/trademark
+notice preserved. Font content is unmodified from the upstream release.

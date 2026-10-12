@@ -530,7 +530,8 @@ def _trusted_nse_candidate(instrument: dict[str, Any]) -> str | None:
 def _trusted_nse_candidate_reason(instrument: dict[str, Any], identity: str, candidate: dict[str, Any], expected_symbol: str) -> str | None:
     if str(candidate.get("symbol") or "").upper() != expected_symbol:
         return "SYMBOL_MISMATCH"
-    if str(candidate.get("quoteType") or "").upper() not in {"EQUITY", "STOCK"}:
+    allowed_types = {"ETF"} if instrument.get("assetType") == "ETF" else {"EQUITY", "STOCK"}
+    if str(candidate.get("quoteType") or "").upper() not in allowed_types:
         return "QUOTE_TYPE_MISMATCH"
     candidate_listing = _exchange_family(candidate.get("exchange") or candidate.get("exchDisp"), expected_symbol)
     if candidate_listing != "XNSE":

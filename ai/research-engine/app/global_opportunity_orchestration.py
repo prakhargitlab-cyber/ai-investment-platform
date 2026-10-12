@@ -762,6 +762,12 @@ class GlobalOpportunityOrchestrator:
         scanner = GlobalScanner(_PersistedUniverse(rows), self.persistence, batch_size=1,
                                 run_blocking=self._run_blocking)
         scan = await scanner.scan(as_of=as_of, top_n=0)
+        if checkpoint is not None:
+            previous_selection = await checkpoint.selection()
+            if not previous_selection or 'deep_ids' not in previous_selection:
+                await checkpoint.save_selection({'phase': 'CANDIDATE_SELECTION',
+                    'baseline_evaluated': len(scan.candidates),
+                    'universe_count': scan.total_canonical_active_equities})
         phase1 = {c.global_instrument_id:c for c in scan.candidates if c.eligible_for_deep_analysis}
         metadata = {str(row.get("globalInstrumentId")): row for row in rows}
 
@@ -870,6 +876,8 @@ class GlobalOpportunityOrchestrator:
             # same ordered set (discovery rotation is not re-run).
             restored_selection = (await checkpoint.selection()) if checkpoint is not None else None
             selected_missing: list = []
+            if restored_selection is not None and 'deep_ids' not in restored_selection:
+                restored_selection = None
             if restored_selection is not None:
                 restored_selection = dict(restored_selection)
                 restored_selection["deep_ids"] = list(dict.fromkeys(restored_selection.get("deep_ids", [])))[:shortlist_limit]
@@ -901,6 +909,9 @@ class GlobalOpportunityOrchestrator:
                 shortlist = list(deep_candidates)
             if checkpoint is not None:
                 await checkpoint.save_selection({
+                    "phase": "DEEP",
+                    "baseline_evaluated": len(scan.candidates),
+                    "universe_count": scan.total_canonical_active_equities,
                     "acquisition_selection_version": ACQUISITION_SELECTION_VERSION,
                     "deep_ids": (restored_selection["deep_ids"] if restored_selection is not None
                                  else [str(c.global_instrument_id) for c in deep_candidates]),

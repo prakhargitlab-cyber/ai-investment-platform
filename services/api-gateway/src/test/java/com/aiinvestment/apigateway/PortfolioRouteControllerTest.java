@@ -27,6 +27,31 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PortfolioRouteControllerTest {
 
     @Test
+    void mvcRegistersPreviewAndForwardsVerifiedCancellationIdentityAndStatusErrors() throws Exception {
+        AtomicReference<String> role = new AtomicReference<>();
+        startServer(exchange -> {
+            role.set(exchange.getRequestHeaders().getFirst("X-AIP-User-Roles"));
+            int code = exchange.getRequestURI().getPath().endsWith("/status") ? 500 : 200;
+            writeResponse(exchange, code, "application/json", "{\"status\":\"CANCEL_REQUESTED\"}".getBytes(StandardCharsets.UTF_8));
+        });
+        String secret = "test-radar-contract-secret-at-least-32-characters";
+        var filter = new GatewayAuthenticationFilter(new GatewayAuthProperties("test", secret));
+        String local = "http://127.0.0.1:" + server.getAddress().getPort();
+        var controller = new PortfolioRouteController(local, local, local, local, local, local, local);
+        var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(controller).addFilters(filter).build();
+        String token = new com.aiinvestment.shared.web.auth.HmacJwtService(secret).issue(
+            new com.aiinvestment.shared.web.auth.JwtClaims("test", "admin", "admin@example.test", "Admin", List.of("ADMIN"), java.time.Instant.now().plusSeconds(300)));
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/api/v1/market-universe/india/nse-etf/preview")
+            .header("Authorization", "Bearer " + token)).andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/v1/research/opportunities/cycles/00000000-0000-0000-0000-000000000001/cancel")
+            .header("Authorization", "Bearer " + token).header("X-AIP-User-Roles", "USER"))
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
+        assertThat(role.get()).isEqualTo("ADMIN");
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/api/v1/research/opportunities/cycles/00000000-0000-0000-0000-000000000001/status")
+            .header("Authorization", "Bearer " + token)).andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isInternalServerError());
+    }
+
+    @Test
     void connectorSessionUrlTargetsItsDynamicRuntimeService() throws Exception {
         Method target = PortfolioRouteController.class.getDeclaredMethod("connectorRuntimeBaseUrl", String.class);
         target.setAccessible(true);

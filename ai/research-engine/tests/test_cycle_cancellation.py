@@ -717,22 +717,14 @@ async def test_recovery_pause_blocks_startup_recovery():
         runner_calls.append(kwargs.get("cycle_id"))
         return {"cycle_id": kwargs.get("cycle_id"), "universe_count": 1}
     store2, worker = _pod(store, _runner, lease=60, paused=True)
+    before = store2.opportunity_jobs()
     worker.start()
     await asyncio.sleep(0.2)
     assert runner_calls == []  # no resume while paused
     assert worker.active is None
-    # Status recorded as RECOVERY_PAUSED in the job log.
-    import json as _json
-    rows = store2._connection.execute(
-        "SELECT payload FROM global_opportunity_top_selection").fetchall()
-    job = None
-    for row in rows:
-        val = _json.loads(row["payload"])
-        if val.get("record_kind") == "CYCLE_JOB" and val.get("cycle_id") == cycle_id:
-            job = val
-            break
-    assert job is not None
-    assert job["error_code"] == "RECOVERY_PAUSED"
+    # Paused startup must not create a job record or background task.
+    assert worker.task is None
+    assert store2.opportunity_jobs() == before
     # Run row status unchanged (still RUNNING in the DB).
     assert store.cycle_run(cycle_id)["status"] == "RUNNING"
     await worker.close()
@@ -850,8 +842,10 @@ def test_cancel_cycle_run_unowned_transitions_to_terminal():
     store.claim_cycle_run(cycle_id, "worker-1", lease_seconds=60)
     store.request_cycle_cancel(cycle_id)
     assert store.cycle_run(cycle_id)["status"] == "CANCEL_REQUESTED"
-    # Owner still present but we use the unowned path.
-    assert store.cycle_run(cycle_id)["owner_id"] == "worker-1"
+    # A live owner must drain itself; operator finalization only after expiry.
+    assert not store.cancel_cycle_run_unowned(cycle_id)
+    from test_radar_recovery_closure import expire
+    expire(store, cycle_id)
 
     transitioned = store.cancel_cycle_run_unowned(cycle_id)
     assert transitioned is True
@@ -1019,6 +1013,8 @@ def _wire_cancel_contract_api(monkeypatch, store, worker):
     # Exercise submission/state only. The ASGI transport does not start the
     # application lifespan, and this worker never launches a research runner.
     monkeypatch.setattr(worker, 'start', lambda: None)
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(worker, '_start_async', AsyncMock())
     return main.app
 
 
@@ -1090,6 +1086,8 @@ async def test_cancel_contract_api_finalization_updates_status_and_coalescing(mo
             assert draining.json()['status'] == 'CANCEL_REQUESTED'
             assert store.active_cycle_run()['cycle_id'] == cycle_id
 
+            from test_radar_recovery_closure import expire
+            expire(store, cycle_id)
             finalized = await client.post(path + '/finalize-cancel')
             assert finalized.status_code == 200
             assert finalized.json() == {'cycle_id': cycle_id, 'transitioned': True, 'status': 'CANCELLED'}
@@ -1186,6 +1184,8 @@ async def test_cancel_contract_old_runner_cleanup_preserves_queued_replacement()
         old_id = worker.submit({'top_n': 4})['cycle_id']
         await asyncio.wait_for(old_started.wait(), 2)
         store.request_cycle_cancel(old_id)
+        from test_radar_recovery_closure import expire
+        expire(store, old_id)
         assert store.cancel_cycle_run_unowned(old_id)
         replacement_id = worker.submit({'top_n': 4})['cycle_id']
         assert replacement_id != old_id and calls == [old_id]

@@ -9,4 +9,5 @@ public interface AppUserRoleRepository extends JpaRepository<AppUserRoleEntity, 
     List<AppUserRoleEntity> findByUserId(UUID userId);
     boolean existsByUserIdAndRole(UUID userId, String role);
     void deleteByUserIdAndRole(UUID userId, String role);
+    boolean existsByRole(String role);
 }

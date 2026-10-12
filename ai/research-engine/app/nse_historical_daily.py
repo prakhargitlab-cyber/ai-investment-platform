@@ -65,7 +65,7 @@ class NseHistoricalResult:
 def verified_identity(metadata: dict, key: UUID) -> tuple[str, str]:
     if str(metadata.get("globalInstrumentId")) != str(key):
         raise ValueError("IDENTITY_MISMATCH")
-    if (metadata.get("status") != "ACTIVE" or metadata.get("assetType") != "EQUITY"
+    if (metadata.get("status") != "ACTIVE" or metadata.get("assetType") not in {"EQUITY", "ETF"}
             or metadata.get("country") not in {"IN", "IND", "INDIA"}
             or metadata.get("primaryExchange") not in {"NSE", "XNSE"}):
         raise ValueError("UNSUPPORTED_INSTRUMENT")

@@ -499,7 +499,7 @@ export function InvestmentWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [accessToken, authenticatedUser?.userId]);
+  }, [accessToken, authenticatedUser]);
 
   useEffect(() => {
     console.info("[AIP_MARKET_ENSURE]", { event: "EFFECT", authReady: marketEnsureAuthReady });
@@ -837,7 +837,7 @@ export function InvestmentWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [accessToken, selectedPortfolioId, portfolioHistoryRange]);
+  }, [accessToken, authenticatedUser, selectedPortfolioId, portfolioHistoryRange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -868,7 +868,7 @@ export function InvestmentWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [accessToken]);
+  }, [accessToken, authenticatedUser]);
 
   const sortedPositions = useMemo(() => {
     const normalizedSearch = searchText.trim().toLowerCase();
@@ -1594,7 +1594,7 @@ export function InvestmentWorkspace() {
                 type="button"
               >
                 <Icon size={18} aria-hidden="true" />
-                {item.id === "admin" ? <>Administration → {item.label}</> : item.label}
+                {item.id === "admin" ? <>Administration &rarr; {item.label}</> : item.label}
               </button>
             );
           })}
@@ -1699,7 +1699,7 @@ export function InvestmentWorkspace() {
           {view === "backtesting" ? <Backtesting /> : null}
           {view === "admin" ? <AdminUsers operatorId={authenticatedUser.userId} roles={authenticatedUser.roles ?? []} /> : null}
           {loading ? <LoadingView /> : null}
-          {view === "dashboard" && (loading || error) ? <RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
+          {view === "dashboard" && (loading || error) ? <RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
 
           {!loading && !error ? (
             <>
@@ -1719,7 +1719,7 @@ export function InvestmentWorkspace() {
                       onAddWatchlist={(selection) => { void addRankedStockToWatchlist(selection); }}
                       savedInstrumentIds={watchlists.filter((list) => list.region === sectorPerformanceRegion && list.systemDefault).flatMap((list) => savedWatchlistIds[list.watchlistId] ?? [])}
                       watchlistBusy={watchlistMutation !== null}
-                      radar={<RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
+                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
                       performance={sectorPerformance}
                       performanceRegion={sectorPerformanceRegion}
                       performanceSector={sectorPerformanceSector}
@@ -1744,7 +1744,7 @@ export function InvestmentWorkspace() {
                       portfolio={selectedPortfolio}
                       summary={summary}
                       positions={positions}
-                      radar={<RadarTabs heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
+                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
                       onCreate={createPortfolio}
                       onSync={selectedPortfolio?.brokerConnectionId ? syncSelectedPortfolio : undefined}
                       onRefreshPrices={selectedPortfolio?.acquisitionSource === "MANUAL_CSV_IMPORT" ? refreshSelectedPrices : undefined}
@@ -3830,7 +3830,7 @@ function ResearchView({
         setWatchlistDetailError(getApiFailure(error).message);
         setWatchlistDetailLoading(false);
       });
-  }, [researchDetail?.watchlistInstrumentId, researchDetail?.researchInstrumentId, detailRegion, watchlistDetailRetryKey]);
+  }, [researchDetail, detailRegion, watchlistDetailRetryKey]);
   const filteredEvents = (summary?.recentEvents ?? []).filter((event) => {
     return (!eventType || event.eventType === eventType) && (!impact || event.impact === impact);
   });
@@ -5088,7 +5088,7 @@ function UploadEvidenceDialog({
     setTouchedFactRows(new Set());
     setReconcileConflicts(false);
     setPasteError(null);
-  }, [draft?.draftId]);
+  }, [draft]);
 
   const updateFactRow = (index: number, patch: Partial<FinancialFactRow>) => {
     setFactRows((current) => current.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)));
@@ -5592,7 +5592,7 @@ function UploadEvidenceDialog({
                     placeholder="YYYY-MM-DD, YYYY-MM, or e.g. Jun 2026"
                   />
                   <p className="hint">
-                    A month-only value (e.g. "2026-06" or "Jun 2026") keeps MONTH precision --
+                    A month-only value (e.g. &quot;2026-06&quot; or &quot;Jun 2026&quot;) keeps MONTH precision --
                     it is never guessed to a specific day.
                   </p>
                 </label>

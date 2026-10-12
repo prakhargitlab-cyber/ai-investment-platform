@@ -16,7 +16,7 @@ reports what fraction of factor weight was actually available.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -212,7 +212,7 @@ def _score_risk(metrics: EtfDeterministicMetrics) -> EtfFactorScoreResult:
 def _fresh_fact(fact: EtfFact | None, metric: EtfMetric, *, now: datetime) -> EtfFact | None:
     if fact is None:
         return None
-    if etf_freshness(fact, metric, now=now) in {"FRESH", "STALE"}:
+    if etf_freshness(fact, metric, now=now) == "FRESH":
         return fact
     return None
 
@@ -278,9 +278,9 @@ def _score_cost(data: EtfRuleEngineInput) -> EtfFactorScoreResult:
 
 def _score_nav_premium_discount(data: EtfRuleEngineInput) -> EtfFactorScoreResult:
     weight = ETF_RULE_ENGINE_FACTOR_WEIGHTS[EtfRuleEngineFactor.NAV_PREMIUM_DISCOUNT]
-    nav = data.nav if data.nav is not None and etf_freshness(data.nav, EtfMetric.NAV, now=data.now) in {"FRESH", "STALE"} else None
+    nav = data.nav if data.nav is not None and etf_freshness(data.nav, EtfMetric.NAV, now=data.now) == "FRESH" else None
     price = _fresh_fact(data.market_price_fact, EtfMetric.MARKET_PRICE, now=data.now)
-    if nav is None or price is None or nav.nav == 0:
+    if nav is None or price is None or nav.nav == 0 or nav.nav_date != price.as_of_date or nav.currency != price.unit:
         return EtfFactorScoreResult(factor=EtfRuleEngineFactor.NAV_PREMIUM_DISCOUNT, weight=weight,
             status=EtfFactorStatus.UNAVAILABLE, raw_metric=None, normalized_score=None, weighted_contribution=None,
             freshness=None, source_provenance=None, confidence=None, reason="NAV_OR_MARKET_PRICE_UNAVAILABLE")
@@ -295,7 +295,7 @@ def _score_nav_premium_discount(data: EtfRuleEngineInput) -> EtfFactorScoreResul
 def _score_diversification(data: EtfRuleEngineInput) -> EtfFactorScoreResult:
     weight = ETF_RULE_ENGINE_FACTOR_WEIGHTS[EtfRuleEngineFactor.DIVERSIFICATION]
     snapshot = data.holdings
-    if snapshot is None or not snapshot.holdings:
+    if snapshot is None or not snapshot.holdings or etf_freshness(snapshot, EtfMetric.UNDERLYING_HOLDINGS, now=data.now) != "FRESH":
         return EtfFactorScoreResult(factor=EtfRuleEngineFactor.DIVERSIFICATION, weight=weight,
             status=EtfFactorStatus.UNAVAILABLE, raw_metric=None, normalized_score=None, weighted_contribution=None,
             freshness=None, source_provenance=None, confidence=None, reason="NO_HOLDINGS_SNAPSHOT")
@@ -324,7 +324,16 @@ def _score_data_completeness(scored_so_far: Sequence[EtfFactorScoreResult]) -> E
         source_provenance="ETF_RULE_ENGINE_V1_SELF_REPORT", confidence=1.0)
 
 
+def _current_metrics(data):
+    from app.etf_readiness import _DERIVED_METRIC_MAX_AGE_DAYS
+    stamp = data.metrics.as_of_date
+    if stamp is None or not 0 <= (data.now.date() - stamp).days <= _DERIVED_METRIC_MAX_AGE_DAYS:
+        return EtfDeterministicMetrics(instrument_id=data.instrument_id, as_of_date=stamp)
+    return data.metrics
+
+
 def score_etf(data: EtfRuleEngineInput) -> EtfRuleEngineResult:
+    data = replace(data, metrics=_current_metrics(data))
     """Pure, deterministic ETF scoring. No I/O, no LLM, no randomness."""
     factor_results = [
         _score_performance_momentum(data.metrics),
@@ -352,6 +361,7 @@ def score_etf(data: EtfRuleEngineInput) -> EtfRuleEngineResult:
 
 
 def evaluate_etf_risk_gates(data: EtfRuleEngineInput, result: EtfRuleEngineResult) -> list[EtfRiskGate]:
+    data = replace(data, metrics=_current_metrics(data))
     """Deterministic risk gates, independent of (but informed by) the score.
 
     Every gate distinguishes a provider/infra TECHNICAL_FAILURE, from
@@ -382,10 +392,10 @@ def evaluate_etf_risk_gates(data: EtfRuleEngineInput, result: EtfRuleEngineResul
     gates.append(EtfRiskGate(gate_id="EXCESSIVE_DRAWDOWN", category=EtfRiskGateCategory.POOR_CHARACTERISTICS,
         severity=EtfRiskGateSeverity.WARNING, triggered=excessive_drawdown,
         reason="Trailing max drawdown is 50% or worse."))
-    nav = data.nav if data.nav is not None and etf_freshness(data.nav, EtfMetric.NAV, now=data.now) in {"FRESH", "STALE"} else None
+    nav = data.nav if data.nav is not None and etf_freshness(data.nav, EtfMetric.NAV, now=data.now) == "FRESH" else None
     price = _fresh_fact(data.market_price_fact, EtfMetric.MARKET_PRICE, now=data.now)
     abnormal_premium = False
-    if nav is not None and price is not None and nav.nav:
+    if nav is not None and price is not None and nav.nav and nav.nav_date == price.as_of_date:
         abnormal_premium = abs(float((price.value - nav.nav) / nav.nav * 100)) > 5.0
     gates.append(EtfRiskGate(gate_id="ABNORMAL_NAV_PREMIUM_DISCOUNT", category=EtfRiskGateCategory.POOR_CHARACTERISTICS,
         severity=EtfRiskGateSeverity.WARNING, triggered=abnormal_premium,

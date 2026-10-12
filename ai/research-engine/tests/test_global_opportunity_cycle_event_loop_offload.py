@@ -217,3 +217,26 @@ async def test_blocking_helper_falls_back_to_inline_when_boundary_absent(monkeyp
 
     assert selection['status'] == 'COMPLETED'
     assert len(selection['top_short_term']) == 1
+
+
+@pytest.mark.asyncio
+async def test_all_dashboard_radar_reads_dispatch_persistence(monkeypatch):
+    from app import main
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from uuid import uuid4
+    methods = ['global_opportunity_radar', 'portfolio_recommendation_signals',
+        'recommendation_history', 'etf_portfolio_recommendation_signals',
+        'latest_etf_radar_cycle', 'etf_radar_cycle']
+    store = SimpleNamespace(**{name: Mock() for name in methods})
+    dispatch = AsyncMock(return_value={})
+    monkeypatch.setattr(main, 'repository', SimpleNamespace(persistence=store, _run_blocking_persistence=dispatch))
+    await main.opportunity_radar()
+    await main.current_portfolio_recommendations([])
+    await main.opportunity_history(uuid4())
+    await main.current_etf_portfolio_recommendations([])
+    await main.etf_radar_current()
+    await main.etf_radar_cycle_status(uuid4())
+    assert [call.args[0] for call in dispatch.await_args_list] == [getattr(store, name) for name in methods]
+    assert (await main.health())['status'] == 'ok'
+    assert (await main.liveness())['status'] == 'ok'

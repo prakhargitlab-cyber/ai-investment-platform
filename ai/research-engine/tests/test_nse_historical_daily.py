@@ -58,7 +58,7 @@ def test_bigint_duplicates():
 def test_bad_contract(body):
     with pytest.raises((ValueError,csv.Error)): parse_csv(body,result(),'INR')
 
-@pytest.mark.parametrize('change',[dict(providerMappings=[]),dict(status='INACTIVE'),dict(assetType='ETF'),dict(globalInstrumentId=str(UUID(int=2))),dict(providerMappings=META['providerMappings']*2),dict(currency=None,providerMappings=[dict(provider='NSE',providerSymbol='X',status='VERIFIED')]),*[dict(providerMappings=[META['providerMappings'][0]|u]) for u in [dict(status='UNVERIFIED'),dict(active=False),dict(providerSymbol=' '),dict(resolutionSource='BROKER_IMPORT_IDENTITY'),dict(currency='USD')]]])
+@pytest.mark.parametrize('change',[dict(providerMappings=[]),dict(status='INACTIVE'),dict(assetType='BOND'),dict(globalInstrumentId=str(UUID(int=2))),dict(providerMappings=META['providerMappings']*2),dict(currency=None,providerMappings=[dict(provider='NSE',providerSymbol='X',status='VERIFIED')]),*[dict(providerMappings=[META['providerMappings'][0]|u]) for u in [dict(status='UNVERIFIED'),dict(active=False),dict(providerSymbol=' '),dict(resolutionSource='BROKER_IMPORT_IDENTITY'),dict(currency='USD')]]])
 def test_identity(change):
     with pytest.raises(ValueError): verified_identity(META|change,KEY)
 
@@ -223,3 +223,26 @@ async def test_generic_verified_symbol_not_primary_symbol():
         return httpx.Response(200,content=FIXTURE.read_bytes().replace(b'POLYCAB',b'ANOTHER'))
     r,_=await fetch_with(handler,metadata=metadata)
     assert r.rows_accepted==4 and all(b.provider_symbol=='ANOTHER' and b.global_instrument_id==KEY for b in r.bars)
+
+
+def test_verified_etf_is_eligible_without_changing_equity_identity():
+    assert verified_identity(META | {"assetType": "ETF"}, KEY) == verified_identity(META, KEY)
+
+
+@pytest.mark.asyncio
+async def test_etf_history_uses_existing_verified_nse_contract():
+    metadata = META | {"assetType": "ETF", "providerMappings": [META["providerMappings"][0] | {"providerSymbol": "FIXTUREETF"}]}
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if "generateSecurityWiseHistoricalData" in request.url.path:
+            assert request.url.params["symbol"] == "FIXTUREETF"
+            assert request.url.params["series"] == "EQ"
+            return httpx.Response(200, content=FIXTURE.read_bytes().replace(b"POLYCAB", b"FIXTUREETF"),
+                                  headers={"content-type": "text/csv"})
+        return httpx.Response(200, text="bootstrap")
+    value, _ = await fetch_with(handler, metadata=metadata)
+    assert value.status == "SUCCESS"
+    assert len(value.bars) == 4
+    assert len(calls) == 2
+    assert all(bar.global_instrument_id == KEY and bar.currency == "INR" and bar.provider == "NSE" for bar in value.bars)

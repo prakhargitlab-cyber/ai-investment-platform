@@ -146,6 +146,26 @@ class CycleRunPersistenceMixin:
     def _cycle_rowcount(self, cursor) -> int:
         return int(getattr(cursor, "rowcount", 0) or 0)
 
+    def _lease_clock_sql(self) -> str:
+        return "strftime('%Y-%m-%dT%H:%M:%f000+00:00', 'now')"
+
+    def _lease_now(self, now: datetime | None) -> datetime:
+        if now is not None:
+            return now
+        with self._connection:
+            row = self._connection.execute(f"SELECT {self._lease_clock_sql()} AS lease_now").fetchone()
+        return datetime.fromisoformat(row['lease_now'])
+
+    def _fence_published_owner(self, cycle_id: str, owner_id: str) -> None:
+        # Must remain inside the caller's publication/projection transaction.
+        cursor = self._connection.execute(
+            "UPDATE global_opportunity_cycle_run SET updated_at = ? "
+            "WHERE cycle_id = ? AND owner_id = ? AND status = 'PUBLISHED' "
+            f"AND lease_expires_at > {self._lease_clock_sql()}",
+            (_iso(_now()), str(cycle_id), owner_id))
+        if self._cycle_rowcount(cursor) != 1:
+            raise CycleOwnershipLost(str(cycle_id))
+
     # -- run -----------------------------------------------------------------
     def active_cycle_run(self, market: str = "NSE") -> dict[str, Any] | None:
         with self._connection:
@@ -191,16 +211,10 @@ class CycleRunPersistenceMixin:
                         now: datetime | None = None) -> bool:
         """Atomically take (or keep) the lease when free, ours, or expired.
 
-        CANCEL_REQUESTED is included so the current lease-holder can re-claim
-        and drain in-flight work through the worker's _run_one path. A
-        DIFFERENT worker cannot claim a CANCEL_REQUESTED cycle because:
-        (1) _maybe_take_over and start() refuse it before claiming, and
-        (2) even if a different worker somehow reached claim with an expired
-        lease, it would drain to terminal CANCELLED -- which is the same
-        outcome as the original owner draining. The invariant we guarantee is:
-        no new candidates are admitted (checked in the orchestrator's admission
-        loop) and the cycle reaches terminal CANCELLED (not PUBLISHED)."""
-        now = now or _now()
+        A replacement may claim an expired CANCEL_REQUESTED lease only to
+        drain/finalize cancellation. The worker never invokes acquisition for it.
+        """
+        now = self._lease_now(now)
         with self._connection:
             cursor = self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET "
@@ -215,11 +229,12 @@ class CycleRunPersistenceMixin:
 
     def renew_cycle_lease(self, cycle_id: str, owner_id: str, *, lease_seconds: int = DEFAULT_LEASE_SECONDS,
                           now: datetime | None = None) -> bool:
-        now = now or _now()
+        now = self._lease_now(now)
         with self._connection:
             cursor = self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET lease_expires_at = ?, updated_at = ? "
-                "WHERE cycle_id = ? AND owner_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED')",
+                "WHERE cycle_id = ? AND owner_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED') "
+                f"AND lease_expires_at > {self._lease_clock_sql()}",
                 (_iso(now + timedelta(seconds=lease_seconds)), _iso(now), str(cycle_id), owner_id))
             return self._cycle_rowcount(cursor) == 1
 
@@ -227,12 +242,20 @@ class CycleRunPersistenceMixin:
         with self._connection:
             self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET owner_id = NULL, lease_expires_at = NULL, updated_at = ? "
-                "WHERE cycle_id = ? AND owner_id = ?", (_iso(_now()), str(cycle_id), owner_id))
+                "WHERE cycle_id = ? AND owner_id = ? "
+                f"AND lease_expires_at > {self._lease_clock_sql()} "
+                "AND status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED')",
+                (_iso(_now()), str(cycle_id), owner_id))
 
     def update_cycle_run(self, cycle_id: str, owner_id: str, **fields) -> None:
         """Fenced update of status / as_of / selection / error_code."""
         allowed = {"status", "as_of", "selection", "error_code"}
         assert set(fields) <= allowed, set(fields) - allowed
+        states = "('ACCEPTED','RUNNING')"
+        if fields.get('status') == 'COMPLETED':
+            states = "('RUNNING','PUBLISHED')"
+        elif fields.get('status') == 'CANCELLED':
+            states = "('ACCEPTED','RUNNING','CANCEL_REQUESTED')"
         sets, params = [], []
         for key, value in fields.items():
             sets.append(f"{key} = ?")
@@ -241,7 +264,8 @@ class CycleRunPersistenceMixin:
         params.append(_iso(_now()))
         with self._connection:
             cursor = self._connection.execute(
-                f"UPDATE global_opportunity_cycle_run SET {', '.join(sets)} WHERE cycle_id = ? AND owner_id = ?",
+                f"UPDATE global_opportunity_cycle_run SET {', '.join(sets)} WHERE cycle_id = ? AND owner_id = ? "
+                f"AND lease_expires_at > {self._lease_clock_sql()} AND status IN {states}",
                 (*params, str(cycle_id), owner_id))
             if self._cycle_rowcount(cursor) != 1:
                 raise CycleOwnershipLost(str(cycle_id))
@@ -253,17 +277,19 @@ class CycleRunPersistenceMixin:
 
     def fail_unowned_cycle_run(self, cycle_id: str, error_code: str) -> None:
         with self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET status = 'FAILED', error_code = ?, owner_id = NULL, "
-                "lease_expires_at = NULL, updated_at = ? WHERE cycle_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED')",
+                "lease_expires_at = NULL, updated_at = ? WHERE cycle_id = ? AND status IN ('ACCEPTED','RUNNING') "
+                f"AND (owner_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= {self._lease_clock_sql()})",
                 (error_code, _iso(_now()), str(cycle_id)))
-            self._connection.execute("DELETE FROM global_opportunity_cycle_active WHERE cycle_id = ?", (str(cycle_id),))
+            if self._cycle_rowcount(cursor) == 1:
+                self._connection.execute("DELETE FROM global_opportunity_cycle_active WHERE cycle_id = ?", (str(cycle_id),))
 
     def request_cycle_cancel(self, cycle_id: str, error_code: str = 'CYCLE_CANCELLED') -> bool:
         """Durable, idempotent operator cancellation REQUEST (two-phase).
 
         Phase 1 (request): sets status='CANCEL_REQUESTED' for any still-active
-        run (ACCEPTED/RUNNING/PUBLISHED). The active slot, owner_id, and
+        run (ACCEPTED/RUNNING). The active slot, owner_id, and
         lease_expires_at are PRESERVED so the current lease-holder worker can
         drain in-flight work and maintain lease renewal during draining. A
         CANCEL_REQUESTED run is not resumable by a *different* worker (the
@@ -285,7 +311,7 @@ class CycleRunPersistenceMixin:
             cursor = self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET status = 'CANCEL_REQUESTED', error_code = ?, "
                 "updated_at = ? "
-                "WHERE cycle_id = ? AND status IN ('ACCEPTED','RUNNING','PUBLISHED')",
+                "WHERE cycle_id = ? AND status IN ('ACCEPTED','RUNNING')",
                 (error_code, _iso(_now()), str(cycle_id)))
             rowcount = self._cycle_rowcount(cursor)
             # Do NOT delete the active slot here: the current owner must keep
@@ -307,7 +333,8 @@ class CycleRunPersistenceMixin:
             cursor = self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET status = 'CANCELLED', error_code = ?, "
                 "owner_id = NULL, lease_expires_at = NULL, updated_at = ? "
-                "WHERE cycle_id = ? AND owner_id = ? AND status IN ('CANCEL_REQUESTED','RUNNING','PUBLISHED','ACCEPTED')",
+                "WHERE cycle_id = ? AND owner_id = ? AND status IN ('CANCEL_REQUESTED','RUNNING','ACCEPTED') "
+                f"AND lease_expires_at > {self._lease_clock_sql()}",
                 (error_code, _iso(_now()), str(cycle_id), owner_id))
             rowcount = self._cycle_rowcount(cursor)
             if rowcount == 1:
@@ -363,7 +390,8 @@ class CycleRunPersistenceMixin:
             cursor = self._connection.execute(
                 "UPDATE global_opportunity_cycle_run SET status = 'CANCELLED', "
                 "error_code = ?, owner_id = NULL, lease_expires_at = NULL, updated_at = ? "
-                "WHERE cycle_id = ? AND status = 'CANCEL_REQUESTED'",
+                "WHERE cycle_id = ? AND status = 'CANCEL_REQUESTED' "
+                f"AND (owner_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= {self._lease_clock_sql()})",
                 (reason or 'CYCLE_CANCELLED', _iso(_now()), str(cycle_id)))
             rowcount = self._cycle_rowcount(cursor)
             if rowcount == 1:
@@ -389,7 +417,8 @@ class CycleRunPersistenceMixin:
                 raise CycleOwnershipLost(str(cycle_id))
         cursor = self._connection.execute(
             "UPDATE global_opportunity_cycle_run SET status = 'PUBLISHED', updated_at = ? "
-            "WHERE cycle_id = ? AND owner_id = ? AND status = 'RUNNING'", (_iso(_now()), str(cycle_id), owner_id))
+            "WHERE cycle_id = ? AND owner_id = ? AND status = 'RUNNING' "
+            f"AND lease_expires_at > {self._lease_clock_sql()}", (_iso(_now()), str(cycle_id), owner_id))
         if self._cycle_rowcount(cursor) != 1:
             raise CycleOwnershipLost(str(cycle_id))
 
@@ -412,6 +441,10 @@ class CycleRunPersistenceMixin:
                 "INSERT INTO global_opportunity_cycle_progress "
                 "(cycle_id, phase, global_instrument_id, state, disposition, failure_reason, attempts, payload, updated_at) "
                 "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? FROM global_opportunity_cycle_run WHERE cycle_id = ? AND owner_id = ? "
+                f"AND lease_expires_at > {self._lease_clock_sql()} "
+                "AND (status = 'RUNNING' OR (status = 'CANCEL_REQUESTED' AND ? = 0 AND EXISTS ("
+                "SELECT 1 FROM global_opportunity_cycle_progress p WHERE p.cycle_id = global_opportunity_cycle_run.cycle_id "
+                "AND p.phase = ? AND p.global_instrument_id = ?))) "
                 "ON CONFLICT (cycle_id, phase, global_instrument_id) DO UPDATE SET "
                 " state = excluded.state, disposition = excluded.disposition, failure_reason = excluded.failure_reason, "
                 " attempts = global_opportunity_cycle_progress.attempts + excluded.attempts, "
@@ -419,7 +452,7 @@ class CycleRunPersistenceMixin:
                 (str(cycle_id), phase, str(instrument_id), str(state), disposition, failure_reason,
                  1 if start_attempt else 0,
                  json.dumps(payload, sort_keys=True, default=str) if payload is not None else None, now,
-                 str(cycle_id), owner_id))
+                 str(cycle_id), owner_id, int(start_attempt), phase, str(instrument_id)))
             if self._cycle_rowcount(cursor) < 1:
                 raise CycleOwnershipLost(str(cycle_id))
 
@@ -451,15 +484,29 @@ class CycleRunPersistenceMixin:
                      and int(row.get("attempts") or 0) >= DEFAULT_MAX_ATTEMPTS]
         technical = [row for row in scoped if CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE]
         ready = eligible = failed = 0
+        deep_ready = deep_readiness_failed = deep_technical_failure = 0
         for row in terminal:
             diagnostic = ((row.get("payload") or {}).get("diagnostic") or {})
             disposition = row.get("disposition") or diagnostic.get("disposition")
-            ready += int(disposition in {"ANALYZED", "RANK_FILTERED"})
-            failed += int(CandidateState(row["state"]) == CandidateState.EVIDENCE_UNAVAILABLE)
+            is_ready = disposition in {"ANALYZED", "RANK_FILTERED"}
+            is_readiness_failed = CandidateState(row["state"]) == CandidateState.EVIDENCE_UNAVAILABLE
+            is_technical = CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE
+            ready += int(is_ready)
+            failed += int(is_readiness_failed)
             eligible += int(bool(diagnostic.get("rank_eligible")))
+            deep_ready += int(is_ready)
+            deep_readiness_failed += int(is_readiness_failed)
+            deep_technical_failure += int(is_technical)
         return {
+            "phase": ('DEEP' if 'deep_ids' in selection else selection.get('phase', 'BASELINE')),
+            "baseline_evaluated": selection.get('baseline_evaluated'),
+            "universe_count": selection.get('universe_count'),
+            "deep_attempted": sum(int(row.get('attempts') or 0) > 0 for row in scoped),
             "deep_completed": len(terminal),
             "deep_denominator": len(admitted),
+            "deep_ready": deep_ready,
+            "deep_readiness_failed": deep_readiness_failed,
+            "deep_technical_failure": deep_technical_failure,
             "ready": ready,
             "failed": failed,
             "technical": len(technical),

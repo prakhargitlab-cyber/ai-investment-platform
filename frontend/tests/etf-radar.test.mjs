@@ -115,7 +115,8 @@ test('ETF radar content renders an empty-ranking message with no cards', () => {
     data: { radar_version: 'ETF_RADAR_V1', cycle_id: 'c1', correlation_id: null, as_of: '2026-09-27T12:00:00Z',
       candidates: [], ranked: [], excluded_by_reason: {} },
   }));
-  assert.match(html, /No ETF currently ranks/);
+  assert.match(html, /No ETF instruments were evaluated/);
+  assert.doesNotMatch(html, /No ETF currently ranks/);
   assert.equal((html.match(/class="opportunity-card etf-radar-card"/g) ?? []).length, 0);
 });
 
@@ -180,12 +181,12 @@ test('RadarTabs holds no loading/error/result state of its own that could leak b
   assert.match(radarTabsSource, /useState<"equity" \| "etf">\("equity"\)/);
 });
 
-test('switching tabs cannot target the wrong radar\'s refresh action: "Run ETF Radar" is scoped to etf-radar.tsx only', () => {
+test('switching tabs cannot target the wrong radar\'s refresh action: "Run full NSE ETF Radar" is scoped to etf-radar.tsx only', () => {
   const etfRadarSource = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
   const opportunityRadarSource = fs.readFileSync(new URL('../app/components/opportunity-radar.tsx', import.meta.url), 'utf8');
-  assert.match(etfRadarSource, /Run ETF Radar/);
-  assert.doesNotMatch(radarTabsSource, /Run ETF Radar/);
-  assert.doesNotMatch(opportunityRadarSource, /Run ETF Radar/);
+  assert.match(etfRadarSource, /Run full NSE ETF Radar/);
+  assert.doesNotMatch(radarTabsSource, /Run full NSE ETF Radar/);
+  assert.doesNotMatch(opportunityRadarSource, /Run full NSE ETF Radar/);
   // And the ETF run action calls only the ETF-radar endpoints, never the
   // Equity opportunities endpoints.
   assert.doesNotMatch(etfRadarSource, /\/api\/v1\/research\/opportunities/);
@@ -213,4 +214,67 @@ test('EtfRadar never imports or re-implements OpportunityRadar\'s equity-only fi
   const etfRadarSource = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
   assert.doesNotMatch(etfRadarSource, /from "\.\/opportunity-radar"/);
   assert.doesNotMatch(etfRadarSource, /\broe\b|\brocE\b|order[_-]?book|promoterHolding|promoter_holding/i);
+});
+
+
+for (const [disposition, reason, message] of [
+  ['INSUFFICIENT_DATA', 'MISSING_USABLE_PRICE', /data prerequisites are missing/],
+  ['TECHNICAL_FAILURE', 'MARKET_DATA_LOOKUP_FAILED', /technical failures/],
+  ['INELIGIBLE', 'FAILED_NSE_ETF_ACTIVE_PREFILTER', /Review the evaluation and exclusion counts/],
+]) {
+  test(`empty ETF rankings distinguish ${disposition} and expose reasons`, () => {
+    const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: {
+      cycle_id: 'legacy', as_of: '2026-10-11T12:00:00Z',
+      candidates: [candidate({ disposition, reason, recommendation: null })], ranked: [],
+      excluded_by_reason: { [reason]: 1 },
+    } }));
+    assert.match(html, message);
+    assert.match(html, new RegExp(reason));
+    assert.match(html, /Universe size<\/dt><dd>1/);
+    assert.match(html, /Evaluated ETFs<\/dt><dd>0/);
+    assert.doesNotMatch(html, /No ETF currently ranks as a qualifying opportunity/);
+  });
+}
+
+test('ETF ranks are not represented as qualifying opportunities', () => {
+  const item = candidate({ recommendation: 'INSUFFICIENT_DATA' });
+  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: {
+    cycle_id: 'c1', as_of: '2026-10-11T12:00:00Z', candidates: [item], ranked: [item], excluded_by_reason: {},
+  } }));
+  assert.match(html, /Evaluated ETFs<\/dt><dd>1/);
+  assert.match(html, /Opportunity recommendations<\/dt><dd>0/);
+  assert.match(html, /Insufficient data<\/dt><dd>1/);
+  assert.match(html, /Ranked ETFs<\/dt><dd>1/);
+  assert.doesNotMatch(html, /Top ETF opportunities/);
+});
+
+test('Full universe coverage and peer ranks remain distinct from shortlist size', () => {
+  const item = candidate({ peer_group: 'GOLD' });
+  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: {
+    cycle_id: 'full', as_of: '2026-10-11T12:00:00Z', scope: 'FULL_OFFICIAL_NSE_ETF',
+    universe_count: 352, candidates: [item], ranked: [item], excluded_by_reason: {},
+    coverage: { official: 352, attempted: 352, acquired: 351, ranked: 1, shortlisted: 1 },
+  } }));
+  assert.match(html, /official<\/dt><dd>352/);
+  assert.match(html, /GOLD: peer rank 1/);
+  assert.match(html, /Rankings compare verified peers only/);
+});
+
+test('Regular ETF action targets full universe, not the five-ID smoke endpoint', () => {
+  const source = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
+  assert.match(source, /etf-radar\/full-universe-cycles/);
+  assert.doesNotMatch(source, /controlled-cycles/);
+  assert.doesNotMatch(source, /top_n: 10/);
+});
+
+
+test('ETF opportunity cards disclose gaps, valuation dates and actual source references', () => {
+  const html = renderToStaticMarkup(React.createElement(EtfRadarCard, { item: candidate({
+    missing_data: ['TRACKING_QUALITY'], limitations: ['Corporate-action adjustments unavailable'],
+    source_references: [{metric:'NAV',value:'100',as_of:'2026-10-09',provider:'NSE',url:'https://www.nseindia.com/'}],
+  }) }));
+  assert.match(html, /TRACKING_QUALITY/);
+  assert.match(html, /Corporate-action adjustments unavailable/);
+  assert.match(html, /2026-10-09/);
+  assert.match(html, /https:\/\/www.nseindia.com/);
 });

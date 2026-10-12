@@ -15,7 +15,6 @@ from test_recommendation_lifecycle import snapshot, publish
 def test_postgres_publish_read_history_and_immutable_trigger():
     parsed = urlparse(os.environ["RECOMMENDATION_TEST_PG_DSN"])
 
-    # Safety: allow only our dedicated disposable PostgreSQL instance
     assert parsed.scheme == "postgresql"
     assert parsed.hostname == "127.0.0.1"
     assert parsed.port == 55439

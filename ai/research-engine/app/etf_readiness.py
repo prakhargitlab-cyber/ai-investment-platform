@@ -110,8 +110,18 @@ def _etf_requirement_role(requirement: str) -> str:
     return "SUPPORTING"
 
 
-def _check_identity_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _check_identity_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     """Require an owned, canonical listing and age its durable observation."""
+    # A positively observed metadata conflict invalidates even fresh cached
+    # quotes. Only a strictly newer successful verification clears the conflict;
+    # timestamps tied by a coarse clock fail closed, independent of UUID ordering.
+    checks = [a for a in store.etf_attempts(instrument_id) if a.metric == "IDENTITY" and a.provider == "NSE"]
+    conflicts = [a.attempted_at for a in checks if a.reason == "NSE_METADATA_IDENTITY_CONFLICT"]
+    verified = [a.attempted_at for a in checks if a.reason == "NSE_METADATA_IDENTITY_VERIFIED"
+                and a.outcome == EtfAcquisitionOutcome.SUCCESS_WITH_DATA]
+    if conflicts and (not verified or max(conflicts) >= max(verified)):
+        return EtfRequirementStatus(requirement="IDENTITY", role="MANDATORY", applicability="APPLICABLE",
+            status=EtfReadinessStatus.TECHNICAL_FAILURE, reason="NSE_METADATA_IDENTITY_CONFLICT")
     listings = [listing for listing in store.etf_listings()
                 if listing.instrument_id == instrument_id and listing.instrument_id is not None]
     if not listings:
@@ -159,7 +169,7 @@ def _check_identity_ready(store: SqliteResearchPersistence, instrument_id) -> Et
     # The observation date is not reported as a fabricated source/as-of date.
     observed_at = listing.provenance.published_at or listing.provenance.retrieved_at
     freshness = etf_freshness(SimpleNamespace(as_of_date=observed_at.date()), EtfMetric.IDENTITY,
-                              now=datetime.now(timezone.utc))
+                              now=now or datetime.now(timezone.utc))
     return EtfRequirementStatus(
         requirement="IDENTITY",
         role="MANDATORY",
@@ -175,19 +185,24 @@ def _check_identity_ready(store: SqliteResearchPersistence, instrument_id) -> Et
     )
 
 
-def _check_market_price_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _missing_market_evidence(store, instrument_id, metric):
+    attempts = [a for a in store.etf_attempts(instrument_id) if a.metric == metric]
+    latest = max((a.attempted_at for a in attempts), default=None)
+    failures = [a for a in attempts if a.attempted_at == latest
+                and a.outcome == EtfAcquisitionOutcome.TECHNICAL_FAILURE]
+    return EtfRequirementStatus(requirement=metric, role="MANDATORY", applicability="APPLICABLE",
+        status=EtfReadinessStatus.TECHNICAL_FAILURE if failures else EtfReadinessStatus.MISSING,
+        reason=failures[0].reason if failures else None)
+
+
+def _check_market_price_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     """Check if MARKET_PRICE is ready."""
     facts = store.etf_facts(instrument_id, EtfMetric.MARKET_PRICE)
     if not facts:
-        return EtfRequirementStatus(
-            requirement="MARKET_PRICE",
-            role="MANDATORY",
-            applicability="APPLICABLE",
-            status=EtfReadinessStatus.MISSING,
-        )
+        return _missing_market_evidence(store, instrument_id, "MARKET_PRICE")
 
     fact = facts[0]
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     freshness = etf_freshness(fact, EtfMetric.MARKET_PRICE, now=now)
 
     return EtfRequirementStatus(
@@ -204,19 +219,14 @@ def _check_market_price_ready(store: SqliteResearchPersistence, instrument_id) -
     )
 
 
-def _check_trading_volume_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _check_trading_volume_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     """Check if TRADING_VOLUME (LIQUIDITY) is ready."""
     facts = store.etf_facts(instrument_id, EtfMetric.TRADING_VOLUME)
     if not facts:
-        return EtfRequirementStatus(
-            requirement="TRADING_VOLUME",
-            role="MANDATORY",
-            applicability="APPLICABLE",
-            status=EtfReadinessStatus.MISSING,
-        )
+        return _missing_market_evidence(store, instrument_id, "TRADING_VOLUME")
 
     fact = facts[0]
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     freshness = etf_freshness(fact, EtfMetric.TRADING_VOLUME, now=now)
 
     # Zero volume is valid evidence (not missing)
@@ -234,7 +244,7 @@ def _check_trading_volume_ready(store: SqliteResearchPersistence, instrument_id)
     )
 
 
-def _check_supporting_ready(store: SqliteResearchPersistence, instrument_id, metric: EtfMetric) -> EtfRequirementStatus:
+def _check_supporting_ready(store: SqliteResearchPersistence, instrument_id, metric: EtfMetric, *, now: datetime | None = None) -> EtfRequirementStatus:
     """Check if a supporting metric is ready."""
     facts = store.etf_facts(instrument_id, metric)
 
@@ -247,7 +257,7 @@ def _check_supporting_ready(store: SqliteResearchPersistence, instrument_id, met
         )
 
     fact = facts[0]
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     freshness = etf_freshness(fact, metric, now=now)
 
     return EtfRequirementStatus(
@@ -304,28 +314,28 @@ def _etf_deterministic_metrics(store: SqliteResearchPersistence, instrument_id):
     return compute_etf_deterministic_metrics(instrument_id, bars)
 
 
-def _check_historical_returns_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _check_historical_returns_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     """HISTORICAL_RETURNS is ready once at least the shortest (1M) period return is computable."""
     metrics = _etf_deterministic_metrics(store, instrument_id)
-    return _derived_metric_status("HISTORICAL_RETURNS", metrics.get(EtfMetricId.RETURN_1M), now=datetime.now(timezone.utc))
+    return _derived_metric_status("HISTORICAL_RETURNS", metrics.get(EtfMetricId.RETURN_1M), now=now or datetime.now(timezone.utc))
 
 
-def _check_volatility_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _check_volatility_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     metrics = _etf_deterministic_metrics(store, instrument_id)
-    return _derived_metric_status("VOLATILITY", metrics.get(EtfMetricId.ANNUALIZED_VOLATILITY), now=datetime.now(timezone.utc))
+    return _derived_metric_status("VOLATILITY", metrics.get(EtfMetricId.ANNUALIZED_VOLATILITY), now=now or datetime.now(timezone.utc))
 
 
-def _check_drawdown_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _check_drawdown_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     metrics = _etf_deterministic_metrics(store, instrument_id)
-    return _derived_metric_status("DRAWDOWN", metrics.get(EtfMetricId.MAX_DRAWDOWN), now=datetime.now(timezone.utc))
+    return _derived_metric_status("DRAWDOWN", metrics.get(EtfMetricId.MAX_DRAWDOWN), now=now or datetime.now(timezone.utc))
 
 
-def _check_momentum_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _check_momentum_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     metrics = _etf_deterministic_metrics(store, instrument_id)
-    return _derived_metric_status("INDEX_MOMENTUM", metrics.get(EtfMetricId.MOMENTUM_50_200), now=datetime.now(timezone.utc))
+    return _derived_metric_status("INDEX_MOMENTUM", metrics.get(EtfMetricId.MOMENTUM_50_200), now=now or datetime.now(timezone.utc))
 
 
-def _check_concentration_ready(store: SqliteResearchPersistence, instrument_id) -> EtfRequirementStatus:
+def _check_concentration_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     """CONCENTRATION is derived from the same UNDERLYING_HOLDINGS snapshot and
     freshness policy already used elsewhere -- not a separate evidence model."""
     snapshots = store.etf_holdings(instrument_id)
@@ -336,7 +346,7 @@ def _check_concentration_ready(store: SqliteResearchPersistence, instrument_id) 
     if not any(holding.weight_percentage is not None for holding in snapshot.holdings):
         return EtfRequirementStatus(requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
             status=EtfReadinessStatus.MISSING, reason="HOLDINGS_LACK_WEIGHTS")
-    freshness = etf_freshness(snapshot, EtfMetric.UNDERLYING_HOLDINGS, now=datetime.now(timezone.utc))
+    freshness = etf_freshness(snapshot, EtfMetric.UNDERLYING_HOLDINGS, now=now or datetime.now(timezone.utc))
     return EtfRequirementStatus(
         requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
         status=EtfReadinessStatus.READY_FRESH if freshness == "FRESH"
@@ -379,7 +389,7 @@ def _check_contextual_ready(store: SqliteResearchPersistence, instrument_id) -> 
     )
 
 
-def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id) -> tuple[list[EtfRequirementStatus], EtfReadinessSummary]:
+def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> tuple[list[EtfRequirementStatus], EtfReadinessSummary]:
     """Evaluate ETF readiness for a single instrument.
 
     Returns a list of requirement statuses and a summary.
@@ -392,13 +402,13 @@ def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id) -> t
     statuses = []
 
     # Check mandatory requirements
-    identity_status = _check_identity_ready(store, instrument_id)
+    identity_status = _check_identity_ready(store, instrument_id, now=now)
     statuses.append(identity_status)
 
-    market_price_status = _check_market_price_ready(store, instrument_id)
+    market_price_status = _check_market_price_ready(store, instrument_id, now=now)
     statuses.append(market_price_status)
 
-    volume_status = _check_trading_volume_ready(store, instrument_id)
+    volume_status = _check_trading_volume_ready(store, instrument_id, now=now)
     statuses.append(volume_status)
 
     # Check supporting requirements. Every name in ETC3_SUPPORTING must be
@@ -409,12 +419,12 @@ def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id) -> t
     for metric in ETC3_SUPPORTING:
         try:
             m = EtfMetric(metric)
-            statuses.append(_check_supporting_ready(store, instrument_id, m))
+            statuses.append(_check_supporting_ready(store, instrument_id, m, now=now))
             continue
         except ValueError:
             pass
         if metric in _DERIVED_METRIC_CHECKS:
-            statuses.append(_DERIVED_METRIC_CHECKS[metric](store, instrument_id))
+            statuses.append(_DERIVED_METRIC_CHECKS[metric](store, instrument_id, now=now))
         elif metric in _NOT_IMPLEMENTED_SUPPORTING:
             statuses.append(EtfRequirementStatus(requirement=metric, role="SUPPORTING", applicability="APPLICABLE",
                 status=EtfReadinessStatus.NOT_IMPLEMENTED, reason="NO_TRUSTED_DATA_SOURCE_DEFINED"))

@@ -180,6 +180,13 @@ public class InstrumentMasterService {
                 .flatMap(mapping -> masters.findById(mapping.getInstrumentId()));
         if (existing.isPresent() && existing.get().getIsin() != null && !normalized.equals(existing.get().getIsin()))
             throw new IllegalStateException("NSE_IDENTITY_MISMATCH");
+        if (assetType == com.aiinvestment.shared.domain.AssetType.ETF && existing.isPresent()) {
+            var current = existing.get();
+            if (current.getAssetType() != assetType || !normalized.equals(InstrumentMasterEntity.normalizeIsin(current.getIsin()))
+                    || !"NSE".equals(current.getPrimaryExchange()) || !symbol.equals(current.getPrimarySymbol()))
+                throw new IllegalStateException("NSE_ETF_EXISTING_IDENTITY_CONFLICT");
+            return current; // Recheck under the identity lock; a concurrent creator is never overwritten.
+        }
         InstrumentMasterEntity master = existing.orElseGet(() -> masters.saveAndFlush(new InstrumentMasterEntity(UUID.randomUUID(), normalized,
                 firstText(companyName, symbol), assetType, "INR", "IN", "NSE", symbol, "ACTIVE", Instant.now())));
         master.applyVerifiedPrimaryListing("NSE", symbol, companyName);

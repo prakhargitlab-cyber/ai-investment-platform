@@ -284,3 +284,76 @@ def test_short_partial_exit_independent_of_long(long_action):
     state = lifecycle(r, r, 1185, {'review': True})
     assert state['current_short_action'] == 'PARTIAL_EXIT'
     assert state['current_long_action'] == long_action
+
+
+@pytest.mark.asyncio
+async def test_worker_db_boundaries_leave_event_loop_responsive():
+    import threading
+    import time
+    from test_global_opportunity_cycle_event_loop_offload import _thread_safe_store
+    store = _thread_safe_store()
+    lock = RLock()
+    offloaded = []
+    main_thread = threading.get_ident()
+    async def dispatch(operation, *args, **kwargs):
+        def call():
+            with lock:
+                offloaded.append(getattr(operation, '__name__', ''))
+                assert threading.get_ident() != main_thread
+                return operation(*args, **kwargs)
+        return await asyncio.to_thread(call)
+    repo = SimpleNamespace(persistence=store, _persistence_worker_lock=lock,
+        _run_blocking_persistence=dispatch)
+    async def runner(**kwargs):
+        return {'cycle_id': kwargs['cycle_id']}
+    worker = OpportunityCycleWorker(repo, runner)
+    store.create_cycle_run('thread-check', {})
+    original = store.claim_cycle_run
+    entered, release = threading.Event(), threading.Event()
+    def slow_claim(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original(*args, **kwargs)
+    store.claim_cycle_run = slow_claim
+    job = {'cycle_id': 'thread-check', 'parameters': {}, 'updated_at': '2026-10-11T00:00:00+00:00'}
+    task = asyncio.create_task(worker._run_one(job))
+    try:
+        for _ in range(100):
+            if entered.is_set(): break
+            await asyncio.sleep(.005)
+        assert entered.is_set() and not task.done()
+        # The loop reached here while the DB thread remains blocked.
+        release.set()
+        await task
+        assert store.cycle_run('thread-check')['status'] == 'COMPLETED'
+        assert 'record' in offloaded and 'slow_claim' in offloaded
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_persistence_dispatch_stays_bounded_when_caller_is_cancelled():
+    import threading
+    from app.repository import ResearchRepository
+    repo = object.__new__(ResearchRepository)
+    repo._persistence = object()
+    repo._persistence_worker_lock = RLock()
+    entered, release, second = threading.Event(), threading.Event(), threading.Event()
+    def first():
+        entered.set()
+        assert release.wait(2)
+    task = asyncio.create_task(repo._run_blocking_persistence(first))
+    for _ in range(100):
+        if entered.is_set(): break
+        await asyncio.sleep(.005)
+    assert entered.is_set()
+    task.cancel()
+    other = asyncio.create_task(repo._run_blocking_persistence(second.set))
+    try:
+        await asyncio.sleep(.02)
+        assert not second.is_set() and not task.done()
+    finally:
+        release.set()
+        await asyncio.gather(task, other, return_exceptions=True)
+    assert second.is_set() and task.cancelled()

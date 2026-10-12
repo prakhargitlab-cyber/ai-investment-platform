@@ -266,4 +266,3 @@ class TestAcceptPreservesExistingInvariants:
                 {"metric": "revenue", "value": "5282", "periodEnd": "2026-06-01",
                  "periodType": "QUARTERLY", "unit": "INR crore", "sourceUrl": "manual-evidence:x"},
             ]})
-

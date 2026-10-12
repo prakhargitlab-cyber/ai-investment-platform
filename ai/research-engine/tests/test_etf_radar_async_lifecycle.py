@@ -283,3 +283,40 @@ def test_etf_and_equity_workers_do_not_interfere():
             await equity_worker.close()
 
     _run(scenario())
+
+
+@pytest.mark.asyncio
+async def test_etf_evaluation_and_publication_are_offloaded_and_count_is_explicit():
+    import threading
+    from app.etf_opportunity_cycle import run_etf_radar_cycle_async
+    from test_global_opportunity_cycle_event_loop_offload import _thread_safe_store
+    from unittest.mock import AsyncMock
+    store = _thread_safe_store()
+    main_thread = threading.get_ident()
+    observed = []
+    async def dispatch(operation, *args, **kwargs):
+        def call():
+            observed.append(threading.get_ident())
+            return operation(*args, **kwargs)
+        return await asyncio.to_thread(call)
+    repo = SimpleNamespace(persistence=store, _persistence_worker_lock=RLock(), _run_blocking_persistence=dispatch)
+    source = SimpleNamespace(active_global_etfs=AsyncMock(return_value=[{'globalInstrumentId': str(uuid4()), 'assetType': 'ETF', 'exchange': 'NSE', 'status': 'ACTIVE'}]))
+    result = await run_etf_radar_cycle_async(repo, source)
+    assert result['universe_count'] == 1
+    assert observed and main_thread not in observed
+    assert store.latest_etf_radar_cycle()['universe_count'] == 1
+
+
+@pytest.mark.parametrize("candidates", [[], [{"disposition": "INSUFFICIENT_DATA"}]])
+def test_published_legacy_result_recovers_without_re_evaluation(candidates):
+    from unittest.mock import AsyncMock, Mock
+    from app.etf_opportunity_cycle import run_etf_radar_cycle_async
+    cycle_id = uuid4()
+    persistence = SimpleNamespace(etf_radar_cycle=Mock(return_value={"candidates": candidates, "ranked": []}))
+    checkpoint = SimpleNamespace(run=AsyncMock(return_value={"status": "PUBLISHED"}))
+    orchestrator = SimpleNamespace(active_global_etfs=AsyncMock())
+    result = asyncio.run(run_etf_radar_cycle_async(
+        SimpleNamespace(persistence=persistence), orchestrator, cycle_id=cycle_id, checkpoint=checkpoint))
+    assert result == {"cycle_id": str(cycle_id), "universe_count": len(candidates)}
+    orchestrator.active_global_etfs.assert_not_called()
+    persistence.etf_radar_cycle.assert_called_once_with(cycle_id)

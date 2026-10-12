@@ -157,3 +157,15 @@ class TestCanonicalEtfUniverse:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         rows = await CanonicalEtfUniverse(client, "https://portfolio-service.internal").active_global_etfs()
         assert rows == []
+
+
+@pytest.mark.parametrize("field", ["ticker", "primarySymbol", "symbol"])
+def test_canonical_symbol_fields_are_preserved_even_for_excluded_candidates(field):
+    from types import SimpleNamespace
+    from app.etf_universe import admit_etf_candidates
+    row = {"globalInstrumentId": str(ID), "assetType": "ETF", "exchange": "NSE", "status": "ACTIVE", field: "NIFTYBEES"}
+    decisions = admit_etf_candidates([row], SimpleNamespace(etf_listings=lambda: []))
+    assert decisions[0].symbol == "NIFTYBEES"
+    assert decisions[0].reason == "UNVERIFIED_MAPPING"
+    row["status"] = "INACTIVE"
+    assert admit_etf_candidates([row], None)[0].symbol == "NIFTYBEES"

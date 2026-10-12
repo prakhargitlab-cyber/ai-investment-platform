@@ -54,6 +54,7 @@ class EtfProvenance(ResearchBaseModel):
     source_type: str = Field(min_length=1)
     source_identity: str = Field(min_length=1)
     source_url: str = Field(min_length=1)
+    source_metadata: dict | None = None
     source_locator: str | None = None
     authority: EtfAuthority
     published_at: AwareDatetime | None = None
@@ -162,6 +163,8 @@ def evidence_id(evidence) -> str:
     """
     payload = evidence.model_dump(mode="json")
     payload["provenance"].pop("retrieved_at")
+    if payload["provenance"].get("source_metadata") is None:
+        payload["provenance"].pop("source_metadata", None)
     if isinstance(evidence, EtfFact) and isinstance(evidence.value, Decimal):
         payload["value"] = str(evidence.value.normalize())
     if isinstance(evidence, EtfNavObservation):

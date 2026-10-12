@@ -192,8 +192,8 @@ async def _complete_published_cycle(repository, checkpoint):
         raise RuntimeError('PUBLISHED_CYCLE_SELECTION_MISSING')
     scan = selection.get('suggestion_scan')
     if scan is not None:
-        with repository._persistence_worker_lock:
-            repository.persistence.persist_global_suggestion_lifecycle(scan, _suggestion_cards(selection))
+        await _blocking(repository, repository.persistence.persist_global_suggestion_lifecycle,
+                        scan, _suggestion_cards(selection), fence=(checkpoint.cycle_id, checkpoint.owner_id))
     return selection
 
 
@@ -291,7 +291,7 @@ async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4,
     # evidence; suppress all discovery eligibility. No unavailable price is invented.
     if candidate_ids is None:
         done = {s['global_instrument_id'] for s in snapshots}
-        histories = {r['recommendation_id']: r for r in repository.persistence.recommendation_history()}
+        histories = {r['recommendation_id']: r for r in (await _blocking(repository, repository.persistence.recommendation_history))}
         for state in previous_states:
             key = state['global_instrument_id']
             if key in done or not active_recommendation(state):
@@ -383,6 +383,7 @@ async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4,
             selection = repository.persistence.publish_opportunity_cycle(
                 snapshots, [], [], {'cycle_id': cycle_id}, build=build,
                 **({'fence': fence} if fence is not None else {}))
-            repository.persistence.persist_global_suggestion_lifecycle(scan, _suggestion_cards(selection))
+            repository.persistence.persist_global_suggestion_lifecycle(
+                scan, _suggestion_cards(selection), **({'fence': fence} if fence is not None else {}))
             return selection
     return await _blocking(repository, _publish)

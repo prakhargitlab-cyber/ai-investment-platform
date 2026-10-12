@@ -57,8 +57,10 @@ def parse_nse_etf_list(text: str, provenance: EtfProvenance, master_rows=()) -> 
 
 
 class EtfAcquisitionService:
-    def __init__(self, persistence, *, clock=None):
+    def __init__(self, persistence, *, clock=None, run_blocking=None, fence=None):
         self.persistence = persistence
+        self.fence = fence
+        self.run_blocking = run_blocking
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def reusable_evidence(self, instrument_id, metric: EtfMetric, *, allow_secondary=False):
@@ -81,10 +83,15 @@ class EtfAcquisitionService:
         result = EtfAcquisitionAttempt(instrument_id=instrument_id, metric=str(metric), provider=provider,
             attempted_at=self.clock(), outcome=outcome or (Outcome.SUCCESS_WITH_DATA if evidence else Outcome.SUCCESS_EMPTY),
             reason=reason, evidence_ids=[evidence_id(item) for item in evidence], unavailability_evidence=unavailability_evidence)
-        self.persistence.save_etf_acquisition(evidence, result)
+        self.persistence.save_etf_acquisition(evidence, result, **({"fence": self.fence} if self.fence else {}))
         return result
 
-    async def discover_nse(self, client, *, master_rows=()):
+    async def _record_async(self, *args, **kwargs):
+        if self.run_blocking is not None:
+            return await self.run_blocking(lambda: self._record(*args, **kwargs))
+        return self._record(*args, **kwargs)
+
+    async def discover_nse(self, client, *, master_rows=(), instrument_ids=None):
         """One explicit list request; never loops over fund/provider endpoints."""
         try:
             response = await client.get(NSE_ETF_LIST_URL, headers={"Accept": "text/csv", "Referer": "https://www.nseindia.com/"})
@@ -92,18 +99,33 @@ class EtfAcquisitionService:
             provenance = EtfProvenance(provider="NSE", source_type="NSE_OFFICIAL_ETF_SECURITY_LIST",
                 source_identity=NSE_ETF_LIST_URL, source_url=NSE_ETF_LIST_URL,
                 retrieved_at=self.clock(), authority=EtfAuthority.OFFICIAL_EXCHANGE, reliability_level="LEVEL_A")
+            if instrument_ids is not None:
+                # A fresh successful discovery is a dated identity observation;
+                # repeat requests on the same day retain the same evidence key.
+                provenance.source_identity += "#observed=" + provenance.retrieved_at.date().isoformat()
             evidence = parse_nse_etf_list(response.text, provenance, master_rows)
+            self.discovered_listings = evidence
+            if instrument_ids is not None:
+                requested = set(instrument_ids)
+                evidence = [item for item in evidence if item.instrument_id in requested]
+                if {item.instrument_id for item in evidence} != requested:
+                    raise ValueError("CANONICAL_ETF_NOT_IN_OFFICIAL_LIST")
+                expected = {UUID(str(row.get("globalInstrumentId") or row.get("instrumentId"))):
+                            str(row.get("primarySymbol") or row.get("ticker") or row.get("symbol"))
+                            for row in master_rows}
+                if any(item.symbol != expected[item.instrument_id] for item in evidence):
+                    raise ValueError("OFFICIAL_ETF_SYMBOL_CONFLICT")
         except Exception as exc:
-            return self._record(None, "DISCOVERY", "NSE", outcome=Outcome.TECHNICAL_FAILURE,
+            return await self._record_async(None, "DISCOVERY", "NSE", outcome=Outcome.TECHNICAL_FAILURE,
                 reason=f"NSE_ETF_DISCOVERY_FAILED:{type(exc).__name__}:{str(exc)[:160]}")
-        return self._record(None, "DISCOVERY", "NSE", evidence)
+        return await self._record_async(None, "DISCOVERY", "NSE", evidence)
 
     async def acquire_secondary_quote(self, profile: EtfResearchProfile, metric: EtfMetric, provider, instrument: dict):
         """Reuse Yahoo's proven quote facts, not its undated navPrice mapping."""
         mapping = {EtfMetric.MARKET_PRICE: "latestPrice", EtfMetric.TRADING_VOLUME: "volume",
                    EtfMetric.BID: "bid", EtfMetric.ASK: "ask"}
         if metric not in mapping:
-            return self._record(profile.instrument_id, metric, "YAHOO_FINANCE", outcome=Outcome.NOT_IMPLEMENTED,
+            return await self._record_async(profile.instrument_id, metric, "YAHOO_FINANCE", outcome=Outcome.NOT_IMPLEMENTED,
                 reason="NO_PROVEN_FIELD_DATE_CONTRACT" if metric == EtfMetric.NAV else "NO_PROVEN_ETF_ADAPTER")
         try:
             if provider.provider_name != "YAHOO_FINANCE":
@@ -120,9 +142,18 @@ class EtfAcquisitionService:
                 raise ValueError(f"STRUCTURED_STATUS:{snapshot.status}")
             value = snapshot.facts.get(mapping[metric])
             if value is None:
-                return self._record(profile.instrument_id, metric, provider.provider_name, reason="VALID_RESPONSE_FIELD_ABSENT")
+                return await self._record_async(profile.instrument_id, metric, provider.provider_name, reason="VALID_RESPONSE_FIELD_ABSENT")
             if value.as_of_date is None:
                 raise ValueError("QUOTE_AS_OF_DATE_MISSING")
+            numeric = Decimal(str(value.value))
+            if not numeric.is_finite() or numeric < 0 or (metric == EtfMetric.MARKET_PRICE and numeric == 0):
+                raise ValueError("INVALID_QUOTE_VALUE")
+            if metric == EtfMetric.TRADING_VOLUME and (value.unit != "shares" or numeric != numeric.to_integral_value()):
+                raise ValueError("INVALID_VOLUME_UNIT_OR_VALUE")
+            if metric != EtfMetric.TRADING_VOLUME and profile.currency and value.unit != profile.currency:
+                raise ValueError("QUOTE_CURRENCY_MISMATCH")
+            if value.as_of_date.date() > self.clock().date():
+                raise ValueError("FUTURE_DATED_QUOTE")
             fact = EtfFact(instrument_id=profile.instrument_id, metric=metric, value=Decimal(str(value.value)),
                 unit=value.unit, as_of_date=value.as_of_date.date(), provenance=EtfProvenance(
                     provider=provider.provider_name, source_type="STRUCTURED_MARKET_PROVIDER",
@@ -131,9 +162,9 @@ class EtfAcquisitionService:
                     published_at=value.published_at, authority=EtfAuthority.SECONDARY,
                     confidence=value.confidence, reliability_level="LEVEL_C"))
         except Exception as exc:
-            return self._record(profile.instrument_id, metric, "YAHOO_FINANCE", outcome=Outcome.TECHNICAL_FAILURE,
+            return await self._record_async(profile.instrument_id, metric, "YAHOO_FINANCE", outcome=Outcome.TECHNICAL_FAILURE,
                 reason=f"STRUCTURED_ACQUISITION_FAILED:{type(exc).__name__}:{str(exc)[:160]}")
-        return self._record(profile.instrument_id, metric, provider.provider_name, [fact])
+        return await self._record_async(profile.instrument_id, metric, provider.provider_name, [fact])
 
     def acquire_official_document(self, profile: EtfResearchProfile, document: ResearchDocument, metric: EtfMetric):
         """Parse only demonstrated legacy TER/AUM labels from a validated document.

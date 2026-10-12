@@ -839,7 +839,7 @@ test("HH. CURRENT_NEWS field suggestions pre-fill the editable manual-fields for
     workspace,
     /setManualFields\(draft\?\.fieldSuggestions \? \{ \.\.\.draft\.fieldSuggestions \} : \{\}\);/
   );
-  assert.match(workspace, /\[draft\?\.draftId\]\);/);
+  assert.match(workspace, /\[draft\]\);/);
   // The Review screen tells the user suggested fields were pre-filled
   // and must be reviewed -- it never claims they were auto-accepted.
   assert.match(workspace, /pre-filled from the uploaded\s*\n\s*file as a non-binding suggestion/);

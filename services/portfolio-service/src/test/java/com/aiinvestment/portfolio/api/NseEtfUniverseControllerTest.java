@@ -68,8 +68,7 @@ class NseEtfUniverseControllerTest {
         mockMvc.perform(authenticatedRequest(get(PREVIEW_PATH), "ADMIN")).andExpect(status().isOk());
 
         verify(preview).preview();
-        verify(users).upsert(any());
-        verifyNoInteractions(apply);
+        verifyNoInteractions(users, apply);
     }
 
     // 4. Unauthenticated apply is rejected before any service is invoked.
@@ -111,7 +110,7 @@ class NseEtfUniverseControllerTest {
         mockMvc.perform(authenticatedRequest(post(APPLY_PATH), "ADMIN")).andExpect(status().isOk());
 
         verify(apply).apply();
-        verify(users).upsert(any());
+        verifyNoInteractions(users);
     }
 
     // 7. A concurrently-rejected apply (service returns empty) surfaces as 409 Conflict, not a 200 or 500.
@@ -127,9 +126,46 @@ class NseEtfUniverseControllerTest {
         verify(apply).apply();
     }
 
+    @Test void canonicalMetadataReadDoesNotProvisionUser() throws Exception {
+        var instruments = mock(com.aiinvestment.portfolio.application.InstrumentMasterService.class);
+        var reconciliation = mock(com.aiinvestment.portfolio.application.GlobalInstrumentReconciliationService.class);
+        var users = mock(AppUserProvisioner.class);
+        var key = java.util.UUID.randomUUID();
+        when(instruments.globalInstrument(key)).thenReturn(Optional.empty());
+        var mvc = MockMvcBuilders.standaloneSetup(new GlobalInstrumentController(instruments, reconciliation, users)).build();
+        mvc.perform(authenticatedRequest(get("/api/v1/instruments/" + key), "ADMIN")).andExpect(status().isNotFound());
+        verifyNoInteractions(users, reconciliation);
+    }
+
+    @Test void etfEnumerationAuthenticatesWithoutProvisioningUsers() throws Exception {
+        var instruments = mock(com.aiinvestment.portfolio.application.InstrumentMasterService.class);
+        var reconciliation = mock(com.aiinvestment.portfolio.application.GlobalInstrumentReconciliationService.class);
+        var users = mock(AppUserProvisioner.class);
+        when(instruments.enumerate(any(), any(), any())).thenReturn(org.springframework.data.domain.Page.empty());
+        when(instruments.searchMappings(any())).thenReturn(java.util.Map.of());
+        var mvc = MockMvcBuilders.standaloneSetup(new GlobalInstrumentController(instruments, reconciliation, users)).build();
+        mvc.perform(get("/api/v1/instruments").param("assetType", "ETF")).andExpect(status().isUnauthorized());
+        verifyNoInteractions(instruments, users, reconciliation);
+        mvc.perform(authenticatedRequest(get("/api/v1/instruments").param("assetType", "ETF"), "ADMIN"))
+                .andExpect(status().isOk());
+        verifyNoInteractions(users, reconciliation);
+    }
+
+    @Test void equityEnumerationPreservesExistingProvisioningContract() throws Exception {
+        var instruments = mock(com.aiinvestment.portfolio.application.InstrumentMasterService.class);
+        var reconciliation = mock(com.aiinvestment.portfolio.application.GlobalInstrumentReconciliationService.class);
+        var users = mock(AppUserProvisioner.class);
+        when(instruments.enumerate(any(), any(), any())).thenReturn(org.springframework.data.domain.Page.empty());
+        when(instruments.searchMappings(any())).thenReturn(java.util.Map.of());
+        var mvc = MockMvcBuilders.standaloneSetup(new GlobalInstrumentController(instruments, reconciliation, users)).build();
+        mvc.perform(authenticatedRequest(get("/api/v1/instruments").param("assetType", "EQUITY"), "ADMIN"))
+                .andExpect(status().isOk());
+        verify(users).upsert(any());
+    }
+
     private static MockMvc mockMvc(NseEtfUniversePreviewService preview, NseEtfUniverseApplyService apply,
             AppUserProvisioner users) {
-        return MockMvcBuilders.standaloneSetup(new NseEtfUniverseController(preview, apply, users)).build();
+        return MockMvcBuilders.standaloneSetup(new NseEtfUniverseController(preview, apply)).build();
     }
 
     private static MockHttpServletRequestBuilder authenticatedRequest(MockHttpServletRequestBuilder builder, String role) {

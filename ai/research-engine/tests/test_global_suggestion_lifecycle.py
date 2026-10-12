@@ -625,7 +625,7 @@ def test_T_dashboard_reads_dedicated_global_persistence():
     sell3 = make_card(3, action='SELL', horizon='SHORT_TERM', price=350.0,
                       opportunity_score=50.0, fingerprint='fp-T-sell3')
     store.persist_global_suggestion_lifecycle(scan, [short_card, long_card, buy3])
-    store.persist_global_suggestion_lifecycle(make_scan(scan_id=str(uuid4())), [sell3])
+    store.persist_global_suggestion_lifecycle(make_scan(completed_at='2026-09-14T10:05:00+00:00'), [short_card, long_card, sell3])
 
     radar = store.global_opportunity_radar()
     # Must return the dedicated read model structure
@@ -730,7 +730,7 @@ def test_V_two_users_receive_identical_projection():
                   opportunity_score=85.0, fingerprint='fp-V-d'),
     ]
     store.persist_global_suggestion_lifecycle(scan, cards)
-    store.persist_global_suggestion_lifecycle(make_scan(scan_id=str(uuid4())), [sell3])
+    store.persist_global_suggestion_lifecycle(make_scan(completed_at='2026-09-14T10:05:00+00:00'), [cards[0], cards[1], cards[3], sell3])
 
     # Call the read model twice — both must produce identical output
     radar_1 = store.global_opportunity_radar()
@@ -936,7 +936,7 @@ def test_Y_radar_projection_handles_postgresql_decoded_json(monkeypatch):
         reasons=['QUALITY'],                   # PG native list
         risks={'volatility': 'high'},          # PG native dict
         evidence_snapshot={'price': 1000.0},   # PG native dict
-        engine_version='STOCK_RULE_ENGINE_V1', last_scan_id=str(uuid4()),
+        engine_version='STOCK_RULE_ENGINE_V1', last_scan_id=scan['scan_id'],
         # V15 widened columns (real-data radar fields) -- _card() indexes
         # these unconditionally, so any row reaching it (PostgreSQL included)
         # must carry them.
@@ -1013,7 +1013,7 @@ def test_AB_radar_tolerates_pre_v15_schema(monkeypatch):
         entry_range_low=980.0, entry_range_high=1020.0, fair_value=1300.0,
         target_1=1100.0, target_2=1200.0, invalidation_price=800.0,
         reasons=['QUALITY'], risks={}, evidence_snapshot={'price': 1000.0},
-        engine_version='STOCK_RULE_ENGINE_V1', last_scan_id=str(uuid4()),
+        engine_version='STOCK_RULE_ENGINE_V1', last_scan_id=scan['scan_id'],
         # deliberately omits every V15 column -- reproduces the live 500
     )
     monkeypatch.setattr(store, 'global_current_suggestions', lambda **k: [pre_v15_card])

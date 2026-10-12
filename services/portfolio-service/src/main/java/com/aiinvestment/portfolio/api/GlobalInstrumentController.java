@@ -40,9 +40,8 @@ public class GlobalInstrumentController {
     @GetMapping("/{globalInstrumentId}")
     @Operation(summary = "Read public global instrument metadata and provider mappings")
     public GlobalInstrumentResponse get(@PathVariable("globalInstrumentId") UUID globalInstrumentId, HttpServletRequest servletRequest) {
-        // Follow the service-wide authenticated-request convention, without
-        // applying portfolio ownership because this resource is global/public.
-        appUserProvisioner.upsert(AuthenticatedUserResolver.require(servletRequest));
+        // Public metadata has no user foreign-key write; authenticate without provisioning.
+        AuthenticatedUserResolver.require(servletRequest);
         return instrumentMasterService.globalInstrument(globalInstrumentId)
                 .map(GlobalInstrumentResponse::from)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Global instrument not found"));
@@ -71,7 +70,9 @@ public class GlobalInstrumentController {
             @RequestParam(name = "assetType", defaultValue = "EQUITY") AssetType assetType,
             @RequestParam(name = "page", defaultValue = "0") int page,
             @RequestParam(name = "size", defaultValue = "100") int size, HttpServletRequest servletRequest) {
-        appUserProvisioner.upsert(AuthenticatedUserResolver.require(servletRequest));
+        var user = AuthenticatedUserResolver.require(servletRequest);
+        // ETF universe enumeration has no user foreign-key writes; keep it read-only.
+        if (assetType != AssetType.ETF) appUserProvisioner.upsert(user);
         var values = instrumentMasterService.enumerate(status, assetType, PageRequest.of(Math.max(0, page), Math.min(500, Math.max(1, size)), Sort.by("primarySymbol").ascending().and(Sort.by("instrumentId"))));
         var mappings = instrumentMasterService.searchMappings(values.getContent().stream().map(value -> value.getInstrumentId()).toList());
         return new InstrumentUniverseResponse(values.getContent().stream().map(value -> InstrumentUniverseItem.from(value,

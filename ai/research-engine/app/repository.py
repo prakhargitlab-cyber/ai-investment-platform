@@ -786,10 +786,15 @@ class ResearchRepository:
             except asyncio.CancelledError:
                 # Cancellation cannot stop a running DB thread. Retain the slot
                 # until it drains so queued work stays bounded and fenced.
-                try:
-                    await task
-                finally:
-                    raise
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue  # repeated cancellation cannot release the DB slot
+                # Retrieve any thread exception, but preserve caller cancellation.
+                if not task.cancelled():
+                    task.exception()
+                raise
 
     def _run_serialized_persistence_operation(self, operation, args, kwargs, dispatched_at=None):
         with self._persistence_worker_lock:

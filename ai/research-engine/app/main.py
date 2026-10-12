@@ -1,3 +1,4 @@
+from datetime import date as CalendarDate
 from typing import Any, Literal
 from uuid import UUID, uuid4
 import logging
@@ -102,22 +103,22 @@ manual_evidence_acceptor = ManualEvidenceAcceptor(
 
 @asynccontextmanager
 async def research_lifespan(application):
-    if hasattr(repository.persistence, 'record_opportunity_job'):
-        # The worker (queue processor) always starts: manually-POSTed and
+    if not settings.research_opportunity_recovery_paused and hasattr(repository.persistence, 'record_opportunity_job'):
+        # Outside recovery pause, the worker starts: manually-POSTed and
         # controlled/candidate cycles must still run even when the
         # automatic scheduler is disabled. Only the scheduler -- which
         # decides *when* to submit production cycles on its own -- is
         # gated by the narrow research_opportunity_scheduler_enabled flag.
-        _opportunity_worker().start()
+        await _opportunity_worker().start_async()
         if settings.research_opportunity_scheduler_enabled:
             _opportunity_scheduler().start()
-    if hasattr(repository.persistence, 'create_cycle_run'):
+    if not settings.research_opportunity_recovery_paused and hasattr(repository.persistence, 'create_cycle_run'):
         # ETF Radar's own worker, same generic lifecycle machinery, isolated
         # by market='ETF' (its own durable active-cycle slot/lease
         # namespace, never colliding with Equity's 'NSE' one). No scheduler:
         # ETF Radar cycles are only ever submitted on demand (API), never
         # auto-scheduled.
-        _etf_radar_worker().start()
+        await _etf_radar_worker().start_async()
     try:
         yield
     finally:
@@ -279,6 +280,136 @@ async def current_etf_portfolio_recommendations(
 # provider acquisition -- they only ever read already-persisted evidence.
 # ---------------------------------------------------------------------------
 
+class EtfEvidenceRequest(BaseModel):
+    instrument_ids: list[UUID] = Field(min_length=1, max_length=5)
+
+
+class EtfHistoryRequest(EtfEvidenceRequest):
+    start: CalendarDate
+    end: CalendarDate
+
+
+_etf_ingestion_lock = asyncio.Lock()
+
+
+async def _ingest_etf(body, request, *, history=False):
+    from app.etf_ingestion import canonical_etfs, ingest_quotes, ingest_history
+    headers = request.headers
+    _require_market_data_admin(headers.get('x-aip-user-id'), headers.get('x-aip-user-issuer'),
+                               headers.get('x-aip-user-subject'), headers.get('x-aip-user-roles'))
+    identity = _identity_headers(headers.get('x-aip-user-id'), headers.get('x-aip-user-issuer'),
+                                 headers.get('x-aip-user-subject'), None, None, headers.get('x-aip-user-roles'))
+    if _etf_ingestion_lock.locked():
+        raise HTTPException(409, 'ETF_INGESTION_ALREADY_RUNNING')
+    async with _etf_ingestion_lock:
+        try:
+            rows = await canonical_etfs(portfolio_orchestrator, body.instrument_ids, identity_headers=identity,
+                                        correlation_id=headers.get('x-correlation-id'))
+            if history:
+                return await ingest_history(market_data_population_jobs, rows, start=body.start, end=body.end,
+                                            identity_headers=identity, correlation_id=headers.get('x-correlation-id'))
+            async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+                return await ingest_quotes(repository, portfolio_orchestrator, rows, client)
+        except GlobalInstrumentNotFoundError as exc:
+            raise HTTPException(404, 'GLOBAL_INSTRUMENT_NOT_FOUND') from exc
+        except PortfolioServiceUnavailableError as exc:
+            raise HTTPException(503, 'CANONICAL_ETF_SOURCE_UNAVAILABLE') from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+
+@app.post('/api/v1/etf-radar/evidence')
+async def ingest_etf_evidence(body: EtfEvidenceRequest, request: Request):
+    return await _ingest_etf(body, request)
+
+
+@app.post('/api/v1/etf-radar/evidence/history')
+async def ingest_etf_history(body: EtfHistoryRequest, request: Request):
+    return await _ingest_etf(body, request, history=True)
+
+
+async def _controlled_etf_preflight(instrument_ids, request):
+    from app.etf_ingestion import canonical_etfs, etf_preflight
+    headers = request.headers
+    _require_market_data_admin(headers.get('x-aip-user-id'), headers.get('x-aip-user-issuer'),
+                               headers.get('x-aip-user-subject'), headers.get('x-aip-user-roles'))
+    identity = _identity_headers(headers.get('x-aip-user-id'), headers.get('x-aip-user-issuer'),
+        headers.get('x-aip-user-subject'), None, None, headers.get('x-aip-user-roles'))
+    try:
+        rows = await canonical_etfs(portfolio_orchestrator, instrument_ids, identity_headers=identity,
+                                   correlation_id=headers.get('x-correlation-id'))
+        result = await _radar_read(etf_preflight, repository.persistence, rows)
+        active = await _radar_read(repository.persistence.active_cycle_run, 'ETF')
+    except GlobalInstrumentNotFoundError:
+        raise HTTPException(404, 'GLOBAL_INSTRUMENT_NOT_FOUND')
+    except PortfolioServiceUnavailableError:
+        raise HTTPException(503, 'CANONICAL_ETF_SOURCE_UNAVAILABLE')
+    except ValueError:
+        raise HTTPException(422, 'INVALID_CANONICAL_ETF_SELECTION')
+    result['recovery_paused'] = settings.research_opportunity_recovery_paused
+    result['active_cycle_id'] = active['cycle_id'] if active else None
+    result['can_submit'] = result['status'] == 'READY' and not result['recovery_paused'] and active is None
+    return result
+
+
+class EtfFullUniverseRequest(BaseModel):
+    max_universe: int = Field(default=2000, ge=1, le=5000)
+    max_requests: int = Field(default=1500, ge=1, le=15000)
+    max_seconds: int = Field(default=3600, ge=30, le=14400)
+
+
+def _authorize_full_etf(request):
+    h = request.headers
+    _require_market_data_admin(h.get('x-aip-user-id'), h.get('x-aip-user-issuer'),
+                              h.get('x-aip-user-subject'), h.get('x-aip-user-roles'))
+
+
+@app.post('/api/v1/etf-radar/full-universe-cycles')
+async def full_etf_cycle(body: EtfFullUniverseRequest, request: Request):
+    _authorize_full_etf(request)
+    if settings.research_opportunity_recovery_paused:
+        raise HTTPException(503, 'RECOVERY_PAUSED')
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=202, content=await _etf_radar_worker().submit_async(
+        {'top_n': None, 'full_universe_limits': body.model_dump()}))
+
+
+@app.get('/api/v1/etf-radar/full-universe-cycles/{cycle_id}/coverage')
+async def full_etf_coverage(cycle_id: UUID, request: Request):
+    _authorize_full_etf(request)
+    def read():
+        run = repository.persistence.cycle_run(str(cycle_id))
+        if not run or run['market'] != 'ETF' or (run.get('selection') or {}).get('scope') != 'FULL_OFFICIAL_NSE_ETF':
+            raise HTTPException(404, 'FULL_ETF_CYCLE_NOT_FOUND')
+        selection = run['selection']
+        progress = repository.persistence.cycle_progress(str(cycle_id), 'BASELINE')
+        return {'cycle_id': str(cycle_id), 'status': run['status'], 'scope': selection['scope'],
+            'official_count': len(selection['universe']) if 'universe' in selection else None,
+            'completed_count': sum(bool(p.get('payload')) for p in progress.values()),
+            'request_reservations': selection['request_reservations'],
+            'failure_reason': selection.get('failure_reason') or run.get('error_code'),
+            'outcomes': [p['payload'] for p in progress.values() if p.get('payload')]}
+    return await _radar_read(read)
+
+
+@app.get('/api/v1/etf-radar/preflight')
+async def controlled_etf_preflight(request: Request, instrument_ids: list[UUID] = Query(min_length=1, max_length=5)):
+    return await _controlled_etf_preflight(instrument_ids, request)
+
+
+@app.post('/api/v1/etf-radar/controlled-cycles')
+async def controlled_etf_cycle(body: EtfEvidenceRequest, request: Request):
+    preflight = await _controlled_etf_preflight(body.instrument_ids, request)
+    if preflight['recovery_paused']:
+        raise HTTPException(503, 'RECOVERY_PAUSED')
+    if not preflight['can_submit']:
+        raise HTTPException(409, detail=preflight)
+    from fastapi.responses import JSONResponse
+    result = await _etf_radar_worker().submit_async({'top_n': None,
+        'candidate_ids': [str(key) for key in body.instrument_ids], 'verify_canonical_candidates': True})
+    return JSONResponse(status_code=202, content=result)
+
+
 @app.get('/api/v1/etf-radar/current')
 async def etf_radar_current():
     """DB-only read of the most recently persisted ETF Radar cycle. Never
@@ -300,7 +431,7 @@ async def etf_radar_cycle_status(cycle_id: UUID):
 
 class EtfRadarCycleRequest(BaseModel):
     top_n: int | None = Field(default=10, ge=1, le=100)
-    candidate_ids: list[UUID] | None = Field(default=None, max_length=200)
+    candidate_ids: list[UUID] | None = Field(default=None, min_length=1, max_length=200)
 
 
 @app.post('/api/v1/etf-radar/cycles')
@@ -327,21 +458,25 @@ async def etf_radar_cycle(body: EtfRadarCycleRequest, request: Request):
     acquires anything from a provider, and never touches company-specific
     (Equity) research acquisition.
     """
+    if settings.research_opportunity_recovery_paused:
+        raise HTTPException(503, 'RECOVERY_PAUSED')
     from app.etf_opportunity_cycle import etf_cycle_result_to_dict, run_etf_radar_cycle
 
     correlation_id = request.headers.get('x-correlation-id')
     if body.candidate_ids is not None:
         rows = [{'globalInstrumentId': str(instrument_id), 'assetType': 'ETF', 'exchange': 'NSE', 'status': 'ACTIVE'}
                 for instrument_id in body.candidate_ids]
-        with repository._persistence_worker_lock:
-            result = run_etf_radar_cycle(rows, repository.persistence, correlation_id=correlation_id, top_n=body.top_n)
-            payload = etf_cycle_result_to_dict(result)
-            repository.persistence.save_etf_radar_cycle(result.cycle_id, result.radar_version, result.correlation_id,
-                result.as_of, payload)
-        return payload
+        def evaluate():
+            with repository._persistence_worker_lock:
+                result = run_etf_radar_cycle(rows, repository.persistence, correlation_id=correlation_id, top_n=body.top_n)
+                payload = etf_cycle_result_to_dict(result)
+                repository.persistence.save_etf_radar_cycle(result.cycle_id, result.radar_version, result.correlation_id,
+                    result.as_of, payload)
+            return payload
+        return await _radar_read(evaluate)
     worker = _etf_radar_worker()
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=202, content=worker.submit({'top_n': body.top_n}))
+    return JSONResponse(status_code=202, content=await worker.submit_async({'top_n': body.top_n}))
 
 
 def _etf_owned_run(store, cycle_id: str):
@@ -370,7 +505,15 @@ async def etf_radar_cycle_lifecycle_status(cycle_id: UUID):
         with repository._persistence_worker_lock:
             if _etf_owned_run(repository.persistence, str(cycle_id)) is None:
                 return None
-            return loader(str(cycle_id)) if loader is not None else None
+            value = loader(str(cycle_id)) if loader is not None else None
+            run = _etf_owned_run(repository.persistence, str(cycle_id))
+            selection = run.get('selection') or {}
+            if value is not None and selection.get('scope') == 'FULL_OFFICIAL_NSE_ETF':
+                progress = repository.persistence.cycle_progress(str(cycle_id), 'BASELINE')
+                value = {**value, 'scope': selection['scope'], 'coverage': {
+                    'official': len(selection['universe']) if 'universe' in selection else None,
+                    'completed': sum(bool(p.get('payload')) for p in progress.values())}}
+            return value
 
     if run_blocking is not None:
         value = await run_blocking(_load)
@@ -453,7 +596,7 @@ async def opportunity_cycle(body: OpportunityCycleRequest, request: Request):
     worker = _opportunity_worker()
     if body.candidate_ids is None:
         from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=202, content=worker.submit(
+        return JSONResponse(status_code=202, content=await worker.submit_async(
             {'top_n': body.top_n, 'shortlist_limit': body.shortlist_limit, 'analysis_scope': body.analysis_scope}))
     # Diagnostics use the same process lock and never update production state.
     async with worker.run_lock:
@@ -542,24 +685,26 @@ async def finalize_cycle_cancel(
     store = repository.persistence
     if not hasattr(store, 'cancel_cycle_run_unowned'):
         raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
-    with repository._persistence_worker_lock:
-        run = store.cycle_run(str(cycle_id))
-        if run is None:
-            raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
-        status = run.get('status')
-        if status == 'CANCELLED':
-            raise HTTPException(409, 'ALREADY_CANCELLED')
-        if status != 'CANCEL_REQUESTED':
-            raise HTTPException(409, f'NOT_IN_CANCEL_REQUESTED: {status}')
-        # Fenced terminal transition: status='CANCEL_REQUESTED' -> 'CANCELLED'.
-        # Does NOT require owner_id (the cycle may be unowned).
-        transitioned = store.cancel_cycle_run_unowned(str(cycle_id))
-        run = store.cycle_run(str(cycle_id)) or run
-    return {
-        'cycle_id': str(cycle_id),
-        'transitioned': transitioned,
-        'status': run.get('status'),
-    }
+    def finalize():
+        with repository._persistence_worker_lock:
+            run = store.cycle_run(str(cycle_id))
+            if run is None:
+                raise HTTPException(404, 'OPPORTUNITY_CYCLE_NOT_FOUND')
+            status = run.get('status')
+            if status == 'CANCELLED':
+                raise HTTPException(409, 'ALREADY_CANCELLED')
+            if status != 'CANCEL_REQUESTED':
+                raise HTTPException(409, f'NOT_IN_CANCEL_REQUESTED: {status}')
+            # Fenced terminal transition: status='CANCEL_REQUESTED' -> 'CANCELLED'.
+            # Does NOT require owner_id (the cycle may be unowned).
+            transitioned = store.cancel_cycle_run_unowned(str(cycle_id))
+            run = store.cycle_run(str(cycle_id)) or run
+        return {
+            'cycle_id': str(cycle_id),
+            'transitioned': transitioned,
+            'status': run.get('status'),
+        }
+    return await _radar_read(finalize)
 
 
 class BacktestRequest(BaseModel):

@@ -10,6 +10,9 @@
     # `.\platform.ps1 components`.
     [string]$Profile,
 
+    [switch]$DryRun,
+    [switch]$AcceptBootstrapRisk,
+    [switch]$ConfirmCallerFreeze,
     [switch]$SkipBuild,
     [switch]$NoCache,
     [switch]$KeepOldImages,
@@ -59,7 +62,7 @@ $ProgressPreference = "SilentlyContinue"
 # - `up` builds the complete stack; `deploy` rebuilds only selected components/profiles.
 # - Every build uses a new immutable timestamp tag. After a successful rollout,
 #   older images for the deployed component(s) are removed unless -KeepOldImages is used.
-# - Imports the immutable images directly into k3d (no local-registry push required).
+# - up imports images into k3d; component deploy pushes through the existing registry.
 # - Installs/upgrades the Helm release without blocking on startup, then reconciles
 #   application Deployments to the exact immutable release tag.
 # - Applies LOCAL runtime normalization before waiting for readiness.
@@ -150,6 +153,8 @@ $DeploymentProfiles = [ordered]@{
     "mcp"         = @("mcp-gateway", "yahoo-finance-mcp")
 }
 
+$QuietPeriodSeconds = 600
+
 function Write-Step {
     param([string]$Message)
     Write-Host ""
@@ -185,7 +190,7 @@ function Assert-FileExists {
 
 function Assert-LocalPrerequisites {
     Require-Command "docker"
-    Require-Command "k3d"
+    if ($Command -ne "deploy") { Require-Command "k3d" }
     Require-Command "kubectl"
     Require-Command "helm"
 
@@ -703,13 +708,13 @@ function Set-ImmutableDeploymentImages {
         $initContainerPatch = @()
 
         foreach ($container in @($deployment.spec.template.spec.containers)) {
-            if ($container.name -eq $deploymentName -or $container.image -like "$($image.Repo):*") {
-                $containerPatch += @{ name = $container.name; image = $image.Image }
+            if ($container.name -eq $deploymentName -or $container.image -like "$($image.Repo):*" -or $container.image -like "$($image.Repo.Replace('localhost:5001/', 'ai-investment-registry:5000/')):*") {
+                $containerPatch += @{ name = $container.name; image = (Get-DeploymentImage $image) }
             }
         }
         foreach ($container in @($deployment.spec.template.spec.initContainers)) {
-            if ($null -ne $container -and ($container.name -eq $deploymentName -or $container.image -like "$($image.Repo):*")) {
-                $initContainerPatch += @{ name = $container.name; image = $image.Image }
+            if ($null -ne $container -and ($container.name -eq $deploymentName -or $container.image -like "$($image.Repo):*" -or $container.image -like "$($image.Repo.Replace('localhost:5001/', 'ai-investment-registry:5000/')):*")) {
+                $initContainerPatch += @{ name = $container.name; image = (Get-DeploymentImage $image) }
             }
         }
 
@@ -756,16 +761,16 @@ function Assert-ImmutableDeploymentImages {
         $deployment = $deploymentJsonRaw | ConvertFrom-Json
         $matchingImages = @()
         foreach ($container in @($deployment.spec.template.spec.containers)) {
-            if ($container.name -eq $image.Name -or $container.image -like "$($image.Repo):*") { $matchingImages += $container.image }
+            if ($container.name -eq $image.Name -or $container.image -like "$($image.Repo):*" -or $container.image -like "$($image.Repo.Replace('localhost:5001/', 'ai-investment-registry:5000/')):*") { $matchingImages += $container.image }
         }
         foreach ($container in @($deployment.spec.template.spec.initContainers)) {
-            if ($null -ne $container -and ($container.name -eq $image.Name -or $container.image -like "$($image.Repo):*")) { $matchingImages += $container.image }
+            if ($null -ne $container -and ($container.name -eq $image.Name -or $container.image -like "$($image.Repo):*" -or $container.image -like "$($image.Repo.Replace('localhost:5001/', 'ai-investment-registry:5000/')):*")) { $matchingImages += $container.image }
         }
 
-        $wrong = @($matchingImages | Where-Object { $_ -ne $image.Image })
+        $wrong = @($matchingImages | Where-Object { $_ -ne (Get-DeploymentImage $image) })
         if ($matchingImages.Count -eq 0) { $failures += "$($image.Name): no matching container image found" }
-        elseif ($wrong.Count -gt 0) { $failures += "$($image.Name): expected '$($image.Image)', found '$($wrong -join ', ')'" }
-        else { Write-Host "$($image.Name) -> $($image.Image)" -ForegroundColor DarkGray }
+        elseif ($wrong.Count -gt 0) { $failures += "$($image.Name): expected '$(Get-DeploymentImage $image)', found '$($wrong -join ', ')'" }
+        else { Write-Host "$($image.Name) -> $(Get-DeploymentImage $image)" -ForegroundColor DarkGray }
     }
 
     if ($failures.Count -gt 0) {
@@ -1640,16 +1645,585 @@ function Start-Platform {
     }
 }
 
-function Deploy-SelectedComponents {
-    Assert-LocalPrerequisites
-    Ensure-RuntimeDirectory
-
-    if (-not (Test-ClusterExists)) {
-        throw "Component deployment requires an existing local cluster. Run '.\\platform.ps1 up' once to create the full stack."
+function Assert-ExistingCluster {
+    $expected = "k3d-$ClusterName"
+    $context = kubectl config current-context
+    if ($LASTEXITCODE -ne 0 -or ($context | Out-String).Trim() -ne $expected) {
+        throw "Select the existing context first: kubectl config use-context $expected"
     }
+    $ready = kubectl --context $expected get --raw=/readyz --request-timeout=10s
+    if ($LASTEXITCODE -ne 0 -or ($ready | Out-String).Trim() -ne "ok") {
+        throw "Existing cluster '$expected' is unavailable; deployment will not create or start a cluster."
+    }
+    $nodes = kubectl --context $expected get nodes -o json --request-timeout=10s | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $nodes.items) { throw "Cannot validate existing cluster nodes." }
+    foreach ($node in $nodes.items) {
+        if (-not @($node.status.conditions | Where-Object { $_.type -eq "Ready" -and $_.status -eq "True" }).Count) {
+            throw "Cluster node '$($node.metadata.name)' is not Ready."
+        }
+    }
+}
 
-    Ensure-Cluster
-    Ensure-Namespace
+function Get-DeploymentImage {
+    param($Image)
+    if ($Command -eq "deploy") { return $Image.Image.Replace("localhost:5001/", "ai-investment-registry:5000/") }
+    return $Image.Image
+}
+
+function Push-SelectedImages {
+    param([string[]]$Names)
+    foreach ($image in Get-ImageDefinitions -Names $Names) {
+        Invoke-Checked "Pushing $($image.Image)" { docker push $image.Image }
+    }
+}
+
+# This narrow path deliberately leaves other component/up workflows unchanged.
+function ConvertTo-DeploymentArgument {
+    param([AllowEmptyString()][string]$Value)
+    # Windows CommandLineToArgvW/CRT quoting, including empty args and trailing slashes.
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $out='"'; $slashes=0
+    foreach($char in $Value.ToCharArray()) {
+        if ($char -eq '\') { $slashes++; continue }
+        if ($char -eq '"') { $out+=('\' * ($slashes*2+1))+'"' }
+        else { $out+=('\' * $slashes)+$char }
+        $slashes=0
+    }
+    return $out+('\' * ($slashes*2))+'"'
+}
+
+function Invoke-DeploymentNativeCommand {
+    param([string]$Program,[string[]]$Arguments)
+    $file=(Get-Command $Program -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=$file
+    $quoted=(@($Arguments | ForEach-Object { ConvertTo-DeploymentArgument $_ }) -join ' ')
+    if ([IO.Path]::GetExtension($file) -in @('.cmd','.bat')) {
+        # Maven's Windows launcher needs cmd.exe. Reject shell expansion rather
+        # than silently reinterpret an argument. Current scoped Maven args qualify.
+        if ($file -match '["&|<>^%!\r\n]' -or @($Arguments | Where-Object {$_ -match '["&|<>^%!\r\n]'}).Count) { throw 'Unsafe batch launcher argument' }
+        $info.FileName=$env:ComSpec
+        $info.Arguments='/d /s /c ""'+$file+'" '+$quoted+'"'
+    } else { $info.Arguments=$quoted }
+    $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+    $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+    $process=New-Object Diagnostics.Process
+    $process.StartInfo=$info
+    try {
+        $null=$process.Start()
+        $stdout=$process.StandardOutput.ReadToEndAsync()
+        $stderr=$process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        return [pscustomobject]@{ExitCode=$process.ExitCode;StdOut=$stdout.Result;StdErr=$stderr.Result}
+    } finally { $process.Dispose() }
+}
+
+function Set-DeploymentPhase {
+    param([string]$Name)
+    if ($script:DeploymentRun) { $script:DeploymentRun.Phase=$Name }
+    Write-Host "DEPLOYMENT PHASE: $Name"
+}
+
+function Initialize-DeploymentDiagnostics {
+    param([string[]]$Names)
+    $script:DeploymentRun=@{Phase='ARTIFACT_PREFLIGHT';Names=$Names;Built=@();Pushed=@();PatchAttempts=@();Patched=@();Verified=@();BaselineImages=@{};LastCommand=$null;Failure=$null}
+}
+
+function Invoke-DeploymentCommand {
+    param([string]$Program, [string[]]$Arguments)
+    $command=$Program+' '+(@($Arguments | ForEach-Object {ConvertTo-DeploymentArgument $_}) -join ' ')
+    if ($script:DeploymentRun) {
+        $script:DeploymentRun.LastCommand=$command
+        if ($Program -eq 'kubectl' -and $Arguments -contains 'patch') {
+            $at=[Array]::IndexOf($Arguments,'patch'); $script:DeploymentRun.PatchAttempts+= $Arguments[$at+2]
+        }
+    }
+    $result=Invoke-DeploymentNativeCommand $Program $Arguments
+    # Native stderr must not become a PowerShell terminating NativeCommandError
+    # before stdout and the real exit code have been captured.
+    if ($result.StdErr) { Write-Host $result.StdErr }
+    if ($result.ExitCode -ne 0) {
+        $phase=if($script:DeploymentRun){$script:DeploymentRun.Phase}else{'UNSPECIFIED'}
+        $failure=@{Phase=$phase;Command=$command;ExitCode=$result.ExitCode;StdOut=$result.StdOut;StdErr=$result.StdErr}
+        if ($script:DeploymentRun) { $script:DeploymentRun.Failure=$failure }
+        Write-Host "FAILED PHASE: $phase"
+        Write-Host "FAILED COMMAND: $command"
+        if ($result.StdOut) { Write-Host "Original stdout: $($result.StdOut)" }
+        Write-Host "Original stderr: $($result.StdErr)"
+        throw "$Program failed (exit $($result.ExitCode)) in $phase. Deployment stopped; no automatic rollback."
+    }
+    if ($script:DeploymentRun) {
+        if ($Program -eq 'docker' -and $Arguments[0] -eq 'build') { $script:DeploymentRun.Built+=$Arguments[[Array]::IndexOf($Arguments,'-t')+1] }
+        if ($Program -eq 'docker' -and $Arguments[0] -eq 'push') { $script:DeploymentRun.Pushed+=$Arguments[1] }
+        if ($Program -eq 'kubectl' -and $Arguments -contains 'patch') { $at=[Array]::IndexOf($Arguments,'patch');$script:DeploymentRun.Patched+=$Arguments[$at+2] }
+    }
+    return $result.StdOut
+}
+
+function Get-DeploymentFailureState {
+    $state=@{Verified=$false;Deployments=@();Isolation='UNKNOWN';ResearchRecovery='UNKNOWN';Scheduler='UNKNOWN';ImagesMatchBaseline=$false}
+    try {
+        $prefix=@('--context','k3d-ai-investment-dev','-n','ai-investment','--request-timeout=10s')
+        $d=Invoke-DeploymentNativeCommand kubectl ($prefix+@('get','deployments','-o','json'))
+        $p=Invoke-DeploymentNativeCommand kubectl ($prefix+@('get','networkpolicies','-o','json'))
+        if ($d.ExitCode -ne 0 -or $p.ExitCode -ne 0) { return $state }
+        $deployments=($d.StdOut | ConvertFrom-Json).items
+        $policies=($p.StdOut | ConvertFrom-Json).items
+        $state.Isolation=if(@($policies | Where-Object {$_.metadata.name -eq 'research-bootstrap-isolation'}).Count){'ACTIVE'}else{'ABSENT'}
+        foreach($name in @('api-gateway','research-engine','portfolio-service','frontend')) {
+            $item=@($deployments | Where-Object {$_.metadata.name -eq $name})
+            if ($item.Count -ne 1) { return $state }
+            $main=@($item[0].spec.template.spec.containers | Where-Object name -eq $name)
+            if ($main.Count -ne 1) { return $state }
+            $state.Deployments+=@{Name=$name;Image=$main[0].image;Ready=$item[0].status.readyReplicas;Desired=$item[0].spec.replicas;Generation=$item[0].metadata.generation;ObservedGeneration=$item[0].status.observedGeneration}
+            if ($name -eq 'research-engine') {
+                $state.ResearchRecovery=($main[0].env | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED').value
+                $state.Scheduler=($main[0].env | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED').value
+            }
+        }
+        $state.ImagesMatchBaseline=$true
+        foreach($name in $script:DeploymentRun.Names) {
+            if (-not $script:DeploymentRun.BaselineImages.ContainsKey($name) -or ($state.Deployments | Where-Object Name -eq $name).Image -ne $script:DeploymentRun.BaselineImages[$name]) { $state.ImagesMatchBaseline=$false }
+        }
+        $state.Verified=$true
+    } catch { $state.Verified=$false }
+    return $state
+}
+
+function Show-DeploymentFailure {
+    param($ErrorRecord)
+    $state=Get-DeploymentFailureState
+    $run=$script:DeploymentRun
+    Write-Host "DEPLOYMENT STOPPED: phase=$($run.Phase); error=$($ErrorRecord.Exception.Message)"
+    if (-not $run.Failure) { Write-Host "Last command/operation: $($run.LastCommand); native exit code: not available for this validation failure" }
+    Write-Host ('Progress: '+(@{Built=$run.Built;Pushed=$run.Pushed;PatchAttempts=$run.PatchAttempts;Patched=$run.Patched;Verified=$run.Verified} | ConvertTo-Json -Compress))
+    Write-Host ('Current read-only state: '+($state | ConvertTo-Json -Depth 8 -Compress))
+    $ready=@($state.Deployments | Where-Object {$_.Ready -lt 1 -or $_.Ready -ne $_.Desired -or $_.Generation -ne $_.ObservedGeneration}).Count -eq 0
+    if ($state.Verified -and $state.ImagesMatchBaseline -and $state.Isolation -eq 'ABSENT' -and $ready -and $run.PatchAttempts.Count -eq 0) {
+        Write-Host 'Fresh attempt: CONDITIONAL, from the beginning only after the reported cause is fixed and deployment is approved. All mandatory checks will rerun.'
+    } else {
+        Write-Host 'Fresh attempt: BLOCKED. Inspect/reconcile isolation and workload state with the saved baseline; do not automatically retry or roll back research.'
+    }
+    Write-Host 'No cleanup, retry, network-policy change or rollback was performed by failure diagnostics.'
+}
+
+function Invoke-DeploymentKubectl {
+    param([string[]]$Arguments)
+    Invoke-DeploymentCommand 'kubectl' (@('--context', 'k3d-ai-investment-dev', '-n', 'ai-investment') + $Arguments)
+}
+
+function Get-VerifiedRegistryImage {
+    param([ValidateSet('api-gateway','research-engine','portfolio-service','frontend')][string]$Name, [string]$Reference)
+    if ($Reference -notmatch '^(sha256:[a-f0-9]{64}|[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$') { throw 'Invalid image reference' }
+    $base = "http://localhost:5001/v2/ai-investment/$Name"
+    $accept = 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+    $pending = New-Object 'System.Collections.Generic.Queue[string]'
+    $pending.Enqueue($Reference)
+    $seen = @{}
+    $rootDigest = $null
+    $runnable = $false
+    while ($pending.Count -gt 0) {
+        $ref = $pending.Dequeue()
+        if ($seen.ContainsKey($ref)) { continue }
+        if ($seen.Count -ge 32) { throw 'Unexpectedly large image index' }
+        $seen[$ref] = $true
+        if ($script:DeploymentRun) { $script:DeploymentRun.LastCommand="HTTP GET $base/manifests/$ref" }
+        $response = Invoke-WebRequest -Uri "$base/manifests/$ref" -Headers @{ Accept=$accept } -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
+        if ($response.StatusCode -ne 200) { throw 'Manifest unavailable' }
+        $bytes = if ($response.Content -is [byte[]]) { $response.Content } else { [Text.Encoding]::UTF8.GetBytes([string]$response.Content) }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $digest = 'sha256:' + ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
+        if ($response.Headers['Docker-Content-Digest'] -ne $digest -or ($ref.StartsWith('sha256:') -and $ref -ne $digest)) { throw 'Manifest digest mismatch' }
+        if (-not $rootDigest) { $rootDigest = $digest }
+        $manifest = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if ($manifest.schemaVersion -ne 2) { throw 'Unsupported manifest schema' }
+        if ($manifest.mediaType -in @('application/vnd.oci.image.index.v1+json','application/vnd.docker.distribution.manifest.list.v2+json')) {
+            if (-not $manifest.manifests) { throw 'Empty image index' }
+            foreach ($child in $manifest.manifests) {
+                if ($child.digest -notmatch '^sha256:[a-f0-9]{64}$') { throw 'Invalid child digest' }
+                if ($child.platform.os -eq 'linux' -and $child.platform.architecture -eq 'amd64') { $runnable = $true }
+                $pending.Enqueue($child.digest)
+            }
+        } elseif ($manifest.mediaType -in @('application/vnd.oci.image.manifest.v1+json','application/vnd.docker.distribution.manifest.v2+json')) {
+            if (-not $manifest.config -or -not $manifest.layers) { throw 'Incomplete image manifest' }
+            foreach ($blob in @($manifest.config) + @($manifest.layers)) {
+                if ($blob.digest -notmatch '^sha256:[a-f0-9]{64}$') { throw 'Invalid blob digest' }
+                if ($script:DeploymentRun) { $script:DeploymentRun.LastCommand="HTTP HEAD $base/blobs/$($blob.digest)" }
+                $head = Invoke-WebRequest -Uri "$base/blobs/$($blob.digest)" -Method Head -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
+                if ($head.StatusCode -ne 200 -or [long]$head.Headers['Content-Length'] -ne [long]$blob.size) { throw 'Missing or incomplete image blob' }
+            }
+            # Direct manifests need explicit platform evidence from their config.
+            if ($ref -eq $Reference) {
+                $configResponse = Invoke-WebRequest -Uri "$base/blobs/$($manifest.config.digest)" -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
+                $configBytes = if ($configResponse.Content -is [byte[]]) { $configResponse.Content } else { [Text.Encoding]::UTF8.GetBytes([string]$configResponse.Content) }
+                $hash = [Security.Cryptography.SHA256]::Create()
+                try { $configDigest = 'sha256:' + ([BitConverter]::ToString($hash.ComputeHash($configBytes))).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
+                if ($configResponse.StatusCode -ne 200 -or $configDigest -ne $manifest.config.digest) { throw 'Config digest mismatch' }
+                $config = [Text.Encoding]::UTF8.GetString($configBytes) | ConvertFrom-Json
+                $runnable = $config.os -eq 'linux' -and $config.architecture -eq 'amd64'
+            }
+        } else { throw 'Unsupported manifest media type' }
+    }
+    if (-not $runnable) { throw 'No linux/amd64 image verified' }
+    $imageReference="ai-investment-registry:5000/ai-investment/${Name}@$rootDigest"
+    if (-not $script:VerifiedDeploymentDigests) { $script:VerifiedDeploymentDigests=@{} }
+    $script:VerifiedDeploymentDigests[$imageReference]=@($rootDigest)+@($seen.Keys | Where-Object { $_ -match '^sha256:[a-f0-9]{64}$' })
+    return $imageReference
+}
+
+function New-VerifiedDeploymentPatch {
+    param($Deployment, [string]$Name, [string]$Image)
+    if ($Name -notin @('api-gateway','research-engine','portfolio-service','frontend') -or $Deployment.metadata.name -ne $Name -or $Deployment.metadata.namespace -ne 'ai-investment') { throw 'Unexpected deployment identity' }
+    if ($Image -notmatch "^ai-investment-registry:5000/ai-investment/$Name@sha256:[a-f0-9]{64}$") { throw 'Deployment requires verified digest' }
+    if (@($Deployment.spec.template.spec.containers | Where-Object { $_.name -eq $Name }).Count -ne 1) { throw "Missing/duplicate container: $Name" }
+    $initCount=@($Deployment.spec.template.spec.initContainers | Where-Object {$null -ne $_}).Count
+    if (($Name -eq 'research-engine' -and $initCount -ne 1) -or ($Name -ne 'research-engine' -and $initCount -ne 0)) { throw "Unexpected init container layout: $Name ($initCount)" }
+    if (-not $Deployment.metadata.resourceVersion) { throw 'Missing deployment resource version' }
+    $container = @{ name=$Name; image=$Image }
+    $spec = @{ containers=@($container) }
+    if ($Name -eq 'research-engine') {
+        if (@($Deployment.spec.template.spec.initContainers | Where-Object { $_.name -eq 'wait-for-research-migrations' }).Count -ne 1) { throw 'Missing migration-wait init container' }
+        $spec.initContainers = @(@{ name='wait-for-research-migrations'; image=$Image })
+        $container.env = @(
+            @{ name='AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED'; value='true'; valueFrom=$null },
+            @{ name='AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED'; value='false'; valueFrom=$null }
+        )
+    }
+    return @{ metadata=@{resourceVersion=$Deployment.metadata.resourceVersion}; spec=@{template=@{spec=$spec}} }
+}
+
+# Definitions only. Loaded by platform.ps1; every external boundary is mockable.
+function Invoke-DeploymentObservation {
+    param($Gate)
+    $source=Get-Content -Raw (Join-Path $ProjectRoot 'scripts\database\deployment_observation.py')
+    $expected=if($Gate.Migrations){$Gate.Migrations | ConvertTo-Json -Compress}else{'null'}
+    $source += "`nraise SystemExit(main(json.loads('$expected')))`n"
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($source))
+    $result=Invoke-DeploymentKubectl @('exec',"pod/$($Gate.ResearchPod)",'-c','research-engine','--','python','-c',"import base64;exec(base64.b64decode('$encoded'))")
+    $value=($result | Out-String) | ConvertFrom-Json
+    if ($value.fingerprint -notmatch '^[a-f0-9]{64}$') { throw 'Database observation missing fingerprint' }
+    if ($value.status -eq 'UNKNOWN') { throw 'Database observation UNKNOWN' }
+    # Incomplete refresh runs have no authoritative worker-termination proof.
+    # Pausing admission, isolation, stable pod identity, quiet logs and unchanged
+    # fingerprints cannot exclude a silent worker. Preserve every BLOCKED result.
+    if ($value.status -ne 'QUIET_SNAPSHOT') { throw 'Database observation UNKNOWN/BLOCKED' }
+    return $value
+}
+
+function Get-DeploymentInventory {
+    $pods=Invoke-DeploymentKubectl @('get','pods','--all-namespaces','-o','json') | ConvertFrom-Json
+    if (@($pods.items | Where-Object {$_.metadata.namespace -notin @('ai-investment','kube-system')}).Count) { throw 'Unreviewed cross-namespace callers' }
+    $jobs=Invoke-DeploymentKubectl @('get','jobs,cronjobs','--all-namespaces','-o','json') | ConvertFrom-Json
+    if (@($jobs.items | Where-Object { ($_.kind -eq 'CronJob' -and -not $_.spec.suspend) -or ($_.kind -eq 'Job' -and $_.status.active -gt 0) }).Count) { throw 'Scheduled/internal work is not frozen' }
+    if (@($pods.items | Where-Object { $_.spec.hostNetwork -and $_.metadata.namespace -ne 'kube-system' }).Count) { throw 'Host-network caller cannot be isolated' }
+    # Do not terminate unrelated PIDs. Require operators to close API-server tunnels.
+    $tunnels=@(Get-CimInstance Win32_Process -Filter "Name = 'kubectl.exe'" | Where-Object { $_.CommandLine -match '\b(port-forward|proxy)\b' })
+    if ($tunnels.Count) { throw 'Operator kubectl tunnels must be closed before deployment' }
+    return @{items=@($pods.items | Where-Object {$_.metadata.namespace -eq 'ai-investment'})}
+}
+
+function Invoke-IsolationProbe {
+    param([string]$Pod,[string]$HostName,[int]$Port,[switch]$Denied)
+    if ($Pod -notmatch '^[a-z0-9.-]+$' -or $HostName -notmatch '^[a-z0-9.-]+$' -or $Port -notin @(80,8000)) { throw 'Invalid probe address' }
+    # timeout 124 specifically distinguishes an isolation timeout from a missing
+    # binary, refused connection, DNS failure, or unhealthy HTTP response.
+    $probe="timeout 3 bash -c 'exec 3<>/dev/tcp/$HostName/$Port; printf `"GET /health HTTP/1.0\r\nHost: research-engine\r\n\r\n`" >&3; head -n 1 <&3'"
+    if ($HostName -eq 'research-service') { $probe=$probe.Replace('GET /health ','GET /actuator/health/readiness ') }
+    $shell="$probe; result=`$?; if [ `$result -eq 124 ]; then echo ISOLATED; elif [ `$result -ne 0 ]; then exit `$result; fi"
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($shell))
+    $out=(Invoke-DeploymentKubectl @('exec',"pod/$Pod",'--','bash','-c',"echo '$encoded' | base64 -d | bash") | Out-String).Trim()
+    if ($Denied) { if ($out -ne 'ISOLATED') { throw 'Research ingress isolation failed' } }
+    elseif ($out -notmatch '^HTTP/1\.[01] 200\b' -or $out -match 'ISOLATED') { throw 'Probe control or baseline unavailable' }
+}
+
+function Assert-DeploymentIsolation {
+    param($Gate,[switch]$Probe)
+    $null=Get-DeploymentInventory
+    $policies=Invoke-DeploymentKubectl @('get','networkpolicies','-o','json') | ConvertFrom-Json
+    if (@($policies.items).Count -ne 1 -or $policies.items[0].metadata.name -ne 'research-bootstrap-isolation') { throw 'Unexpected additive network policies' }
+    $spec=$policies.items[0].spec
+    if (@($spec.ingress | Where-Object {$null -ne $_}).Count -ne 0 -or @($spec.policyTypes).Count -ne 1 -or $spec.policyTypes[0] -ne 'Ingress' -or ($spec.podSelector | ConvertTo-Json -Compress -Depth 8) -ne ($Gate.Selector | ConvertTo-Json -Compress -Depth 8)) { throw 'Isolation policy drift' }
+    if ($Probe) {
+        foreach($pod in $Gate.Callers) {
+            Invoke-IsolationProbe $pod 'research-service' 80
+            Invoke-IsolationProbe $pod $Gate.ServiceIP 80 -Denied
+            Invoke-IsolationProbe $pod $Gate.PodIP 8000 -Denied
+        }
+    }
+}
+
+function Initialize-DeploymentSafety {
+    param([string[]]$Names)
+    $pods=Get-DeploymentInventory
+    $research=@($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq 'research-engine'})
+    if ($research.Count -ne 1 -or $research[0].status.phase -ne 'Running') { throw 'Ambiguous research pod' }
+    $r=$research[0]
+    if (@($r.status.containerStatuses | Where-Object {-not $_.ready}).Count) { throw 'Research not ready' }
+    $gate=@{ResearchPod=$r.metadata.name;ResearchUID=$r.metadata.uid;PodIP=$r.status.podIP;Names=$Names;Migrations=$null}
+    $gate.PodIdentity=($r.status.containerStatuses | Select-Object name,restartCount,containerID | ConvertTo-Json -Compress)
+    $deployment=Invoke-DeploymentKubectl @('get','deployment','research-engine','-o','json') | ConvertFrom-Json
+    $envs=($deployment.spec.template.spec.containers | Where-Object name -eq 'research-engine').env
+    if (($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED').value -ne 'false') { throw 'Old scheduler state unsafe/unknown' }
+    if ('research-engine' -notin $Names -and ($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED').value -ne 'true') { throw 'Research replacement or existing recovery pause required' }
+    $gate.Selector=$deployment.spec.selector
+    $labels=$gate.Selector.matchLabels
+    if ($labels.'app.kubernetes.io/component' -ne 'research-engine' -or $labels.'app.kubernetes.io/instance' -ne 'ai-investment-platform' -or $labels.'app.kubernetes.io/name' -ne 'ai-investment-platform' -or @($labels.PSObject.Properties).Count -ne 3) { throw 'Unexpected research selector' }
+    $service=Invoke-DeploymentKubectl @('get','service','research-engine','-o','json') | ConvertFrom-Json
+    $gate.ServiceIP=$service.spec.clusterIP
+    $gate.Callers=@()
+    foreach($name in @('api-gateway','portfolio-service','mcp-gateway')) {
+        $caller=@($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq $name})
+        if ($caller.Count -ne 1) { throw 'Ambiguous internal caller' }
+        $gate.Callers+= $caller[0].metadata.name
+    }
+    $policies=Invoke-DeploymentKubectl @('get','networkpolicies','-o','json') | ConvertFrom-Json
+    if (@($policies.items).Count) { throw 'Existing network policies require separate review' }
+    foreach($pod in $gate.Callers) {
+        Invoke-IsolationProbe $pod 'research-service' 80
+        Invoke-IsolationProbe $pod $gate.ServiceIP 80
+        Invoke-IsolationProbe $pod $gate.PodIP 8000
+    }
+    if ($Names -contains 'portfolio-service') {
+        # Flyway's SQL checksum is CRC32 over UTF-8 lines, excluding BOM/newlines.
+        $code="import pathlib,zlib,json; print(json.dumps({p.name:((zlib.crc32(''.join(p.read_text(encoding='utf-8-sig').splitlines()).encode())+2**31)%2**32)-2**31 for p in pathlib.Path('services/portfolio-service/src/main/resources/db/migration').glob('V*__*.sql')}))"
+        $gate.Migrations=(Invoke-DeploymentCommand python @('-c',$code) | Out-String) | ConvertFrom-Json
+        if (-not $gate.Migrations -or @($gate.Migrations.PSObject.Properties).Count -eq 0) { throw 'Missing migration manifest' }
+    }
+    if ($Names -contains 'frontend') {
+        $code='const fs=require("fs"),p=require("path"),v=new Set();function scan(d){for(const f of fs.readdirSync(d,{withFileTypes:true})){const n=p.join(d,f.name);if(f.isDirectory())scan(n);else if(n.endsWith(".js")){for(const m of fs.readFileSync(n,"utf8").matchAll(/apiBaseUrl:"([^"]*)",authDevLoginEnabled:(![01]|true|false)/g))v.add(JSON.stringify({apiBaseUrl:m[1],authDevLoginEnabled:["!0","true"].includes(m[2])?"true":"false"}));}}}scan("/app/.next");if(v.size!==1)process.exit(2);console.log([...v][0]);'
+        $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($code))
+        $gate.Frontend=(Invoke-DeploymentKubectl @('exec','deployment/frontend','--','node','-e',"eval(Buffer.from('$encoded','base64').toString())") | Out-String) | ConvertFrom-Json
+        if ($gate.Frontend.authDevLoginEnabled -notin @('true','false') -or $null -eq $gate.Frontend.apiBaseUrl) { throw 'Frontend build configuration unknown' }
+    }
+    Set-DeploymentPhase 'INITIAL_POSTGRES_OBSERVATION'
+    $gate.Baseline=Invoke-DeploymentObservation $gate
+    $gate.Workloads=Invoke-DeploymentKubectl @('get','deployments,statefulsets','-o','json') | ConvertFrom-Json
+    return $gate
+}
+
+function Save-DeploymentBaseline {
+    param($Tag,$Deployments,$Gate)
+    $path=Join-Path $RuntimeDir $Tag
+    New-Item -ItemType Directory -Path $path -ErrorAction Stop | Out-Null
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent().Name
+    Invoke-DeploymentCommand icacls @($path,'/inheritance:r','/grant:r',"${identity}:(OI)(CI)F") | Out-Null
+    $Gate.AuditPath=$path
+    $Deployments | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $path 'original-deployments.json') -Encoding UTF8
+    $Gate.Workloads | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $path 'original-workloads.json') -Encoding UTF8
+}
+
+function Start-DeploymentIsolation {
+    param($Gate)
+    $policy=@{apiVersion='networking.k8s.io/v1';kind='NetworkPolicy';metadata=@{name='research-bootstrap-isolation';namespace='ai-investment'};spec=@{podSelector=$Gate.Selector;policyTypes=@('Ingress');ingress=@()}}
+    $path=Join-Path $Gate.AuditPath 'isolation.json'
+    $policy | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $path -Encoding UTF8
+    Invoke-DeploymentKubectl @('create','--dry-run=server','-f',$path) | Out-Null
+    Invoke-DeploymentKubectl @('create','-f',$path) | Out-Null
+    # On any subsequent failure leave isolation in place; no automatic rollback.
+    $Gate.Isolated=$true
+    $Gate.Started=[DateTime]::UtcNow.ToString('o')
+    Assert-DeploymentIsolation $Gate -Probe
+}
+
+function Assert-DeploymentQuietSample {
+    param($Gate,[switch]$Probe)
+    # Recheck policy/inventory each sample. Bounded network enforcement probes
+    # bracket the quiet window, rather than consume most of every sample period.
+    Assert-DeploymentIsolation $Gate -Probe:$Probe
+    Assert-DeploymentWorkloads $Gate @()
+    $pod=Invoke-DeploymentKubectl @('get','pod',$Gate.ResearchPod,'-o','json') | ConvertFrom-Json
+    $identity=$pod.status.containerStatuses | Select-Object name,restartCount,containerID | ConvertTo-Json -Compress
+    if ($pod.metadata.uid -ne $Gate.ResearchUID -or $identity -ne $Gate.PodIdentity) { throw 'Research pod changed during observation' }
+    if (@($pod.status.containerStatuses | Where-Object {-not $_.ready}).Count) { throw 'Research became unready during observation' }
+    $logs=Invoke-DeploymentKubectl @('logs',$Gate.ResearchPod,'--timestamps',"--since-time=$($Gate.Started)")
+    foreach($line in $logs) {
+        if (($line -match '"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) ' -and $line -notmatch '"GET /health(/live)? HTTP/1\.[01]" 200') -or $line -match 'ERROR|Traceback|takeover|acquisition|cycle.*(start|resum)') { throw 'Unexpected research traffic/activity' }
+    }
+    $sample=Invoke-DeploymentObservation $Gate
+    if ($sample.fingerprint -ne $Gate.Baseline.fingerprint) { throw 'Durable state changed during observation' }
+    $sample | ConvertTo-Json -Depth 10 -Compress | Add-Content -LiteralPath (Join-Path $Gate.AuditPath 'observations.jsonl') -Encoding UTF8
+}
+
+function Wait-DeploymentQuiet {
+    param($Gate)
+    $started=Get-DeploymentMonotonicSeconds
+    $next=$started
+    do {
+        Assert-DeploymentQuietSample $Gate
+        $now=Get-DeploymentMonotonicSeconds
+        $elapsed=$now-$started
+        Write-Host ('Quiet observation: {0:N0}/' + $QuietPeriodSeconds + ' seconds; process-local quiescence remains unproven.' -f $elapsed)
+        if ($elapsed -gt ($QuietPeriodSeconds + 60)) { throw 'Quiet observation exceeded bounded window' }
+        if ($now-$next -gt 30) { throw 'Observation cannot sustain 30-second sampling' }
+        if ($elapsed -ge $QuietPeriodSeconds) { break }
+        $next+=30
+        $sleep=[Math]::Ceiling($next-$now)
+        if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
+    } while ($true)
+}
+
+function Complete-DeploymentSafety {
+    param($Gate,[string[]]$Names,$Images)
+    $pods=Invoke-DeploymentKubectl @('get','pods','-o','json') | ConvertFrom-Json
+    foreach($name in $Names) {
+        $items=@($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq $name})
+        if ($items.Count -ne 1 -or $items[0].metadata.deletionTimestamp) { throw 'Old/new pod overlap remains' }
+        $status=@($items[0].status.containerStatuses | Where-Object name -eq $name)
+        if ($status.Count -ne 1 -or -not $status[0].ready) { throw 'Pod image/health verification failed' }
+        Assert-VerifiedPodImage $Images[$name] $status[0].imageID
+        if ($name -eq 'research-engine') {
+            $init=@($items[0].status.initContainerStatuses | Where-Object name -eq 'wait-for-research-migrations')
+            if ($init.Count -ne 1 -or $null -eq $init[0].state.terminated -or $init[0].state.terminated.exitCode -ne 0) { throw 'Migration-wait init did not complete' }
+            Assert-VerifiedPodImage $Images[$name] $init[0].imageID
+        }
+    }
+    Assert-DeploymentWorkloads $Gate $Names
+    # DB state must also remain unchanged through rollout. Repoint only to new research pod.
+    $Gate.ResearchPod=($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq 'research-engine'}).metadata.name
+    $sample=Invoke-DeploymentObservation $Gate
+    if ($sample.fingerprint -ne $Gate.Baseline.fingerprint) { throw 'Durable state changed during rollout' }
+    $release=Invoke-DeploymentCommand helm @('--kube-context','k3d-ai-investment-dev','-n','ai-investment','status','ai-investment-platform','-o','json') | ConvertFrom-Json
+    if ($release.version -ne $Gate.HelmRevision) { throw 'Helm revision changed' }
+    Invoke-DeploymentKubectl @('delete','networkpolicy','research-bootstrap-isolation','--wait=true') | Out-Null
+    Write-Host 'Isolation removed after verification. Keep caller freeze; recovery stays paused. No ETF operations authorized.'
+}
+
+function Assert-VerifiedPodImage {
+    param([string]$Expected,[string]$Actual)
+    if ($Actual -notmatch '(sha256:[a-f0-9]{64})$' -or -not $script:VerifiedDeploymentDigests -or $Matches[1] -notin $script:VerifiedDeploymentDigests[$Expected]) { throw 'Pod digest not in verified OCI image graph' }
+}
+
+function Get-DeploymentMonotonicSeconds { return [Diagnostics.Stopwatch]::GetTimestamp()/[double][Diagnostics.Stopwatch]::Frequency }
+
+function Assert-DeploymentWorkloads {
+    param($Gate,[string[]]$Except)
+    $actual=Invoke-DeploymentKubectl @('get','deployments,statefulsets','-o','json') | ConvertFrom-Json
+    $before=@($Gate.Workloads.items | Where-Object {$_.metadata.name -notin $Except})
+    $after=@($actual.items | Where-Object {$_.metadata.name -notin $Except})
+    if ($before.Count -ne $after.Count) { throw 'Unrelated workload set changed' }
+    foreach($item in $before) {
+        $other=@($after | Where-Object {$_.kind -eq $item.kind -and $_.metadata.name -eq $item.metadata.name})
+        if ($other.Count -ne 1 -or ($item.spec | ConvertTo-Json -Depth 100 -Compress) -ne ($other[0].spec | ConvertTo-Json -Depth 100 -Compress)) { throw 'Unrelated workload changed' }
+    }
+}
+
+function Deploy-VerifiedRadarComponents {
+    param([string[]]$Names)
+    Initialize-DeploymentDiagnostics $Names
+    try { Deploy-VerifiedRadarComponentsCore -Names $Names }
+    catch { Show-DeploymentFailure $_; throw }
+}
+
+function Deploy-VerifiedRadarComponentsCore {
+    param([string[]]$Names)
+    if (-not $Names -or @($Names | Where-Object { $_ -notin @('api-gateway','research-engine','portfolio-service','frontend') }).Count) { throw 'Invalid safe deployment selection' }
+    if ($SkipBuild) { throw 'SkipBuild is not supported for verified deployment' }
+    Assert-LocalPrerequisites
+    # Every operation is pinned; never rely on mutable current-context state.
+    $ready = Invoke-DeploymentKubectl @('get','--raw=/readyz','--request-timeout=10s')
+    if (($ready | Out-String).Trim() -ne 'ok') { throw 'Cluster is not ready' }
+    $release = Invoke-DeploymentCommand 'helm' @('--kube-context','k3d-ai-investment-dev','-n','ai-investment','status','ai-investment-platform','-o','json')
+    if (-not ($release | ConvertFrom-Json).name -or ($release | ConvertFrom-Json).version -lt 1) { throw 'Missing Helm release/revision' }
+    $rollback = @{
+        'api-gateway'='sha256:69895f18d6360cdc087d51b3f54c29a822d283f709a1b50ae77bb2e18239d5b5'
+        'research-engine'='sha256:c9ccb210e81c45a3152079baca8ca939e521340ed23dcace4522748eb98edff3'
+        'portfolio-service'='sha256:6d5e111a118a659bf84bdee03e2b0561feed003f7feb6b41fa9ddebef80ddd9f'
+        'frontend'='sha256:af0ddfbc03c38e44187a89382c88d717cc0b6bfa5ec199b9a0f0d519c889c60d'
+    }
+    $deployments = @{}
+    $oldImages = @{}
+    foreach ($name in $Names) {
+        $oldImages[$name] = Get-VerifiedRegistryImage $name $rollback[$name]
+        $deployment = Invoke-DeploymentKubectl @('get','deployment',$name,'-o','json') | ConvertFrom-Json
+        $null = New-VerifiedDeploymentPatch $deployment $name $oldImages[$name]
+        $containers = @($deployment.spec.template.spec.containers | Where-Object { $_.name -eq $name })
+        if ($name -eq 'research-engine') { $containers += @($deployment.spec.template.spec.initContainers | Where-Object { $_.name -eq 'wait-for-research-migrations' }) }
+        foreach ($container in $containers) {
+            $prefix = "ai-investment-registry:5000/ai-investment/$name"
+            if ($container.image -notmatch ('^' + [regex]::Escape($prefix) + '[:@](.+)$')) { throw 'Unexpected running image repository' }
+            $current = Get-VerifiedRegistryImage $name $Matches[1]
+            if ($current -ne $oldImages[$name]) { throw 'Running image differs from approved rollback baseline; review required' }
+        }
+        $deployments[$name] = $deployment
+        $script:DeploymentRun.BaselineImages[$name]=($deployment.spec.template.spec.containers | Where-Object name -eq $name).image
+    }
+    if ($DryRun) { Write-Host "Verified artifact preflight: $($Names -join ', '). No build, push or patch. Database/isolation/quiet gates NOT executed; this is not deployment readiness."; return }
+    if (-not $AcceptBootstrapRisk -or -not $ConfirmCallerFreeze) { throw 'Explicit bootstrap risk acceptance and caller freeze are required' }
+    Set-DeploymentPhase 'READ_ONLY_PREFLIGHT'
+    $gate = Initialize-DeploymentSafety -Names $Names
+    $gate.HelmRevision=($release | ConvertFrom-Json).version
+    $tag = 'review-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N')
+    Ensure-RuntimeDirectory
+    $rollbackPath = Join-Path $RuntimeDir "rollback-$tag.json"
+    $oldImages | ConvertTo-Json | Set-Content -LiteralPath $rollbackPath -Encoding ASCII
+    Save-DeploymentBaseline -Tag $tag -Deployments $deployments -Gate $gate
+    $java = @($Names | Where-Object { $_ -in @('api-gateway','portfolio-service') })
+    if ($java.Count) {
+        Set-DeploymentPhase 'JAVA_PACKAGE'
+        Assert-BuildPrerequisites
+        Invoke-DeploymentCommand 'mvn' @('-f',(Join-Path $ProjectRoot 'services/pom.xml'),'-pl',($java -join ','),'-am','package','-DskipTests') | Out-Host
+    }
+    $images = @{}
+    foreach ($name in $Names) {
+        $image = "localhost:5001/ai-investment/${name}:$tag"
+        $contexts=@{'api-gateway'='services/api-gateway';'portfolio-service'='services/portfolio-service';'research-engine'='ai/research-engine';'frontend'='frontend'}
+        $context=Join-Path $ProjectRoot $contexts[$name]
+        $buildArgs = @('build','-t',$image)
+        if ($name -eq 'frontend') { $buildArgs += @('--build-arg',"NEXT_PUBLIC_API_BASE_URL=$($gate.Frontend.apiBaseUrl)",'--build-arg',"NEXT_PUBLIC_AUTH_DEV_LOGIN_ENABLED=$($gate.Frontend.authDevLoginEnabled)") }
+        if ($NoCache) { $buildArgs += '--no-cache' }
+        Set-DeploymentPhase "BUILD/$name"
+        Invoke-DeploymentCommand 'docker' ($buildArgs + @($context)) | Out-Host
+        Set-DeploymentPhase "PUSH/$name"
+        Invoke-DeploymentCommand 'docker' @('push',$image) | Out-Host
+        $images[$name] = Get-VerifiedRegistryImage $name $tag
+    }
+    Set-DeploymentPhase 'ADMISSION_ISOLATION'
+    Start-DeploymentIsolation -Gate $gate
+    Set-DeploymentPhase 'QUIET_PERIOD'
+    Wait-DeploymentQuiet -Gate $gate
+    # Verify every image and construct every patch before the first workload mutation.
+    Set-DeploymentPhase 'FINAL_ARTIFACT_AND_PATCH_REVIEW'
+    $patchPaths = @{}
+    foreach ($name in $Names) {
+        # Builds may be lengthy; recheck rollback availability immediately before rollout.
+        if ((Get-VerifiedRegistryImage $name $rollback[$name]) -ne $oldImages[$name]) { throw 'Rollback verification changed' }
+        $fresh=Invoke-DeploymentKubectl @('get','deployment',$name,'-o','json') | ConvertFrom-Json
+        if ($fresh.metadata.resourceVersion -ne $deployments[$name].metadata.resourceVersion) { throw 'Deployment drift during observation' }
+        $patch = New-VerifiedDeploymentPatch $fresh $name $images[$name]
+        $path = Join-Path $RuntimeDir "$name-$tag.patch.json"
+        $patch | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $path -Encoding ASCII
+        $patchPaths[$name] = $path
+    }
+    Assert-DeploymentQuietSample -Gate $gate -Probe
+    foreach ($name in @('research-engine','api-gateway','portfolio-service','frontend') | Where-Object { $_ -in $Names }) {
+        Set-DeploymentPhase "ROLLOUT/$name"
+        Invoke-DeploymentKubectl @('patch','deployment',$name,'--type=strategic','--patch-file',$patchPaths[$name]) | Out-Host
+        Invoke-DeploymentKubectl @('rollout','status',"deployment/$name",'--timeout=420s') | Out-Host
+        $actual = Invoke-DeploymentKubectl @('get','deployment',$name,'-o','json') | ConvertFrom-Json
+        $null = New-VerifiedDeploymentPatch $actual $name $images[$name]
+        if (($actual.spec.template.spec.containers | Where-Object { $_.name -eq $name }).image -ne $images[$name]) { throw 'Deployment image verification failed' }
+        if ($name -eq 'research-engine') {
+            if (($actual.spec.template.spec.initContainers | Where-Object { $_.name -eq 'wait-for-research-migrations' }).image -ne $images[$name]) { throw 'Init image verification failed' }
+            $envs = ($actual.spec.template.spec.containers | Where-Object { $_.name -eq $name }).env
+            if (($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED').value -ne 'true' -or ($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED').value -ne 'false') { throw 'Startup pause verification failed' }
+        }
+    }
+    $script:DeploymentRun.Verified=@($Names)
+    Set-DeploymentPhase 'POST_ROLLOUT_VERIFICATION'
+    Complete-DeploymentSafety -Gate $gate -Names $Names -Images $images
+    Set-DeploymentPhase 'COMPLETE'
+    Write-Host "Verified deployment completed. Old images retained; rollback references: $rollbackPath. Recovery remains paused. No automatic rollback."
+}
+
+function Deploy-SelectedComponents {
+    $safeSelection = @(Resolve-SelectedComponents -RequireSelection)
+    if (@($safeSelection | Where-Object { $_ -notin @('api-gateway', 'research-engine', 'portfolio-service', 'frontend') }).Count -eq 0) {
+        Deploy-VerifiedRadarComponents -Names $safeSelection
+        return
+    }
+    if (@($safeSelection | Where-Object { $_ -in @('api-gateway','research-engine','portfolio-service','frontend') }).Count) { throw 'Protected components cannot use the general deployment path' }
+    Assert-LocalPrerequisites
+    Assert-ExistingCluster
 
     $release = helm status $ReleaseName -n $Namespace -o json 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($release | Out-String).Trim())) {
@@ -1660,15 +2234,19 @@ function Deploy-SelectedComponents {
         throw "-SkipBuild is intentionally disabled for component deploys. Component deploys always build a fresh image from the current working tree."
     }
 
-    Initialize-ImageTag
     $selected = @(Resolve-SelectedComponents -RequireSelection)
+    if ($DryRun) {
+        Write-Host "Dry run: build/push selected components via localhost:5001, deploy via ai-investment-registry:5000: $($selected -join ', ')"
+        return
+    }
+    Initialize-ImageTag
 
     Write-Host "Selected components: $($selected -join ', ')" -ForegroundColor Cyan
 
     if (@($selected | Where-Object { $_ -in $JavaServices }).Count -gt 0) { Assert-BuildPrerequisites }
     Build-Images -Names $selected
 
-    Import-ImagesIntoK3d -Names $selected
+    Push-SelectedImages -Names $selected
     Set-ImmutableDeploymentImages -Names $selected
 
     # Only normalize selected DB-backed Java services. Avoid touching/restarting
@@ -1818,6 +2396,8 @@ function Clean-Platform {
     Write-Host "Fresh install command : .\platform.ps1 up -NoCache -NoBrowser" -ForegroundColor Cyan
     Write-Host ""
 }
+
+if ($DryRun -and $Command -ne "deploy") { throw "-DryRun is supported only for component deploy." }
 
 switch ($Command) {
     "up"            { Start-Platform }

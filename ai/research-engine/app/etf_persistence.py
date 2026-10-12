@@ -96,13 +96,25 @@ class EtfPersistenceMixin:
         with self._connection:
             return self._insert_etf_evidence(evidence)
 
-    def save_etf_acquisition(self, evidence, attempt: EtfAcquisitionAttempt):
+    def save_etf_acquisition(self, evidence, attempt: EtfAcquisitionAttempt, *, fence=None):
         """Evidence and the attempt outcome commit or roll back together."""
         if attempt.evidence_ids != [evidence_id(e) for e in evidence]:
             raise ValueError("Attempt must identify exactly the evidence being persisted")
         if any(e.instrument_id != attempt.instrument_id for e in evidence) and attempt.metric != "DISCOVERY":
             raise ValueError("Acquisition instrument mismatch")
+        def assert_owner():
+            if fence is None:
+                return
+            from app.cycle_checkpoint import CycleOwnershipLost
+            cursor = self._connection.execute(
+                "UPDATE global_opportunity_cycle_run SET updated_at=updated_at "
+                "WHERE cycle_id=? AND owner_id=? AND status='RUNNING' "
+                f"AND lease_expires_at > {self._lease_clock_sql()}", fence)
+            if self._cycle_rowcount(cursor) != 1:
+                raise CycleOwnershipLost(str(fence[0]))
+
         with self._connection:
+            assert_owner()
             for item in evidence:
                 self._insert_etf_evidence(item)
             self._connection.execute(
@@ -111,6 +123,7 @@ class EtfPersistenceMixin:
                 ON CONFLICT DO NOTHING""",
                 (str(attempt.attempt_id), str(attempt.instrument_id) if attempt.instrument_id else None,
                  attempt.metric, attempt.provider, attempt.attempted_at.isoformat(), attempt.outcome, attempt.model_dump_json()))
+            assert_owner()  # Expiry/cancellation during the transaction also rolls back evidence.
 
     def _etf_rows(self, table, model, instrument_id, *, source_mode="REAL", metric=None):
         query = f"SELECT payload FROM {table} WHERE instrument_id=? AND source_mode=?"
@@ -141,17 +154,21 @@ class EtfPersistenceMixin:
             selected.setdefault((listing.exchange, listing.isin), listing)
         return [selected[key] for key in sorted(selected)]
 
-    def save_etf_radar_cycle(self, cycle_id, radar_version, correlation_id, as_of, payload: dict) -> None:
+    def save_etf_radar_cycle(self, cycle_id, radar_version, correlation_id, as_of, payload: dict, *, fence=None) -> None:
         """`payload` is the already-JSON-safe dict from
         app.etf_opportunity_cycle.etf_cycle_result_to_dict -- this method
         performs no further serialization logic of its own."""
         from datetime import datetime, timezone
         with self._connection:
+            if fence is not None:
+                self._fence_cycle_publication(*fence)
             self._connection.execute(
                 """INSERT INTO etf_radar_cycles (cycle_id,radar_version,correlation_id,as_of,payload,created_at)
                 VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
                 (str(cycle_id), radar_version, correlation_id, as_of.isoformat() if hasattr(as_of, "isoformat") else as_of,
                  json.dumps(payload), datetime.now(timezone.utc).isoformat()))
+            if fence is not None:
+                self._fence_published_owner(*fence)
 
     def latest_etf_radar_cycle(self) -> dict | None:
         with self._connection:

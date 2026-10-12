@@ -35,7 +35,7 @@ def _bar(trading_date, close):
 
 
 def _flat_history(days=260, price=100):
-    return [_bar(date(2025, 1, 1) + timedelta(days=i), price) for i in range(days)]
+    return [_bar(NOW.date() - timedelta(days=days-1-i), price) for i in range(days)]
 
 
 def _ready_summary(*, mandatory_ready=3, missing=0, stale=0, technical=0) -> EtfReadinessSummary:
@@ -123,12 +123,12 @@ class TestScoreEtfFullEvidence:
         result = score_etf(self._full_input())
         assert result.overall_score > 60
 
-    def test_stale_optional_evidence_is_still_used_but_not_fabricated_fresh(self):
+    def test_stale_optional_evidence_is_not_scored(self):
         stale_nav = EtfNavObservation(instrument_id=ID, nav=Decimal("100"), currency="INR",
             nav_date=(NOW - timedelta(days=10)).date(), provenance=provenance(provider="AMC"))
         result = score_etf(self._full_input(nav=stale_nav))
         nav_factor = next(r for r in result.factor_results if r.factor == "NAV_PREMIUM_DISCOUNT")
-        assert nav_factor.status == EtfFactorStatus.SCORED  # STALE still usable, never silently dropped to zero
+        assert nav_factor.status == EtfFactorStatus.UNAVAILABLE
 
 
 class TestRiskGates:
@@ -169,7 +169,7 @@ class TestRiskGates:
         # The peak must fall inside the trailing 252-session drawdown window
         # for it to be captured; a peak far enough in the past rolls off.
         prices = [60] * 3 + [150] + [60] * 251
-        bars = [_bar(date(2025, 1, 1) + timedelta(days=i), p) for i, p in enumerate(prices)]
+        bars = [_bar(NOW.date() - timedelta(days=len(prices)-1-i), p) for i, p in enumerate(prices)]
         data = _base_input(bars=bars)
         gates = evaluate_etf_risk_gates(data, score_etf(data))
         gate = next(g for g in gates if g.gate_id == "EXCESSIVE_DRAWDOWN")
@@ -207,3 +207,25 @@ class TestRecommendationDerivation:
 
     def test_rule_engine_version_is_pinned(self):
         assert ETF_RULE_ENGINE_VERSION == "ETF_RULE_ENGINE_V1"
+
+@pytest.mark.parametrize('days',[1,10])
+def test_nav_price_different_valuation_dates_not_compared(days):
+    data=TestScoreEtfFullEvidence()._full_input()
+    from dataclasses import replace
+    nav=data.nav.model_copy(update={'nav_date':NOW.date()-timedelta(days=days)})
+    data=replace(data,nav=nav)
+    result=score_etf(data)
+    factor=next(f for f in result.factor_results if f.factor=='NAV_PREMIUM_DISCOUNT')
+    assert factor.status==EtfFactorStatus.UNAVAILABLE
+    assert not next(g for g in evaluate_etf_risk_gates(data,result) if g.gate_id=='ABNORMAL_NAV_PREMIUM_DISCOUNT').triggered
+
+
+@pytest.mark.parametrize('days',[6,-1])
+def test_stale_future_history_is_not_scored(days):
+    from dataclasses import replace
+    data=_base_input()
+    data=replace(data,metrics=replace(data.metrics,as_of_date=NOW.date()-timedelta(days=days)))
+    result=score_etf(data)
+    for factor in result.factor_results:
+        if factor.factor in ('PERFORMANCE_MOMENTUM','RISK_DRAWDOWN_VOLATILITY'):
+            assert factor.status==EtfFactorStatus.UNAVAILABLE

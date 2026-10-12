@@ -192,8 +192,8 @@ async def _complete_published_cycle(repository, checkpoint):
         raise RuntimeError('PUBLISHED_CYCLE_SELECTION_MISSING')
     scan = selection.get('suggestion_scan')
     if scan is not None:
-        with repository._persistence_worker_lock:
-            repository.persistence.persist_global_suggestion_lifecycle(scan, _suggestion_cards(selection))
+        await _blocking(repository, repository.persistence.persist_global_suggestion_lifecycle,
+                        scan, _suggestion_cards(selection), fence=(checkpoint.cycle_id, checkpoint.owner_id))
     return selection
 
 
@@ -383,6 +383,7 @@ async def run_global_opportunity_cycle(repository, canonical_source, *, top_n=4,
             selection = repository.persistence.publish_opportunity_cycle(
                 snapshots, [], [], {'cycle_id': cycle_id}, build=build,
                 **({'fence': fence} if fence is not None else {}))
-            repository.persistence.persist_global_suggestion_lifecycle(scan, _suggestion_cards(selection))
+            repository.persistence.persist_global_suggestion_lifecycle(
+                scan, _suggestion_cards(selection), **({'fence': fence} if fence is not None else {}))
             return selection
     return await _blocking(repository, _publish)

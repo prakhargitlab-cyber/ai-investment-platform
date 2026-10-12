@@ -149,7 +149,13 @@ def evaluate_admitted_etf(decision: EtfAdmissionDecision, store, *, now: datetim
     instrument_id = decision.global_instrument_id
     try:
         bars = _bars(store, instrument_id)
-        statuses, summary = evaluate_etf_readiness(store, instrument_id)
+        statuses, summary = evaluate_etf_readiness(store, instrument_id, now=now)
+        if not summary.ready_for_analysis:
+            reason = "MANDATORY_EVIDENCE_NOT_READY:" + ",".join(
+                f"{item.requirement}={item.status}" for item in statuses
+                if item.role == "MANDATORY" and item.status != "READY_FRESH")
+            return EtfCycleCandidateResult(instrument_id, decision.symbol,
+                EtfCycleDisposition.INSUFFICIENT_DATA, reason)
         metrics = compute_etf_deterministic_metrics(instrument_id, bars)
         rule_input = EtfRuleEngineInput(
             instrument_id=instrument_id, readiness_statuses=statuses, readiness_summary=summary, metrics=metrics,
@@ -224,7 +230,7 @@ def run_etf_radar_cycle(rows: list[dict], store, *, now: datetime | None = None,
 async def run_etf_radar_cycle_async(repository, portfolio_orchestrator, *, top_n: int | None = 10,
                                      candidate_ids: list | None = None, correlation_id: str | None = None,
                                      cycle_id: UUID | None = None, checkpoint=None,
-                                     identity_headers: dict | None = None, **_ignored_resumable_extras):
+                                     identity_headers: dict | None = None, verify_canonical_candidates: bool = False, full_universe_limits: dict | None = None, **_ignored_resumable_extras):
     """Async entry point for the generic OpportunityCycleWorker (market='ETF').
 
     Mirrors the exact body the synchronous API endpoint used to run inline:
@@ -233,18 +239,29 @@ async def run_etf_radar_cycle_async(repository, portfolio_orchestrator, *, top_n
     inside the HTTP request, so POST /api/v1/etf-radar/cycles returns as
     soon as the durable run row is created.
 
-    `checkpoint` (a per-instrument CycleCheckpoint, passed by the worker
-    whenever the persistence layer supports resumable runs) is deliberately
-    accepted and ignored: a full ETF Radar pass is a single bounded,
-    deterministic, DB-evidence-only computation with no per-candidate
-    acquisition phases (no BASELINE/DEEP split like Equity's Stage2), so
-    there is nothing in it that benefits from per-instrument resumability.
-    If the worker process restarts mid-run, the whole (still-bounded) cycle
-    simply re-executes under the same cycle_id, which is safe because this
-    function performs no provider acquisition and is idempotent over
-    already-persisted evidence.
+    The checkpoint fences publication and recovers an already published result.
+    Evaluation reads persisted evidence only; an interrupted, unpublished pass
+    can be repeated under its new lease without acquiring provider data.
     """
-    if candidate_ids is not None:
+    run_blocking = getattr(repository, '_run_blocking_persistence', None)
+    if checkpoint is not None:
+        run = await checkpoint.run()
+        if run and run.get('status') == 'PUBLISHED':
+            loader = repository.persistence.etf_radar_cycle
+            saved = await run_blocking(loader, cycle_id) if run_blocking else loader(cycle_id)
+            if saved is None:
+                raise RuntimeError('PUBLISHED_ETF_RESULT_MISSING')
+            return {'cycle_id': str(cycle_id), 'universe_count': saved.get('universe_count', len(saved.get('candidates', [])))}
+    if full_universe_limits is not None:
+        from app.etf_full_universe import run_full_etf_cycle
+        return await run_full_etf_cycle(repository, portfolio_orchestrator, checkpoint=checkpoint,
+            cycle_id=cycle_id, identity_headers=identity_headers, correlation_id=correlation_id,
+            limits=full_universe_limits)
+    if verify_canonical_candidates:
+        from app.etf_ingestion import canonical_etfs, etf_preflight
+        rows = await canonical_etfs(portfolio_orchestrator, [UUID(str(key)) for key in (candidate_ids or [])],
+            identity_headers=identity_headers, correlation_id=correlation_id)
+    elif candidate_ids is not None:
         # Bounded diagnostic path: rows are built from the given ids
         # directly, with no portfolio-service call at all -- there is
         # nothing here for identity_headers to apply to, and this path is
@@ -253,13 +270,19 @@ async def run_etf_radar_cycle_async(repository, portfolio_orchestrator, *, top_n
                 for instrument_id in candidate_ids]
     else:
         rows = await portfolio_orchestrator.active_global_etfs(correlation_id=correlation_id, identity_headers=identity_headers)
+    if not rows:
+        from app.global_opportunity_cycle import UniverseUnavailableError
+        raise UniverseUnavailableError('ETF_UNIVERSE_UNAVAILABLE')
+
     def evaluate_and_save():
         with repository._persistence_worker_lock:
+            if verify_canonical_candidates and etf_preflight(repository.persistence, rows)['status'] != 'READY':
+                raise ValueError('ETF_MANDATORY_EVIDENCE_NOT_READY')
             result = run_etf_radar_cycle(rows, repository.persistence, cycle_id=cycle_id,
                 correlation_id=correlation_id, top_n=top_n)
             payload = etf_cycle_result_to_dict(result)
             repository.persistence.save_etf_radar_cycle(result.cycle_id, result.radar_version, result.correlation_id,
-                result.as_of, payload)
+                result.as_of, payload, **({'fence': (checkpoint.cycle_id, checkpoint.owner_id)} if checkpoint else {}))
         return {'cycle_id': str(result.cycle_id), 'universe_count': len(rows)}
 
     run_blocking = getattr(repository, '_run_blocking_persistence', None)

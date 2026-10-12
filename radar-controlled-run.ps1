@@ -1,3 +1,11 @@
+[CmdletBinding()]
+param(
+    [switch]$LiveRun,
+    [ValidateRange(0.01, 168)][double]$MaxMonitorHours = $(if ($env:RADAR_MAX_MONITOR_HOURS) { [double]$env:RADAR_MAX_MONITOR_HOURS } else { 8 }),
+    [ValidateRange(1, 300)][int]$PollIntervalSeconds = 10,
+    [string]$KubeContext = "k3d-ai-investment-dev"
+)
+
 # Controlled Radar runtime validation runner. Exactly one mutating request is made.
 $ErrorActionPreference = "Continue"
 $Namespace = "ai-investment"
@@ -17,8 +25,6 @@ $cycleLogs = @()
 # admitted candidate pool can run for hours, so this defaults high; the
 # backend's own timeouts/retries/budgets are entirely unaffected by this
 # value. Override by setting $env:RADAR_MAX_MONITOR_HOURS before running.
-$MaxMonitorHours = if ($env:RADAR_MAX_MONITOR_HOURS) { [double]$env:RADAR_MAX_MONITOR_HOURS } else { 8.0 }
-$PollIntervalSeconds = 10
 $maxIterations = [int][Math]::Ceiling(([TimeSpan]::FromHours($MaxMonitorHours)).TotalSeconds / $PollIntervalSeconds)
 
 # ---------------------------------------------------------------------------
@@ -416,6 +422,24 @@ function Write-RadarProgress {
     }
 }
 
+function New-FullEquityRequest { return @{ analysis_scope = "FULL" } }
+
+function Assert-FullEquityResponse {
+    param($Response, $Created)
+    if ($Response.StatusCode -ne 202 -or $Created.parameters.analysis_scope -ne "FULL") {
+        throw "Cycle response did not confirm FULL. No retry or cancellation attempted. cycle_id=$($Created.cycle_id)"
+    }
+}
+
+$requestParameters = New-FullEquityRequest
+if (-not $LiveRun) {
+    Write-Host "DRY RUN: POST /api/v1/research/opportunities/cycles $($requestParameters | ConvertTo-Json -Compress)"
+    Write-Host "No requests made. -LiveRun explicitly approves one start; monitoring timeout never cancels or retries."
+    return
+}
+$currentContext = kubectl config current-context
+if ($LASTEXITCODE -ne 0 -or ($currentContext | Out-String).Trim() -ne $KubeContext) { throw "Select expected context $KubeContext before running." }
+
 try {
     Write-Host "Starting temporary port-forward $LocalPort -> svc/${Service}:80"
     $pf = Start-Process -FilePath "kubectl" -ArgumentList @("port-forward", "-n", $Namespace, "svc/$Service", "${LocalPort}:80") -PassThru -WindowStyle Hidden
@@ -427,25 +451,18 @@ try {
         Write-Host "Health OK (HTTP $($health.StatusCode))"
     } catch { Write-Host "FATAL: health check failed: $($_.Exception.Message)" -ForegroundColor Red; throw }
 
-    # The only authorized mutating operation in this script.
-    # analysis_scope=FULL is the explicit, backend-supported request for a
-    # genuine full-universe deep scan (see app/global_opportunity_cycle.py /
-    # app/main.py). shortlist_limit is retained as a valid API field but is
-    # ignored for deep admission once FULL mode is requested -- the backend
-    # bypasses the pre-deep shortlist cap entirely in that mode.
-    Write-Host "Creating exactly one Radar FULL analysis cycle"
-    Write-Host "analysis_scope: FULL"
-    Write-Host "top_n: 4"
-    Write-Host "shortlist_limit: 25 (ignored for deep admission in FULL mode)"
-    $requestParameters = @{ top_n = 4; shortlist_limit = 25; analysis_scope = "FULL" }
+    # Refuse a deployed backend that cannot explicitly accept FULL.
+    $schema = Invoke-RestMethod -Uri "$BaseUrl/openapi.json" -TimeoutSec 10
+    if (@($schema.components.schemas.OpportunityCycleRequest.properties.analysis_scope.enum) -notcontains "FULL") {
+        throw "Deployed backend does not advertise FULL; no cycle created."
+    }
+    Write-Host "Creating exactly one FULL cycle; backend concurrency, timeouts and eligibility gates remain in force."
     $body = $requestParameters | ConvertTo-Json -Compress
     try { $createResponse = Invoke-WebRequest -Uri "$BaseUrl/api/v1/research/opportunities/cycles" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing -TimeoutSec 15 }
     catch { Write-Host "Cycle creation failed; no retry will be attempted: $($_.Exception.Message)" -ForegroundColor Red; throw }
     $created = $createResponse.Content | ConvertFrom-Json
-    # Prefer what the backend actually persisted (created.parameters), fall
-    # back to the value this script requested -- display-only, BOUNDED-mode
-    # compatible (if this literal is ever BOUNDED, the display follows it).
-    $AnalysisScope = if ($created.parameters -and $created.parameters.analysis_scope) { $created.parameters.analysis_scope } else { $requestParameters.analysis_scope }
+    Assert-FullEquityResponse $createResponse $created
+    $AnalysisScope = $created.parameters.analysis_scope
     $cycleId = $created.cycle_id
     $correlationId = if ($created.correlation_id) { $created.correlation_id } elseif ($created.parameters) { $created.parameters.correlation_id } else { $null }
     $initialStatus = $created.status
@@ -577,6 +594,7 @@ try {
     Write-Host "restart_count: $($container.restartCount)"
     Write-Host "last_termination_reason: $($termination.reason)"
     Write-Host "last_termination_exit_code: $($termination.exitCode)"
+    if ($finalStatusObject.status -ne "COMPLETED") { throw "Cycle not confirmed COMPLETED; cycle_id=$cycleId. No retry or cancellation attempted." }
 } finally {
     Write-Progress -Activity "Radar Full Deep Scan" -Completed
     if ($pf -and -not $pf.HasExited) { Stop-Process -Id $pf.Id -Force -ErrorAction SilentlyContinue; Write-Host "Temporary port-forward terminated." }

@@ -30,6 +30,9 @@ class PostgresResearchPersistence(SqliteResearchPersistence):
         self._connection.commit()
         self._assert_schema_available()
 
+    def _lease_clock_sql(self) -> str:
+        return "to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00'"
+
     def migrate(self) -> None:
         raise RuntimeError("PostgreSQL research schema is owned by research-service Flyway migrations")
 
@@ -78,26 +81,23 @@ class PostgresResearchPersistence(SqliteResearchPersistence):
 class _PostgresConnectionAdapter:
     def __init__(self, connection) -> None:
         self.connection = connection
+        self._depth = 0
+        self._rollback_only = False
 
     def execute(self, sql: str, params=None):
         statement = sql.replace("?", "%s")
         if "INSERT OR IGNORE INTO" in statement:
             statement = statement.replace("INSERT OR IGNORE INTO", "INSERT INTO") + " ON CONFLICT DO NOTHING"
-        # A failed statement must never leave this shared connection sitting in
-        # PostgreSQL's aborted-transaction state ("current transaction is
-        # aborted, commands ignored until end of transaction block"). Plenty of
-        # call sites issue a single read (e.g. load_manual_evidence_drafts)
-        # without wrapping the call in `with self._connection:`, so there is no
-        # other __exit__ to perform that rollback for them. Roll back here on
-        # any failure and re-raise the original exception unchanged: the error
-        # is never hidden, nothing is reconnected, and a multi-statement
-        # `with self._connection:` block that later also rolls back in its own
-        # __exit__ is unaffected (rollback on an already-aborted transaction is
-        # a harmless no-op).
+        # Standalone failures must clear the shared connection's aborted state.
+        # Within nested contexts, retain rollback-only state until the outer
+        # transaction exits; an inner context must never commit partial work.
         try:
             return self.connection.execute(statement, params)
         except Exception:
-            self.connection.rollback()
+            if self._depth:
+                self._rollback_only = True
+            else:
+                self.connection.rollback()
             raise
 
     def executescript(self, sql: str) -> None:
@@ -107,13 +107,21 @@ class _PostgresConnectionAdapter:
         self.connection.commit()
 
     def __enter__(self):
+        self._depth += 1
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self.connection.commit()
-        else:
-            self.connection.rollback()
+        self._rollback_only |= exc_type is not None
+        self._depth -= 1
+        if self._depth == 0:
+            rollback = self._rollback_only
+            self._rollback_only = False
+            if rollback:
+                self.connection.rollback()
+                if exc_type is None:
+                    raise RuntimeError('PERSISTENCE_TRANSACTION_ABORTED')
+            else:
+                self.connection.commit()
         return False
 
 

@@ -66,15 +66,17 @@ async def test_run_etf_radar_cycle_async_forwards_identity_headers_to_universe_e
 
     server_identity = _internal_service_identity(main_settings())
 
-    result = await cycle.run_etf_radar_cycle_async(
-        repository, orchestrator, top_n=10, correlation_id="corr-1", identity_headers=server_identity,
-    )
+    from app.global_opportunity_cycle import UniverseUnavailableError
+    with pytest.raises(UniverseUnavailableError, match="ETF_UNIVERSE_UNAVAILABLE"):
+        await cycle.run_etf_radar_cycle_async(
+            repository, orchestrator, top_n=10, correlation_id="corr-1", identity_headers=server_identity,
+        )
 
     assert orchestrator.active_global_etfs.await_count == 1
     forwarded = orchestrator.active_global_etfs.call_args.kwargs
     assert forwarded["identity_headers"] == server_identity
     assert forwarded["correlation_id"] == "corr-1"
-    assert result["universe_count"] == 0
+    assert repository.persistence.latest_etf_radar_cycle() is None
 
 
 def main_settings():

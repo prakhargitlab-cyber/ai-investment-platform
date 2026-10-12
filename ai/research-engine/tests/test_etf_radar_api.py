@@ -174,3 +174,13 @@ def test_etf_portfolio_recommendations_endpoint_is_db_only_and_global_only(monke
     assert "/api/v1/research/etf-recommendations/current" in paths
     assert "/api/v1/research/recommendations/current" in paths
     assert "/api/v1/research/etf-recommendations/current" != "/api/v1/research/recommendations/current"
+
+
+def test_empty_explicit_candidates_rejected_without_replacing_history(monkeypatch, repo):
+    store = repo.persistence
+    previous = {"cycle_id": "previous", "candidates": [], "ranked": []}
+    store.save_etf_radar_cycle("previous", "ETF_RADAR_V1", None, NOW, previous)
+    monkeypatch.setattr(main, "repository", repo)
+    response = TestClient(fastapi_app).post("/api/v1/etf-radar/cycles", json={"candidate_ids": []})
+    assert response.status_code == 422
+    assert store.latest_etf_radar_cycle() == previous

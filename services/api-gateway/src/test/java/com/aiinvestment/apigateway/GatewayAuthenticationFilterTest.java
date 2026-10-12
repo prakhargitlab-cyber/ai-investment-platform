@@ -24,15 +24,16 @@ class GatewayAuthenticationFilterTest {
     @Test
     void radarCancellationRequiresBearerAdminAndIgnoresSpoofedRoles() throws Exception {
         for (String prefix : List.of("research/opportunities", "etf-radar")) {
-            for (String role : List.of("NONE", "USER", "ADMIN")) {
+            for (String role : List.of("NONE", "MALFORMED", "USER", "ADMIN")) {
                 var request = new MockHttpServletRequest("DELETE", "/api/v1/" + prefix + "/cycles/" + UUID.randomUUID() + "/cancel");
                 request.addHeader("X-AIP-User-Roles", "ADMIN");
                 request.addHeader("X-AIP-User-Id", UUID.randomUUID().toString());
-                if (!role.equals("NONE")) request.addHeader("Authorization", "Bearer " + new HmacJwtService(SECRET).issue(
+                if (role.equals("MALFORMED")) request.addHeader("Authorization", "Bearer malformed.token");
+                else if (!role.equals("NONE")) request.addHeader("Authorization", "Bearer " + new HmacJwtService(SECRET).issue(
                     new JwtClaims(ISSUER, "user-a", "a@example.test", "A", List.of(role), Instant.now().plusSeconds(300))));
                 var response = new MockHttpServletResponse();
                 filter.doFilter(request, response, new MockFilterChain());
-                assertThat(response.getStatus()).isEqualTo(role.equals("NONE") ? 401 : role.equals("ADMIN") ? 200 : 403);
+                assertThat(response.getStatus()).isEqualTo((role.equals("NONE") || role.equals("MALFORMED")) ? 401 : role.equals("ADMIN") ? 200 : 403);
                 if (role.equals("ADMIN")) assertThat(request.getAttribute(GatewayAuthenticationFilter.ATTR_ROLES)).isEqualTo("ADMIN");
             }
         }

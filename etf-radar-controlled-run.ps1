@@ -1,282 +1,95 @@
-# ETF Radar controlled runtime runner. Modeled on radar-controlled-run.ps1
-# (Equity Radar), but ETF Radar's HTTP surface and lifecycle are simpler:
-# no Write-Progress log-scraping state machine exists for it because the
-# backend (app/etf_opportunity_cycle.py) does not emit the rich
-# stage2_*/baseline_acquisition_* log lines the Equity script parses --
-# progress here is read entirely from the durable job-status endpoint
-# (GET /api/v1/etf-radar/cycles/{id}/status), which is both simpler and
-# more authoritative than scraping logs.
-#
-# PowerShell 5.1 compatible: no classes, no ??/?.  operators, no ternary,
-# no short-circuit assumptions on -and/-or. All control flow uses plain
-# if/else. Requires only cmdlets/types available since PowerShell 3.0
-# (splatting, ConvertTo-Json/ConvertFrom-Json, [System.Management.Automation.Language.Parser]).
-#
-# SAFETY (non-negotiable, enforced in code, not just by convention):
-#   - Defaults to -DryRun semantics: a mutating cycle is created ONLY when
-#     -LiveRun is passed explicitly. There is no parameter combination that
-#     creates a cycle without -LiveRun.
-#   - Never calls the NSE ETF Preview or Apply endpoints, and never issues
-#     any request that could write to instrument_master, provider mappings,
-#     or portfolio_positions. This script is scoped to Radar execution only.
-#   - Never fabricates or forges authentication headers. The optional
-#     eligibility pre-check against portfolio-service's authenticated
-#     instrument API (GET /api/v1/instruments) is attempted ONLY when the
-#     caller supplies real credentials via -PortfolioAuthHeaders; if absent,
-#     the check is skipped with an explicit warning rather than bypassed.
-#   - Exactly one mutating request is made per -LiveRun invocation (the
-#     single POST to create the cycle) -- there is exactly one call site
-#     for that POST in this entire file, and it is never retried.
-#   - All cleanup (stopping the port-forward process) happens in a
-#     function-local try/finally using `return`, never `exit`, inside the
-#     try block. `return` inside a try ALWAYS runs its finally in every
-#     PowerShell version; relying on `exit`-inside-try-runs-finally would
-#     not be as certain, so this script never does that. The outer, true
-#     process exit happens exactly once, after the function has already
-#     returned and its finally has already run.
-#   - Exits non-zero on any technical failure, analytical failure the
-#     caller should know about, or monitoring-budget exhaustion.
-
-[CmdletBinding()]
+# Bounded, explicitly approved ETF verification. Defaults to a no-request dry run.
+# Uses authenticated Gateway routes; never direct research identity headers.
 param(
-    [switch]$LiveRun,                      # Must be passed explicitly to create a cycle. Default = dry run.
-    [int]$TopN = 10,                       # Validated against the API's own bounds (1-100) before any call.
-    [guid[]]$CandidateIds = $null,         # Optional bounded diagnostic override (API max 200). Dry-run still validates this.
-    [string]$KubeContext = "k3d-ai-investment-dev",
-    [string]$Namespace = "ai-investment",
-    [string]$Deployment = "research-engine",
-    [string]$Service = "research-engine",
-    [int]$LocalPort = 18082,               # Distinct from radar-controlled-run.ps1's 18081 so both can run concurrently.
-    [double]$MaxMonitorHours = 2.0,        # ETF Radar cycles are bounded/DB-evidence-only, not a full-universe deep
-                                            # scan, so the default monitoring budget is far smaller than Equity's 8h.
-    [int]$PollIntervalSeconds = 5,
-    [hashtable]$PortfolioAuthHeaders = $null  # Optional real credentials for the read-only eligibility pre-check.
+    [switch]$LiveRun,
+    [switch]$PreflightOnly,
+    [guid[]]$CandidateIds,
+    [Nullable[int]]$TopN = $null,
+    [string]$BaseUrl = 'http://localhost:18080',
+    [Alias('AuthHeaders')][hashtable]$PortfolioAuthHeaders = $null,
+    [double]$MaxMonitorHours = 2.0,
+    [int]$PollIntervalSeconds = 5
 )
 
 function Invoke-EtfRadarRun {
-    [CmdletBinding()]
-    param()
-
-    $BaseUrl = "http://127.0.0.1:$LocalPort"
-    $pf = $null
-    $exitCode = 0
-
-    function Invoke-Kubectl {
-        param([string[]]$KubectlArgs)
-        & kubectl --context $KubeContext @KubectlArgs
+    if ($LiveRun -and $PreflightOnly) { Write-Host 'Choose preflight-only or approved live execution.'; return 1 }
+    if ($null -ne $TopN -or -not $CandidateIds -or $CandidateIds.Count -gt 5 -or
+        @($CandidateIds | Select-Object -Unique).Count -ne $CandidateIds.Count -or
+        $CandidateIds -contains [guid]::Empty) {
+        Write-Host 'Supply 1-5 distinct canonical ETF CandidateIds; TopN must remain unset.'; return 1
     }
-
-    # -----------------------------------------------------------------
-    # Parameter validation -- enforced here, not left to the API, so a
-    # bad invocation fails fast and visibly, in both dry-run and live mode.
-    # -----------------------------------------------------------------
-    if ($TopN -lt 1 -or $TopN -gt 100) {
-        Write-Host "FATAL: -TopN must be between 1 and 100 (EtfRadarCycleRequest.top_n bounds). Got: $TopN" -ForegroundColor Red
-        return 1
+    if ($MaxMonitorHours -le 0 -or $MaxMonitorHours -gt 168 -or $PollIntervalSeconds -lt 1) {
+        Write-Host 'Invalid monitoring bounds.'; return 1
     }
-    if ($CandidateIds -and $CandidateIds.Count -gt 200) {
-        Write-Host "FATAL: -CandidateIds supports at most 200 entries (EtfRadarCycleRequest.candidate_ids max_length). Got: $($CandidateIds.Count)" -ForegroundColor Red
-        return 1
+    $body = @{ instrument_ids=@($CandidateIds | ForEach-Object { $_.ToString() }) }
+    if (-not $LiveRun -and -not $PreflightOnly) {
+        Write-Host ('DRY RUN: bounded canonical ETF preflight, then one approved controlled cycle: ' + ($body | ConvertTo-Json -Compress))
+        return 0
     }
-
-    Write-Host "Mode        : $(if ($LiveRun) { 'LIVE -- will create exactly one ETF Radar cycle' } else { 'DRY RUN -- no cycle will be created' })"
-    Write-Host "KubeContext : $KubeContext"
-    Write-Host "Namespace   : $Namespace"
-    Write-Host "top_n       : $TopN"
-    Write-Host "candidate_ids: $(if ($CandidateIds) { $CandidateIds -join ',' } else { '(none -- full canonical ETF universe)' })"
-
+    $uri = $null
+    if (-not [uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
+        ($uri.Scheme -ne 'https' -and -not ($uri.Scheme -eq 'http' -and $uri.IsLoopback))) {
+        Write-Host 'Use a trusted HTTPS Gateway or loopback HTTP URL.'; return 1
+    }
+    if (-not $PortfolioAuthHeaders -or $PortfolioAuthHeaders.Count -ne 1 -or
+        [string]$PortfolioAuthHeaders['Authorization'] -notmatch '^Bearer \S+$') {
+        Write-Host 'Supply only the authenticated ADMIN Authorization bearer header; never identity headers.'; return 1
+    }
+    $headers = @{ Authorization=$PortfolioAuthHeaders['Authorization'] }
+    $base = $BaseUrl.TrimEnd('/')
+    $query = (@($CandidateIds | ForEach-Object { 'instrument_ids=' + $_.ToString() }) -join '&')
     try {
-        Write-Host "`nStarting temporary port-forward $LocalPort -> svc/${Service}:80"
-        $pf = Start-Process -FilePath "kubectl" -ArgumentList @("--context", $KubeContext, "port-forward", "-n", $Namespace, "svc/$Service", "${LocalPort}:80") -PassThru -WindowStyle Hidden
-        Start-Sleep -Seconds 3
-
-        Write-Host "Checking research-engine /health"
-        try {
-            $health = Invoke-WebRequest -Uri "$BaseUrl/health" -UseBasicParsing -TimeoutSec 5
-            if ($health.StatusCode -ne 200) { throw "Health returned HTTP $($health.StatusCode)" }
-            Write-Host "Health OK (HTTP $($health.StatusCode))"
-        } catch {
-            Write-Host "FATAL: research-engine health check failed: $($_.Exception.Message)" -ForegroundColor Red
-            return 1
+        $response = Invoke-WebRequest -Uri "$base/api/v1/etf-radar/preflight?$query" -Headers $headers -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
+        if ($response.StatusCode -ne 200) { throw 'Unexpected preflight status' }
+        $preflight = $response.Content | ConvertFrom-Json
+        $actual = @($preflight.instruments | ForEach-Object { [string]$_.instrument_id } | Sort-Object)
+        $expected = @($body.instrument_ids | Sort-Object)
+        if ($preflight.scope -ne 'BOUNDED_CANONICAL_ETF' -or $preflight.candidate_count -ne $CandidateIds.Count -or
+            ($actual -join ',') -ne ($expected -join ',')) { throw 'Preflight scope mismatch' }
+        Write-Host "Preflight: status=$($preflight.status), ready=$($preflight.ready_count)/$($preflight.candidate_count), recovery_paused=$($preflight.recovery_paused)"
+        foreach ($item in $preflight.instruments) {
+            Write-Host "ETF $($item.instrument_id): mandatory_ready=$($item.mandatory_evidence_ready), reasons=$($item.blocking_reasons -join ',')"
         }
-
-        # -----------------------------------------------------------------
-        # Read-only ETF universe eligibility pre-check. Uses the AUTHENTICATED
-        # portfolio-service instrument API exactly as production does -- never
-        # an unauthenticated or internal-service-identity shortcut, because
-        # this script runs as an external operator, not as research-engine's
-        # own internal worker. If the caller did not supply real credentials,
-        # the check is skipped (not bypassed) with an explicit warning; the
-        # rest of this script still has value (it can still create/poll a
-        # cycle with an explicit -CandidateIds override, which never queries
-        # portfolio-service).
-        # -----------------------------------------------------------------
-        Write-Host "`nETF universe eligibility pre-check (read-only, authenticated)"
-        if ($PortfolioAuthHeaders) {
-            $pfPortfolio = $null
-            try {
-                $pfPortfolio = Start-Process -FilePath "kubectl" -ArgumentList @("--context", $KubeContext, "port-forward", "-n", $Namespace, "svc/portfolio-service", "18090:80") -PassThru -WindowStyle Hidden
-                Start-Sleep -Seconds 3
-                $uri = "http://127.0.0.1:18090/api/v1/instruments?status=ACTIVE&assetType=ETF&size=1"
-                $resp = Invoke-WebRequest -Uri $uri -Headers $PortfolioAuthHeaders -UseBasicParsing -TimeoutSec 10
-                $parsed = $resp.Content | ConvertFrom-Json
-                $activeEtfCount = $parsed.totalElements
-                Write-Host "ACTIVE ETF instruments currently in instrument_master: $activeEtfCount"
-                if ($activeEtfCount -eq 0) {
-                    Write-Host "WARNING: zero ACTIVE ETF instruments. Without an explicit -CandidateIds override, a live cycle will complete with an empty candidate set (not an error, but not useful). The NSE ETF universe must be populated via the ADMIN-gated Preview/Apply flow first -- this script never calls that flow." -ForegroundColor Yellow
-                }
-            } catch {
-                Write-Host "Eligibility pre-check failed (non-fatal, continuing): $($_.Exception.Message)" -ForegroundColor Yellow
-            } finally {
-                if ($pfPortfolio -and -not $pfPortfolio.HasExited) { Stop-Process -Id $pfPortfolio.Id -Force -ErrorAction SilentlyContinue }
+        if ($PreflightOnly) { if ($preflight.status -eq 'READY') { return 0 }; return 6 }
+        if ($preflight.status -ne 'READY' -or $preflight.can_submit -isnot [bool] -or -not $preflight.can_submit) {
+            Write-Host 'BLOCKED: missing prerequisites, recovery pause or an active ETF cycle. No cycle submitted.'; return 6
+        }
+        # Exactly one mutating request; never retry a timeout or ambiguous response.
+        $response = Invoke-WebRequest -Uri "$base/api/v1/etf-radar/controlled-cycles" -Method Post -Headers $headers `
+            -ContentType 'application/json' -Body ($body | ConvertTo-Json -Compress) -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
+        if ($response.StatusCode -ne 202) { throw 'Unexpected admission response' }
+        $created = $response.Content | ConvertFrom-Json
+        $cycleId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$created.cycle_id, [ref]$cycleId) -or $cycleId -eq [guid]::Empty) { throw 'Missing cycle identity' }
+        Write-Host "cycle_id=$cycleId"
+        if ($created.coalesced -or $created.paused) { Write-Host 'Another cycle won admission; no retry or cancellation.'; return 6 }
+        $deadline = (Get-Date).AddHours($MaxMonitorHours)
+        do {
+            $response = Invoke-WebRequest -Uri "$base/api/v1/etf-radar/cycles/$cycleId/status" -Headers $headers -UseBasicParsing -TimeoutSec 10 -MaximumRedirection 0
+            if ($response.StatusCode -ne 200) { throw 'Status unavailable' }
+            $status = $response.Content | ConvertFrom-Json
+            if ([string]$status.cycle_id -ne $cycleId.ToString()) { throw 'Status identity mismatch' }
+            Write-Host "status=$($status.status)"
+            if ($status.status -eq 'FAILED') { return 3 }
+            if ($status.status -eq 'CANCELLED') { return 4 }
+            if ($status.status -eq 'COMPLETED') {
+                $response = Invoke-WebRequest -Uri "$base/api/v1/etf-radar/cycles/$cycleId" -Headers $headers -UseBasicParsing -TimeoutSec 10 -MaximumRedirection 0
+                if ($response.StatusCode -ne 200) { throw 'Result unavailable' }
+                $result = $response.Content | ConvertFrom-Json
+                if ([string]$result.cycle_id -ne $cycleId.ToString()) { throw 'Result identity mismatch' }
+                Write-Host "Persisted terminal result: candidates=$(@($result.candidates).Count), ranked=$(@($result.ranked).Count)"
+                Write-Host ($result.excluded_by_reason | ConvertTo-Json -Compress)
+                return 0
             }
-        } else {
-            Write-Host "SKIPPED -- no -PortfolioAuthHeaders supplied. This script will not fabricate authentication to perform this check. Pass a real, already-authenticated header set (e.g. captured from your own session) if you want it verified before running live." -ForegroundColor Yellow
-        }
-
-        if (-not $LiveRun) {
-            Write-Host "`nDry run complete. No cycle was created. Re-run with -LiveRun to create one (requires separate authorization)."
-            return 0
-        }
-
-        # -----------------------------------------------------------------
-        # The ONE authorized mutating operation in this script.
-        # -----------------------------------------------------------------
-        Write-Host "`nCreating exactly one ETF Radar cycle (POST /api/v1/etf-radar/cycles)"
-        $requestBody = @{ top_n = $TopN }
-        if ($CandidateIds) { $requestBody.candidate_ids = @($CandidateIds | ForEach-Object { $_.ToString() }) }
-        $bodyJson = $requestBody | ConvertTo-Json -Compress
-        $correlationId = [guid]::NewGuid().ToString()
-
-        try {
-            $createResponse = Invoke-WebRequest -Uri "$BaseUrl/api/v1/etf-radar/cycles" -Method POST -ContentType "application/json" `
-                -Headers @{ "x-correlation-id" = $correlationId } -Body $bodyJson -UseBasicParsing -TimeoutSec 30
-        } catch {
-            Write-Host "FATAL: cycle creation failed; no retry will be attempted: $($_.Exception.Message)" -ForegroundColor Red
-            return 1
-        }
-
-        $created = $createResponse.Content | ConvertFrom-Json
-
-        if ($CandidateIds) {
-            # The candidate_ids path (EtfRadarCycleRequest.candidate_ids is set)
-            # runs synchronously and returns the final persisted payload
-            # directly -- there is no separate job to poll. See
-            # app/main.py:etf_radar_cycle: when body.candidate_ids is not
-            # None, run_etf_radar_cycle executes inline and the response IS
-            # the result, not a 202-style "accepted" envelope.
-            Write-Host "cycle_id        : $($created.cycle_id)"
-            Write-Host "correlation_id  : $($created.correlation_id)"
-            Write-Host "radar_version   : $($created.radar_version)"
-            Write-Host "as_of           : $($created.as_of)"
-            Write-Host "`nRanked results:"
-            $created.ranked | ForEach-Object {
-                Write-Host ("  rank={0} symbol={1} disposition={2} recommendation={3} reason={4}" -f $_.rank, $_.symbol, $_.disposition, $_.recommendation, $_.reason)
-            }
-            Write-Host "`nExcluded by reason:"
-            $created.excluded_by_reason.PSObject.Properties | ForEach-Object { Write-Host ("  {0} : {1}" -f $_.Name, $_.Value) }
-            return 0
-        }
-
-        # No candidate_ids override: this went through the durable
-        # OpportunityCycleWorker (market='ETF') and returns a 202-style
-        # envelope (HTTP 202 is not separately checked here because
-        # Invoke-WebRequest only returns on 2xx/catchable-throw on non-2xx;
-        # the response body is what carries the cycle_id we need next).
-        $cycleId = $created.cycle_id
-        if ([string]::IsNullOrWhiteSpace([string]$cycleId)) {
-            Write-Host "FATAL: cycle response did not contain cycle_id: $($createResponse.Content)" -ForegroundColor Red
-            return 1
-        }
-        Write-Host "cycle_id       : $cycleId"
-        Write-Host "correlation_id : $correlationId"
-
-        $terminalStatuses = @("COMPLETED", "FAILED", "CANCELLED")
-        $technicalFailureNote = $null
-        $maxIterations = [int][Math]::Ceiling(([TimeSpan]::FromHours($MaxMonitorHours)).TotalSeconds / $PollIntervalSeconds)
-        $iteration = 0
-        $status = $null
-        $startTime = Get-Date
-
-        Write-Host "`nPolling GET /api/v1/etf-radar/cycles/$cycleId/status every ${PollIntervalSeconds}s (budget: $maxIterations iterations / ~$MaxMonitorHours h, client-side only)"
-        while (($iteration -lt $maxIterations) -and ($terminalStatuses -notcontains $status)) {
+            if ($status.status -notin @('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED')) { throw 'Unknown lifecycle status' }
             Start-Sleep -Seconds $PollIntervalSeconds
-            $iteration++
-            try {
-                $statusResponse = Invoke-WebRequest -Uri "$BaseUrl/api/v1/etf-radar/cycles/$cycleId/status" -UseBasicParsing -TimeoutSec 10
-                $statusObject = $statusResponse.Content | ConvertFrom-Json
-                $status = $statusObject.status
-                $elapsed = (Get-Date) - $startTime
-                Write-Host ("[{0}s] status={1}" -f [int]$elapsed.TotalSeconds, $status)
-                if ($statusObject.error_code) { $technicalFailureNote = $statusObject.error_code }
-            } catch {
-                Write-Host "Status poll failed (continuing): $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
-
-        if ($terminalStatuses -notcontains $status) {
-            Write-Host "TIMEOUT: monitoring budget ($maxIterations iterations / ~$MaxMonitorHours h) exhausted before a terminal status was reached. The backend cycle is unaffected by this client-side give-up; check status later with cycle_id=$cycleId." -ForegroundColor Red
-            $exitCode = 2
-        } elseif ($status -eq "FAILED") {
-            Write-Host "TECHNICAL FAILURE: cycle reported status=FAILED. error_code=$technicalFailureNote" -ForegroundColor Red
-            $exitCode = 3
-        } elseif ($status -eq "CANCELLED") {
-            Write-Host "CANCELLED: cycle reported status=CANCELLED." -ForegroundColor Yellow
-            $exitCode = 4
-        } else {
-            Write-Host "COMPLETED. Fetching persisted result (GET /api/v1/etf-radar/cycles/$cycleId)"
-            try {
-                $resultResponse = Invoke-WebRequest -Uri "$BaseUrl/api/v1/etf-radar/cycles/$cycleId" -UseBasicParsing -TimeoutSec 10
-                $result = $resultResponse.Content | ConvertFrom-Json
-                Write-Host "radar_version : $($result.radar_version)"
-                Write-Host "as_of         : $($result.as_of)"
-                Write-Host "`nRanked results:"
-                if ($result.ranked -and $result.ranked.Count -gt 0) {
-                    $result.ranked | ForEach-Object {
-                        Write-Host ("  rank={0} symbol={1} disposition={2} recommendation={3} reason={4}" -f $_.rank, $_.symbol, $_.disposition, $_.recommendation, $_.reason)
-                    }
-                } else {
-                    Write-Host "  (empty -- likely zero eligible ACTIVE ETF instruments; see the eligibility pre-check above)"
-                }
-                Write-Host "`nExcluded by reason:"
-                if ($result.excluded_by_reason) { $result.excluded_by_reason.PSObject.Properties | ForEach-Object { Write-Host ("  {0} : {1}" -f $_.Name, $_.Value) } }
-            } catch {
-                Write-Host "Failed to fetch persisted result: $($_.Exception.Message)" -ForegroundColor Yellow
-                $exitCode = 5
-            }
-        }
-
-        # Bounded diagnostic log tail -- never the full cycle history, just
-        # enough to see an Exception/ERROR/Traceback if one occurred. ETF
-        # Radar does not emit the structured stage2_*/baseline_* progress
-        # lines Equity does, so no analogous progress log-scrape is attempted.
-        try {
-            $podList = Invoke-Kubectl @("get", "pods", "-n", $Namespace, "-l", "app.kubernetes.io/component=$Deployment", "-o", "json") | ConvertFrom-Json
-            if (-not $podList.items) { $podList = Invoke-Kubectl @("get", "pods", "-n", $Namespace, "-l", "app=$Deployment", "-o", "json") | ConvertFrom-Json }
-            $podName = ($podList.items | Select-Object -First 1).metadata.name
-            if ($podName) {
-                Write-Host "`nDiagnostic log tail (pod=$podName, filtered for errors / etf_radar)"
-                $logs = Invoke-Kubectl @("logs", $podName, "-n", $Namespace, "-c", $Deployment, "--tail=500")
-                $relevant = $logs | Select-String -Pattern "etf_radar|etf-radar|Exception|Traceback|ERROR|CRITICAL|$cycleId"
-                if ($relevant) { $relevant | ForEach-Object { Write-Host $_.Line } } else { Write-Host "(no matching lines in last 500)" }
-            }
-        } catch { Write-Host "Log collection skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
-
-        return $exitCode
-
+        } while ((Get-Date) -lt $deadline)
+        Write-Host "Monitor timeout; cycle $cycleId may still be running. No retry or cancellation."; return 2
     } catch {
-        Write-Host "UNHANDLED ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        # Do not print exceptions that may include bearer headers or response bodies.
+        Write-Host 'Request or validation failed. No start request will be retried; inspect the returned cycle ID if available.'
         return 1
-    } finally {
-        # This finally is inside the function, and every path above uses
-        # `return`, never `exit` -- so this cleanup is GUARANTEED to run
-        # before the function hands control back, on every code path,
-        # including the unhandled-error catch above. No reliance on
-        # exit-inside-try-runs-finally semantics anywhere in this script.
-        if ($pf -and -not $pf.HasExited) {
-            Stop-Process -Id $pf.Id -Force -ErrorAction SilentlyContinue
-            Write-Host "`nTemporary port-forward terminated."
-        }
     }
 }
 

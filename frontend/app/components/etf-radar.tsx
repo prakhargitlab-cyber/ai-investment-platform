@@ -59,10 +59,16 @@ export type EtfCandidate = {
   risk_gates: EtfRiskGate[];
   recommendation: string | null;
   rank: number | null;
+  peer_group?: string;
+  missing_data?: string[];
+  limitations?: string[];
+  source_references?: { metric: string; value: string; as_of: string; provider: string; url: string }[];
 };
 
 export type EtfCycleResult = {
   universe_count?: number;
+  scope?: string;
+  coverage?: Record<string, number>;
   radar_version: string;
   cycle_id: string;
   correlation_id: string | null;
@@ -107,7 +113,7 @@ export function EtfRadarCard({ item }: { item: EtfCandidate }) {
           <h4>{item.symbol ?? "Unknown ETF"}</h4>
           <small>{item.subtype ?? "Unclassified"}</small>
         </div>
-        {item.rank != null ? <div className="opportunity-card-flags"><span>Rank {item.rank}</span></div> : null}
+        {item.rank != null ? <div className="opportunity-card-flags"><span>{item.peer_group ? `${item.peer_group}: peer rank ` : "Rank "}{item.rank}</span></div> : null}
       </header>
       <p className="opportunity-action">{item.recommendation ?? item.disposition}</p>
       <dl className="opportunity-primary-metrics">
@@ -120,6 +126,11 @@ export function EtfRadarCard({ item }: { item: EtfCandidate }) {
           <div key={factorName}><dt>{label}</dt><dd>{factorDisplay(result, factorName)}</dd></div>
         ))}
       </dl>
+      {item.missing_data?.length ? <p>Missing data: {item.missing_data.join(", ")}</p> : null}
+      {item.limitations?.length ? <ul>{item.limitations.map(text => <li key={text}>{text}</li>)}</ul> : null}
+      {item.source_references?.length ? <details><summary>Evidence dates and sources</summary><ul>
+        {item.source_references.map(source => <li key={source.metric}>{source.metric}: {source.value}; as of {source.as_of}; {source.provider}; {source.url}</li>)}
+      </ul></details> : null}
       {triggeredGates.length ? (
         <details>
           <summary>Risk flags · {triggeredGates.length}</summary>
@@ -131,16 +142,43 @@ export function EtfRadarCard({ item }: { item: EtfCandidate }) {
 }
 
 export function EtfRadarContent({ data }: { data: EtfCycleResult }) {
+  const evaluated = data.candidates.filter(c => c.disposition === "EVALUATED").length;
+  const eligible = data.candidates.filter(c => c.recommendation === "OPPORTUNITY" || c.recommendation === "STRONG_OPPORTUNITY").length;
+  const dataGaps = data.candidates.filter(c => c.disposition === "INSUFFICIENT_DATA" || c.recommendation === "INSUFFICIENT_DATA").length;
+  const failures = data.candidates.filter(c => c.disposition === "TECHNICAL_FAILURE").length;
+  const excluded = data.candidates.length - evaluated;
   return (
     <>
       <p>
         Last cycle: {new Date(data.as_of).toLocaleString()} · {data.ranked.length} ranked ETF{data.ranked.length === 1 ? "" : "s"}
       </p>
-      <h3>Top ETF opportunities</h3>
+      <dl className="opportunity-primary-metrics">
+        <div><dt>Universe size</dt><dd>{data.universe_count ?? data.candidates.length}</dd></div>
+        <div><dt>Evaluated ETFs</dt><dd>{evaluated}</dd></div>
+        <div><dt>Opportunity recommendations</dt><dd>{eligible}</dd></div>
+        <div><dt>Excluded before scoring</dt><dd>{excluded}</dd></div>
+        <div><dt>Insufficient data</dt><dd>{dataGaps}</dd></div>
+        <div><dt>Technical failures</dt><dd>{failures}</dd></div>
+        <div><dt>Ranked ETFs</dt><dd>{data.ranked.length}</dd></div>
+      </dl>
+      {Object.keys(data.excluded_by_reason ?? {}).length ? <details>
+        <summary>Exclusion reasons</summary>
+        <ul>{Object.entries(data.excluded_by_reason ?? {}).map(([reason, count]) => <li key={reason}>{reason}: {count}</li>)}</ul>
+      </details> : null}
+      {data.coverage ? <dl aria-label="Official NSE coverage">{Object.entries(data.coverage).map(([key, value]) =>
+        <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{value}</dd></div>)}</dl> : null}
+      {data.scope === "FULL_OFFICIAL_NSE_ETF" ? <p>Complete official snapshot assessed. Rankings compare verified peers only; missing peer classification cannot produce a buy shortlist.</p> : null}
+      {data.scope === "FULL_OFFICIAL_NSE_ETF" ? <details><summary>All assessed ETFs ({data.candidates.length})</summary><ul>
+        {data.candidates.map(item => <li key={item.global_instrument_id ?? item.symbol}>{item.symbol ?? "Unknown ETF"}: {item.disposition}; {item.recommendation ?? item.reason}{item.missing_data?.length ? `; missing: ${item.missing_data.join(", ")}` : ""}</li>)}
+      </ul></details> : null}
+      <h3>ETF rankings</h3>
       <div className="opportunity-cards">{data.ranked.map((item) => <EtfRadarCard key={item.global_instrument_id ?? item.symbol} item={item} />)}</div>
       {(data.universe_count ?? data.candidates.length) === 0
         ? <p role="alert">No ETF instruments were evaluated. ETF universe setup or discovery needs attention.</p>
-        : !data.ranked.length ? <p>No ETF currently ranks as a qualifying opportunity.</p> : null}
+        : !data.ranked.length ? <p>{failures > 0
+          ? "ETF evaluation encountered technical failures. Review the failure reasons before interpreting the empty ranking."
+          : dataGaps > 0 ? "ETF data prerequisites are missing. Review the exclusion reasons and synchronize verified ETF evidence."
+          : "No ETFs were ranked. Review the evaluation and exclusion counts."}</p> : null}
     </>
   );
 }
@@ -154,6 +192,7 @@ type EtfActiveCycle = {
   updatedAt: string | null;
   errorCode: string | null;
   pollError: boolean;
+  coverage?: { official: number | null; completed: number };
 };
 
 // Client-side only (not a backend capability): the current ETF API surface
@@ -198,7 +237,7 @@ export function EtfRadar() {
     if (!cycleId) return;
     let active = true;
     const poll = () => {
-      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string }>(
+      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string; coverage?: { official: number | null; completed: number } }>(
         `/api/v1/etf-radar/cycles/${cycleId}/status`
       )
         .then((value) => {
@@ -206,7 +245,7 @@ export function EtfRadar() {
           setActiveCycle((previous) => previous && previous.cycleId === cycleId
             ? { ...previous, status: value.status, updatedAt: value.updated_at ?? previous.updatedAt,
                 startedAt: previous.startedAt ?? value.created_at ?? null,
-                errorCode: value.error_code ?? previous.errorCode, pollError: false }
+                errorCode: value.error_code ?? previous.errorCode, pollError: false, coverage: value.coverage }
             : previous);
           if (isTerminalRadarStatus(value.status)) {
             try { window.sessionStorage.removeItem(ETF_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
@@ -236,7 +275,7 @@ export function EtfRadar() {
 
   const runCycle = () => {
     request<{ cycle_id: string; status: string; updated_at?: string }>(
-      "/api/v1/etf-radar/cycles", { method: "POST", body: JSON.stringify({ top_n: 10 }) }
+      "/api/v1/etf-radar/full-universe-cycles", { method: "POST", body: JSON.stringify({ max_universe: 2000, max_requests: 1500, max_seconds: 3600 }) }
     )
       .then((value) => {
         setActiveCycle({ cycleId: value.cycle_id, status: value.status, startedAt: value.updated_at ?? null,
@@ -247,21 +286,12 @@ export function EtfRadar() {
   };
 
   const running = !!activeCycle && !isTerminalRadarStatus(activeCycle.status);
-  // ETF Radar's cycle is single-pass/bounded with no per-candidate
-  // checkpointing (see run_etf_radar_cycle_async's own docstring: no
-  // BASELINE/DEEP split like Equity's Stage2) -- the status endpoint never
-  // carries a live authoritative_progress for it, so WHILE RUNNING an
-  // indeterminate bar plus the lifecycle status remains the only truthful
-  // presentation. This stays genuinely empty until terminal; it is never
-  // populated with a fabricated 0/0 snapshot.
-  //
-  // Once COMPLETED, though, the persisted EtfCycleResult.candidates tuple
-  // (not .ranked, which is truncated to top_n) already covers every row
-  // the cycle admitted/evaluated, with a real per-candidate disposition
-  // and, for EVALUATED rows, a real recommendation -- a genuinely complete,
-  // trustworthy final breakdown, not a provisional or partial one.
+  // Live counts come only from this cycle's durable official-snapshot checkpoints.
   const terminalData = activeCycle?.status === "COMPLETED" && data?.cycle_id === activeCycle.cycleId ? data : null;
-  const counters: RadarProgressCounter[] = !terminalData ? [] : [
+  const counters: RadarProgressCounter[] = !terminalData ? (activeCycle?.coverage ? [
+    { label: "Official NSE universe", value: activeCycle.coverage.official },
+    { label: "First-pass outcomes", value: activeCycle.coverage.completed },
+  ] : []) : [
     { label: "Total universe", value: terminalData.candidates.length },
     { label: "Evaluated candidates", value: terminalData.candidates.filter((c) => c.disposition === "EVALUATED").length },
     { label: "Technical failures", value: terminalData.candidates.filter((c) => c.disposition === "TECHNICAL_FAILURE").length },
@@ -289,7 +319,7 @@ export function EtfRadar() {
     <section className="opportunity-radar etf-radar" aria-label="ETF radar">
       <h2>ETF radar</h2>
       <button type="button" className="button button-primary radar-run-action" disabled={running} onClick={runCycle}>
-        {running ? "Running…" : "Run ETF Radar"}
+        {running ? "Running…" : "Run full NSE ETF Radar"}
       </button>
       {activeCycle ? (
         <RadarProgressPanel radarType="ETF" cycleId={activeCycle.cycleId} status={activeCycle.status}

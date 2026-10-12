@@ -98,7 +98,7 @@ def admit_etf_candidate(row: dict, store) -> EtfAdmissionDecision:
     ordinary data problem -- those become TECHNICAL_FAILURE/INELIGIBLE/
     INSUFFICIENT_DATA decisions instead, so one bad row never aborts a batch.
     """
-    symbol = row.get("symbol")
+    symbol = (row.get("symbol") or row.get("ticker") or row.get("primarySymbol"))
     if row.get("assetType") != "ETF":
         return EtfAdmissionDecision(_parse_instrument_id(row), symbol, EtfAdmissionOutcome.INELIGIBLE, "NOT_ETF", row)
     if row.get("status") != "ACTIVE":
@@ -139,6 +139,6 @@ def admit_etf_candidates(rows: list[dict], store) -> list[EtfAdmissionDecision]:
         if id(row) in prefiltered_ids:
             decisions.append(admit_etf_candidate(row, store))
         else:
-            decisions.append(EtfAdmissionDecision(_parse_instrument_id(row), row.get("symbol"),
+            decisions.append(EtfAdmissionDecision(_parse_instrument_id(row), (row.get("symbol") or row.get("ticker") or row.get("primarySymbol")),
                 EtfAdmissionOutcome.INELIGIBLE, "FAILED_NSE_ETF_ACTIVE_PREFILTER", row))
     return decisions

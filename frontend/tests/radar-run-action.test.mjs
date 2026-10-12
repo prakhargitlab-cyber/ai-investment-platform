@@ -16,8 +16,8 @@ test('Run Equity Radar posts only to the Equity cycles endpoint, never the ETF o
   assert.doesNotMatch(opportunityRadarSource, /\/api\/v1\/etf-radar\//);
 });
 
-test('Run ETF Radar posts only to the ETF cycles endpoint, never the Equity one', () => {
-  assert.match(etfRadarSource, /"\/api\/v1\/etf-radar\/cycles"/);
+test('Run full NSE ETF Radar posts only to the full-universe ETF endpoint, never the Equity one', () => {
+  assert.match(etfRadarSource, /"\/api\/v1\/etf-radar\/full-universe-cycles"/);
   assert.doesNotMatch(etfRadarSource, /\/api\/v1\/research\/opportunities\/cycles"/);
 });
 
@@ -38,10 +38,10 @@ test('both run buttons are disabled while their own cycle is non-terminal (no do
   assert.match(etfRadarSource, /const running = !!activeCycle && !isTerminalRadarStatus\(activeCycle\.status\);/);
 });
 
-test('button labels are consistently cased: "Run Equity Radar" / "Run ETF Radar"', () => {
+test('button labels are consistently cased: "Run Equity Radar" / "Run full NSE ETF Radar"', () => {
   assert.match(opportunityRadarSource, /Run Equity Radar/);
-  assert.match(etfRadarSource, /Run ETF Radar/);
-  assert.doesNotMatch(opportunityRadarSource, /Run ETF Radar/);
+  assert.match(etfRadarSource, /Run full NSE ETF Radar/);
+  assert.doesNotMatch(opportunityRadarSource, /Run full NSE ETF Radar/);
   assert.doesNotMatch(etfRadarSource, /Run Equity Radar/);
 });
 
@@ -76,9 +76,11 @@ test('a failed status poll keeps the panel showing the last known state rather t
   assert.match(progressSource, /Could not refresh status just now/);
 });
 
-test('ETF progress never fabricates counters while RUNNING (single-pass cycle has no live per-instrument progress)', () => {
+test('ETF live counters require durable coverage; legacy cycles stay indeterminate', () => {
   assert.match(etfRadarSource, /const terminalData = activeCycle\?\.status === "COMPLETED" && data\?\.cycle_id === activeCycle\.cycleId \? data : null;/);
-  assert.match(etfRadarSource, /const counters: RadarProgressCounter\[\] = !terminalData \? \[\] : \[/);
+  assert.match(etfRadarSource, /activeCycle\?\.coverage \? \[/);
+  assert.match(etfRadarSource, /value: activeCycle\.coverage\.official/);
+  assert.match(etfRadarSource, /value: activeCycle\.coverage\.completed/);
   assert.match(etfRadarSource, /percent=\{null\}/);
 });
 
@@ -360,3 +362,67 @@ test('ADMIN cancellation uses DELETE request helper and exposes permission failu
     globalThis.window = originalWindow;
   }
 });
+
+
+const deepProgress = (completed, attempted = completed) => ({
+  phase: 'DEEP', deep_completed: completed, deep_attempted: attempted,
+  deep_denominator: 25, deep_ready: 0, deep_readiness_failed: completed,
+  deep_technical_failure: 0
+});
+for (const scenario of [
+  { name: '25 terminal and zero ready remains RUNNING at 100% processed', progress: deepProgress(25), status: 'RUNNING', percent: 100 },
+  { name: '25 terminal remains PUBLISHED at 100% processed', progress: deepProgress(25), status: 'PUBLISHED', percent: 100 },
+  { name: '4 terminal and zero ready out of 25 admitted is 16%', progress: deepProgress(4), percent: 16 },
+  { name: '25 attempts with only 4 terminal is still 16%', progress: deepProgress(4, 25), percent: 16 },
+  { name: 'legacy completion without granular readiness still measures work', progress: { phase: 'DEEP', deep_completed: 4, deep_denominator: 25 }, percent: 16 },
+  { name: 'readiness without completion cannot manufacture work progress', progress: { phase: 'DEEP', deep_ready: 25, deep_denominator: 25 } },
+  { name: 'missing legacy fields remain indeterminate', progress: {} },
+  ...['COMPLETED', 'CANCELLED', 'FAILED'].map(status => ({ name: `${status} preserves counters and hides active bars`, status, progress: deepProgress(4, 25), terminal: true })),
+  { name: 'acquisition phase with authoritative scan counters', progress: { phase: 'BASELINE', baseline_evaluated: 700, universe_count: 2621, deep_denominator: 25 }, acquisitionPercent: 700 / 2621 * 100 },
+  { name: 'acquisition phase without counters never uses the shortlist', progress: { phase: 'BASELINE', deep_denominator: 25 } },
+  { name: 'acquisition phase with missing total is indeterminate', progress: { phase: 'BASELINE', baseline_evaluated: 700, deep_denominator: 25 } },
+  { name: 'durable full-market scan and deep work have independent percentages', progress: { ...deepProgress(4), baseline_evaluated: 2621, universe_count: 2621 }, percent: 16, acquisitionPercent: 100 },
+]) {
+  test(`Equity progress: ${scenario.name}`, async () => {
+    const originalWindow = globalThis.window, originalTimeout = globalThis.setTimeout, originalClear = globalThis.clearTimeout;
+    const status = scenario.status ?? 'RUNNING';
+    let tree;
+    try {
+      globalThis.window = { sessionStorage: { getItem: () => 'progress-cycle', removeItem() {} } };
+      globalThis.setTimeout = () => 1;
+      globalThis.clearTimeout = () => {};
+      const { OpportunityRadar } = loadComponent('opportunity-radar.tsx', { request: async url =>
+        url.endsWith('/status') ? { status, authoritative_progress: scenario.progress }
+          : { generated_at: null, best_buy_today: null, top_short_term: [], top_long_term: [] }
+      });
+      await settle(() => { tree = create(React.createElement(OpportunityRadar, { heldIds: [], watchlistedIds: [] })); });
+      const bars = tree.root.findAll(node => node.props.role === 'progressbar');
+      const counter = label => tree.root.findAllByType('dt').find(node => node.children.join('') === label).parent.findByType('dd').children.join('');
+      assert.equal(counter('Deep completed'), String(scenario.progress.deep_completed ?? 'Unavailable'));
+      assert.equal(counter('Ready for ranking'), String(scenario.progress.deep_ready ?? 'Unavailable'));
+      assert.equal(counter('Deep attempted'), String(scenario.progress.deep_attempted ?? 'Unavailable'));
+      assert.equal(button(tree, scenario.terminal ? 'Run Equity Radar' : 'Running\u2026').props.disabled, !scenario.terminal);
+      if (scenario.terminal) {
+        assert.equal(bars.length, 0);
+        assert.match(textOf(tree), new RegExp(status[0] + status.slice(1).toLowerCase()));
+      } else {
+        const market = bars.find(node => node.props['aria-label'] === 'Full-market baseline scan');
+        assert.equal(market.props['aria-valuenow'], scenario.acquisitionPercent);
+        const deep = bars.find(node => node.props['aria-label'] === 'Deep processing');
+        if (scenario.progress.phase === 'DEEP') assert.equal(deep.props['aria-valuenow'], scenario.percent);
+        else assert.equal(deep, undefined);
+        if (scenario.progress.phase === 'BASELINE') {
+          assert.equal(bars.length, 1);
+          assert.match(textOf(tree), /Baseline scanning/);
+          if (scenario.acquisitionPercent === undefined) assert.match(textOf(tree), /live full-market scan progress is unavailable/);
+        }
+        if (scenario.percent === 100) assert.match(textOf(tree), new RegExp(status === 'PUBLISHED' ? 'Published' : 'Running'));
+      }
+    } finally {
+      if (tree) await settle(() => tree.unmount());
+      globalThis.window = originalWindow;
+      globalThis.setTimeout = originalTimeout;
+      globalThis.clearTimeout = originalClear;
+    }
+  });
+}

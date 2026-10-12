@@ -39,6 +39,12 @@ class FakeWorker:
         self.active: dict | None = None
         self.submit_raises = submit_raises
 
+    async def _blocking(self, operation, *args, **kwargs):
+        return operation(*args, **kwargs)
+
+    async def submit_async(self, parameters):
+        return self.submit(parameters)
+
     def start(self):
         pass
 

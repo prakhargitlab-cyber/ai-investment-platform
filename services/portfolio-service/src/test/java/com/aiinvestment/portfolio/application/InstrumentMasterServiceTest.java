@@ -28,6 +28,17 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class InstrumentMasterServiceTest {
+    @Test void etfCreationRechecksConcurrentExistingEquityUnderIdentityLock() {
+        var existing = new InstrumentMasterEntity(UUID.randomUUID(), "IN0000000021", "Existing equity", AssetType.EQUITY,
+                "INR", "IN", "NSE", "TESTETF", "ACTIVE", java.time.Instant.now());
+        when(masters.findByNormalizedIsin("IN0000000021")).thenReturn(Optional.of(existing));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> service.canonicalizeOfficialEtf("IN0000000021", "TESTETF", "ETF"))
+                .isInstanceOf(IllegalStateException.class).hasMessage("NSE_ETF_EXISTING_IDENTITY_CONFLICT");
+        assertThat(existing.getAssetType()).isEqualTo(AssetType.EQUITY);
+        verify(masters, never()).saveAndFlush(any());
+        verify(mappings, never()).save(any());
+    }
+
     @Test
     void benchmarkRegistrationUsesPlatformKeyAndIsIdempotent() {
         String key = "INDIA_FINANCIALS_PRICE";

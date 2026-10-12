@@ -44,6 +44,9 @@ def _admit(store, instrument_id, symbol, *, with_price=True, with_history=False)
         store.save_etf_evidence(EtfFact(instrument_id=instrument_id, metric=EtfMetric.MARKET_PRICE,
             value=Decimal("100"), unit="INR", as_of_date=NOW.date(),
             provenance=provenance(provider="YAHOO_FINANCE", authority=EtfAuthority.SECONDARY)))
+    store.save_etf_evidence(EtfFact(instrument_id=instrument_id, metric=EtfMetric.TRADING_VOLUME,
+        value=Decimal("500000"), unit="shares", as_of_date=NOW.date(),
+        provenance=provenance(provider="YAHOO_FINANCE", authority=EtfAuthority.SECONDARY)))
     if with_history:
         for i in range(260):
             store.upsert_daily_market_bar(DailyMarketBar(global_instrument_id=instrument_id,

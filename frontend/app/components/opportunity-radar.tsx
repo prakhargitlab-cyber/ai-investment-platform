@@ -235,6 +235,8 @@ export function RadarContent({ data, heldIds = [], watchlistedIds = [] }: { data
 type EquityAuthoritativeProgress = {
   phase?: string; baseline_evaluated?: number; universe_count?: number; deep_attempted?: number;
   deep_completed?: number; deep_denominator?: number;
+  /** Readiness outcomes are separate from terminal work completion. */
+  deep_ready?: number; deep_readiness_failed?: number; deep_technical_failure?: number;
   ready?: number; failed?: number; technical?: number; eligible?: number;
 };
 
@@ -268,8 +270,11 @@ function equityCounters(progress: EquityAuthoritativeProgress | null): RadarProg
   return [
     { label: "Baseline evaluated", value: progress?.baseline_evaluated ?? null },
     { label: "Deep attempted", value: progress?.deep_attempted ?? null },
-    { label: "Deep admitted", value: progress?.deep_denominator ?? null },
     { label: "Deep completed", value: progress?.deep_completed ?? null },
+    { label: "Deep admitted", value: progress?.deep_denominator ?? null },
+    { label: "Ready for ranking", value: progress?.deep_ready ?? progress?.ready ?? null },
+    { label: "Deep readiness failed", value: progress?.deep_readiness_failed ?? progress?.failed ?? null },
+    { label: "Deep technical failures", value: progress?.deep_technical_failure ?? progress?.technical ?? null },
     { label: "Eligible", value: progress?.eligible ?? null },
     { label: "Ready", value: progress?.ready ?? null },
     { label: "Readiness failed", value: progress?.failed ?? null },
@@ -291,8 +296,11 @@ function equityCounters(progress: EquityAuthoritativeProgress | null): RadarProg
 }
 
 function equityPercent(progress: EquityAuthoritativeProgress | null): number | null {
-  if (!progress || progress.phase !== "DEEP" || !progress.deep_denominator || progress.deep_completed == null) return null;
-  return ((progress.deep_completed / progress.deep_denominator) * 100);
+  if (!progress || progress.phase !== "DEEP" || !progress.deep_denominator) return null;
+  // Terminal outcomes measure work, including failures. Readiness and the
+  // overall lifecycle are independent; 100% processed can still be RUNNING.
+  if (progress.deep_completed == null) return null;
+  return (progress.deep_completed / progress.deep_denominator) * 100;
 }
 
 export function OpportunityRadar({ heldIds, watchlistedIds, roles = [] }: { heldIds: string[]; watchlistedIds: string[]; roles?: string[] }) {
@@ -404,6 +412,7 @@ export function OpportunityRadar({ heldIds, watchlistedIds, roles = [] }: { held
       <RadarProgressPanel radarType="Equity" cycleId={activeCycle.cycleId} status={activeCycle.status}
         startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt}
         counters={equityCounters(activeCycle.progress)}
+        acquisition={{ scanned: activeCycle.progress?.baseline_evaluated ?? null, total: activeCycle.progress?.universe_count ?? null }}
         phase={activeCycle.progress?.phase} percent={equityPercent(activeCycle.progress)} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
     ) : null}
     {error ? <p role="alert">Opportunity radar unavailable.</p> : null}

@@ -27,6 +27,23 @@ function Invoke-PodExec {
     return [PSCustomObject]@{ Output = ($output | Out-String); ExitCode = $LASTEXITCODE }
 }
 
+function Convert-ToKubectlLocalPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $currentDir = (Get-Location).Path.TrimEnd('\') + '\'
+
+    if (-not $fullPath.StartsWith(
+        $currentDir,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Local backup path must be inside the current working directory."
+    }
+
+    $relativePath = $fullPath.Substring($currentDir.Length)
+
+    return ".\" + $relativePath
+}
 function Copy-FromPostgresPod {
     # Binary-safe pull of a single file out of the pod. kubectl cp streams
     # the file as a tar archive over the exec protocol; it does not pass
@@ -38,7 +55,7 @@ function Copy-FromPostgresPod {
         [Parameter(Mandatory = $true)][string]$RemotePath,
         [Parameter(Mandatory = $true)][string]$LocalPath
     )
-    kubectl cp "${Namespace}/${PodName}:${RemotePath}" $LocalPath | Out-Host
+    kubectl cp "${Namespace}/${PodName}:${RemotePath}" (Convert-ToKubectlLocalPath -Path $LocalPath) | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "kubectl cp failed while pulling '$RemotePath' from pod '$PodName' to '$LocalPath'."
     }
@@ -51,7 +68,7 @@ function Copy-ToPostgresPod {
         [Parameter(Mandatory = $true)][string]$LocalPath,
         [Parameter(Mandatory = $true)][string]$RemotePath
     )
-    kubectl cp $LocalPath "${Namespace}/${PodName}:${RemotePath}" | Out-Host
+    kubectl cp (Convert-ToKubectlLocalPath -Path $LocalPath) "${Namespace}/${PodName}:${RemotePath}" | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "kubectl cp failed while pushing '$LocalPath' to pod '$PodName' path '$RemotePath'."
     }

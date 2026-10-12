@@ -221,13 +221,13 @@ class GlobalOpportunityScheduler:
             logger.exception("scheduler operation=OPPORTUNITY_CYCLE_SUBMIT_FAILURE phase=INITIAL_BOOTSTRAP")
             return False
 
-    def _maybe_submit(self) -> bool:
-        """Decide whether to submit a cycle and do so if due. Returns True if submitted."""
+    def _submission_due(self):
+        """Decide whether to submit a cycle and do so if due. Returns the due time and phase."""
         if self._recovery_paused:
             logger.info("scheduler operation=OPPORTUNITY_CYCLE_SKIP phase=RECOVERY_PAUSED reason=pause_active")
-            return False
+            return None
         if self.active:
-            return False
+            return None
         # Stop admitting new candidates: if the active cycle has been cancelled
         # (durable status='CANCELLED'), do not submit a new cycle until the
         # operator clears it.
@@ -242,13 +242,13 @@ class GlobalOpportunityScheduler:
             if run_status in ('CANCEL_REQUESTED', 'CANCELLED'):
                 logger.info("scheduler operation=OPPORTUNITY_CYCLE_SKIP phase=%s reason=%s cycleId=%s",
                             "CANCEL_CHECK", run_status, active_run.get('cycle_id'))
-                return False
+                return None
         now = self.clock()
         schedules, exceptions = self._load_schedules()
         status = market_session_status(self.market_code, schedules, exceptions, now)
         # Fail closed: UNKNOWN means we can't determine session state.
         if status not in ("OPEN", "CLOSED"):
-            return False
+            return None
         phase = None
         if status == "OPEN":
             if self._market_hours_due(now):
@@ -257,7 +257,14 @@ class GlobalOpportunityScheduler:
             if self._post_close_due(now, schedules, exceptions):
                 phase = "POST_CLOSE"
         if phase is None:
+            return None
+        return now, phase
+
+    def _maybe_submit(self) -> bool:
+        due = self._submission_due()
+        if due is None:
             return False
+        now, phase = due
         # Submit a production (non-controlled) cycle.
         parameters = dict(top_n=4, shortlist_limit=self.shortlist_limit, candidate_ids=None)
         try:
@@ -288,16 +295,25 @@ class GlobalOpportunityScheduler:
         single-flight protections. See _maybe_submit_initial (retained as an
         explicit/programmatic helper only).
         """
-        self._recover_last_runs()
+        await self.worker._blocking(self._recover_last_runs)
         while not self._stopped:
             try:
-                self._maybe_submit()
+                due = await self.worker._blocking(self._submission_due)
+                if due is not None:
+                    now, phase = due
+                    await self.worker.submit_async(dict(top_n=4, shortlist_limit=self.shortlist_limit, candidate_ids=None))
+                    if phase == 'MARKET_HOURS':
+                        self._last_market_hours_run = now
+                    else:
+                        self._last_post_close_run = now
             except Exception:
                 logger.exception("scheduler operation=POLL_ERROR")
             await asyncio.sleep(self.poll_interval.total_seconds())
 
     def start(self):
         """Begin the background scheduling loop. Idempotent."""
+        if self._recovery_paused:
+            return
         if self.task is not None and not self.task.done():
             return
         self._stopped = False

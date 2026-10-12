@@ -75,7 +75,9 @@ def _store(info):
 def test_v1_to_v16_apply_and_engine_schema_check_passes(database):
     conn = _connect(database)
     files = _migrations()
-    assert files[-1].name.startswith("V17__")
+    versions = [int(f.name[1:].split("__")[0]) for f in files]
+    assert 17 in versions
+    assert versions[-1] == 23
     _apply(conn, files)
     tables = {r[0] for r in conn.execute(
         "SELECT table_name FROM information_schema.tables WHERE table_schema='research'").fetchall()}
@@ -94,7 +96,8 @@ def test_v10_upgrade_to_v16_preserves_existing_rows(database):
         VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', now(), 100, 'EXISTING', 'https://example.test', now())""")
     conn.commit()
     _apply(conn, rest)
-    assert len(rest) == 7  # V11..V17 (the Java upgrade test's stale "3" predates V14..V17)
+    versions = [int(f.name[1:].split("__")[0]) for f in rest]
+    assert versions == list(range(11, 24))
     assert conn.execute("SELECT COUNT(*) FROM global_market_price_observations").fetchone()[0] == 1
 
 
@@ -207,7 +210,9 @@ def _url_of_length(label: str, length: int) -> str:
 def test_v1_to_v17_url_columns_become_text(database):
     conn = _connect(database)
     files = _migrations()
-    assert files[-1].name.startswith("V17__")
+    versions = [int(f.name[1:].split("__")[0]) for f in files]
+    assert 17 in versions
+    assert versions[-1] == 23
     _apply(conn, files)
     doc_rows = conn.execute(
         "SELECT column_name, data_type FROM information_schema.columns "
@@ -876,3 +881,135 @@ def test_manual_evidence_sql_failure_does_not_poison_connection_for_opportunity_
     run, created = store.create_cycle_run("defect-c-regression", {"top_n": 4})
     assert created is True
     assert run["cycle_id"] == "defect-c-regression"
+
+
+@pytest.mark.parametrize("state", ["expired", "cancelled", "takeover", "valid"])
+def test_etf_publication_lease_fence_on_disposable_postgres(database, state):
+    from app.cycle_checkpoint import CycleOwnershipLost
+    _apply(_connect(database), _migrations())
+    store = _store(database)
+    cycle_id = str(uuid.uuid4())
+    store.create_cycle_run(cycle_id, {}, market="ETF")
+    assert store.claim_cycle_run(cycle_id, "old")
+    if state in {"expired", "takeover"}:
+        with store._connection:
+            store._connection.execute(
+                "UPDATE global_opportunity_cycle_run SET lease_expires_at = ? WHERE cycle_id = ?",
+                ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), cycle_id))
+        assert not store.renew_cycle_lease(cycle_id, "old")
+        if state == "takeover":
+            assert store.claim_cycle_run(cycle_id, "new")
+    elif state == "cancelled":
+        assert store.request_cycle_cancel(cycle_id)
+    payload = {"cycle_id": cycle_id, "universe_count": 1, "candidates": [], "ranked": []}
+    def publish():
+        store.save_etf_radar_cycle(cycle_id, "ETF_RADAR_V1", None, datetime.now(timezone.utc), payload,
+                                  fence=(cycle_id, "old"))
+    if state == "valid":
+        publish()
+        assert store.etf_radar_cycle(cycle_id) == payload
+        assert store.cycle_run(cycle_id)["status"] == "PUBLISHED"
+        assert not store.request_cycle_cancel(cycle_id)
+    else:
+        with pytest.raises(CycleOwnershipLost):
+            publish()
+        assert store.etf_radar_cycle(cycle_id) is None
+
+
+@pytest.mark.asyncio
+async def test_etf_scoped_ingestion_on_disposable_postgres(database):
+    import asyncio
+    from threading import RLock
+    from types import SimpleNamespace
+    from test_etf_ingestion import ingest, ID, NOW
+    from app.etf_evidence import EtfMetric, evidence_id
+    _apply(_connect(database), _migrations())
+    store = _store(database)
+    repo = SimpleNamespace(persistence=store, _persistence_worker_lock=RLock(),
+                           _run_blocking_persistence=asyncio.to_thread)
+    for _ in range(2):
+        result, _ = await ingest(repo)
+        assert result["status"] == "COMPLETED"
+    assert len(store.etf_listings()) == 1
+    assert len(store.etf_facts(ID, EtfMetric.MARKET_PRICE)) == 1
+    assert len(store.etf_facts(ID, EtfMetric.TRADING_VOLUME)) == 1
+    assert len(store.etf_navs(ID)) == 1
+    observations = [store.etf_facts(ID, metric)[0] for metric in
+                    (EtfMetric.MARKET_PRICE, EtfMetric.TRADING_VOLUME)] + store.etf_navs(ID)
+    for observation in observations:
+        assert observation.instrument_id == ID
+        assert observation.provenance.provider == "NSE"
+        assert observation.provenance.authority == "OFFICIAL_EXCHANGE"
+        assert observation.provenance.source_metadata["metadata"]["isin"] == "IN0000000021"
+        assert observation.provenance.source_metadata["session"]["timestamp"] == "09-Oct-2026 12:00:00"
+        assert (getattr(observation, "as_of_date", None) or observation.nav_date) == NOW.date()
+    # Independent connection: evidence and provenance are committed, not cached.
+    reopened = _store(database)
+    restored = [reopened.etf_facts(ID, metric)[0] for metric in
+                (EtfMetric.MARKET_PRICE, EtfMetric.TRADING_VOLUME)] + reopened.etf_navs(ID)
+    assert [evidence_id(item) for item in restored] == [evidence_id(item) for item in observations]
+    assert [item.model_dump() for item in restored] == [item.model_dump() for item in observations]
+    assert store.latest_etf_radar_cycle() is None
+
+
+@pytest.mark.asyncio
+async def test_nse_etf_failures_preserve_history_and_identity_on_postgres(database):
+    import asyncio
+    from threading import RLock
+    from types import SimpleNamespace
+    import httpx
+    from test_etf_ingestion import ingest, snapshot, ID, META, CSV, NOW
+    from app.etf_ingestion import ingest_quotes
+    from app.etf_evidence import EtfMetric, evidence_id
+    from app.etf_readiness import evaluate_etf_readiness
+
+    _apply(_connect(database), _migrations())
+    store = _store(database)
+    repo = SimpleNamespace(persistence=store, _persistence_worker_lock=RLock(),
+                           _run_blocking_persistence=asyncio.to_thread)
+    await ingest(repo, snapshot(age=3))
+    await ingest(repo)
+    cycle_id = str(uuid.uuid4())
+    completed = {"cycle_id": cycle_id, "status": "COMPLETED", "universe_count": 1,
+                 "candidates": [{"instrument_id": str(ID)}], "ranked": []}
+    store.save_etf_radar_cycle(cycle_id, "ETF_RADAR_V1", "fixture", NOW, completed)
+
+    def saved(persistence):
+        rows = [item for metric in (EtfMetric.MARKET_PRICE, EtfMetric.TRADING_VOLUME)
+                for item in persistence.etf_facts(ID, metric)] + persistence.etf_navs(ID)
+        return {evidence_id(item): item.model_dump(mode="json") for item in rows}
+    original = saved(store)
+    assert len(original) == 6
+    partial = snapshot()
+    partial["data"]["data"][0]["nav"] = "NaN"
+    result, _ = await ingest(repo, partial)
+    assert result["status"] == "PARTIAL_FAILURE"
+    assert all(saved(store).get(key) == value for key, value in original.items())
+    assert len(store.etf_navs(ID)) == 2  # rejected NAV does not overwrite either date
+
+    def conflict(request):
+        if request.url.path.endswith(".csv"):
+            return httpx.Response(200, text=CSV)
+        if "marketWatchApi" in request.url.path:
+            return httpx.Response(200, json=snapshot())
+        return httpx.Response(200, json={"symbol": "TESTETF", "isin": "CONFLICT"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(conflict)) as client:
+        result = await ingest_quotes(repo, None, [META], client, clock=lambda: NOW + timedelta(seconds=1))
+    assert result["status"] == "PARTIAL_FAILURE"
+    after_conflict = saved(store)
+
+    reopened = _store(database)
+    repo.persistence = reopened
+    await ingest(repo, failure=TimeoutError("fixture outage"), now=NOW + timedelta(seconds=2))
+    statuses, summary = evaluate_etf_readiness(reopened, ID, now=NOW + timedelta(seconds=2))
+    identity = next(item for item in statuses if item.requirement == "IDENTITY")
+    assert identity.status == "TECHNICAL_FAILURE"
+    assert identity.reason == "NSE_METADATA_IDENTITY_CONFLICT"
+    assert not summary.ready_for_analysis
+    assert saved(reopened) == after_conflict
+    assert all(saved(reopened).get(key) == value for key, value in original.items())
+    assert reopened.etf_radar_cycle(cycle_id) == completed
+    assert reopened.latest_etf_radar_cycle() == completed
+    attempts = reopened.etf_attempts(ID)
+    assert any(a.reason == "NSE_METADATA_IDENTITY_CONFLICT" for a in attempts)
+    assert any("TimeoutError" in a.reason for a in attempts)

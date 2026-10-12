@@ -209,7 +209,7 @@ def world_factory(monkeypatch):
     return make
 
 
-async def _run_until_crash(world, monkeypatch, *, lease_seconds=0.3):
+async def _run_until_crash(world, monkeypatch, *, lease_seconds=60):
     repo, _, runner = build_process(world, monkeypatch)
     worker = OpportunityCycleWorker(repo, runner, lease_seconds=lease_seconds, poll_seconds=0.05)
     job = worker.submit({"top_n": 4, "shortlist_limit": 100})
@@ -218,8 +218,10 @@ async def _run_until_crash(world, monkeypatch, *, lease_seconds=0.3):
     return job, worker
 
 
-async def _restart_and_finish(world, monkeypatch, *, lease_seconds=0.3):
-    await asyncio.sleep(lease_seconds + 0.1)  # the dead owner's lease expires
+async def _restart_and_finish(world, monkeypatch, *, lease_seconds=60):
+    # Expire the dead owner's lease explicitly; recovery is not a timing race.
+    from test_radar_recovery_closure import expire
+    expire(world.store, world.store.active_cycle_run()['cycle_id'])
     repo, _, runner = build_process(world, monkeypatch)
     worker = OpportunityCycleWorker(repo, runner, lease_seconds=lease_seconds, poll_seconds=0.05)
     worker.start()
@@ -278,12 +280,14 @@ async def test_A_candidate_completes_normally_with_durable_checkpoint(world_fact
     finished = _job(world.store, cycle_id)
     assert finished["status"] == "COMPLETED" and finished["result_cycle_id"] == cycle_id
     _assert_no_duplicates(world.store, cycle_id, 12)
-    # Idempotent checkpoint write: replaying a final write changes nothing.
+    # Terminal runs reject late checkpoint writes even if an owner id is injected.
     key, row = next(iter(deep.items()))
     world.store._connection.execute("UPDATE global_opportunity_cycle_run SET owner_id='x' WHERE cycle_id=?", (cycle_id,))
+    from app.cycle_checkpoint import CycleOwnershipLost
     for _ in range(2):
-        world.store.record_cycle_progress(cycle_id, "x", PHASE_DEEP, key, CandidateState.COMPLETED,
-                                          disposition=row["disposition"], payload=row["payload"])
+        with pytest.raises(CycleOwnershipLost):
+            world.store.record_cycle_progress(cycle_id, "x", PHASE_DEEP, key, CandidateState.COMPLETED,
+                                              disposition=row["disposition"], payload=row["payload"])
     again = world.store.cycle_progress(cycle_id)[(PHASE_DEEP, key)]
     assert again["state"] == row["state"] and again["attempts"] == row["attempts"] and again["payload"] == row["payload"]
 
@@ -444,12 +448,12 @@ async def test_crash_after_publication_completes_suggestions_exactly_once(world_
     original = SqliteResearchPersistence.persist_global_suggestion_lifecycle
     state = {"crash": True, "calls": 0}
 
-    def lifecycle(self, scan, cards):
+    def lifecycle(self, scan, cards, **kwargs):
         state["calls"] += 1
         if state["crash"]:
             state["crash"] = False
             raise SimulatedCrash("after publication")
-        return original(self, scan, cards)
+        return original(self, scan, cards, **kwargs)
     monkeypatch.setattr(SqliteResearchPersistence, "persist_global_suggestion_lifecycle", lifecycle)
     job, _ = await _run_until_crash(world, monkeypatch)
     cycle_id = job["cycle_id"]

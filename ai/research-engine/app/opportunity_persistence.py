@@ -296,14 +296,17 @@ class OpportunityPersistenceMixin:
         # Project the authoritative state without rewriting historical events.
         for row in self._connection.execute(
             "SELECT cycle_id, status, updated_at, error_code, parameters FROM global_opportunity_cycle_run "
-            "WHERE status IN ('CANCEL_REQUESTED','CANCELLED')"
         ).fetchall():
             run = dict(row)
             job = latest.setdefault(run['cycle_id'], {
                 'cycle_id': run['cycle_id'], 'record_kind': 'CYCLE_JOB',
                 'parameters': json.loads(run['parameters']),
             })
-            job.update({key: run[key] for key in ('status', 'updated_at', 'error_code')})
+            job.update({key: run[key] for key in ('status', 'updated_at')})
+            if run.get('error_code') or run['status'] in ('COMPLETED', 'FAILED', 'CANCELLED'):
+                job['error_code'] = run.get('error_code')
+            if job['status'] == 'PUBLISHED':
+                job['status'] = 'RUNNING'
         # The durable checkpoint is the source of truth for business counters;
         # immutable job events remain useful for activity/status history only.
         for cycle_id, job in latest.items():
@@ -329,7 +332,7 @@ class OpportunityPersistenceMixin:
         # stale/missing immutable job event, without changing event history.
         row = self._connection.execute(
             "SELECT cycle_id, status, updated_at, error_code, parameters FROM global_opportunity_cycle_run "
-            "WHERE cycle_id = ? AND status IN ('CANCEL_REQUESTED','CANCELLED')",
+            "WHERE cycle_id = ?",
             (cycle_id,),
         ).fetchone()
         if row is not None:
@@ -340,7 +343,11 @@ class OpportunityPersistenceMixin:
                     'record_kind': 'CYCLE_JOB',
                     'parameters': json.loads(run['parameters']),
                 }
-            job.update({key: run[key] for key in ('status', 'updated_at', 'error_code')})
+            job.update({key: run[key] for key in ('status', 'updated_at')})
+            if run.get('error_code') or run['status'] in ('COMPLETED', 'FAILED', 'CANCELLED'):
+                job['error_code'] = run.get('error_code')
+            if job['status'] == 'PUBLISHED':
+                job['status'] = 'RUNNING'
 
         if job is None:
             return None
@@ -520,6 +527,8 @@ class OpportunityPersistenceMixin:
                     + 'ON CONFLICT(global_instrument_id) DO UPDATE SET ' + ','.join(f'{c}=excluded.{c}' for c in cols[1:]),
                     tuple(s.get(c) for c in cols[:-1]) + (json.dumps(s, sort_keys=True),))
             self._insert_opportunity('global_opportunity_top_selection', ('cycle_id', 'generated_at', 'market'), selection)
+            if fence is not None:
+                self._fence_published_owner(*fence)
         return selection
 
     def save_backtest(self, result):
@@ -559,20 +568,23 @@ class OpportunityPersistenceMixin:
                     invalidation_price=card.get('long_invalidation'))
 
     def record_global_market_scan(self, scan):
-        """Persist a completed market scan. Idempotent via INSERT OR IGNORE."""
         with self._connection:
-            self._connection.execute("""INSERT OR IGNORE INTO global_market_scan
-                (scan_id,started_at,completed_at,status,market,exchange,
-                 universe_count,shortlist_count,evaluated_count,rank_eligible_count,
-                 suppressed_count,engine_version,controlled,failure_reason_code,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (str(scan['scan_id']), scan['started_at'], scan['completed_at'], scan['status'],
-                 scan.get('market'), scan.get('exchange'), int(scan['universe_count']),
-                 int(scan['shortlist_count']), int(scan['evaluated_count']),
-                 int(scan['rank_eligible_count']), int(scan['suppressed_count']),
-                 scan['engine_version'], 1 if scan.get('controlled') else 0,
-                 scan.get('failure_reason_code'),
-                 scan.get('created_at', datetime.now(timezone.utc).isoformat())))
+            self._record_global_market_scan(scan)
+
+    def _record_global_market_scan(self, scan):
+        """Persist a completed market scan. Idempotent via INSERT OR IGNORE."""
+        self._connection.execute("""INSERT OR IGNORE INTO global_market_scan
+            (scan_id,started_at,completed_at,status,market,exchange,
+             universe_count,shortlist_count,evaluated_count,rank_eligible_count,
+             suppressed_count,engine_version,controlled,failure_reason_code,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(scan['scan_id']), scan['started_at'], scan['completed_at'], scan['status'],
+             scan.get('market'), scan.get('exchange'), int(scan['universe_count']),
+             int(scan['shortlist_count']), int(scan['evaluated_count']),
+             int(scan['rank_eligible_count']), int(scan['suppressed_count']),
+             scan['engine_version'], 1 if scan.get('controlled') else 0,
+             scan.get('failure_reason_code'),
+             scan.get('created_at', datetime.now(timezone.utc).isoformat())))
 
     def global_market_scans(self):
         """Read all scan records, most recent first."""
@@ -580,7 +592,7 @@ class OpportunityPersistenceMixin:
             'SELECT * FROM global_market_scan ORDER BY completed_at DESC, scan_id DESC').fetchall()
         return [_decode_scan_row(r) for r in rows]
 
-    def persist_global_suggestion_lifecycle(self, scan, cards):
+    def persist_global_suggestion_lifecycle(self, scan, cards, *, fence=None):
         """Persist the complete global suggestion lifecycle after a production scan.
 
         Records the market scan, creates immutable original suggestions for new
@@ -591,14 +603,17 @@ class OpportunityPersistenceMixin:
         Only successfully completed *production* (non-controlled) scans publish
         current global suggestions.
         """
-        self.record_global_market_scan(scan)
-        # Only production completed scans publish current global suggestions.
-        if scan.get('controlled') or scan.get('status') != 'COMPLETED':
-            return
-        now = scan.get('completed_at', datetime.now(timezone.utc).isoformat())
-        engine_version = scan.get('engine_version', 'STOCK_RULE_ENGINE_V1')
-        seen = set()
         with self._connection:
+            if fence is not None:
+                # Lock and fence the projection transaction independently of
+                # snapshot publication, including recovery of PUBLISHED runs.
+                self._fence_published_owner(*fence)
+            self._record_global_market_scan(scan)
+            if scan.get('controlled') or scan.get('status') != 'COMPLETED':
+                return
+            now = scan.get('completed_at', datetime.now(timezone.utc).isoformat())
+            engine_version = scan.get('engine_version', 'STOCK_RULE_ENGINE_V1')
+            seen = set()
             for card in cards:
                 action = card.get('public_action')
                 if action not in ('STRONG_BUY', 'BUY', 'PARTIAL_EXIT', 'SELL'):
@@ -608,6 +623,8 @@ class OpportunityPersistenceMixin:
                     continue
                 seen.add(key)
                 self._persist_single_suggestion(scan['scan_id'], card, now, engine_version)
+            if fence is not None:
+                self._fence_published_owner(*fence)
 
     def _persist_single_suggestion(self, scan_id, card, now, engine_version):
         gid = str(card['global_instrument_id'])
@@ -661,46 +678,44 @@ class OpportunityPersistenceMixin:
             'SELECT event_fingerprint FROM global_stock_suggestion_history '
             'WHERE suggestion_id=? ORDER BY action_at DESC, event_id DESC LIMIT 1',
             (suggestion_id,)).fetchone()
-        if last_fingerprint is None or last_fingerprint[0] != fingerprint:
+        if last_fingerprint is None or last_fingerprint['event_fingerprint'] != fingerprint:
             self._insert_global_history_event(suggestion_id, scan_id, card, ranges, now, fingerprint, engine_version)
         self._upsert_global_current(suggestion_id, scan_id, card, ranges, now, engine_version)
 
     def _insert_global_suggestion(self, suggestion_id, scan_id, card, ranges, now, engine_version):
-        with self._connection:
-            self._connection.execute("""INSERT INTO global_stock_suggestion
-                (suggestion_id,scan_id,global_instrument_id,symbol,company_name,horizon,
-                 initial_action,suggested_at,suggested_price,rank,opportunity_score,
-                 confidence,coverage,data_state,entry_range_low,entry_range_high,fair_value,
-                 target_1,target_2,invalidation_price,reasons,risks,evidence_snapshot,
-                 engine_version,recommendation_fingerprint,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (suggestion_id, str(scan_id), str(card['global_instrument_id']),
-                 card.get('symbol'), card.get('company_name'), card['horizon'],
-                 card['public_action'], now, card.get('price_at_recommendation'),
-                 card.get('rank_position'), card.get('opportunity_score'),
-                 card.get('confidence'), card.get('coverage'), card.get('data_state'),
-                 ranges['entry_range_low'], ranges['entry_range_high'], ranges['fair_value'],
-                 ranges['target_1'], ranges['target_2'], ranges['invalidation_price'],
-                 self._suggest_json(card.get('top_positive_reasons')),
-                 self._suggest_json(card.get('top_negative_reasons')),
-                 self._suggest_json(card.get('evidence_snapshot')),
-                 engine_version, card.get('fingerprint', ''),
-                 datetime.now(timezone.utc).isoformat()))
+        self._connection.execute("""INSERT INTO global_stock_suggestion
+            (suggestion_id,scan_id,global_instrument_id,symbol,company_name,horizon,
+             initial_action,suggested_at,suggested_price,rank,opportunity_score,
+             confidence,coverage,data_state,entry_range_low,entry_range_high,fair_value,
+             target_1,target_2,invalidation_price,reasons,risks,evidence_snapshot,
+             engine_version,recommendation_fingerprint,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (suggestion_id, str(scan_id), str(card['global_instrument_id']),
+             card.get('symbol'), card.get('company_name'), card['horizon'],
+             card['public_action'], now, card.get('price_at_recommendation'),
+             card.get('rank_position'), card.get('opportunity_score'),
+             card.get('confidence'), card.get('coverage'), card.get('data_state'),
+             ranges['entry_range_low'], ranges['entry_range_high'], ranges['fair_value'],
+             ranges['target_1'], ranges['target_2'], ranges['invalidation_price'],
+             self._suggest_json(card.get('top_positive_reasons')),
+             self._suggest_json(card.get('top_negative_reasons')),
+             self._suggest_json(card.get('evidence_snapshot')),
+             engine_version, card.get('fingerprint', ''),
+             datetime.now(timezone.utc).isoformat()))
 
     def _insert_global_history_event(self, suggestion_id, scan_id, card, ranges, now, fingerprint, engine_version):
-        with self._connection:
-            self._connection.execute("""INSERT INTO global_stock_suggestion_history
-                (event_id,suggestion_id,scan_id,global_instrument_id,horizon,action,
-                 action_at,action_price,rank,opportunity_score,confidence,reasons,
-                 risks,evidence_snapshot,engine_version,event_fingerprint)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (str(uuid4()), str(suggestion_id), str(scan_id), str(card['global_instrument_id']),
-                 card['horizon'], card['public_action'], now, card.get('current_price'),
-                 card.get('rank_position'), card.get('opportunity_score'),
-                 card.get('confidence'), self._suggest_json(card.get('top_positive_reasons')),
-                 self._suggest_json(card.get('top_negative_reasons')),
-                 self._suggest_json(card.get('evidence_snapshot')),
-                 engine_version, fingerprint))
+        self._connection.execute("""INSERT INTO global_stock_suggestion_history
+            (event_id,suggestion_id,scan_id,global_instrument_id,horizon,action,
+             action_at,action_price,rank,opportunity_score,confidence,reasons,
+             risks,evidence_snapshot,engine_version,event_fingerprint)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(uuid4()), str(suggestion_id), str(scan_id), str(card['global_instrument_id']),
+             card['horizon'], card['public_action'], now, card.get('current_price'),
+             card.get('rank_position'), card.get('opportunity_score'),
+             card.get('confidence'), self._suggest_json(card.get('top_positive_reasons')),
+             self._suggest_json(card.get('top_negative_reasons')),
+             self._suggest_json(card.get('evidence_snapshot')),
+             engine_version, fingerprint))
 
     def _upsert_global_current(self, suggestion_id, scan_id, card, ranges, now, engine_version):
         # Look up original suggestion values so they remain stable across
@@ -719,29 +734,28 @@ class OpportunityPersistenceMixin:
                 'new_investor_action','existing_holder_action','current_short_action','current_long_action')
         conflict_cols = cols[1:]  # everything after global_instrument_id,horizon (the PK)
         update_cols = cols[2:]    # everything after suggestion_id
-        with self._connection:
-            self._connection.execute(
-                f"INSERT INTO global_stock_suggestion_current ({','.join(cols)}) "
-                f"VALUES ({','.join('?' for _ in cols)}) "
-                f"ON CONFLICT(global_instrument_id,horizon) DO UPDATE SET "
-                + ','.join(f'{c}=excluded.{c}' for c in update_cols),
-                (str(card['global_instrument_id']), card['horizon'], str(suggestion_id),
-                 card['public_action'], now, card.get('current_price'),
-                 original_suggested_at, original_suggested_price,
-                 card.get('rank_position'), card.get('opportunity_score'),
-                 card.get('confidence'), card.get('coverage'),
-                 ranges['entry_range_low'], ranges['entry_range_high'], ranges['fair_value'],
-                 ranges['target_1'], ranges['target_2'], ranges['invalidation_price'],
-                 self._suggest_json(card.get('top_positive_reasons')),
-                 self._suggest_json(card.get('top_negative_reasons')),
-                 self._suggest_json(card.get('evidence_snapshot')),
-                 engine_version, str(scan_id),
-                 card.get('data_state'),
-                 self._suggest_json(card.get('missing_areas')),
-                 self._suggest_json(card.get('stale_areas')),
-                 card.get('short_term_state'), card.get('long_term_state'),
-                 card.get('new_investor_action'), card.get('existing_holder_action'),
-                 card.get('current_short_action'), card.get('current_long_action')))
+        self._connection.execute(
+            f"INSERT INTO global_stock_suggestion_current ({','.join(cols)}) "
+            f"VALUES ({','.join('?' for _ in cols)}) "
+            f"ON CONFLICT(global_instrument_id,horizon) DO UPDATE SET "
+            + ','.join(f'{c}=excluded.{c}' for c in update_cols),
+            (str(card['global_instrument_id']), card['horizon'], str(suggestion_id),
+             card['public_action'], now, card.get('current_price'),
+             original_suggested_at, original_suggested_price,
+             card.get('rank_position'), card.get('opportunity_score'),
+             card.get('confidence'), card.get('coverage'),
+             ranges['entry_range_low'], ranges['entry_range_high'], ranges['fair_value'],
+             ranges['target_1'], ranges['target_2'], ranges['invalidation_price'],
+             self._suggest_json(card.get('top_positive_reasons')),
+             self._suggest_json(card.get('top_negative_reasons')),
+             self._suggest_json(card.get('evidence_snapshot')),
+             engine_version, str(scan_id),
+             card.get('data_state'),
+             self._suggest_json(card.get('missing_areas')),
+             self._suggest_json(card.get('stale_areas')),
+             card.get('short_term_state'), card.get('long_term_state'),
+             card.get('new_investor_action'), card.get('existing_holder_action'),
+             card.get('current_short_action'), card.get('current_long_action')))
 
     def global_current_suggestions(self, *, horizon=None):
         """Read the mutable current projection. No user-scoped filtering.
@@ -815,7 +829,7 @@ class OpportunityPersistenceMixin:
         """
         current = self.global_current_suggestions()
         scans = self.global_market_scans()
-        completed = [s for s in scans if s['status'] == 'COMPLETED']
+        completed = [s for s in scans if s['status'] == 'COMPLETED' and not s.get('controlled')]
         latest_scan = completed[0] if completed else None
         generated_at = latest_scan['completed_at'] if latest_scan else None
 
@@ -886,7 +900,12 @@ class OpportunityPersistenceMixin:
                 'current_long_action': _row_get(row, 'current_long_action'),
             }
 
-        cards = [_card(r) for r in current]
+        scan_id = latest_scan['scan_id'] if latest_scan else None
+        cards = [_card(r) for r in current if r['last_scan_id'] == scan_id]
+        previous = self._radar_previous_recommendations()
+        previous_keys = {(c['global_instrument_id'], c.get('horizon')) for c in previous}
+        previous += [_card(r) for r in current if r['last_scan_id'] != scan_id
+                     and (r['global_instrument_id'], r['horizon']) not in previous_keys]
         buy_cards = [c for c in cards if c['public_action'] in ('STRONG_BUY', 'BUY')]
         exit_cards = [c for c in cards if c['public_action'] in ('PARTIAL_EXIT', 'SELL')]
 
@@ -926,7 +945,7 @@ class OpportunityPersistenceMixin:
             top_short_term_count=len(short_buy),
             top_long_term_count=len(long_buy),
             top_exit_count=len(exit_sorted),
-            previous_recommendations=self._radar_previous_recommendations(),
+            previous_recommendations=previous,
             generated_at=generated_at,
             last_processed_at=generated_at,
             source_scan_id=latest_scan['scan_id'] if latest_scan else None,

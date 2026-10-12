@@ -35,7 +35,11 @@ public class OfficialNseSecurityMasterClient implements NseOfficialSecurityMaste
 
     @Autowired
     public OfficialNseSecurityMasterClient(@Value("${nse.official.equity-security-list-url:https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv}") String securityListUrl) {
-        this(securityListUrl, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).followRedirects(HttpClient.Redirect.NORMAL).build());
+        this(securityListUrl, HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .connectTimeout(Duration.ofSeconds(5))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build());
     }
 
     OfficialNseSecurityMasterClient(String securityListUrl, HttpClient http) {

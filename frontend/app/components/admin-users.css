@@ -1,0 +1,10 @@
+.admin-users { display: grid; gap: 1rem; }
+.admin-users .card { padding: 1.25rem; }
+.admin-users form { display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; margin-bottom: 1rem; }
+.admin-users .field { flex: 1; min-width: 12rem; }
+.admin-users textarea { width: 100%; min-height: 5rem; }
+.admin-table-scroll { overflow-x: auto; margin-bottom: 1rem; }
+.admin-users table { border-collapse: collapse; width: 100%; text-align: left; }
+.admin-users th, .admin-users td { padding: .75rem; vertical-align: top; border-bottom: 1px solid var(--border, #d1d5db); }
+.admin-users li { margin-bottom: 1rem; overflow-wrap: anywhere; }
+.admin-users .badge { margin-right: .25rem; }

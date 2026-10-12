@@ -98,7 +98,9 @@ public class PortfolioRouteController {
         "/api/v1/portfolios",
         "/api/v1/portfolios/**",
         "/api/v1/instruments",
-        "/api/v1/instruments/**"
+        "/api/v1/instruments/**",
+        "/api/v1/market-universe",
+        "/api/v1/market-universe/**"
     })
     public ResponseEntity<byte[]> route(HttpServletRequest request) throws IOException {
         return forwardBytes(request, portfolioServiceBaseUrl, true, restClient);
@@ -133,7 +135,20 @@ public class PortfolioRouteController {
         return forward(request, companyServiceBaseUrl, true);
     }
 
-    @RequestMapping({"/api/v1/research/**", "/api/v1/research"})
+    // RADAR UI + API ROUTING closure -- root cause of the reported 404 on
+    // /api/v1/etf-radar/cycles (any method, not just the browser's GET):
+    // research-engine mounts its ETF Radar endpoints directly under
+    // /api/v1/etf-radar/** (see ai/research-engine/app/main.py), a sibling
+    // of /api/v1/research/**, not a child of it -- so no existing
+    // @RequestMapping on this controller ever matched that path at all.
+    // Spring returns 404 for a path with no matching mapping regardless of
+    // HTTP method (a method mismatch on an EXISTING mapping would be 405,
+    // which is not what was observed), confirming this is a genuinely
+    // missing route, not a GET/POST mismatch. Equity Radar's cycle
+    // endpoints are already under /api/v1/research/opportunities/** and are
+    // unaffected. Reuses routeResearch's existing byte-exact forwarding --
+    // no duplicate endpoint, no new method.
+    @RequestMapping({"/api/v1/research/**", "/api/v1/research", "/api/v1/etf-radar/**", "/api/v1/etf-radar"})
     public ResponseEntity<byte[]> routeResearch(HttpServletRequest request) throws IOException {
         // Root cause (runtime defect closure): this route used to call the
         // String-based forward(), which reads the raw request body via

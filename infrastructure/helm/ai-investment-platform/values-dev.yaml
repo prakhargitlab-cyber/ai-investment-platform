@@ -190,3 +190,12 @@ marketData:
   demoMode: true
   quoteCacheMode: redis
 
+
+# Stage 9: portfolio-service-only candidate image validation. Takes precedence over
+# global.imageTag for this one workload only (see aip.imageExplicitTag in _helpers.tpl
+# and the image line in templates/java-services.yaml); every other workload is governed
+# by global.imageTag exactly as before. Candidate image already verified (HTTP/1.1 fix +
+# Maven correctness gate); this entry does not itself deploy anything.
+workloadOverrides:
+  portfolio-service:
+    imageTagOverride: dev-20261008-213512

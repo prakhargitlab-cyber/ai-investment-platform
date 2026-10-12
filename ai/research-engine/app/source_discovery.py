@@ -416,7 +416,7 @@ class OfficialFilingDiscovery:
         # attempt is timed here -- a cache hit or a joined single-flight
         # caller (both handled above, before this point) correctly
         # contribute nothing, since neither one performs new discovery work.
-        _discovery_started = time.monotonic()
+        _discovery_started = time.perf_counter()
         try:
             response = await self.client.get(self.announcements_url, params={"index": "equities", "symbol": symbol})
             response.raise_for_status()
@@ -436,7 +436,7 @@ class OfficialFilingDiscovery:
                     self._rows_cache.popitem(last=False)
             return rows
         finally:
-            cycle_timing.record_discovery_elapsed((time.monotonic() - _discovery_started) * 1000)
+            cycle_timing.record_discovery_elapsed((time.perf_counter() - _discovery_started) * 1000)
             self._rows_flights.pop(symbol, None)
 
     async def discover(self, profile: CompanyResearchProfile, categories: set[str], seen_urls: set[str]) -> list[DiscoveryResult]:
@@ -1504,7 +1504,7 @@ async def _safe_search_get(
     # only (mirrors OfficialFilingDiscovery.discover's record_discovery_elapsed
     # placement) -- a timeout or HTTP error still consumes real wall time,
     # so the timing is recorded in a finally, before the error is raised.
-    _search_started = time.monotonic()
+    _search_started = time.perf_counter()
     try:
         response = await client.get(endpoint, params=params, headers=headers)
     except httpx.TimeoutException as exc:
@@ -1512,7 +1512,7 @@ async def _safe_search_get(
     except httpx.HTTPError as exc:
         raise SearchProviderError("SEARCH_PROVIDER_UNAVAILABLE:http_error") from exc
     finally:
-        cycle_timing.record_search_provider_elapsed((time.monotonic() - _search_started) * 1000)
+        cycle_timing.record_search_provider_elapsed((time.perf_counter() - _search_started) * 1000)
     if response.status_code in {401, 403}:
         raise SearchProviderError("SEARCH_PROVIDER_FORBIDDEN")
     if response.status_code == 429:

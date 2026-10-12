@@ -2301,6 +2301,14 @@ tbody tr[class*="ownership-"] td {
 
 /* Manual evidence upload */
 .evidence-upload-popup { max-width: 920px; }
+/* FINAL FIX item 8 -- the SHAREHOLDING facts table gained a Status
+   column and can carry long free-text source-locator/evidence-text
+   values; at the previous 920px popup width those forced the table
+   wider than the dialog, requiring horizontal scrolling to see the
+   metric, extracted value, status and correction input together. */
+@media (min-width: 1240px) {
+  .evidence-upload-popup { max-width: 1180px; }
+}
 .evidence-drop-zone {
   display: grid;
   align-items: center;
@@ -2347,6 +2355,22 @@ tbody tr[class*="ownership-"] td {
 }
 .evidence-facts-table th { background: var(--bg-subtle); font-size: 12px; font-weight: 700; }
 .evidence-facts-table td:last-child input { width: 140px; }
+/* FINAL FIX item 8 -- let the long free-text columns (source/
+   provenance, evidence text) WRAP within a bounded width instead of
+   forcing the table wider than the dialog -- this, not the table
+   itself, was what pushed metric/value/status/correction out of view
+   together and required horizontal scrolling on desktop. */
+.evidence-fact-cell-wrap { max-width: 220px; white-space: normal; word-break: break-word; }
+.evidence-facts-table td:first-child { max-width: 160px; white-space: normal; word-break: break-word; }
+/* FINAL CLOSURE item 3 -- provenance/confidence/source text now live in
+   a per-row collapsed disclosure instead of their own plain columns,
+   so the visible row (field/value/status/correction) never needs
+   horizontal scrolling at normal desktop width. */
+.evidence-fact-details-cell { width: 160px; }
+.evidence-fact-details summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-muted); }
+.evidence-fact-details dl { margin: var(--space-2) 0 0; max-width: 260px; }
+.evidence-fact-details dt { color: var(--text-muted); font-size: 11px; margin-top: var(--space-1); }
+.evidence-fact-details dd { margin: 0; font-size: 13px; white-space: normal; word-break: break-word; }
 .evidence-conflict-consent { display: flex; align-items: flex-start; gap: var(--space-2); margin: var(--space-3) 0; }
 .evidence-manual-fields { display: flex; flex-direction: column; gap: var(--space-3); margin: var(--space-3) 0; }
 .evidence-manual-field { display: flex; flex-direction: column; gap: var(--space-1); font-size: 13px; font-weight: 600; }
@@ -2356,6 +2380,14 @@ tbody tr[class*="ownership-"] td {
 .evidence-extracted-text { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-subtle); }
 .evidence-extracted-text-label { font-size: 12px; font-weight: 700; color: var(--text-muted); }
 .evidence-extracted-text pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; font-size: 13px; max-height: 200px; overflow-y: auto; }
+.evidence-supplementary-fields { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-subtle); }
+.evidence-supplementary-heading { margin: 0; font-size: 13px; font-weight: 700; color: var(--text-muted); }
+.evidence-supplementary-list { display: flex; flex-direction: column; gap: var(--space-1); margin: 0; }
+.evidence-supplementary-row { display: flex; justify-content: space-between; gap: var(--space-2); }
+.evidence-supplementary-row dt { color: var(--text-muted); font-size: 13px; }
+.evidence-supplementary-row dd { margin: 0; font-weight: 600; }
+.evidence-period-correction { margin-bottom: var(--space-3); }
+.evidence-fact-row-missing td { color: var(--text-muted); }
 .evidence-actions {
   display: flex;
   align-items: center;
@@ -2369,6 +2401,23 @@ tbody tr[class*="ownership-"] td {
 .evidence-fact-row-error { display: block; margin-top: 2px; color: var(--danger, #b42318); font-size: 11px; }
 .evidence-fact-row-invalid input,
 .evidence-fact-row-invalid select { border-color: var(--danger, #b42318); }
+
+/* FINAL CLOSURE item 8 -- compact, responsive metric cards replacing the
+   wide 8-column financial-fact table (which forced horizontal scroll at
+   normal widths). One card per row; metric/value/period/basis/unit stay
+   visible together, source/provenance collapses into the same
+   evidence-fact-details disclosure used above. */
+.financial-fact-cards { display: flex; flex-direction: column; gap: var(--space-3); margin: var(--space-2) 0; }
+.financial-fact-card { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); background: var(--surface, #fff); }
+.financial-fact-card.evidence-fact-row-invalid { border-color: var(--danger, #b42318); }
+.financial-fact-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--space-2) var(--space-3); }
+.financial-fact-field { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--text-muted); }
+.financial-fact-field input,
+.financial-fact-field select { width: 100%; padding: 4px 6px; border-radius: var(--radius); border: 1px solid var(--border); font-size: 13px; color: var(--text); }
+.financial-fact-card .evidence-fact-details { margin-top: var(--space-2); }
+.financial-fact-card .evidence-fact-details dl,
+.financial-fact-card .evidence-fact-details .financial-fact-field { max-width: 320px; }
+.financial-fact-card-footer { display: flex; justify-content: flex-end; margin-top: var(--space-2); }
 .evidence-fact-add-row { margin: var(--space-2) 0 var(--space-3); }
 
 @media (max-width: 900px) {

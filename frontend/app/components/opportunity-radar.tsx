@@ -255,15 +255,49 @@ type EquityActiveCycle = {
 // sessionStorage, under its own key -- never shared with ETF Radar's key.
 const EQUITY_ACTIVE_CYCLE_STORAGE_KEY = "aip.opportunityRadar.activeCycleId";
 
-function equityCounters(progress: EquityAuthoritativeProgress | null): RadarProgressCounter[] {
-  if (!progress) return [];
+function equityCounters(progress: EquityAuthoritativeProgress | null, data: Radar | null, status: string): RadarProgressCounter[] {
+  // RADAR UI + API ROUTING closure, item C/D -- every field the spec asks
+  // for is listed, even when this backend genuinely has no trustworthy
+  // value for it: the panel renders "Unavailable" for a null value rather
+  // than hiding the row (see radar-progress.tsx).
+  //
+  // "Total universe"/"Pod restarts" are not in
+  // app.cycle_checkpoint.cycle_status_snapshot's returned shape at all
+  // (deep_completed/deep_denominator/ready/failed/technical/eligible only)
+  // and there is no Kubernetes-restart data source wired into this backend
+  // -- both stay Unavailable; the smallest addition that would populate
+  // Total universe is persisting len(baseline_scan.candidates) into the
+  // cycle's checkpoint selection alongside deep_ids/shortlist_ids.
+  //
+  // BUY/SELL (STRONG_BUY+BUY / PARTIAL_EXIT+SELL across the FULL current
+  // suggestion set, not just the displayed top-N -- see
+  // app.opportunity_persistence.global_opportunity_radar's
+  // top_short_term_count/top_long_term_count/top_exit_count) are only ever
+  // read from this cycle's own freshly-refetched, published `data`, once
+  // this cycle has actually reached COMPLETED -- never from a stale
+  // previous cycle's data and never provisionally mid-run.
+  const terminalData = status === "COMPLETED" ? data : null;
+  const buyCount = terminalData ? (terminalData.top_short_term_count ?? 0) + (terminalData.top_long_term_count ?? 0) : null;
   return [
-    { label: "Deep attempted", value: progress.deep_denominator ?? null },
-    { label: "Deep completed", value: progress.deep_completed ?? null },
-    { label: "Eligible", value: progress.eligible ?? null },
-    { label: "Ready", value: progress.ready ?? null },
-    { label: "Readiness failed", value: progress.failed ?? null },
-    { label: "Technical failures", value: progress.technical ?? null },
+    { label: "Deep attempted", value: progress?.deep_denominator ?? null },
+    { label: "Deep completed", value: progress?.deep_completed ?? null },
+    { label: "Eligible", value: progress?.eligible ?? null },
+    { label: "Ready", value: progress?.ready ?? null },
+    { label: "Readiness failed", value: progress?.failed ?? null },
+    { label: "Technical failures", value: progress?.technical ?? null },
+    { label: "Total universe", value: null },
+    { label: "Pod restarts", value: null },
+    { label: "BUY count", value: buyCount },
+    // Combines PARTIAL_EXIT and SELL (app.opportunity_persistence's own
+    // exit_cards grouping) -- the backend does not expose a SELL-only
+    // count, so this is labeled for what it actually is rather than
+    // mislabeled "SELL count".
+    { label: "Exit (Sell/Partial) count", value: terminalData ? (terminalData.top_exit_count ?? 0) : null },
+    // Equity's public action vocabulary (STRONG_BUY/BUY/PARTIAL_EXIT/SELL)
+    // has no AVOID or HOLD/neutral category at all -- not a transient gap,
+    // genuinely not supported for this radar type.
+    { label: "AVOID count", value: null },
+    { label: "HOLD/neutral count", value: null },
   ];
 }
 
@@ -354,7 +388,8 @@ export function OpportunityRadar({ heldIds, watchlistedIds }: { heldIds: string[
     </button>
     {activeCycle ? (
       <RadarProgressPanel radarType="Equity" cycleId={activeCycle.cycleId} status={activeCycle.status}
-        startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={equityCounters(activeCycle.progress)}
+        startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt}
+        counters={equityCounters(activeCycle.progress, data, activeCycle.status)}
         percent={equityPercent(activeCycle.progress)} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
     ) : null}
     {error ? <p role="alert">Opportunity radar unavailable.</p> : data ? <RadarContent data={data} heldIds={heldIds} watchlistedIds={watchlistedIds} /> : <p>Loading persisted opportunities…</p>}

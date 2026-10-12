@@ -7,9 +7,12 @@ import org.springframework.context.annotation.ComponentScan;
 
 @SpringBootApplication
 @ComponentScan("com.aiinvestment")
-@EnableConfigurationProperties(AuthProperties.class)
+@EnableConfigurationProperties({AuthProperties.class, RoleAdminProperties.class})
 public class AuthServiceApplication {
     public static void main(String[] args) {
-        SpringApplication.run(AuthServiceApplication.class, args);
+        var context = SpringApplication.run(AuthServiceApplication.class, args);
+        if (context.getEnvironment().acceptsProfiles(org.springframework.core.env.Profiles.of("role-admin-cli"))) {
+            System.exit(SpringApplication.exit(context));
+        }
     }
 }

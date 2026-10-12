@@ -9,6 +9,7 @@ Tests cover:
   * Dedup by content hash
   * Readiness recalculation through the normal path (not hard-coded)
 """
+from pathlib import Path
 import asyncio
 import io
 import json
@@ -211,11 +212,26 @@ class TestFileTypeDetection:
     def test_file_types_endpoint_advertises_only_extractable_formats(self):
         from fastapi.testclient import TestClient
         from app.main import app
+        from app.image_evidence_extraction import image_ocr_available
+        from app.document_extraction import docx_extraction_available
 
         response = TestClient(app).get("/api/v1/research/evidence/file-types")
 
         assert response.status_code == 200
-        assert set(response.json()["supportedFileTypes"]) == {"CSV", "PDF", "TXT", "PNG", "JPG", "DOCX"}
+        # PNG/JPG/DOCX are fail-closed, gated on the SAME runtime capability
+        # checks the endpoint itself uses (app.manual_evidence
+        # ._ocr_dependent_labels_available / app.main.supported_evidence_file_types),
+        # not a fixed hardcoded set -- a runtime image without the tesseract
+        # OS binary (e.g. a Windows dev machine without it on PATH) is
+        # expected, correct behavior to omit PNG/JPG here, and this
+        # assertion must track that rather than assume availability.
+        always_available = {"CSV", "PDF", "TXT"}
+        conditionally_available = set()
+        if image_ocr_available():
+            conditionally_available |= {"PNG", "JPG"}
+        if docx_extraction_available():
+            conditionally_available |= {"DOCX"}
+        assert set(response.json()["supportedFileTypes"]) == always_available | conditionally_available
         assert set(response.json()["supportedEvidenceTypes"]) == {
             "SHAREHOLDING", "CURRENT_NEWS", "ORDER_BOOK_CAPEX_GUIDANCE", "GOVERNANCE_HISTORY",
             "BUSINESS_QUALITY_FACTS", "GROWTH_FACTS", "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS",
@@ -857,3 +873,658 @@ Public shareholders: 25.85%
         )
         # 31/03/2024 is a quarter-end, so no PERIOD_NOT_QUARTER_END warning
         assert not any("PERIOD_NOT_QUARTER_END" in w for w in draft.validation_results.warnings)
+
+
+class TestRealProductionPathGokulAgroRegression:
+    """TASK D regression: the REAL production call path end to end --
+    PNG -> app.document_extraction.DocumentExtractor ->
+    ManualEvidenceIngestor.ingest() -> draft response -- never bypassing
+    ManualEvidenceIngestor by calling app.evidence_interpretation directly
+    (that is a separate, narrower unit-test concern covered by
+    tests/test_shareholding_table_interpretation.py). This is the exact
+    path that was found broken (OCR spatial metadata was silently
+    discarded before reaching the interpreter -- see
+    ManualEvidenceIngestor._extract_text / _extract_shareholding)."""
+
+    def test_full_ingest_resolves_all_categories_with_ocr_metadata_reaching_the_interpreter(self, ingestor, monkeypatch):
+        import shutil
+        if not shutil.which("tesseract"):
+            pytest.skip("tesseract not installed in this environment")
+
+        import io
+        from PIL import Image, ImageDraw, ImageFont
+
+        font = ImageFont.truetype(
+            str(Path(__file__).resolve().parent / "fixtures" / "fonts" / "DejaVuSansMono-Bold.ttf"), 36)
+        col_x = [40, 600, 830, 1060, 1290]
+        rows = [
+            ["", "Sep 2025", "Dec 2025", "Mar 2026", "Jun 2026"],
+            ["Promoters", "73.67", "74.24", "74.24", "74.24"],
+            ["FIIs", "1.87", "1.58", "1.51", "1.87"],
+            ["DIIs", "0.01", "0.01", "0.09", "0.11"],
+            ["Public", "24.45", "24.16", "24.18", "23.78"],
+            ["No. of Shareholders", "49,673", "52,198", "52,418", "50,407"],
+        ]
+        image = Image.new("RGB", (1650, 60 + len(rows) * 60), color="white")
+        draw = ImageDraw.Draw(image)
+        for r, row in enumerate(rows):
+            for c, cell in enumerate(row):
+                draw.text((col_x[c], 20 + r * 60), cell, fill="black", font=font)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        # Spy on interpret_shareholding to prove metadata (OCR word
+        # boxes) actually REACHES it through the real ingest() call --
+        # not a structural inference, a direct observation of the call.
+        received = {}
+        from app import evidence_interpretation as ei_module
+        real_interpret = ei_module.interpret_shareholding
+
+        def spy_interpret_shareholding(extracted, **kwargs):
+            received["metadata"] = getattr(extracted, "metadata", None)
+            return real_interpret(extracted, **kwargs)
+
+        monkeypatch.setattr(ei_module, "interpret_shareholding", spy_interpret_shareholding)
+        # app.manual_evidence imports interpret_shareholding lazily
+        # inside _extract_shareholding (`from app.evidence_interpretation
+        # import interpret_shareholding`), so patching the module
+        # attribute above is picked up on the next ingest() call.
+
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=buffer.getvalue(),
+            filename="gokul_agro_shareholding.png",
+            instrument_id=RELIANCE_ID,
+        )
+
+        # 1. OCR word metadata reached the interpreter.
+        assert received.get("metadata"), "interpret_shareholding received no/empty metadata"
+        assert received["metadata"].get("ocrWords"), "ocrWords missing from metadata reaching the interpreter"
+
+        # 2. Four correctly grounded Jun 2026 ownership categories proposed.
+        by_field = {fact.field: fact.value for fact in draft.proposed_facts}
+        assert by_field.get("shareholding:PROMOTER") == Decimal("74.24")
+        assert by_field.get("shareholding:FII_FPI") == Decimal("1.87")
+        assert by_field.get("shareholding:DII") == Decimal("0.11")
+        assert by_field.get("shareholding:PUBLIC_RETAIL") == Decimal("23.78")
+        assert len([f for f in draft.proposed_facts if f.field.startswith("shareholding:")]) == 4
+
+        # 3. Reporting period = 2026-06-01, precision MONTH.
+        assert draft.reporting_period is not None
+        assert (draft.reporting_period.year, draft.reporting_period.month, draft.reporting_period.day) == (2026, 6, 1)
+
+        # 4. Shareholder count remains supplementary, never a proposedFact
+        #    or an ownership percentage.
+        assert draft.field_suggestions is not None
+        assert draft.field_suggestions.get("shareholderCount") == "50407"
+        assert not any("shareholderCount" in f.field for f in draft.proposed_facts)
+        assert not any(f.field == "shareholding:SHAREHOLDER_COUNT" for f in draft.proposed_facts)
+
+        # 5. No promoter pledge is invented -- absent from source, absent from draft.
+        assert not any("PROMOTER_PLEDGE" in f.field for f in draft.proposed_facts)
+
+        # 6. Nothing accepted or persisted as canonical financial evidence
+        #    without explicit user acceptance -- ingest() alone must never
+        #    persist. Drafts live in-process only until accept().
+        assert draft.status == DraftStatus.DRAFT
+
+    def test_unmatched_ocr_garbled_fii_dii_labels_produce_bounded_warnings_not_silence(self, ingestor):
+        """CURRENT CLOSURE update: 'Flls'/'Dlls' (an 'I'/'l' misread of
+        'FIIs'/'DIIs') is now resolved by the margin-safe short-variant
+        matcher, since each is measurably CLOSER to its own canonical
+        variant than to the other category's (see
+        TestCaseXGokulAgroLiteralOcrTypoFiisDiisMarginDisambiguation in
+        test_shareholding_table_interpretation.py) -- that is the fix
+        this closure pass was required to make, so it is covered
+        elsewhere and no longer asserted as 'stays unmatched' here.
+
+        This test now covers the genuinely-unclear case the original
+        intent was protecting: two DIFFERENT garbled labels ('Giis',
+        'Ciis') that are each equidistant (tied) between the FII_FPI
+        and DII canonical variants -- neither can be favored over the
+        other, so both must be left unmatched, never force-assigned by
+        row order or by surrounding percentages/totals, with a bounded
+        warning identifying each unmatched row, not silence."""
+        text = (
+            "Sep 2025,Dec 2025,Mar 2026,Jun 2026\n"
+            "Promoters,73.67,74.24,74.24,74.24\n"
+            "Giis,1.87,1.58,1.51,1.87\n"
+            "Ciis,0.01,0.01,0.09,0.11\n"
+            "Public,24.45,24.16,24.18,23.78\n"
+        )
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=text.encode("utf-8"),
+            filename="gokul_agro_shareholding.csv",
+            instrument_id=RELIANCE_ID,
+        )
+        by_field = {fact.field: fact.value for fact in draft.proposed_facts}
+        assert by_field.get("shareholding:PROMOTER") == Decimal("74.24")
+        assert by_field.get("shareholding:PUBLIC_RETAIL") == Decimal("23.78")
+        assert "shareholding:FII_FPI" not in by_field
+        assert "shareholding:DII" not in by_field
+        warnings_text = " | ".join(draft.validation_results.warnings)
+        assert "AMBIGUOUS_CATEGORY_LABEL_RESEMBLANCE" in warnings_text
+        assert "FII_FPI" in warnings_text and "DII" in warnings_text
+        # Never forced into a category by row position or by nearby
+        # totals/percentages -- the warnings above are the only trace;
+        # no FII_FPI/DII proposedFact was fabricated (already asserted
+        # via by_field above).
+
+    def test_unrelated_text_lines_never_produce_resemblance_warnings(self, ingestor):
+        """Negative control for requirement B: ordinary unrelated text
+        in the document must never trigger a resemblance warning -- only
+        text that is genuinely close to a known short category variant
+        and looks like a table row (has a trailing number) does."""
+        text = (
+            "Sep 2025,Jun 2026\n"
+            "Promoters,73.67,74.24\n"
+            "Public,24.45,23.78\n"
+            "Notes: this filing excludes pledged shares and is subject to review.\n"
+            "Disclaimer,and,other,prose,here\n"
+        )
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=text.encode("utf-8"),
+            filename="shareholding.csv",
+            instrument_id=RELIANCE_ID,
+        )
+        assert not any("RESEMBLANCE" in w for w in draft.validation_results.warnings)
+
+
+class TestFieldClassificationPartialExtraction:
+    """TASK E item 3 -- ManualEvidenceDraft.field_classification exposes
+    per-category EXTRACTED/MISSING/AMBIGUOUS/INVALID status through the
+    real production ingestion path (ingestor.ingest()), reusing
+    app.evidence_interpretation.classify_shareholding_fields -- no new
+    recognition logic, nothing fabricated."""
+
+    def test_complete_extraction_marks_all_four_categories_extracted(self, ingestor):
+        text = (
+            "Sep 2025   Dec 2025   Mar 2026   Jun 2026\n"
+            "Promoters   73.67      74.24      74.24      74.24\n"
+            "FIIs         1.87       1.58       1.51       1.87\n"
+            "DIIs         0.01       0.01       0.09       0.11\n"
+            "Public      24.45      24.16      24.18      23.78\n"
+        )
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=text.encode("utf-8"),
+            filename="complete.csv",
+            instrument_id=RELIANCE_ID,
+        )
+        assert draft.field_classification == {
+            "PROMOTER": "EXTRACTED",
+            "FII_FPI": "EXTRACTED",
+            "DII": "EXTRACTED",
+            "PUBLIC_RETAIL": "EXTRACTED",
+        }
+
+    def test_partial_extraction_classifies_missing_categories_without_dropping_the_rest(self, ingestor):
+        # No DII row or label at all anywhere in the document.
+        text = (
+            "Sep 2025   Dec 2025   Mar 2026   Jun 2026\n"
+            "Promoters   73.67      74.24      74.24      74.24\n"
+            "FIIs         1.87       1.58       1.51       1.87\n"
+            "Public      24.45      24.16      24.18      23.78\n"
+        )
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=text.encode("utf-8"),
+            filename="partial.csv",
+            instrument_id=RELIANCE_ID,
+        )
+        by_field = {fact.field: fact.value for fact in draft.proposed_facts}
+        # The three found categories are still proposed -- DII's absence
+        # never discards them.
+        assert by_field.get("shareholding:PROMOTER") == Decimal("74.24")
+        assert by_field.get("shareholding:FII_FPI") == Decimal("1.87")
+        assert by_field.get("shareholding:PUBLIC_RETAIL") == Decimal("23.78")
+        assert draft.field_classification == {
+            "PROMOTER": "EXTRACTED",
+            "FII_FPI": "EXTRACTED",
+            "DII": "MISSING",
+            "PUBLIC_RETAIL": "EXTRACTED",
+        }
+
+    def test_ambiguous_label_classifies_that_category_as_ambiguous_not_silently_resolved(self, ingestor):
+        # CURRENT CLOSURE update: a single garbled label is only
+        # classified AMBIGUOUS when it is genuinely TIED between FII
+        # and DII variants (equal edit distance to both) -- a label
+        # that is measurably closer to one (e.g. the old "Fdis"
+        # fixture, distance 1 from "fiis" vs distance 2 from "diis")
+        # now resolves to that closer category via the margin-safe
+        # short-variant matcher, so "Giis" (tied at distance 1 to both)
+        # is used here to keep testing genuine, unresolved ambiguity.
+        text = (
+            "Sep 2025   Dec 2025   Mar 2026   Jun 2026\n"
+            "Promoters   73.67      74.24      74.24      74.24\n"
+            "Giis         1.87       1.58       1.51       1.87\n"
+            "Public      24.45      24.16      24.18      23.78\n"
+        )
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=text.encode("utf-8"),
+            filename="ambiguous.csv",
+            instrument_id=RELIANCE_ID,
+        )
+        by_field = {fact.field: fact.value for fact in draft.proposed_facts}
+        assert "shareholding:FII_FPI" not in by_field
+        assert "shareholding:DII" not in by_field
+        assert draft.field_classification["PROMOTER"] == "EXTRACTED"
+        assert draft.field_classification["PUBLIC_RETAIL"] == "EXTRACTED"
+        assert draft.field_classification["FII_FPI"] == "AMBIGUOUS"
+        assert draft.field_classification["DII"] == "AMBIGUOUS"
+        assert any("AMBIGUOUS_CATEGORY_LABEL" in w for w in draft.validation_results.warnings)
+
+    def test_invalid_row_value_classifies_that_category_as_invalid(self, ingestor):
+        # PROMOTER's row has fewer values than the header -- matched
+        # label, unresolved value (existing ROW_COLUMN_COUNT_MISMATCH
+        # behavior), which must classify as INVALID, not MISSING.
+        text = (
+            "Sep 2025   Dec 2025   Mar 2026   Jun 2026\n"
+            "Promoters   74.24\n"
+            "FIIs         1.87       1.58       1.51       1.87\n"
+            "DIIs         0.01       0.01       0.09       0.11\n"
+            "Public      24.45      24.16      24.18      23.78\n"
+        )
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=text.encode("utf-8"),
+            filename="invalid_row.csv",
+            instrument_id=RELIANCE_ID,
+        )
+        by_field = {fact.field: fact.value for fact in draft.proposed_facts}
+        assert "shareholding:PROMOTER" not in by_field
+        assert draft.field_classification["PROMOTER"] == "INVALID"
+        assert draft.field_classification["FII_FPI"] == "EXTRACTED"
+        assert any("ROW_COLUMN_COUNT_MISMATCH" in w for w in draft.validation_results.warnings)
+
+    def test_field_classification_is_none_for_non_shareholding_evidence_types(self, ingestor):
+        draft = ingestor.ingest(
+            evidence_type="CURRENT_NEWS",
+            file_bytes=b"Some news article text about the company.",
+            filename="news.txt",
+            instrument_id=RELIANCE_ID,
+        )
+        assert draft.field_classification is None
+
+
+class TestTaskE2EditableReviewFields:
+    """TASK E2 -- SHAREHOLDING Review fields are editable for all four
+    canonical ownership categories (not just the ones extraction
+    happened to find), reusing the existing `corrections`/accept()
+    contract end to end: no parallel persistence mechanism, no
+    fabrication, no automatic acceptance."""
+
+    PARTIAL_TABLE = (
+        "Sep 2025   Dec 2025   Mar 2026   Jun 2026\n"
+        "Promoters   73.67      74.24      74.24      74.24\n"
+        "FIIs         1.87       1.58       1.51       1.87\n"
+        "Public      24.45      24.16      24.18      23.78\n"
+    )  # DII is entirely MISSING from this source.
+
+    @pytest.mark.asyncio
+    async def test_correcting_an_extracted_value_preserves_the_original_and_marks_user_corrected(
+        self, ingestor, acceptor, repository
+    ):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        promoter_fact = next(f for f in draft.proposed_facts if f.field == "shareholding:PROMOTER")
+        assert promoter_fact.provenance == "OCR_EXTRACTED"
+        assert promoter_fact.original_value is None  # not yet corrected
+
+        await acceptor.accept(
+            draft_id=draft.draft_id,
+            corrections={
+                "shareholding:PROMOTER": Decimal("70.00"),
+                "shareholding:DII": Decimal("0.11"),  # never extracted at all
+            },
+        )
+        snapshots = repository.persistence.load_shareholding_snapshots(instrument_ids={RELIANCE_ID})
+        by_category = {v.category: v.percentage for v in snapshots[0].values}
+        assert by_category[ShareholdingCategory.PROMOTER] == Decimal("70.00")
+        assert by_category[ShareholdingCategory.DII] == Decimal("0.11")
+        assert by_category[ShareholdingCategory.FII_FPI] == Decimal("1.87")
+        assert by_category[ShareholdingCategory.PUBLIC_RETAIL] == Decimal("23.78")
+
+    def test_correcting_a_missing_category_creates_a_fact_with_user_entered_provenance(self, ingestor):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        assert draft.field_classification["DII"] == "MISSING"
+        assert not any(f.field == "shareholding:DII" for f in draft.proposed_facts)
+
+        draft.corrections = {"shareholding:DII": Decimal("0.11")}
+        from app.manual_evidence import ManualEvidenceAcceptor
+        acceptor_for_apply = ManualEvidenceAcceptor(repository=ingestor.repository)
+        correction_errors = acceptor_for_apply._apply_corrections(draft)
+        assert correction_errors == []
+        dii_fact = next(f for f in draft.proposed_facts if f.field == "shareholding:DII")
+        assert dii_fact.provenance == "USER_ENTERED"
+        assert dii_fact.original_value is None
+        assert dii_fact.value == Decimal("0.11")
+
+    @pytest.mark.asyncio
+    async def test_reporting_period_correction_iso_month_preserves_month_precision(
+        self, ingestor, acceptor, repository
+    ):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        result = await acceptor.accept(
+            draft_id=draft.draft_id,
+            corrections={
+                "shareholding:DII": Decimal("0.11"),
+                "reportingPeriod": "2026-09",
+            },
+        )
+        assert result["persisted"] is True
+        snapshots = repository.persistence.load_shareholding_snapshots(instrument_ids={RELIANCE_ID})
+        # "2026-09" (MONTH precision) normalizes to the first of that
+        # month, exactly like "Sep 2026" would during extraction --
+        # never manufactured to a quarter-end day the user never gave.
+        assert snapshots[0].period_end.date().isoformat() == "2026-09-01"
+
+    @pytest.mark.asyncio
+    async def test_reporting_period_correction_explicit_day_is_used_exactly(
+        self, ingestor, acceptor, repository
+    ):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        await acceptor.accept(
+            draft_id=draft.draft_id,
+            corrections={
+                "shareholding:DII": Decimal("0.11"),
+                "reportingPeriod": "2026-06-30",
+            },
+        )
+        snapshots = repository.persistence.load_shareholding_snapshots(instrument_ids={RELIANCE_ID})
+        assert snapshots[0].period_end.date().isoformat() == "2026-06-30"
+
+    @pytest.mark.asyncio
+    async def test_reporting_period_correction_free_text_reuses_extraction_parser(
+        self, ingestor, acceptor, repository
+    ):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        await acceptor.accept(
+            draft_id=draft.draft_id,
+            corrections={
+                "shareholding:DII": Decimal("0.11"),
+                "reportingPeriod": "Sep 2026",
+            },
+        )
+        snapshots = repository.persistence.load_shareholding_snapshots(instrument_ids={RELIANCE_ID})
+        assert snapshots[0].period_end.date().isoformat() == "2026-09-01"
+
+    @pytest.mark.asyncio
+    async def test_invalid_reporting_period_correction_is_rejected_not_guessed(self, ingestor, acceptor):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        with pytest.raises(AcceptanceError, match="INVALID_REPORTING_PERIOD_CORRECTION"):
+            await acceptor.accept(
+                draft_id=draft.draft_id,
+                corrections={"reportingPeriod": "not a real date"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_unknown_category_correction_key_is_rejected(self, ingestor, acceptor):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        with pytest.raises(AcceptanceError, match="UNKNOWN_CATEGORY_CORRECTION"):
+            await acceptor.accept(
+                draft_id=draft.draft_id,
+                corrections={"shareholding:NOT_A_REAL_CATEGORY": Decimal("1.0")},
+            )
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_correction_value_is_rejected_not_crashed(self, ingestor, acceptor):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        with pytest.raises(AcceptanceError, match="INVALID_PERCENTAGE"):
+            await acceptor.accept(
+                draft_id=draft.draft_id,
+                corrections={"shareholding:DII": "not-a-number"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_ownership_total_far_from_100_percent_warns_but_does_not_block(
+        self, ingestor, acceptor, repository
+    ):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        result = await acceptor.accept(
+            draft_id=draft.draft_id,
+            # Deliberately implausible: correcting PROMOTER sharply down
+            # makes the four primary categories sum to far less than
+            # 100% (no OTHERS/mutual-fund/insurance category is being
+            # tracked here, which is legitimate on its own -- so this is
+            # a WARNING, never a hard error).
+            corrections={
+                "shareholding:PROMOTER": Decimal("1.00"),
+                "shareholding:DII": Decimal("0.01"),
+            },
+        )
+        assert result["persisted"] is True
+        assert any("OWNERSHIP_TOTAL_IMPLAUSIBLE" in w for w in result["validationResults"]["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_shareholder_count_correction_key_is_never_persisted_as_a_category(
+        self, ingestor, acceptor, repository
+    ):
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        await acceptor.accept(
+            draft_id=draft.draft_id,
+            corrections={
+                "shareholding:DII": Decimal("0.11"),
+                "shareholderCount": "50407",
+            },
+        )
+        snapshots = repository.persistence.load_shareholding_snapshots(instrument_ids={RELIANCE_ID})
+        categories = {v.category for v in snapshots[0].values}
+        assert ShareholdingCategory.PROMOTER in categories
+        # shareholderCount never became a persisted category.
+        for v in snapshots[0].values:
+            assert v.category != "shareholderCount"
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_partial_extraction_prefill_manual_completion_explicit_acceptance(
+        self, ingestor, acceptor, repository
+    ):
+        """Full TASK E2 workflow: partial extraction -> prefill ->
+        manual completion of the missing category -> deterministic
+        validation -> explicit accept() -- never auto-accepted."""
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=self.PARTIAL_TABLE.encode("utf-8"),
+            filename="partial.csv", instrument_id=RELIANCE_ID,
+        )
+        # Draft stays in DRAFT status until explicit accept().
+        assert draft.status == DraftStatus.DRAFT
+        assert draft.field_classification == {
+            "PROMOTER": "EXTRACTED", "FII_FPI": "EXTRACTED",
+            "DII": "MISSING", "PUBLIC_RETAIL": "EXTRACTED",
+        }
+        prefilled = {f.field: f.value for f in draft.proposed_facts}
+        assert prefilled["shareholding:PROMOTER"] == Decimal("74.24")
+
+        result = await acceptor.accept(
+            draft_id=draft.draft_id,
+            corrections={"shareholding:DII": Decimal("0.11")},
+        )
+        assert result["persisted"] is True
+        snapshots = repository.persistence.load_shareholding_snapshots(instrument_ids={RELIANCE_ID})
+        assert len(snapshots) == 1
+        by_category = {v.category: v.percentage for v in snapshots[0].values}
+        assert by_category == {
+            ShareholdingCategory.PROMOTER: Decimal("74.24"),
+            ShareholdingCategory.FII_FPI: Decimal("1.87"),
+            ShareholdingCategory.DII: Decimal("0.11"),
+            ShareholdingCategory.PUBLIC_RETAIL: Decimal("23.78"),
+        }
+        # USER_UPLOAD authority is unchanged by corrections.
+        assert snapshots[0].source_provider == "USER_UPLOAD"
+        assert result["readiness"] is not None  # recalculated through the normal path
+
+    @pytest.mark.asyncio
+    async def test_higher_authority_official_evidence_is_not_overridden_by_a_correction(
+        self, ingestor, acceptor, repository
+    ):
+        """TASK E2 item 12 -- a USER_UPLOAD correction must never silently
+        override existing trusted official evidence for the same
+        instrument/period/category; the pre-existing conflict-detection
+        path still governs that, untouched by this change."""
+        from app.models import ReliabilityLevel, ShareholdingSnapshot, ShareholdingSnapshotValue, SourceMode
+
+        official_snapshot = ShareholdingSnapshot(
+            # "Jun 2026" in the uploaded table below is MONTH precision,
+            # normalizing to 2026-06-01 (first-of-month placeholder,
+            # never a manufactured day) -- matched here exactly so the
+            # conflict check's period_end equality actually lines up.
+            instrument_id=RELIANCE_ID,
+            period_end=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            source_provider="NSE",
+            source_type="XBRL",
+            source_identity_key="nse-xbrl:official-e2",
+            source_url="https://nse.example/official-e2",
+            confidence=Decimal("0.95"),
+            reliability_level=ReliabilityLevel.LEVEL_A,
+            source_mode=SourceMode.REAL,
+            values=[
+                ShareholdingSnapshotValue(
+                    category=ShareholdingCategory.PROMOTER,
+                    percentage=Decimal("55.00"),
+                    raw_source_label="Promoter",
+                    source_locator="nse-xbrl:2",
+                    evidence_text="Promoter: 55.00%",
+                ),
+            ],
+        )
+        repository.persist_shareholding_snapshot(official_snapshot)
+
+        text = (
+            "Sep 2025   Jun 2026\n"
+            "Promoters   73.67      74.24\n"
+        )
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING", file_bytes=text.encode("utf-8"),
+            filename="conflicting.csv", instrument_id=RELIANCE_ID,
+        )
+        with pytest.raises(AcceptanceError, match="CONFLICT_WITH_TRUSTED_EVIDENCE"):
+            await acceptor.accept(
+                draft_id=draft.draft_id,
+                corrections={"shareholding:PROMOTER": Decimal("30.00")},
+            )
+        snapshots = repository.persistence.load_shareholding_snapshots(instrument_ids={RELIANCE_ID})
+        assert len(snapshots) == 1
+        assert snapshots[0].values[0].percentage == Decimal("55.00")
+
+
+class TestGokulAgroOcrPlusArtifactRegression:
+    """FINAL FIX regression -- the real runtime failure: a real
+    screenshot's OCR pass can read a table gridline/divider as a
+    literal "+" character next to a row label and/or inside a value
+    cell. This is rendered directly into the image (not injected as
+    synthetic text) so Tesseract genuinely produces the "+" the same
+    way the real upload did, and the full PRODUCTION path is exercised
+    end to end: PNG -> ManualEvidenceIngestor.ingest() -> draft.
+
+    Before the fix: a stray "+" defeated BOTH the decorative-label-
+    prefix stripper (so literal "FIIs"/"DIIs" fell through exact/fuzzy
+    matching into AMBIGUOUS_CATEGORY_LABEL_RESEMBLANCE) and the table-
+    context guard (so EVERY row, including PROMOTER/PUBLIC_RETAIL, was
+    rejected as "not a table row"), and the early-return path on zero
+    collected categories also discarded the already-recognized
+    reporting period and shareholderCount.
+    """
+
+    def test_full_ingest_resolves_all_categories_despite_stray_plus_ocr_artifacts(self, ingestor):
+        import shutil
+        if not shutil.which("tesseract"):
+            pytest.skip("tesseract not installed in this environment")
+
+        import io
+        from PIL import Image, ImageDraw, ImageFont
+
+        font = ImageFont.truetype(
+            str(Path(__file__).resolve().parent / "fixtures" / "fonts" / "DejaVuSansMono-Bold.ttf"), 36)
+        col_x = [40, 600, 830, 1060, 1290]
+        # "+" prefixed onto every row label -- as if a misread table
+        # gridline/divider sits just left of the label column, exactly
+        # the reported shape ("AMBIGUOUS_CATEGORY_LABEL_RESEMBLANCE for
+        # literal FIIs and DIIs").
+        rows = [
+            ["", "Sep 2025", "Dec 2025", "Mar 2026", "Jun 2026"],
+            ["+Promoters", "73.67", "74.24", "74.24", "74.24"],
+            ["+FIIs", "1.87", "1.58", "1.51", "1.87"],
+            ["+DIIs", "0.01", "0.01", "0.09", "0.11"],
+            ["+Public", "24.45", "24.16", "24.18", "23.78"],
+            ["+No. of Shareholders", "49,673", "52,198", "52,418", "50,407"],
+        ]
+        image = Image.new("RGB", (1650, 60 + len(rows) * 60), color="white")
+        draw = ImageDraw.Draw(image)
+        for r, row in enumerate(rows):
+            for c, cell in enumerate(row):
+                draw.text((col_x[c], 20 + r * 60), cell, fill="black", font=font)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        draft = ingestor.ingest(
+            evidence_type="SHAREHOLDING",
+            file_bytes=buffer.getvalue(),
+            filename="gokul_agro_shareholding_plus_artifact.png",
+            instrument_id=RELIANCE_ID,
+        )
+        ocr_debug = draft.validation_results.errors + draft.validation_results.warnings
+
+        # All four categories still resolve -- the stray "+" is noise,
+        # never mistaken for a decimal digit or a reason to discard the
+        # row as narrative text.
+        by_field = {fact.field: fact.value for fact in draft.proposed_facts}
+        assert by_field.get("shareholding:PROMOTER") == Decimal("74.24"), ocr_debug
+        assert by_field.get("shareholding:FII_FPI") == Decimal("1.87"), ocr_debug
+        assert by_field.get("shareholding:DII") == Decimal("0.11"), ocr_debug
+        assert by_field.get("shareholding:PUBLIC_RETAIL") == Decimal("23.78"), ocr_debug
+
+        # Literal "FIIs"/"DIIs" (correctly spelled, just "+"-prefixed)
+        # must resolve as EXACT matches, never fall through to the
+        # ambiguous-resemblance warning path.
+        assert not any("AMBIGUOUS_CATEGORY_LABEL_RESEMBLANCE" in w for w in draft.validation_results.warnings), ocr_debug
+        assert not any("UNMATCHED_CATEGORY_LABEL_RESEMBLANCE" in w for w in draft.validation_results.warnings), ocr_debug
+
+        # Reporting period = 2026-06-01, precision MONTH -- preserved
+        # even though it was previously discarded whenever the category
+        # loop found nothing.
+        assert draft.reporting_period is not None, ocr_debug
+        assert (draft.reporting_period.year, draft.reporting_period.month, draft.reporting_period.day) == (2026, 6, 1), ocr_debug
+
+        # Shareholder count stays supplementary, never an ownership fact.
+        assert draft.field_suggestions is not None, ocr_debug
+        assert draft.field_suggestions.get("shareholderCount") == "50407", ocr_debug
+        assert not any("shareholderCount" in f.field for f in draft.proposed_facts)
+
+        # Partial-extraction classification still correctly reports all
+        # four as EXTRACTED (TASK E/E2 behavior preserved by this fix).
+        assert draft.field_classification == {
+            "PROMOTER": "EXTRACTED", "FII_FPI": "EXTRACTED",
+            "DII": "EXTRACTED", "PUBLIC_RETAIL": "EXTRACTED",
+        }, ocr_debug

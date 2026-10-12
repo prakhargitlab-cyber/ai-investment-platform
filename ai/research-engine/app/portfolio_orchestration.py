@@ -39,6 +39,27 @@ from app.sector_performance import belongs_to_region
 logger = logging.getLogger(__name__)
 
 
+def _log_portfolio_service_failure(
+    log: logging.Logger,
+    operation: str,
+    path: str,
+    exc: Exception,
+    *,
+    correlation_id: str | None = None,
+) -> None:
+    """Record enough to tell a downstream auth/validation rejection (401/403/...)
+    apart from a genuine connectivity failure, without ever logging response
+    bodies (which may carry user data) or anything beyond the status code,
+    the exception type, and the correlation id already attached to the
+    request, when one was supplied."""
+    response = getattr(exc, "response", None)
+    status_code = response.status_code if response is not None else "none"
+    log.warning(
+        "portfolio_service_call_failed operation=%s path=%s statusCode=%s exceptionType=%s correlationId=%s",
+        operation, path, status_code, type(exc).__name__, correlation_id or "none",
+    )
+
+
 @dataclass(frozen=True)
 class StructuredReconciliationOutcome:
     snapshot: object | None
@@ -111,6 +132,7 @@ class PortfolioResearchOrchestrator:
                 correlation_id=correlation_id, identity_headers=identity_headers,
             )
         except (httpx.HTTPError, ValueError) as exc:
+            _log_portfolio_service_failure(logger, "active_global_equities", "/api/v1/instruments", exc, correlation_id=correlation_id)
             raise PortfolioServiceUnavailableError("Portfolio service unavailable for instrument enumeration") from exc
 
     async def active_global_etfs(
@@ -337,6 +359,7 @@ class PortfolioResearchOrchestrator:
                 json=json,
             )
         except httpx.HTTPError as exc:
+            _log_portfolio_service_failure(logger, method, path, exc, correlation_id=correlation_id)
             raise PortfolioServiceUnavailableError("Portfolio service unavailable for watchlists") from exc
         if response.status_code == 404:
             raise WatchlistNotFoundError(path)
@@ -351,6 +374,7 @@ class PortfolioResearchOrchestrator:
             response.raise_for_status()
             return response.json() if expect_json else None
         except (httpx.HTTPError, ValueError) as exc:
+            _log_portfolio_service_failure(logger, method, path, exc, correlation_id=correlation_id)
             raise PortfolioServiceUnavailableError("Portfolio service unavailable for watchlists") from exc
 
     async def read_global_company_state(

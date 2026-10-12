@@ -75,7 +75,9 @@ def _store(info):
 def test_v1_to_v16_apply_and_engine_schema_check_passes(database):
     conn = _connect(database)
     files = _migrations()
-    assert files[-1].name.startswith("V17__")
+    versions = [int(f.name[1:].split("__")[0]) for f in files]
+    assert 17 in versions
+    assert versions[-1] == 23
     _apply(conn, files)
     tables = {r[0] for r in conn.execute(
         "SELECT table_name FROM information_schema.tables WHERE table_schema='research'").fetchall()}
@@ -94,7 +96,8 @@ def test_v10_upgrade_to_v16_preserves_existing_rows(database):
         VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', now(), 100, 'EXISTING', 'https://example.test', now())""")
     conn.commit()
     _apply(conn, rest)
-    assert len(rest) == 7  # V11..V17 (the Java upgrade test's stale "3" predates V14..V17)
+    versions = [int(f.name[1:].split("__")[0]) for f in rest]
+assert versions == list(range(11, 24))
     assert conn.execute("SELECT COUNT(*) FROM global_market_price_observations").fetchone()[0] == 1
 
 
@@ -207,7 +210,9 @@ def _url_of_length(label: str, length: int) -> str:
 def test_v1_to_v17_url_columns_become_text(database):
     conn = _connect(database)
     files = _migrations()
-    assert files[-1].name.startswith("V17__")
+    versions = [int(f.name[1:].split("__")[0]) for f in files]
+assert 17 in versions
+assert versions[-1] == 23
     _apply(conn, files)
     doc_rows = conn.execute(
         "SELECT column_name, data_type FROM information_schema.columns "

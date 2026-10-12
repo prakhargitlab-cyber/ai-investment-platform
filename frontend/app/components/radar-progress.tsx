@@ -84,8 +84,15 @@ export function RadarProgressPanel({
       ) : null}
       {counters.length ? (
         <dl className="radar-progress-counters">
-          {counters.filter((c) => c.value != null).map((c) => (
-            <div key={c.label}><dt>{c.label}</dt><dd>{c.value}</dd></div>
+          {/* RADAR UI + API ROUTING closure -- every counter the caller
+              includes is rendered, never silently dropped: a real number
+              when the backend provided one, or the literal word
+              "Unavailable" when it genuinely does not (never a fabricated
+              zero). Callers decide which counters are even worth listing
+              for a given radar/phase; this panel just never hides one of
+              them once listed. */}
+          {counters.map((c) => (
+            <div key={c.label}><dt>{c.label}</dt><dd>{c.value != null ? c.value : "Unavailable"}</dd></div>
           ))}
         </dl>
       ) : null}

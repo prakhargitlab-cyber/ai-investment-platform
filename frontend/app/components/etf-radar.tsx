@@ -241,9 +241,43 @@ export function EtfRadar() {
   };
 
   const running = !!activeCycle && !isTerminalRadarStatus(activeCycle.status);
-  const counters: RadarProgressCounter[] = []; // ETF Radar's cycle is single-pass/bounded and does not expose
-  // per-instrument progress counters (see app/etf_opportunity_cycle.py) -- an
-  // indeterminate bar plus the lifecycle status is the truthful presentation.
+  // ETF Radar's cycle is single-pass/bounded with no per-candidate
+  // checkpointing (see run_etf_radar_cycle_async's own docstring: no
+  // BASELINE/DEEP split like Equity's Stage2) -- the status endpoint never
+  // carries a live authoritative_progress for it, so WHILE RUNNING an
+  // indeterminate bar plus the lifecycle status remains the only truthful
+  // presentation. This stays genuinely empty until terminal; it is never
+  // populated with a fabricated 0/0 snapshot.
+  //
+  // Once COMPLETED, though, the persisted EtfCycleResult.candidates tuple
+  // (not .ranked, which is truncated to top_n) already covers every row
+  // the cycle admitted/evaluated, with a real per-candidate disposition
+  // and, for EVALUATED rows, a real recommendation -- a genuinely complete,
+  // trustworthy final breakdown, not a provisional or partial one.
+  const terminalData = activeCycle?.status === "COMPLETED" ? data : null;
+  const counters: RadarProgressCounter[] = !terminalData ? [] : [
+    { label: "Total universe", value: terminalData.candidates.length },
+    { label: "Admitted candidates", value: terminalData.candidates.filter((c) => c.disposition === "EVALUATED").length },
+    { label: "Technical failures", value: terminalData.candidates.filter((c) => c.disposition === "TECHNICAL_FAILURE").length },
+    // Readiness exclusions (insufficient evidence) kept separate from
+    // eligibility filtering (ineligible/unsupported fund type), per
+    // app/etf_opportunity_cycle.py's own admission-outcome vocabulary.
+    { label: "Readiness excluded", value: terminalData.candidates.filter((c) => c.disposition === "INSUFFICIENT_DATA").length },
+    { label: "Eligibility filtered", value: terminalData.candidates.filter((c) => c.disposition === "INELIGIBLE" || c.disposition === "UNSUPPORTED").length },
+    { label: "Cancelled", value: terminalData.candidates.filter((c) => c.disposition === "CANCELLED").length },
+    { label: "Pod restarts", value: null },
+    // AVOID is a real category in EtfRecommendation (see app/etf_rule_engine.py)
+    // -- "where supported" from the RADAR UI + API ROUTING spec, and ETF is
+    // the radar that supports it.
+    { label: "AVOID count", value: terminalData.candidates.filter((c) => c.recommendation === "AVOID").length },
+    // ETF's recommendation vocabulary (STRONG_OPPORTUNITY/OPPORTUNITY/WATCH/
+    // AVOID/INSUFFICIENT_DATA) has no literal BUY/SELL/HOLD category --
+    // mapping WATCH to "HOLD" or OPPORTUNITY to "BUY" would be inventing a
+    // correspondence the backend never states, so these stay Unavailable.
+    { label: "BUY count", value: null },
+    { label: "SELL count", value: null },
+    { label: "HOLD/neutral count", value: null },
+  ];
 
   return (
     <section className="opportunity-radar etf-radar" aria-label="ETF radar">

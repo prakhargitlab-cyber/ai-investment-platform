@@ -1,6 +1,6 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:auth;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;INIT=CREATE SCHEMA IF NOT EXISTS auth
+    url: jdbc:h2:mem:auth;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;LOCK_TIMEOUT=15000;INIT=CREATE SCHEMA IF NOT EXISTS auth
     username: sa
     password:
     driver-class-name: org.h2.Driver

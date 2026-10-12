@@ -91,6 +91,15 @@ class ImageExtractionResult:
     reason: str | None
     content_hash: str
     page_count: int | None = field(default=None)
+    # Word-level OCR bounding boxes (see app.spatial_table_reconstruction),
+    # populated only for the single-image EXTRACTED path. None for every
+    # other status/path (scanned-PDF OCR does not populate this -- each
+    # rasterized page is still a single-image extraction internally, but
+    # per-page spatial reconstruction is not needed by any interpreter
+    # yet, so threading it through would be unused complexity). Never
+    # required by any caller -- table interpretation falls back to plain
+    # text when this is None.
+    words: "list[object] | None" = field(default=None)
 
 
 def _sanitize_text(raw: str) -> str:
@@ -104,20 +113,40 @@ def _sanitize_text(raw: str) -> str:
     return cleaned[:MAX_EXTRACTED_TEXT_CHARS]
 
 
-def _run_tesseract(image_path: Path, workdir: Path) -> tuple[str | None, str | None]:
+def _run_tesseract(image_path: Path, workdir: Path) -> tuple[str | None, "list[OcrWord] | None", str | None]:
     """Run the tesseract CLI against one bounded, already-validated image
-    file. Returns (text, failure_reason); failure_reason is None on
-    success (including a legitimate empty result)."""
+    file. Returns (text, words, failure_reason); failure_reason is None on
+    success (including a legitimate empty result).
+
+    Runtime defect closure (generalized screenshot evidence extraction):
+    a SINGLE tesseract invocation now requests TSV output (word-level
+    bounding boxes: left/top/width/height/line position, in addition to
+    the recognized text) instead of plain text -- this is the same
+    subprocess call this pipeline already ran, not an extra one, so the
+    existing resource bounds (timeout, isolation) are unchanged. The
+    plain text this function returns is reconstructed from the TSV rows
+    (grouped into lines, joined with single spaces) rather than coming
+    from a second, separate text-mode invocation, so callers that only
+    want text see an unchanged contract. ``words`` carries the same
+    recognized text PLUS each word's position, letting a table
+    interpreter associate a value with its actual header column by
+    geometry (see app.spatial_table_reconstruction) instead of guessing
+    from word order alone. ``words`` is None exactly when extraction
+    failed outright (timeout/missing binary/process failure) -- the same
+    conditions that already returned text=None.
+    """
+    from app.spatial_table_reconstruction import OcrWord
+
     output_base = workdir / "ocr_out"
     try:
         result = subprocess.run(
-            ["tesseract", str(image_path), str(output_base), "--psm", "6"],
+            ["tesseract", str(image_path), str(output_base), "--psm", "6", "tsv"],
             timeout=EXTRACTION_TIMEOUT_SECONDS,
             capture_output=True,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return None, "TIMEOUT"
+        return None, None, "TIMEOUT"
     except FileNotFoundError:
         # tesseract is not installed in this runtime image. This is a
         # truthful, non-crashing rejection -- the capability endpoint
@@ -126,16 +155,70 @@ def _run_tesseract(image_path: Path, workdir: Path) -> tuple[str | None, str | N
         # binary is missing, but a direct API call must still fail closed
         # rather than raise an unhandled exception.
         logger.warning("tesseract_extraction_unavailable reason=binary_not_found")
-        return None, "OCR_UNAVAILABLE"
+        return None, None, "OCR_UNAVAILABLE"
     if result.returncode != 0:
         logger.warning("tesseract_extraction_failed returncode=%s stderr=%s",
                         result.returncode, result.stderr.decode("utf-8", errors="replace")[:500])
-        return None, "OCR_PROCESS_FAILED"
-    output_path = output_base.with_suffix(".txt")
+        return None, None, "OCR_PROCESS_FAILED"
+    output_path = output_base.with_suffix(".tsv")
     if not output_path.exists():
-        return None, "OCR_PROCESS_FAILED"
-    text = output_path.read_text(encoding="utf-8", errors="replace")
-    return text, None
+        return None, None, "OCR_PROCESS_FAILED"
+    words = _parse_tesseract_tsv(output_path, OcrWord)
+    text = _tsv_words_to_text(words)
+    return text, words, None
+
+
+def _parse_tesseract_tsv(tsv_path: Path, ocr_word_cls) -> "list[OcrWord]":
+    """Parse tesseract's TSV output into word-level OcrWord records
+    (level 5 rows only -- block/page/paragraph/line summary rows are
+    skipped). Malformed or non-numeric rows are skipped defensively
+    rather than raising -- a parsing hiccup on this diagnostic-grade
+    output must degrade to "no spatial data" (the caller falls back to
+    the plain-text path), never crash the extraction."""
+    words: list = []
+    try:
+        raw = tsv_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return words
+    lines = raw.splitlines()
+    if not lines:
+        return words
+    header = lines[0].split("	")
+    try:
+        col = {name: header.index(name) for name in
+               ("level", "block_num", "par_num", "line_num", "left", "top", "width", "height", "conf", "text")}
+    except ValueError:
+        return words
+    for line in lines[1:]:
+        fields = line.split("	")
+        if len(fields) <= col["text"]:
+            continue
+        try:
+            if int(fields[col["level"]]) != 5:
+                continue
+            text = fields[col["text"]]
+            if not text.strip():
+                continue
+            words.append(ocr_word_cls(
+                text=text,
+                left=int(fields[col["left"]]), top=int(fields[col["top"]]),
+                width=int(fields[col["width"]]), height=int(fields[col["height"]]),
+                conf=float(fields[col["conf"]]),
+                line_key=(int(fields[col["block_num"]]), int(fields[col["par_num"]]), int(fields[col["line_num"]])),
+            ))
+        except (ValueError, IndexError):
+            continue
+    return words
+
+
+def _tsv_words_to_text(words: "list[OcrWord]") -> str:
+    """Reconstruct the same plain-text shape _run_tesseract used to
+    return directly from tesseract's text-mode output: one line per
+    visual line, words joined with a single space, lines in top-to-
+    bottom reading order."""
+    from app.spatial_table_reconstruction import group_into_lines, line_text
+
+    return "\n".join(line_text(line) for line in group_into_lines(words))
 
 
 def extract_text_from_image(file_bytes: bytes, content_type: str, filename: str | None = None) -> ImageExtractionResult:
@@ -172,7 +255,7 @@ def extract_text_from_image(file_bytes: bytes, content_type: str, filename: str 
                 # file this process itself produced from already-validated
                 # pixel data, never the untrusted bytes directly.
                 image.convert("L").save(normalized_path, format="PNG")
-                text, failure = _run_tesseract(normalized_path, workdir)
+                text, words, failure = _run_tesseract(normalized_path, workdir)
     except Exception as exc:  # noqa: BLE001 -- any decode failure is a truthful rejection, never a crash
         # Bounded diagnostics only (runtime defect closure: clipboard-paste
         # transport tracing) -- filename, declared MIME, byte length, and
@@ -198,7 +281,7 @@ def extract_text_from_image(file_bytes: bytes, content_type: str, filename: str 
     sanitized = _sanitize_text(text or "")
     if not sanitized.strip():
         return ImageExtractionResult("EMPTY", "", None, digest)
-    return ImageExtractionResult("EXTRACTED", sanitized, None, digest)
+    return ImageExtractionResult("EXTRACTED", sanitized, None, digest, words=words)
 
 
 def extract_text_from_scanned_pdf(file_bytes: bytes) -> ImageExtractionResult:
@@ -261,7 +344,7 @@ def extract_text_from_scanned_pdf(file_bytes: bytes) -> ImageExtractionResult:
 
         page_texts: list[str] = []
         for page_image in sorted(workdir.glob("page-*.png")):
-            text, failure = _run_tesseract(page_image, workdir)
+            text, _words, failure = _run_tesseract(page_image, workdir)
             if failure == "TIMEOUT":
                 return ImageExtractionResult("TIMEOUT", None, "EXTRACTION_TIMEOUT", digest, page_count=page_count)
             if failure is not None:

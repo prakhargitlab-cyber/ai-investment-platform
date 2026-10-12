@@ -158,3 +158,35 @@ async def test_investigate_readiness_load_reaches_cycle_aggregate_before_any_spa
     # by it being a finite, non-negative number rather than absent/None.
     assert isinstance(report["aggregate_readiness_load_ms"], float)
     assert report["aggregate_readiness_load_ms"] >= 0.0
+
+
+# 7 -- cross-platform regression guard: both real-network timing sites this
+# module exercises must measure elapsed duration with time.perf_counter(),
+# never time.monotonic(). On Windows, time.monotonic() is backed by a coarse
+# (~15.6ms) tick (GetTickCount64), so an in-process call completing faster
+# than one tick genuinely computes an elapsed delta of 0.0 -- which is
+# exactly what made test_real_discovery_network_call_is_attributed_end_to_end
+# and test_real_mapping_resolution_network_call_is_attributed_even_on_rejection
+# fail on Windows while passing on Linux (where time.monotonic() already has
+# high resolution via clock_gettime(CLOCK_MONOTONIC), so the defect could not
+# be reproduced here by timing alone). time.perf_counter() is documented to
+# always expose the highest-resolution clock available on every platform,
+# which is why every other real-network timing site in this codebase
+# (_safe_search_get's search_provider timing, news_acquisition's throttle
+# timing) already uses it -- this pins the same discipline for the two sites
+# fixed here so a future edit cannot silently regress back to monotonic().
+def test_07_discovery_and_mapping_resolution_timing_use_perf_counter_not_monotonic():
+    import inspect as _inspect
+    from app import source_discovery, structured_market
+
+    discovery_src = _inspect.getsource(source_discovery.OfficialFilingDiscovery._announcement_rows)
+    assert "_discovery_started = time.perf_counter()" in discovery_src
+    assert "time.perf_counter() - _discovery_started" in discovery_src
+    assert "time.monotonic() - _discovery_started" not in discovery_src
+
+    mapping_src = _inspect.getsource(
+        structured_market.YahooFinanceProvider._resolve_verified_nse_candidate
+    )
+    assert "_mapping_started = time.perf_counter()" in mapping_src
+    assert "time.perf_counter() - _mapping_started" in mapping_src
+    assert "time.monotonic() - _mapping_started" not in mapping_src

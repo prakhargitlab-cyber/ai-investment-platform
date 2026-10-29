@@ -834,6 +834,33 @@ async def finalize_cycle_cancel(
     return await _radar_read(finalize)
 
 
+@app.post('/api/v1/research/opportunities/cycles/{cycle_id}/resume')
+async def resume_interrupted_opportunity_cycle(
+    cycle_id: UUID,
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+    x_aip_user_roles: str | None = Header(default=None),
+):
+    """ADMIN-gated explicit resume of the SAME interrupted manual Equity cycle.
+
+    Operator-review exit for an active slot whose RUNNING cycle lost its lease
+    while recovery is paused (no automatic takeover exists in that mode). Only
+    under the LOCAL manual Equity gate; refuses a live lease, a cancelled or
+    terminal cycle, or a cycle that is not the active one (409 with the reason).
+    Never creates a cycle, never writes a terminal status, and ownership is
+    still decided by the fenced claim in the worker.
+    """
+    from fastapi.responses import JSONResponse
+    from app.opportunity_worker import ManualEtfAdmissionError
+    _require_market_data_admin(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject, x_aip_user_roles)
+    try:
+        content = await _opportunity_worker().resume_interrupted_manual_equity_async(str(cycle_id))
+    except ManualEtfAdmissionError as exc:
+        raise HTTPException(409, str(exc))
+    return JSONResponse(status_code=202, content=content)
+
+
 class BacktestRequest(BaseModel):
     start: str
     end: str

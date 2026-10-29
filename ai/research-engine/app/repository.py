@@ -868,6 +868,21 @@ class ResearchRepository:
                     task.exception()
                 raise
 
+    async def _run_lease_persistence(self, operation, *args, **kwargs):
+        """Cycle-lease liveness writes only (renewal), ahead of queued work.
+
+        The general dispatch slot above is FIFO: a lease renewal queued behind
+        a long Stage 2 persistence backlog can be delayed past lease expiry and
+        silently cost a healthy worker its cycle. This path skips the queue but
+        not serialization -- it still waits for the shared connection lock, so
+        at most for the single operation currently executing (bounded by the
+        database statement timeout). Use it only for small, owner-fenced lease
+        statements; the SQL fence itself is unchanged.
+        """
+        if isinstance(self._persistence, SqliteResearchPersistence) and self._persistence.__class__.__module__ != "app.postgres_persistence":
+            return operation(*args, **kwargs)
+        return await asyncio.to_thread(self._run_serialized_persistence_operation, operation, args, kwargs, None)
+
     def _run_serialized_persistence_operation(self, operation, args, kwargs, dispatched_at=None):
         with self._persistence_worker_lock:
             op_name = (getattr(operation, "__qualname__", None)

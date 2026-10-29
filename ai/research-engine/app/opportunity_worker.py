@@ -356,6 +356,49 @@ class OpportunityCycleWorker:
             self.task = asyncio.create_task(self._work(), name='manual-equity-opportunity-worker')
             return dict(value)
 
+    async def resume_interrupted_manual_equity_async(self, cycle_id):
+        """Explicit operator resume of the SAME interrupted manual Equity cycle.
+
+        For the reviewed case where the active slot holds a RUNNING/ACCEPTED
+        cycle whose lease lapsed (e.g. opportunity_cycle_lease_lapsed_without_
+        successor) while recovery is paused, so neither startup recovery nor
+        idle takeover will ever claim it. Same LOCAL manual gate as
+        submit_manual_equity_async; never automatic. Admission only enqueues:
+        ownership is still decided by the fenced claim_cycle_run in _run_one,
+        so a live owner is never displaced, and the runner restores every
+        durably finished candidate from the checkpoint instead of re-acquiring.
+        No new cycle is created and nothing terminal is written here.
+        """
+        settings = getattr(self.repository, 'settings', None)
+        if not (getattr(settings, 'environment', None) == 'LOCAL'
+                and bool(getattr(settings, 'research_opportunity_recovery_paused', False))
+                and getattr(settings, 'research_opportunity_scheduler_enabled', True) is False
+                and bool(getattr(settings, 'research_equity_manual_execution_enabled', False))):
+            raise ManualEtfAdmissionError('ETF_MANUAL_EXECUTION_DISABLED')
+        cycle_id = str(cycle_id)
+        async with self._submission_lock:
+            if self.active is not None or self.queue.full() or not self._resumable_supported():
+                raise ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+            run = await self._blocking(self._store.active_cycle_run, self.market)
+            if run is None or run['cycle_id'] != cycle_id:
+                raise ManualEtfAdmissionError('OPPORTUNITY_CYCLE_NOT_ACTIVE')
+            if await self._blocking(self._cancel_status, cycle_id) is not None:
+                raise ManualEtfAdmissionError('OPPORTUNITY_CYCLE_CANCELLED')
+            if run.get('status') not in ('ACCEPTED', 'RUNNING'):
+                raise ManualEtfAdmissionError('OPPORTUNITY_CYCLE_NOT_RESUMABLE')
+            if not await self._blocking(self._lease_expired, run):
+                raise ManualEtfAdmissionError('OPPORTUNITY_CYCLE_LEASE_ACTIVE')
+            job = await self._blocking(self._job_for_run, run)
+            value = {**job, 'resumed': True}
+            logger.warning("opportunity_cycle_operator_resume_admitted cycleId=%s owner=%s previousOwner=%s "
+                           "leaseExpiresAt=%s resumeCount=%s", cycle_id, self.owner_id, run.get('owner_id'),
+                           run.get('lease_expires_at'), run.get('resume_count'))
+            self.active = value
+            self.queue.put_nowait(value)
+            if self.task is None or self.task.done():
+                self.task = asyncio.create_task(self._work(), name='manual-equity-opportunity-worker')
+            return dict(value)
+
     def _enqueue_resume(self, run):
         if self.active is not None or self.queue.full():
             return
@@ -468,13 +511,22 @@ class OpportunityCycleWorker:
             finally:
                 self.queue.task_done()
 
+    async def _lease_blocking(self, operation, *args, **kwargs):
+        # Lease renewal must not queue behind the general (FIFO) persistence
+        # backlog a long FULL Stage 2 creates; see
+        # ResearchRepository._run_lease_persistence. Same fenced SQL, same lock.
+        run_lease = getattr(self.repository, '_run_lease_persistence', None)
+        if run_lease is not None:
+            return await run_lease(operation, *args, **kwargs)
+        return await self._blocking(operation, *args, **kwargs)
+
     async def _heartbeat(self, cycle_id):
         interval = max(0.02, self.lease_seconds / 3)
         while True:
             await asyncio.sleep(interval)
             try:
-                renewed = await self._blocking(self._store.renew_cycle_lease, cycle_id, self.owner_id,
-                                               lease_seconds=self.lease_seconds)
+                renewed = await self._lease_blocking(self._store.renew_cycle_lease, cycle_id, self.owner_id,
+                                                     lease_seconds=self.lease_seconds)
             except Exception:
                 logger.exception("opportunity_cycle_lease_renew_failed cycleId=%s", cycle_id)
                 continue
@@ -494,6 +546,14 @@ class OpportunityCycleWorker:
         return (run.get('status') in ('ACCEPTED', 'RUNNING', 'PUBLISHED')
                 and run.get('owner_id') not in (None, self.owner_id))
 
+    def _lapsed_without_successor(self, cycle_id):
+        """Our own lease simply expired: still ACCEPTED/RUNNING, still naming
+        this worker as owner, and nobody claimed it. Not a supersession -- the
+        cycle is resumable and its status must say so rather than be hidden."""
+        run = self._locked(self._store.cycle_run, cycle_id)
+        return bool(run and run.get('status') in ('ACCEPTED', 'RUNNING')
+                    and run.get('owner_id') == self.owner_id and self._lease_expired(run))
+
     def _fail_run(self, cycle_id, error_code):
         with suppress(CycleOwnershipLost):
             run = self._locked(self._store.cycle_run, cycle_id)
@@ -508,6 +568,7 @@ class OpportunityCycleWorker:
         self._in_flight_cycle_id = cycle_id
         resumable = self._resumable_supported() and await self._blocking(self._store.cycle_run, cycle_id) is not None
         checkpoint = heartbeat = None
+        lapsed_without_successor = False
         if resumable:
             if not await self._blocking(self._store.claim_cycle_run, cycle_id, self.owner_id, lease_seconds=self.lease_seconds):
                 # A live worker (possibly another replica) owns this cycle.
@@ -595,12 +656,20 @@ class OpportunityCycleWorker:
                     await self._blocking(self._fail_run, cycle_id, 'WORKER_STOPPED')
             raise
         except CycleOwnershipLost:
-            # Our lease expired and another worker owns the cycle now; it
-            # continues the same cycle_id. Record nothing terminal.
+            # Our lease is gone. Either another worker owns the cycle now and
+            # continues the same cycle_id, or (always, while recovery is
+            # paused) nobody does. Record nothing terminal either way.
             logger.warning("opportunity_cycle_ownership_lost cycleId=%s owner=%s", cycle_id, self.owner_id)
             if await self._blocking(self._is_cycle_cancelled, cycle_id):
                 await self._blocking(self._store.cancel_cycle_run, cycle_id, self.owner_id)
             value = {**value, 'status': 'RUNNING', 'error_code': 'OWNERSHIP_LOST'}
+            if resumable and await self._blocking(self._lapsed_without_successor, cycle_id):
+                # Not superseded: report the truthful, resumable state instead
+                # of suppressing it. Recovery is an explicit operator action
+                # (resume_interrupted_manual_equity_async) or normal takeover.
+                lapsed_without_successor = True
+                logger.warning("opportunity_cycle_lease_lapsed_without_successor cycleId=%s owner=%s",
+                               cycle_id, self.owner_id)
         except UniverseUnavailableError as exc:
             # Empty/missing universe -- fail fast without overwriting the
             # persisted radar. Distinct error_code so ops/monitoring can
@@ -641,6 +710,10 @@ class OpportunityCycleWorker:
             # A zombie owner (lease taken over, or the cycle already completed
             # by another worker) must never publish any status for it.
             zombie = resumable and value.get('status') != 'COMPLETED' and await self._blocking(self._superseded_or_done, cycle_id)
+            if zombie and lapsed_without_successor and await self._blocking(self._lapsed_without_successor, cycle_id):
+                # Re-checked at write time: still ours, still unclaimed. A claim
+                # by another worker in between keeps this status suppressed.
+                zombie = False
             value['updated_at'] = datetime.now(timezone.utc).isoformat()
             try:
                 if zombie:

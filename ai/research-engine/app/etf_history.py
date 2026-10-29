@@ -3,7 +3,6 @@
 Uses the existing Yahoo acquisition/identity verifier. Close-only observations
 are persisted as such: open/high/low/volume are never synthesized.
 """
-import logging
 from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
 from uuid import UUID
@@ -12,11 +11,8 @@ from app.historical_market_data import (
     HistoricalPriceIdentityConflict,
     HistoricalPriceProviderError,
     YahooHistoricalPriceProvider,
-    _sanitized_diagnostic_field,
 )
 from app.models import DailyMarketBar
-
-logger = logging.getLogger(__name__)
 
 
 def _field_check_status(returned, ok: bool) -> str:
@@ -39,56 +35,12 @@ def _field_check_status(returned, ok: bool) -> str:
 
 class EtfHistoryProvider(YahooHistoricalPriceProvider):
     def _verify_identity_or_raise(self, instrument, ticker, access):
+        if instrument.get("assetType") != "ETF":
+            raise HistoricalPriceIdentityConflict("ETF_HISTORY_LISTING_NOT_VERIFIED")
+        # One policy owns returned identifiers, canonical NSE ETF trust and
+        # provider type ambiguity. A second, literal listing comparison would
+        # reject valid results already verified by that shared policy.
         super()._verify_identity_or_raise(instrument, ticker, access)
-        info = access.info or {}
-        returned_symbol = info.get('symbol')
-        returned_quote_type = info.get('quoteType')
-        returned_currency = info.get('currency')
-        returned_exchange = info.get('exchange')
-        symbol_ok = returned_symbol == ticker
-        quote_type_ok = returned_quote_type == 'ETF'
-        currency_ok = returned_currency == 'INR'
-        exchange_ok = returned_exchange in {'NSI', 'NSE'}
-        if not (symbol_ok and quote_type_ok and currency_ok and exchange_ok):
-            # Diagnostic only (no behavior change): the prior raise site gave
-            # no indication of WHICH of the four compared fields actually
-            # failed, leaving this ETF-specific second gate (distinct from,
-            # and stricter than, the shared verify_historical_price_identity
-            # fallback already logged via historical_price_identity_rejected)
-            # completely unobservable -- exactly the gap blocking root-cause
-            # attribution for the ETF_HISTORY_LISTING_NOT_VERIFIED share of
-            # ETF_ONBOARD technical failures. Logging the actual returned
-            # values (not the request-side ticker), plus an explicit per-
-            # field MISSING/CONFLICTING/MATCHED breakdown (symbolCheck/
-            # quoteTypeCheck/currencyCheck/exchangeCheck), lets a future
-            # cycle's logs show directly, e.g., whether Yahoo omitted
-            # exchange entirely (MISSING) versus returned a genuinely
-            # different one (CONFLICTING), or whether the symbol comparison
-            # failed because Yahoo echoed it in a different case/suffix
-            # form (CONFLICTING, not MISSING) -- without changing what is
-            # verified or persisted. NOTE: this raise condition compares
-            # returned_symbol against `ticker` (which includes the ".NS"
-            # suffix) verbatim, unlike the shared fallback in
-            # verify_historical_price_identity, which deliberately compares
-            # via _bare_symbol() (ignoring the ".NS" suffix) specifically
-            # because Yahoo does not always echo that suffix back. Whether
-            # that difference is this gate's actual root cause for the
-            # ETF_HISTORY_LISTING_NOT_VERIFIED failures is NOT confirmed by
-            # any observed Yahoo response available in this investigation
-            # (no live provider call was made); this diagnostic is added so
-            # the next real cycle's logs can confirm or rule it out before
-            # any comparison logic here is changed.
-            logger.info(
-                "etf_history_listing_not_verified globalInstrumentId=%s expectedTicker=%s "
-                "returnedSymbol=%s returnedQuoteType=%s returnedCurrency=%s returnedExchange=%s "
-                "symbolCheck=%s quoteTypeCheck=%s currencyCheck=%s exchangeCheck=%s",
-                instrument.get("globalInstrumentId"), ticker,
-                _sanitized_diagnostic_field(returned_symbol), _sanitized_diagnostic_field(returned_quote_type),
-                _sanitized_diagnostic_field(returned_currency), _sanitized_diagnostic_field(returned_exchange),
-                _field_check_status(returned_symbol, symbol_ok), _field_check_status(returned_quote_type, quote_type_ok),
-                _field_check_status(returned_currency, currency_ok), _field_check_status(returned_exchange, exchange_ok),
-            )
-            raise HistoricalPriceIdentityConflict('ETF_HISTORY_LISTING_NOT_VERIFIED')
 
 
 async def acquire_etf_history(repository, row, *, now, checkpoint, provider=None, start=None, end=None):
@@ -127,12 +79,28 @@ async def acquire_etf_history(repository, row, *, now, checkpoint, provider=None
     try:
         observations = await provider.closes({**row, 'structuredProviderTicker': ticker},
             start=start, end=end)
-        bars = [DailyMarketBar(global_instrument_id=key, trading_date=o.observed_at.date(),
-                close=o.price.quantize(Decimal('0.000000000001'), rounding=ROUND_HALF_EVEN),
-                currency=o.currency, provider=o.provider, provider_symbol=ticker,
-                source_mode='REAL', source_url=o.source_url, retrieved_at=o.retrieved_at)
-                for o in observations if o.instrument_id == key and o.currency == 'INR'
-                and start.date() <= o.observed_at.date() < end_date]
+        bars = []
+        for observation in observations:
+            if observation.instrument_id != key:
+                raise HistoricalPriceIdentityConflict(
+                    "VERIFIED_HISTORICAL_IDENTITY_MISMATCH:OBSERVATION_INSTRUMENT_MISMATCH")
+            if observation.currency != "INR":
+                raise HistoricalPriceIdentityConflict(
+                    "VERIFIED_HISTORICAL_IDENTITY_MISMATCH:CURRENCY_MISMATCH")
+            stamp = observation.observed_at
+            if stamp.tzinfo is None or stamp.utcoffset() is None:
+                raise HistoricalPriceProviderError("ETF_HISTORY_INVALID_OBSERVATION:NAIVE_TIMESTAMP")
+            if stamp > now:
+                raise HistoricalPriceProviderError("ETF_HISTORY_INVALID_OBSERVATION:FUTURE_TIMESTAMP")
+            if not start.date() <= stamp.date() < end_date:
+                continue
+            close = observation.price
+            if not close.is_finite() or close <= 0:
+                raise HistoricalPriceProviderError("ETF_HISTORY_INVALID_OBSERVATION:INVALID_CLOSE")
+            bars.append(DailyMarketBar(global_instrument_id=key, trading_date=stamp.date(),
+                close=close.quantize(Decimal('0.000000000001'), rounding=ROUND_HALF_EVEN),
+                currency=observation.currency, provider=observation.provider, provider_symbol=ticker,
+                source_mode='REAL', source_url=observation.source_url, retrieved_at=observation.retrieved_at))
     except HistoricalPriceProviderError as exc:
         # Root cause (ETF_ONBOARD 352-failure investigation, source-
         # specific failure classification): collapsing every exception

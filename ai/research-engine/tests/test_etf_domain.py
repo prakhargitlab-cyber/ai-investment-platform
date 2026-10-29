@@ -156,3 +156,41 @@ def test_nse_benchmark_index_name_is_read_from_metadata_not_guessed():
         update={"ticker": "NIFTYBEES", "fund_name": "Nifty 50 ETF"})
     assert classify_etf(candidate) == EtfSubtype.OTHER
     assert classify_etf(candidate, investment_strategy="Nifty 50") == EtfSubtype.EQUITY_INDEX
+
+
+@pytest.mark.parametrize("category,strategy", [
+    ("EQUITY_SMART_BETA", "Nifty 200 Momentum 30"),
+    ("EQUITY_SMART_BETA", "Nifty 100 Quality 30"),
+    ("EQUITY_SECTOR_THEMATIC", "Nifty India Consumption"),
+])
+def test_explicit_category_precedes_benchmark_family_fallback(category, strategy):
+    candidate = profile(asset_class="Equity")
+    assert classify_etf(candidate, category=category, investment_strategy=strategy) == EtfSubtype(category)
+
+
+def test_explicit_profile_subtype_precedes_benchmark_family_fallback():
+    candidate = profile(asset_class="Equity", subtype=EtfSubtype.EQUITY_SMART_BETA)
+    assert classify_etf(candidate, investment_strategy="Nifty 200 Momentum 30") == EtfSubtype.EQUITY_SMART_BETA
+
+
+@pytest.mark.parametrize("category,strategy", [
+    ("EQUITY_INDEX", "sector"),
+    ("EQUITY_SMART_BETA", "broad market index"),
+    ("EQUITY_SECTOR_THEMATIC", "smart beta"),
+])
+def test_explicit_generic_strategy_conflicts_still_reject(category, strategy):
+    assert classify_etf(profile(asset_class="Equity"), category=category,
+                        investment_strategy=strategy) == EtfSubtype.OTHER
+
+
+@pytest.mark.parametrize("strategy", [
+    "Nifty100Quality30",
+    "Nifty 100 Quality 30",
+    "Nifty200Momentum30",
+    "Nifty 200 Momentum 30",
+    "Nifty Unknown Strategy",
+    "Nifty 100 Digital 30",
+    "Nifty 999",
+])
+def test_unknown_benchmark_family_remains_unclassified_without_explicit_category(strategy):
+    assert classify_etf(profile(asset_class="Equity"), investment_strategy=strategy) == EtfSubtype.OTHER

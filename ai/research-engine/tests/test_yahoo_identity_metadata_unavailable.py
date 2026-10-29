@@ -258,3 +258,62 @@ def test_yahoo_finance_provider_wires_session_refresh_only_for_default_factory()
         Settings(), httpx.AsyncClient(), ticker_factory=lambda symbol: None,
     )
     assert explicit_provider.ticker_contexts._session_refresh is None
+
+
+def _verified_etf_instrument():
+    return {
+        "globalInstrumentId": "00000000-0000-0000-0000-000000000250",
+        "status": "ACTIVE", "assetType": "ETF", "country": "IN",
+        "primaryExchange": "NSE", "primarySymbol": "SMALL250",
+        "structuredProviderTicker": "SMALL250.NS", "currency": "INR",
+        "isin": "INF204KB17I5", "canonicalName": "MOTILALAMC - SMALL250",
+        "providerMappings": [{"provider": "NSE", "providerSymbol": "SMALL250",
+                              "status": "VERIFIED", "exchange": "NSE", "currency": "INR"}],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omitted_fields", [("longName",), ("quoteType",), ("longName", "quoteType")])
+async def test_verified_etf_partial_metadata_can_still_establish_returned_listing_identity(omitted_fields):
+    info = {"symbol": "SMALL250.NS", "longName": "Motilal Oswal Nifty Smallcap 250 ETF",
+            "quoteType": "EQUITY", "exchange": "NSI", "currency": "INR"}
+    for field in omitted_fields:
+        info.pop(field)
+    refreshes = []
+    contexts = YahooTickerContexts(lambda _symbol: _FakeTicker(info), session_refresh=lambda: refreshes.append(1))
+    provider = YahooHistoricalPriceProvider(contexts.factory, ticker_contexts=contexts)
+    instrument = _verified_etf_instrument()
+    rows = await provider.closes(instrument,
+        start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 9, 21, tzinfo=timezone.utc))
+    assert len(rows) == 1
+    assert str(rows[0].instrument_id) == instrument["globalInstrumentId"]
+    assert refreshes == []
+
+
+@pytest.mark.asyncio
+async def test_verified_etf_completely_empty_metadata_still_fails_unavailable():
+    refreshes = []
+    contexts = YahooTickerContexts(lambda _symbol: _FakeTicker({}), session_refresh=lambda: refreshes.append(1))
+    provider = YahooHistoricalPriceProvider(contexts.factory, ticker_contexts=contexts)
+    with pytest.raises(HistoricalPriceIdentityConflict, match="PROVIDER_IDENTITY_UNAVAILABLE"):
+        await provider.closes(_verified_etf_instrument(),
+            start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 21, tzinfo=timezone.utc))
+    assert refreshes == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value,reason", [
+    ("exchange", "NYQ", "EXCHANGE_MISMATCH"),
+    ("currency", "USD", "CURRENCY_MISMATCH"),
+    ("symbol", "OTHER.NS", "SYMBOL_MISMATCH"),
+    ("isin", "INF000000000", "ISIN_MISMATCH"),
+])
+async def test_verified_etf_missing_name_never_overrides_explicit_identity_conflict(field, value, reason):
+    info = {"symbol": "SMALL250.NS", "exchange": "NSI", "currency": "INR", field: value}
+    provider = YahooHistoricalPriceProvider(lambda _symbol: _FakeTicker(info))
+    with pytest.raises(HistoricalPriceIdentityConflict, match=reason):
+        await provider.closes(_verified_etf_instrument(),
+            start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 21, tzinfo=timezone.utc))

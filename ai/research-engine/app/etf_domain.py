@@ -132,9 +132,16 @@ def _nse_benchmark_strategy_bucket(strategy: str) -> str | None:
     index-family name, so callers fall back to their existing behavior."""
     if not strategy or not strategy.split(" ")[0] in {"nifty", "sensex", "bse"}:
         return None
-    if any(keyword in strategy for keyword in _NSE_SECTOR_INDEX_KEYWORDS):
+    # Match whole normalized tokens/phrases: "it" inside "quality" or
+    # "digital" does not establish the IT sector.
+    words = f" {strategy} "
+    if any(f" {keyword} " in words for keyword in _NSE_SECTOR_INDEX_KEYWORDS):
         return "sector thematic"
-    return "broad market index"
+    # Only established broad benchmarks may supply a missing strategy.
+    # A recognized prefix alone cannot classify an unknown factor/theme.
+    if strategy in {"nifty 50", "nifty next 50", "nifty 500", "sensex", "bse sensex"}:
+        return "broad market index"
+    return None
 
 
 def classify_etf(
@@ -155,7 +162,10 @@ def classify_etf(
     asset = _normalized(profile.asset_class)
     region = _normalized(exposure_region)
     strategy = _normalized(investment_strategy)
-    strategy = _nse_benchmark_strategy_bucket(strategy) or strategy
+    # A benchmark family is weaker than an explicit verified subtype/category.
+    # Keep exact strategy labels below so genuine category conflicts still fail.
+    if not candidates:
+        strategy = _nse_benchmark_strategy_bucket(strategy) or strategy
     international = region in {"international", "global", "overseas"}
     if asset == "equity":
         if international:

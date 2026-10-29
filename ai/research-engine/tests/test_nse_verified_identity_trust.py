@@ -525,3 +525,65 @@ def test_L_registration_without_any_verified_nse_mapping_does_not_fabricate_indi
     assert profile.country != "IN"
     assert _baseline_jurisdiction(profile) != "INDIA"
     assert jurisdiction_for_profile(profile) != "INDIA"
+
+
+def _verified_etf_history_metadata():
+    return {
+        "globalInstrumentId": "00000000-0000-0000-0000-000000000358",
+        "status": "ACTIVE", "assetType": "ETF", "country": "IN",
+        "primaryExchange": "NSE", "primarySymbol": "DIVIDEND", "currency": "INR",
+        "isin": "INF204KB17I5", "canonicalName": "MIRAEAMC - DIVIDEND",
+        "providerMappings": [{"provider": "NSE", "providerSymbol": "DIVIDEND",
+                              "status": "VERIFIED", "active": True,
+                              "exchange": "NSE", "currency": "INR"}],
+    }
+
+
+@pytest.mark.parametrize("ticker", ["DIVIDEND", "DIVIDEND.NS"])
+def test_etf_history_trust_requires_consistent_canonical_nse_listing(ticker):
+    from app.structured_market import _verified_nse_etf_identity
+
+    assert _verified_nse_etf_identity(_verified_etf_history_metadata(), ticker) is True
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "INACTIVE"}, {"assetType": "EQUITY"}, {"country": "US"},
+    {"primaryExchange": "BSE"}, {"exchange": "BSE"}, {"currency": "USD"}, {"currency": None},
+    {"globalInstrumentId": "not-a-uuid"}, {"isin": None}, {"isin": "INVALID"},
+    {"primarySymbol": "OTHER"}, {"ticker": "OTHER"}, {"nseSymbol": "OTHER"},
+    {"tradingCurrency": "USD"}, {"providerMappings": []},
+])
+def test_etf_history_canonical_identity_defects_cannot_enable_ambiguous_yahoo_fallback(changes):
+    from app.structured_market import _verified_nse_etf_identity
+
+    assert _verified_nse_etf_identity(_verified_etf_history_metadata() | changes, "DIVIDEND.NS") is False
+
+
+@pytest.mark.parametrize("mapping_changes", [
+    {"status": "RESOLVED"}, {"status": None}, {"status": "REJECTED"},
+    {"active": False}, {"providerSymbol": "OTHER"}, {"exchange": "BSE"},
+    {"currency": "USD"}, {"resolutionSource": "BROKER_IMPORT_IDENTITY"},
+    {"resolution_source": "BROKER_IMPORT_IDENTITY"},
+    {"resolutionSource": " BROKER_IMPORT_IDENTITY "}, {"isin": "INF000000000"},
+])
+def test_etf_history_cannot_upgrade_untrusted_or_conflicting_nse_mapping(mapping_changes):
+    from app.structured_market import _verified_nse_etf_identity
+
+    row = _verified_etf_history_metadata()
+    row["providerMappings"] = [row["providerMappings"][0] | mapping_changes]
+    assert _verified_nse_etf_identity(row, "DIVIDEND.NS") is False
+
+
+def test_etf_history_duplicate_verified_nse_mappings_remain_ambiguous():
+    from app.structured_market import _verified_nse_etf_identity
+
+    row = _verified_etf_history_metadata()
+    row["providerMappings"] = row["providerMappings"] * 2
+    assert _verified_nse_etf_identity(row, "DIVIDEND.NS") is False
+
+
+@pytest.mark.parametrize("ticker", ["OTHER.NS", "DIVIDEND.BO", "DIVIDEND.NS.EXTRA"])
+def test_etf_history_trust_does_not_discard_conflicting_ticker_suffix(ticker):
+    from app.structured_market import _verified_nse_etf_identity
+
+    assert _verified_nse_etf_identity(_verified_etf_history_metadata(), ticker) is False

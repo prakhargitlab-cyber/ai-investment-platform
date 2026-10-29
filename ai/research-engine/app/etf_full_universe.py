@@ -20,12 +20,15 @@ from app.etf_history import acquire_etf_history
 from app.etf_opportunity_cycle import run_etf_radar_cycle, etf_cycle_result_to_dict
 from app.etf_screening import screening_evidence, enrich_candidate, research_overview
 from app.nse_historical_daily import verified_identity
+from app.portfolio_orchestration import _trusted_nse_provider_mapping
 
 
 def reconcile(listings, canonical):
     """One auditable result per official identity; reject ambiguity, never guess."""
     # Enumeration uses ticker/exchange; point metadata uses primarySymbol/primaryExchange.
-    canonical = [{**row, 'primarySymbol': row.get('primarySymbol') or row.get('ticker'),
+    canonical = [{**row,
+                  'isin': ''.join(str(row.get('isin') or '').split()).upper(),
+                  'primarySymbol': str(row.get('primarySymbol') or row.get('ticker') or '').strip().upper(),
                   'primaryExchange': row.get('primaryExchange') or row.get('exchange')} for row in canonical]
     symbols = [item.symbol for item in listings]
     if len(set(symbols)) != len(symbols):
@@ -43,8 +46,14 @@ def reconcile(listings, canonical):
                 candidate = matches[0]
                 try:
                     key = UUID(candidate['globalInstrumentId'])
-                    symbol, _ = verified_identity(candidate, key)
-                    if (candidate['isin'] == item.isin and symbol == item.symbol
+                    mappings = [mapping for mapping in candidate.get('providerMappings', [])
+                                if isinstance(mapping, dict) and str(mapping.get('provider', '')).upper() == 'NSE']
+                    if (len(mappings) != 1 or not _trusted_nse_provider_mapping(mappings[0])
+                            or mappings[0].get('active') is False):
+                        raise ValueError('NO_TRUSTED_NSE_MAPPING')
+                    symbol, currency = verified_identity(candidate, key)
+                    if (candidate['isin'] == item.isin and candidate['primarySymbol'] == symbol == item.symbol
+                            and currency == 'INR' and candidate.get('currency') == 'INR'
                             and candidate['assetType'] == 'ETF'):
                         row, reason = candidate, 'VERIFIED'
                 except (ValueError, KeyError, TypeError):
@@ -76,7 +85,8 @@ def official_peer_profile(item, market_fact=None):
         try:
             verify_metadata(details['metadata'], row)
             record = details['record']
-            if record['symbol'] != row['primarySymbol']:
+            if (not isinstance(record.get('symbol'), str)
+                    or record['symbol'].strip().upper() != row['primarySymbol']):
                 return None
             fields = [record.get(k) for k in ('assets', 'mainCatagory', 'subCatagory')]
             if any(v is not None and not isinstance(v, str) for v in fields):
@@ -127,7 +137,7 @@ def peer_results(candidates, profiles):
                 # Finer-grained grouping within a subtype, by the specific
                 # verified official benchmark/category name -- never a guess,
                 # just the already-verified metadata read verbatim.
-                peer = f"{profile.asset_class}:{_normalized(profile.underlying_index)}"
+                peer = f"{_normalized(profile.asset_class).upper()}:{_normalized(profile.underlying_index)}"
             else:
                 peer = subtype
         candidate['peer_group'] = peer

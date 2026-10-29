@@ -19,7 +19,11 @@ except ImportError:
     CurlTimeout = RequestsTimeout
 
 from app.models import MarketPriceObservation
-from app.structured_market import _bare_symbol, verify_historical_price_identity
+from app.structured_market import (
+    _nse_symbol_matches,
+    _canonical_nse_etf_identity_reason,
+    verify_historical_price_identity,
+)
 from app.yahoo_ticker_context import YahooTickerContexts
 
 logger = logging.getLogger(__name__)
@@ -126,36 +130,28 @@ def _etf_fallback_diagnostic(
     returned_quote_type: Any,
     returned_exchange: Any,
     returned_currency: Any,
+    canonical_nse_etf_verified: bool = False,
 ) -> str | None:
-    """Read-only diagnostic classification of why verify_historical_price_
-    identity's ETF-specific COMPANY_NAME_MISMATCH fallback did or did not
-    even get a chance to accept this response. Mirrors that function's own
-    eligibility/match conditions purely for logging -- computing this value
-    never changes, and is never consulted to decide, the actual accept/
-    reject outcome, which remains entirely verify_historical_price_identity's.
-
-    Returns None whenever the fallback was never even reachable (`reason`
-    is anything other than "COMPANY_NAME_MISMATCH" -- ISIN/EXCHANGE/
-    CURRENCY mismatches return early in verify_historical_price_identity
-    and never consult this fallback at all), so the field stays empty for
-    every non-ETF and non-COMPANY_NAME_MISMATCH rejection, exactly as
-    before this diagnostic existed.
-    """
+    """Explain a rejected name fallback without deciding identity itself."""
     if reason != "COMPANY_NAME_MISMATCH":
         return None
-    if str(expected_asset_type or "").upper() != "ETF":
+    if str(expected_asset_type or "").strip().upper() != "ETF":
         return "NOT_APPLICABLE_NOT_AN_ETF"
-    missing = [name for name, value in (
-        ("expectedSymbol", expected_symbol), ("returnedSymbol", returned_symbol),
-        ("returnedQuoteType", returned_quote_type), ("returnedExchange", returned_exchange),
-        ("returnedCurrency", returned_currency)) if not value]
+    required = [("expectedSymbol", expected_symbol), ("returnedSymbol", returned_symbol),
+                ("returnedExchange", returned_exchange), ("returnedCurrency", returned_currency)]
+    if not canonical_nse_etf_verified:
+        required.append(("returnedQuoteType", returned_quote_type))
+    missing = [name for name, value in required if not value]
     if missing:
         return f"INELIGIBLE_MISSING_FIELDS:{','.join(missing)}"
-    if _bare_symbol(returned_symbol) != _bare_symbol(expected_symbol):
+    if not _nse_symbol_matches(expected_symbol, returned_symbol):
         return "ATTEMPTED_SYMBOL_MISMATCH"
-    if str(returned_quote_type).strip().upper() != "ETF":
+    quote_type = str(returned_quote_type or "").strip().upper()
+    if quote_type != "ETF" and not (canonical_nse_etf_verified and quote_type in {"", "EQUITY"}):
         return "ATTEMPTED_QUOTE_TYPE_MISMATCH"
-    return "UNEXPECTED_STILL_REJECTED"  # defensive only; should not occur
+    if canonical_nse_etf_verified:
+        return "CANONICAL_NSE_ETF_NAME_CONFLICT"
+    return "UNEXPECTED_STILL_REJECTED"
 
 
 def _log_historical_price_failure_diagnostic(
@@ -327,6 +323,9 @@ class YahooHistoricalPriceProvider:
             raise HistoricalPriceProviderError("HISTORICAL_PRICE_PROVIDER_UNAVAILABLE:INVALID_INFO")
         expected_name = instrument.get("companyName") or instrument.get("canonicalName") or instrument.get("ticker") or ticker
         returned_name = info.get("longName") or info.get("shortName")
+        etf = str(instrument.get("assetType") or "").strip().upper() == "ETF"
+        canonical_reason = _canonical_nse_etf_identity_reason(instrument, ticker) if etf else None
+        canonical_nse_etf_verified = etf and canonical_reason is None
         reason = verify_historical_price_identity(
             expected_isin=instrument.get("isin"),
             expected_name=expected_name,
@@ -336,16 +335,21 @@ class YahooHistoricalPriceProvider:
             returned_name=returned_name,
             returned_exchange=info.get("exchange") or info.get("fullExchangeName"),
             returned_currency=info.get("currency"),
-            # ETF-specific fallback inputs (see verify_historical_price_identity's
-            # docstring): the caller's own already-verified canonical symbol/
-            # asset-type, and Yahoo's own returned symbol/quoteType for THIS
-            # response. Equities pass no assetType of "ETF" here, so they take
-            # the exact same code path as before this change.
+            # Canonical NSE verification is independent of Yahoo metadata;
+            # it may resolve ETF type/name ambiguity, never explicit conflicts.
             expected_symbol=instrument.get("primarySymbol") or instrument.get("ticker"),
             expected_asset_type=instrument.get("assetType"),
             returned_symbol=info.get("symbol"),
             returned_quote_type=info.get("quoteType"),
+            canonical_nse_etf_verified=canonical_nse_etf_verified,
         )
+        if etf and canonical_reason and ("providerMappings" in instrument
+                or canonical_reason.startswith("CANONICAL_IDENTITY_CONFLICT:")):
+            reason = canonical_reason
+        if (str(instrument.get("assetType") or "").strip().upper() == "ETF"
+                and (expected_symbol := instrument.get("primarySymbol") or instrument.get("ticker"))
+                and not _nse_symbol_matches(expected_symbol, ticker)):
+            reason = "SYMBOL_MISMATCH"
         if reason == "PROVIDER_IDENTITY_UNAVAILABLE":
             # Yahoo returned literally no identity evidence for a resolved
             # ticker (every one of name/isin/exchange/currency absent) --
@@ -363,41 +367,15 @@ class YahooHistoricalPriceProvider:
             # raises and nothing is persisted either way.
             self.ticker_contexts.note_identity_metadata_unavailable()
         if reason is not None:
-            # Include the two compared (public, non-sensitive) fund-name
-            # strings -- previously only the stable reason code was logged,
-            # which made a COMPANY_NAME_MISMATCH indistinguishable from a
-            # genuine wrong-company mapping versus the provider simply
-            # returning a differently-formatted name (or no name at all) for
-            # the correct fund. Diagnostic only: does not change what is
-            # verified, matched, or persisted.
-            #
-            # Also always include the ETF-fallback-relevant fields
-            # (expectedSymbol/expectedAssetType/returnedSymbol/
-            # returnedQuoteType/returnedExchange/returnedCurrency) so a
-            # COMPANY_NAME_MISMATCH on a genuine ETF is distinguishable
-            # from one where the fallback was never even eligible to run
-            # (e.g. Yahoo omitted quoteType/exchange/currency, or
-            # expected_asset_type was not "ETF") versus one where it ran
-            # but the symbol or quoteType genuinely disagreed. These are
-            # harmlessly None/empty for a non-ETF (equity) rejection or a
-            # non-COMPANY_NAME_MISMATCH reason. Diagnostic only.
-            #
-            # etfFallbackDiagnostic (new, diagnostic only): previously an
-            # operator reading this log line had to manually re-derive
-            # eligibility/match from the raw returned fields above to tell
-            # "the ETF fallback was never even eligible to run" apart from
-            # "it ran but the symbol or quoteType genuinely disagreed" --
-            # exactly the ambiguity this function's own docstring already
-            # called out but did not yet surface as a single, direct field.
-            # Computed by _etf_fallback_diagnostic, which mirrors (but never
-            # calls or is called by) verify_historical_price_identity's own
-            # fallback logic -- it changes no accept/reject decision.
+            # Log public identity fields and the applicable trust boundary,
+            # without raw provider payloads or credentials.
             etf_fallback_diagnostic = _etf_fallback_diagnostic(
                 reason, expected_asset_type=instrument.get("assetType"),
                 expected_symbol=instrument.get("primarySymbol") or instrument.get("ticker"),
                 returned_symbol=info.get("symbol"), returned_quote_type=info.get("quoteType"),
                 returned_exchange=info.get("exchange") or info.get("fullExchangeName"),
                 returned_currency=info.get("currency"),
+                canonical_nse_etf_verified=canonical_nse_etf_verified,
             )
             logger.info(
                 "historical_price_identity_rejected globalInstrumentId=%s ticker=%s reason=%s "

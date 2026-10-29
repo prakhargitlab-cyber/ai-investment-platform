@@ -7,6 +7,7 @@ import pytest
 
 import app.etf_readiness as readiness
 from app.etf_evidence import EtfAcquisitionAttempt, EtfFact, EtfListing, EtfMetric, ETF_MAX_AGE
+from app.models import DailyMarketBar
 from test_etf_readiness import ID, NOW, provenance, store
 
 
@@ -138,3 +139,35 @@ def test_identity_attempts_are_also_instrument_scoped(store):
     assert identity.status == readiness.EtfReadinessStatus.TECHNICAL_FAILURE
     assert identity.reason == "OWN_TIMEOUT"
     assert not summary.ready_for_analysis
+
+
+@pytest.mark.parametrize("count", [1, 21, 22, 64, 200, 253])
+def test_persisted_history_readiness_requires_each_metrics_own_observation_window(store, count):
+    store.save_etf_evidence(listing())
+    for offset in range(count):
+        store.upsert_daily_market_bar(DailyMarketBar(global_instrument_id=ID,
+            trading_date=NOW.date() - timedelta(days=count - offset), close=Decimal(100 + offset),
+            currency="INR", provider="YAHOO_FINANCE", provider_symbol="FIXTURE.NS", source_mode="REAL",
+            source_url="https://finance.yahoo.com/quote/FIXTURE.NS/history", retrieved_at=NOW))
+    statuses, _ = readiness.evaluate_etf_readiness(store, ID, now=NOW)
+    by_requirement = {status.requirement: status for status in statuses}
+    for requirement, minimum in (("HISTORICAL_RETURNS", 22), ("VOLATILITY", 64),
+                                 ("INDEX_MOMENTUM", 200), ("DRAWDOWN", 2)):
+        status = by_requirement[requirement]
+        assert status.status == ("READY_FRESH" if count >= minimum else "MISSING")
+        if count < minimum:
+            assert status.reason == "INSUFFICIENT_PRICE_HISTORY"
+    for requirement in ("EXPENSE_RATIO", "AUM", "TRACKING_ERROR", "UNDERLYING_HOLDINGS"):
+        assert by_requirement[requirement].status == "MISSING"
+
+
+def test_another_etfs_persisted_history_cannot_satisfy_price_readiness(store):
+    for offset in range(260):
+        store.upsert_daily_market_bar(DailyMarketBar(global_instrument_id=UUID(int=2),
+            trading_date=NOW.date() - timedelta(days=260 - offset), close=Decimal(100 + offset),
+            currency="INR", provider="YAHOO_FINANCE", source_mode="REAL",
+            source_url="https://finance.yahoo.com/quote/OTHER.NS/history", retrieved_at=NOW))
+    statuses, _ = readiness.evaluate_etf_readiness(store, ID, now=NOW)
+    for status in statuses:
+        if status.requirement in {"HISTORICAL_RETURNS", "VOLATILITY", "INDEX_MOMENTUM", "DRAWDOWN"}:
+            assert status.status == "MISSING"

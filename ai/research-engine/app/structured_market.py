@@ -734,6 +734,80 @@ def _bare_symbol(value: Any) -> str:
     return str(value or "").strip().upper().split(".", 1)[0]
 
 
+def _nse_symbol_matches(expected: Any, returned: Any) -> bool:
+    """Allow only a canonical bare symbol or its NSE Yahoo suffix."""
+    symbol = str(expected or "").strip().upper()
+    if symbol.endswith(".NS"):
+        symbol = symbol[:-3]
+    return bool(symbol and "." not in symbol and
+                str(returned or "").strip().upper() in {symbol, symbol + ".NS"})
+
+
+def _canonical_nse_etf_identity_reason(instrument: dict[str, Any], ticker: Any) -> str | None:
+    """Separate missing canonical evidence from contradictory NSE identifiers."""
+    from app.portfolio_orchestration import _trusted_nse_provider_mapping
+
+    unavailable = "CANONICAL_NSE_ETF_IDENTITY_UNAVAILABLE"
+    if not isinstance(instrument, dict):
+        return unavailable
+    value = lambda field: str(instrument.get(field) or "").strip().upper()
+    if value("assetType") != "ETF":
+        return "CANONICAL_IDENTITY_CONFLICT:ASSET_TYPE"
+    for field, allowed in (("status", {"ACTIVE"}), ("country", {"IN", "IND", "INDIA"}),
+                           ("currency", {"INR"}), ("tradingCurrency", {"INR"})):
+        if value(field) and value(field) not in allowed:
+            return "CANONICAL_IDENTITY_CONFLICT:" + field.upper()
+    if any(_exchange_family(instrument[field], "") != "XNSE"
+           for field in ("primaryExchange", "exchange") if instrument.get(field)):
+        return "CANONICAL_IDENTITY_CONFLICT:EXCHANGE"
+    symbol = value("primarySymbol") or value("ticker")
+    if symbol and (not re.fullmatch(r"[A-Z0-9&_\-]+", symbol)
+                   or not _nse_symbol_matches(symbol, ticker)
+                   or any(value(field) != symbol for field in ("primarySymbol", "ticker", "nseSymbol") if value(field))):
+        return "CANONICAL_IDENTITY_CONFLICT:SYMBOL"
+    isin = value("isin")
+    if isin and not re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", isin):
+        return "CANONICAL_IDENTITY_CONFLICT:ISIN"
+    key = instrument.get("globalInstrumentId")
+    if key:
+        try:
+            UUID(str(key))
+        except (ValueError, TypeError, AttributeError):
+            return "CANONICAL_IDENTITY_CONFLICT:INSTRUMENT_ID"
+    mappings = instrument.get("providerMappings")
+    if not isinstance(mappings, (list, tuple)):
+        return unavailable
+    nse = [m for m in mappings if isinstance(m, dict)
+           and str(m.get("provider") or "").strip().upper() == "NSE"]
+    if len(nse) > 1:
+        return "CANONICAL_IDENTITY_CONFLICT:MULTIPLE_NSE_MAPPINGS"
+    if not nse:
+        return unavailable
+    mapping = nse[0]
+    mapped_symbol = str(mapping.get("providerSymbol") or "").strip().upper()
+    if symbol and mapped_symbol and mapped_symbol != symbol:
+        return "CANONICAL_IDENTITY_CONFLICT:SYMBOL"
+    if mapping.get("exchange") and _exchange_family(mapping["exchange"], "") != "XNSE":
+        return "CANONICAL_IDENTITY_CONFLICT:EXCHANGE"
+    if mapping.get("currency") and str(mapping["currency"]).strip().upper() != "INR":
+        return "CANONICAL_IDENTITY_CONFLICT:CURRENCY"
+    if mapping.get("isin") and str(mapping["isin"]).strip().upper() != isin:
+        return "CANONICAL_IDENTITY_CONFLICT:ISIN"
+    if (not _trusted_nse_provider_mapping(mapping) or mapping.get("active") is False
+            or any(str(mapping.get(field) or "").strip().upper() == "BROKER_IMPORT_IDENTITY"
+                   for field in ("resolutionSource", "resolution_source"))):
+        return "CANONICAL_NSE_MAPPING_NOT_VERIFIED"
+    if not (key and symbol and mapped_symbol and isin and value("status") and value("country")
+            and value("currency") and (value("primaryExchange") or value("exchange"))):
+        return unavailable
+    return None
+
+
+def _verified_nse_etf_identity(instrument: dict[str, Any], ticker: Any) -> bool:
+    """Independent canonical trust, never inferred from Yahoo's response."""
+    return _canonical_nse_etf_identity_reason(instrument, ticker) is None
+
+
 def verify_historical_price_identity(
     *,
     expected_isin: Any,
@@ -748,72 +822,58 @@ def verify_historical_price_identity(
     expected_asset_type: Any = None,
     returned_symbol: Any = None,
     returned_quote_type: Any = None,
+    canonical_nse_etf_verified: bool = False,
 ) -> str | None:
-    """Pre-persistence identity gate for Yahoo historical-price acquisition.
+    """Verify returned identity before persisting history; equities stay strict.
 
-    Verifies that data actually RETURNED by the provider for an
-    already-resolved ticker still belongs to the canonical instrument the
-    ticker was recorded against -- catching a mapping that silently points
-    at the wrong company (the INFY-canonical-UUID/HCL-INSYS.NS corruption
-    class), not merely an echo of the requested symbol. Composed from the
-    same exchange-family/currency/ISIN-or-name checks the live resolution
-    path already enforces (_exchange_family, verify_identity_by_isin_or_name)
-    rather than a second, conflicting definition. Returns None when
-    verified, else a stable rejection reason string.
-
-    ETF-specific fallback (new): Yahoo frequently omits ISIN for Indian-
-    listed ETFs, and its longName/shortName for these is often the raw
-    ticker, a truncated AMC prefix, or the underlying benchmark index name
-    rather than the fund's own registered name -- fuzzy name similarity
-    then rejects a genuinely correct match
-    (see historical_price_identity_rejected diagnostics, e.g. "Nippon India
-    ETF Nifty 50 BeES" vs Yahoo's "NIFTY 50"). This fallback is consulted
-    ONLY when the shared ISIN-or-name gate above would otherwise reject on
-    COMPANY_NAME_MISMATCH specifically -- never on a genuine ISIN conflict,
-    which is returned above unchanged and still fails closed. It requires
-    THREE independent signals to all agree, not symbol matching alone: the
-    exact canonical NSE symbol (ignoring a ".NS" suffix), Yahoo's own
-    returned quoteType confirming the ticker still resolves to an ETF (not
-    silently reassigned to another instrument type), and Yahoo actually
-    having returned a matching exchange and currency (not merely failing to
-    conflict by omitting them -- see the explicit presence check below).
-    The
-    asset-type requirement is the caller's explicit, already-verified
-    canonical classification (expected_asset_type) -- never guessed from
-    the name. When any of expected_symbol/expected_asset_type/
-    returned_symbol/returned_quote_type is unavailable, or
-    expected_asset_type is not "ETF", this falls through unchanged to the
-    original COMPANY_NAME_MISMATCH rejection -- equities take no asset-type
-    signal here and are completely unaffected by this fallback.
+    NSE may authoritatively classify an ETF that Yahoo labels EQUITY or
+    leaves unclassified. Only an independently VERIFIED canonical NSE ETF
+    may use that ambiguity, with the returned NSE symbol, exchange and INR
+    all present and matching. Explicit conflicts always outrank name/ISIN
+    success. An unrelated populated company name is never a fund alias.
     """
+    etf = str(expected_asset_type or "").strip().upper() == "ETF"
     returned_listing = _exchange_family(returned_exchange, "")
     if expected_exchange_family and returned_listing and expected_exchange_family != returned_listing:
         return "EXCHANGE_MISMATCH"
+    if etf and str(returned_exchange or "").strip() and returned_listing != expected_exchange_family:
+        return "EXCHANGE_MISMATCH"
     expected_currency_u = str(expected_currency or "").upper()
     returned_currency_u = str(returned_currency or "").upper()
+    if etf:
+        expected_currency_u = expected_currency_u.strip()
+        returned_currency_u = returned_currency_u.strip()
     if expected_currency_u and returned_currency_u and expected_currency_u != returned_currency_u:
         return "CURRENCY_MISMATCH"
+    if etf:
+        # A matching ISIN/name must not conceal a different returned listing.
+        if returned_symbol and expected_symbol and not _nse_symbol_matches(expected_symbol, returned_symbol):
+            return "SYMBOL_MISMATCH"
+        quote_type = str(returned_quote_type or "").strip().upper()
+        if quote_type not in {"", "ETF", "EQUITY"}:
+            return "QUOTE_TYPE_MISMATCH"
+        expected_isin = str(expected_isin or "").strip().upper()
+        returned_isin = str(returned_isin or "").strip().upper()
     reason = verify_identity_by_isin_or_name(expected_isin, expected_name, returned_isin, returned_name)
-    if reason != "COMPANY_NAME_MISMATCH":
-        return reason  # None (verified) or ISIN_MISMATCH (fail closed) -- unchanged.
-    # The exchange/currency checks above no-op (do not raise) when the
-    # PROVIDER side is simply absent, not merely non-conflicting -- that is
-    # the correct, pre-existing behavior for the general gate (an absent
-    # field is not a mismatch), but it means "exchange-family/currency
-    # agreement already established above" is only actually true when
-    # Yahoo returned BOTH fields. Require their presence explicitly here so
-    # a maximally ambiguous provider response (no ISIN, no exchange, no
-    # currency -- only a bare symbol and quoteType) cannot pass on two
-    # signals while silently missing the third; this does not change the
-    # general EXCHANGE_MISMATCH/CURRENCY_MISMATCH behavior used by every
-    # other path (equities, the ISIN path, or a genuine mismatch), only
-    # this fallback's own three-signals-required bar.
-    if (str(expected_asset_type or "").upper() == "ETF" and expected_symbol and returned_symbol
-            and returned_quote_type and returned_exchange and returned_currency
-            and _bare_symbol(returned_symbol) == _bare_symbol(expected_symbol)
-            and str(returned_quote_type).strip().upper() == "ETF"):
-        return None
-    return reason
+    if not etf or reason == "ISIN_MISMATCH":
+        return reason
+    listing_matches = (
+        bool(expected_symbol and returned_symbol) and _nse_symbol_matches(expected_symbol, returned_symbol)
+        and expected_exchange_family == returned_listing == "XNSE"
+        and expected_currency_u == returned_currency_u == "INR"
+    )
+    if not listing_matches:
+        return reason or "ETF_HISTORY_LISTING_NOT_VERIFIED"
+    if canonical_nse_etf_verified:
+        if (reason is None or not str(returned_name or "").strip() or quote_type == "ETF"
+                or _nse_symbol_matches(expected_symbol, returned_name)
+                or re.search(r"\b(?:etf|exchange[ -]+traded(?:[ -]+fund)?)\b", str(returned_name), re.I)):
+            return None
+        return reason
+    # Legacy ETF fallback still requires provider-confirmed ETF classification.
+    if quote_type != "ETF":
+        return reason or "ETF_HISTORY_LISTING_NOT_VERIFIED"
+    return None if reason in {None, "COMPANY_NAME_MISMATCH"} else reason
 
 
 def _candidate_score(instrument: dict[str, Any], identity: str, candidate: dict[str, Any]) -> float:

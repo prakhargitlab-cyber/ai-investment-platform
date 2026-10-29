@@ -260,3 +260,130 @@ async def test_08_isin_mismatch_rejected_even_with_similar_name():
             start=datetime(2026, 9, 1, tzinfo=timezone.utc),
             end=datetime(2026, 9, 21, tzinfo=timezone.utc),
         )
+
+
+def _dividend_instrument():
+    return {
+        "globalInstrumentId": "00000000-0000-0000-0000-000000000358",
+        "status": "ACTIVE", "assetType": "ETF", "country": "IN",
+        "primaryExchange": "NSE", "exchange": "NSE", "primarySymbol": "DIVIDEND",
+        "structuredProviderTicker": "DIVIDEND.NS", "currency": "INR",
+        "isin": "INF204KB17I5", "canonicalName": "MIRAEAMC - DIVIDEND",
+        "providerMappings": [{"provider": "NSE", "providerSymbol": "DIVIDEND",
+                              "status": "VERIFIED", "exchange": "NSE", "currency": "INR"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_verified_nse_etf_descriptive_name_and_equity_type_persist_under_canonical_id(tmp_path):
+    instrument = _dividend_instrument()
+    key = UUID(instrument["globalInstrumentId"])
+    info = {"symbol": "DIVIDEND.NS", "longName": "Mirae Asset BSE 500 Dividend Leaders 50 ETF",
+            "quoteType": "EQUITY", "exchange": "NSI", "currency": "INR"}
+    persistence = SqliteResearchPersistence(tmp_path / "etf-verified.db")
+    provider = YahooHistoricalPriceProvider(lambda _symbol: _FakeTicker(info, price="28.75"))
+    service = HistoricalPricePopulationService(persistence, provider)
+    for _ in range(2):
+        await service.populate([instrument], start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                               end=datetime(2026, 9, 21, tzinfo=timezone.utc))
+    rows = persistence.load_market_price_observations({key})
+    assert len(rows) == 1
+    assert rows[0].instrument_id == key
+    assert rows[0].price == Decimal("28.75")
+    assert rows[0].currency == "INR"
+    assert "/DIVIDEND.NS/history" in rows[0].source_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value,reason", [
+    ("symbol", "OTHER.NS", "SYMBOL_MISMATCH"),
+    ("symbol", "DIVIDEND.BO", "SYMBOL_MISMATCH"),
+    ("exchange", "BSE", "EXCHANGE_MISMATCH"),
+    ("currency", "USD", "CURRENCY_MISMATCH"),
+    ("isin", "INF000000000", "ISIN_MISMATCH"),
+])
+async def test_etf_explicit_provider_conflicts_do_not_persist_even_with_matching_name(tmp_path, field, value, reason):
+    instrument = _dividend_instrument()
+    key = UUID(instrument["globalInstrumentId"])
+    info = {"symbol": "DIVIDEND.NS", "longName": instrument["canonicalName"],
+            "isin": instrument["isin"], "quoteType": "ETF", "exchange": "NSI", "currency": "INR"}
+    info[field] = value
+    persistence = SqliteResearchPersistence(tmp_path / "etf-conflict.db")
+    service = HistoricalPricePopulationService(persistence,
+        YahooHistoricalPriceProvider(lambda _symbol: _FakeTicker(info)))
+    with pytest.raises(HistoricalPriceIdentityConflict, match=reason):
+        await service.populate([instrument], start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                               end=datetime(2026, 9, 21, tzinfo=timezone.utc))
+    assert persistence.load_market_price_observations({key}) == []
+
+
+@pytest.mark.asyncio
+async def test_similarly_named_different_etf_symbol_is_not_accepted(tmp_path):
+    instrument = _dividend_instrument()
+    key = UUID(instrument["globalInstrumentId"])
+    info = {"symbol": "OTHERDIV.NS", "longName": "Mirae Asset Dividend Leaders ETF",
+            "quoteType": "ETF", "exchange": "NSI", "currency": "INR"}
+    persistence = SqliteResearchPersistence(tmp_path / "similar-etf.db")
+    service = HistoricalPricePopulationService(persistence,
+        YahooHistoricalPriceProvider(lambda _symbol: _FakeTicker(info)))
+    with pytest.raises(HistoricalPriceIdentityConflict, match="SYMBOL_MISMATCH"):
+        await service.populate([instrument], start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                               end=datetime(2026, 9, 21, tzinfo=timezone.utc))
+    assert persistence.load_market_price_observations({key}) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_ticker", ["OTHER.NS", "DIVIDEND.BO"])
+async def test_wrong_etf_request_ticker_rejected_even_when_metadata_echoes_canonical_identity(tmp_path, requested_ticker):
+    instrument = _dividend_instrument() | {"structuredProviderTicker": requested_ticker}
+    key = UUID(instrument["globalInstrumentId"])
+    info = {"symbol": "DIVIDEND.NS", "longName": instrument["canonicalName"],
+            "isin": instrument["isin"], "quoteType": "ETF", "exchange": "NSI", "currency": "INR"}
+    requested = []
+
+    def ticker_factory(symbol):
+        requested.append(symbol)
+        return _FakeTicker(info)
+
+    persistence = SqliteResearchPersistence(tmp_path / "wrong-request.db")
+    service = HistoricalPricePopulationService(persistence, YahooHistoricalPriceProvider(ticker_factory))
+    with pytest.raises(HistoricalPriceIdentityConflict, match="SYMBOL_MISMATCH"):
+        await service.populate([instrument], start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                               end=datetime(2026, 9, 21, tzinfo=timezone.utc))
+    assert requested == [requested_ticker]
+    assert persistence.load_market_price_observations({key}) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope,field,value", [
+    ("canonical", "ticker", "OTHER"),
+    ("canonical", "nseSymbol", "OTHER"),
+    ("canonical", "exchange", "BSE"),
+    ("canonical", "tradingCurrency", "USD"),
+    ("mapping", "isin", "INF000000000"),
+    ("mapping", "status", "RESOLVED"),
+    ("mapping", "resolutionSource", "BROKER_IMPORT_IDENTITY"),
+    ("mapping", "resolution_source", " BROKER_IMPORT_IDENTITY "),
+    ("mapping", "currency", "USD"),
+    ("mapping", "exchange", "BSE"),
+    ("mapping", "active", False),
+    ("duplicate", None, None),
+])
+async def test_matching_provider_etf_identity_cannot_rescue_conflicting_canonical_metadata(tmp_path, scope, field, value):
+    instrument = _dividend_instrument()
+    key = UUID(instrument["globalInstrumentId"])
+    if scope == "canonical":
+        instrument[field] = value
+    elif scope == "mapping":
+        instrument["providerMappings"] = [instrument["providerMappings"][0] | {field: value}]
+    else:
+        instrument["providerMappings"] = instrument["providerMappings"] * 2
+    info = {"symbol": "DIVIDEND.NS", "longName": instrument["canonicalName"],
+            "isin": instrument["isin"], "quoteType": "ETF", "exchange": "NSI", "currency": "INR"}
+    persistence = SqliteResearchPersistence(tmp_path / "canonical-conflict.db")
+    service = HistoricalPricePopulationService(persistence,
+        YahooHistoricalPriceProvider(lambda _symbol: _FakeTicker(info)))
+    with pytest.raises(HistoricalPriceIdentityConflict, match="CANONICAL_(?:IDENTITY_CONFLICT|NSE_)"):
+        await service.populate([instrument], start=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                               end=datetime(2026, 9, 21, tzinfo=timezone.utc))
+    assert persistence.load_market_price_observations({key}) == []

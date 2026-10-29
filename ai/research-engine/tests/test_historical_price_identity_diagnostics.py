@@ -1,10 +1,4 @@
-"""Focused tests for the diagnostic-attribution-only additions made during
-the ETF_HISTORY_LISTING_NOT_VERIFIED / COMPANY_NAME_MISMATCH root-cause
-investigation. No comparison/raise logic was changed anywhere in this
-change: every test here asserts that the NEW diagnostic fields correctly
-classify an outcome that the EXISTING (unchanged) gates already produced,
-never a new accept/reject decision.
-"""
+"""Historical identity diagnostics and the ETF listing policy stay aligned."""
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -125,12 +119,7 @@ def _make_history_ticker(info):
 
 @pytest.mark.asyncio
 async def test_etf_history_gate_logs_missing_exchange(caplog):
-    """Yahoo returning no exchange at all (None) must classify as MISSING,
-    not CONFLICTING -- an omission is a different root-cause question
-    (incomplete provider metadata) than a disagreement (genuine conflict
-    or an overly strict comparison). ISIN matches at the shared base gate
-    so the base gate passes cleanly and etf_history's own extra gate is
-    actually reached."""
+    """Matching ISIN does not hide absent NSE exchange metadata from the shared gate."""
     instrument_id = uuid4()
     ticker_obj = _make_history_ticker({
         "symbol": "NIFTYBEES.NS", "quoteType": "ETF", "currency": "INR",
@@ -149,28 +138,22 @@ async def test_etf_history_gate_logs_missing_exchange(caplog):
                  "assetType": "ETF", "currency": "INR", "isin": "INF204K01VQ2"},
                 start=start, end=end,
             )
-    [record] = [r for r in caplog.records if r.message.startswith("etf_history_listing_not_verified")]
-    assert "symbolCheck=MATCHED" in record.message
-    assert "quoteTypeCheck=MATCHED" in record.message
-    assert "currencyCheck=MATCHED" in record.message
-    assert "exchangeCheck=MISSING" in record.message
+    [record] = [r for r in caplog.records if r.message.startswith("historical_price_identity_rejected")]
+    assert "returnedSymbol=NIFTYBEES.NS" in record.message
+    assert "returnedQuoteType=ETF" in record.message
+    assert "returnedCurrency=INR" in record.message
+    assert "returnedExchange=None" in record.message
+    assert "reason=ETF_HISTORY_LISTING_NOT_VERIFIED" in record.message
 
 
 @pytest.mark.asyncio
-async def test_etf_history_gate_logs_conflicting_exchange_even_when_shared_gate_normalizes_it(caplog):
-    """"XNSE" is an exchange string the SHARED base gate's own normalization
-    (_exchange_family) already recognizes as equivalent to NSE/NSI -- so the
-    base gate passes cleanly -- but it is not literally "NSI" or "NSE", so
-    etf_history's own un-normalized membership check still rejects it. This
-    must classify as CONFLICTING (a present, disagreeing value), not
-    MISSING, and is the concrete evidence for this investigation's leading
-    root-cause hypothesis: this extra gate's comparison is stricter than,
-    and inconsistent with, the shared normalization used everywhere else in
-    this codebase for the exact same field."""
+@pytest.mark.parametrize("symbol,exchange", [("NIFTYBEES.NS", "XNSE"), ("NIFTYBEES", "NSE")])
+async def test_etf_history_gate_uses_shared_symbol_and_exchange_normalization(caplog, symbol, exchange):
+    """The extra gate must accept the same exact NSE listing aliases as the shared gate."""
     instrument_id = uuid4()
     ticker_obj = _make_history_ticker({
-        "symbol": "NIFTYBEES.NS", "quoteType": "ETF", "currency": "INR",
-        "exchange": "XNSE",  # present, base-gate-equivalent, but not in etf_history's literal set
+        "symbol": symbol, "quoteType": "ETF", "currency": "INR",
+        "exchange": exchange,
         "longName": "Nippon India ETF Nifty 50 BeES", "isin": "INF204K01VQ2",
     })
     provider = EtfHistoryProvider(lambda symbol: ticker_obj)
@@ -178,15 +161,14 @@ async def test_etf_history_gate_logs_conflicting_exchange_even_when_shared_gate_
     end = datetime(2026, 2, 3, tzinfo=timezone.utc)
 
     with caplog.at_level("INFO"):
-        with pytest.raises(HistoricalPriceIdentityConflict, match="ETF_HISTORY_LISTING_NOT_VERIFIED"):
-            await provider.closes(
-                {"globalInstrumentId": str(instrument_id), "structuredProviderTicker": "NIFTYBEES.NS",
-                 "companyName": "Nippon India ETF Nifty 50 BeES", "primarySymbol": "NIFTYBEES",
-                 "assetType": "ETF", "currency": "INR", "isin": "INF204K01VQ2"},
-                start=start, end=end,
-            )
-    [record] = [r for r in caplog.records if r.message.startswith("etf_history_listing_not_verified")]
-    assert "exchangeCheck=CONFLICTING" in record.message
+        observations = await provider.closes(
+            {"globalInstrumentId": str(instrument_id), "structuredProviderTicker": "NIFTYBEES.NS",
+             "companyName": "Nippon India ETF Nifty 50 BeES", "primarySymbol": "NIFTYBEES",
+             "assetType": "ETF", "currency": "INR", "isin": "INF204K01VQ2"},
+            start=start, end=end,
+        )
+    assert len(observations) == 1
+    assert not any(r.message.startswith("etf_history_listing_not_verified") for r in caplog.records)
 
 
 @pytest.mark.asyncio

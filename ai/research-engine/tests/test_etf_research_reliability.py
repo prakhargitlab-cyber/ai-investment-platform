@@ -42,31 +42,26 @@ async def test_history_persistence_factor_consumption_retry_and_fence(repo):
         await acquire_etf_history(repo, META, now=NOW, checkpoint=cp, provider=provider)
 
 
-def test_yahoo_mapping_requires_returned_etf_listing():
+def test_verified_nse_etf_mapping_preserves_explicit_conflicts():
     provider = EtfHistoryProvider(None)
     good = {'isin': META['isin'], 'symbol': 'TESTETF.NS', 'quoteType': 'ETF', 'currency': 'INR', 'exchange': 'NSI'}
     provider._verify_identity_or_raise(META, 'TESTETF.NS', SimpleNamespace(info=good))
-    for change in ({'isin': 'IN9999999999'}, {'quoteType': 'EQUITY'}, {'symbol': 'OTHER.NS'}, {'currency': 'USD'}, {'exchange': None}):
+    for change in ({'quoteType': 'EQUITY'}, {'quoteType': None}, {'exchange': 'XNSE'}, {'symbol': 'TESTETF'}):
+        provider._verify_identity_or_raise(META, 'TESTETF.NS', SimpleNamespace(info=good | change))
+    for change in ({'isin': 'IN9999999999'}, {'quoteType': 'MUTUALFUND'}, {'symbol': 'OTHER.NS'},
+                   {'currency': 'USD'}, {'exchange': 'BSE'}):
         with pytest.raises(Exception):
             provider._verify_identity_or_raise(META, 'TESTETF.NS', SimpleNamespace(info=good | change))
 
 
 def test_yahoo_mapping_rejection_logs_which_field_failed(caplog):
-    """Diagnostic-only regression (ETF-radar historical-acquisition-
-    completeness investigation): EtfHistoryProvider's own, stricter,
-    second identity gate (distinct from the shared verify_historical_
-    price_identity fallback) previously raised ETF_HISTORY_LISTING_NOT_
-    VERIFIED with zero logging, making it impossible to tell from
-    production logs which of symbol/quoteType/currency/exchange actually
-    disagreed for any of the real ETF_ONBOARD failures attributed to this
-    reason. The log line must now carry the four actually-returned values
-    -- this must not change what raises or what is persisted."""
+    """The shared rejection remains attributable after removing the redundant gate."""
     provider = EtfHistoryProvider(None)
     good = {'isin': META['isin'], 'symbol': 'TESTETF.NS', 'quoteType': 'ETF', 'currency': 'INR', 'exchange': 'NSI'}
     with caplog.at_level("INFO"):
         with pytest.raises(Exception):
             provider._verify_identity_or_raise(META, 'TESTETF.NS', SimpleNamespace(info=good | {'quoteType': 'MUTUALFUND'}))
-    [record] = [r for r in caplog.records if r.message.startswith("etf_history_listing_not_verified")]
+    [record] = [r for r in caplog.records if r.message.startswith("historical_price_identity_rejected")]
     assert "returnedQuoteType=MUTUALFUND" in record.message
     assert "returnedSymbol=TESTETF.NS" in record.message
     assert "returnedCurrency=INR" in record.message

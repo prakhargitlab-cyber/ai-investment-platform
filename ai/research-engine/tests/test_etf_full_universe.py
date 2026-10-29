@@ -371,6 +371,9 @@ def test_real_canonical_enumeration_projection_is_supported():
     ('Equity','EQUITY_SECTOR_THEMATIC','sector','EQUITY_SECTOR_THEMATIC'),
     ('Debt','DEBT',None,'DEBT'),('Gold','GOLD',None,'GOLD'),('Silver','SILVER',None,'SILVER'),
     ('Equity','INTERNATIONAL_EQUITY',None,'INTERNATIONAL_EQUITY'),
+    ('Equity','EQUITY_SMART_BETA','Nifty 200 Momentum 30','EQUITY_SMART_BETA'),
+    ('Equity','EQUITY_SMART_BETA','Nifty 100 Quality 30','EQUITY_SMART_BETA'),
+    ('Equity','EQUITY_SECTOR_THEMATIC','Nifty India Consumption','EQUITY_SECTOR_THEMATIC'),
     ('Debt','INTERNATIONAL_DEBT',None,'INTERNATIONAL_DEBT'),
     ('Hybrid','HYBRID',None,'HYBRID'),('Equity','GOLD',None,None),
     ('Equity','EQUITY_INDEX','sector',None),('Unknown',None,None,None)])
@@ -402,3 +405,111 @@ async def test_access_restriction_survives_recovery_without_any_provider_call(re
         await run_full_etf_cycle(repo,source,checkpoint=cp,cycle_id=cp.cycle_id,identity_headers={},client=client)
     client.get.assert_not_called()
     source.active_global_etfs.assert_not_called()
+
+
+@pytest.mark.parametrize('field,value', [
+    ('isin', ' in0000000001 '),
+    ('isin', 'in 0000000001'),
+    ('primarySymbol', ' fixture1 '),
+])
+def test_reconcile_normalizes_canonical_identifiers(field,value):
+    rows,csv=universe(1)
+    rows[0][field]=value
+    provenance=EtfProvenance(provider='NSE',source_type='NSE_OFFICIAL_ETF_SECURITY_LIST',source_identity='fixture',
+        source_url='https://nsearchives.nseindia.com/fixture',retrieved_at=NOW,
+        authority=EtfAuthority.OFFICIAL_EXCHANGE,reliability_level='LEVEL_A')
+    result=reconcile(parse_nse_etf_list(csv,provenance),rows)[0]
+    assert result['identity_status']=='VERIFIED'
+    assert result['canonical']['isin']=='IN0000000001'
+    assert result['canonical']['primarySymbol']=='FIXTURE1'
+    # Reconciliation copies metadata; caller-owned rows retain their source text.
+    assert rows[0][field]==value
+
+
+@pytest.mark.parametrize('canonical_changes,mapping_changes', [
+    ({'primarySymbol':'DIFFERENT'}, {}),
+    ({'isin':'IN9999999999'}, {}),
+    ({}, {'providerSymbol':'DIFFERENT'}),
+    ({}, {'status':'RESOLVED'}),
+    ({}, {'status':'REJECTED'}),
+    ({}, {'status':None}),
+    ({}, {'resolutionSource':'BROKER_IMPORT_IDENTITY'}),
+    ({}, {'active':False}),
+    ({'currency':'USD'}, {'currency':'USD'}),
+    ({'currency':None}, {}),
+    ({}, {'currency':'USD'}),
+    ({'primaryExchange':'BSE'}, {}),
+    ({'assetType':'EQUITY'}, {}),
+])
+def test_reconcile_rejects_explicit_conflicts_and_untrusted_nse_mapping(canonical_changes,mapping_changes):
+    rows,csv=universe(1)
+    rows[0]=rows[0] | canonical_changes
+    rows[0]['providerMappings']=[rows[0]['providerMappings'][0] | mapping_changes]
+    provenance=EtfProvenance(provider='NSE',source_type='NSE_OFFICIAL_ETF_SECURITY_LIST',source_identity='fixture',
+        source_url='https://nsearchives.nseindia.com/fixture',retrieved_at=NOW,
+        authority=EtfAuthority.OFFICIAL_EXCHANGE,reliability_level='LEVEL_A')
+    result=reconcile(parse_nse_etf_list(csv,provenance),rows)[0]
+    assert result['identity_status']=='CANONICAL_IDENTITY_CONFLICT'
+    assert result['canonical'] is None
+
+
+@pytest.mark.parametrize('field,value', [
+    ('isin',' in0000000001 '),
+    ('primarySymbol',' fixture1 '),
+])
+def test_reconcile_rejects_multiple_matches_after_normalization(field,value):
+    rows,csv=universe(1)
+    duplicate=rows[0] | {'globalInstrumentId':str(UUID(int=2)), 'isin':'IN0000000002', 'primarySymbol':'OTHER',field:value}
+    provenance=EtfProvenance(provider='NSE',source_type='NSE_OFFICIAL_ETF_SECURITY_LIST',source_identity='fixture',
+        source_url='https://nsearchives.nseindia.com/fixture',retrieved_at=NOW,
+        authority=EtfAuthority.OFFICIAL_EXCHANGE,reliability_level='LEVEL_A')
+    result=reconcile(parse_nse_etf_list(csv,provenance),rows+[duplicate])[0]
+    assert result['identity_status']=='CANONICAL_IDENTITY_CONFLICT'
+    assert result['canonical'] is None
+
+
+def test_reconcile_rejects_duplicate_nse_mappings():
+    rows,csv=universe(1)
+    rows[0]['providerMappings']=rows[0]['providerMappings'] * 2
+    provenance=EtfProvenance(provider='NSE',source_type='NSE_OFFICIAL_ETF_SECURITY_LIST',source_identity='fixture',
+        source_url='https://nsearchives.nseindia.com/fixture',retrieved_at=NOW,
+        authority=EtfAuthority.OFFICIAL_EXCHANGE,reliability_level='LEVEL_A')
+    result=reconcile(parse_nse_etf_list(csv,provenance),rows)[0]
+    assert result['identity_status']=='CANONICAL_IDENTITY_CONFLICT'
+    assert result['canonical'] is None
+
+
+def test_peer_group_normalizes_official_asset_class_case_and_spacing():
+    from app.models import EtfResearchProfile,EtfSubtype
+    profiles={str(UUID(int=n)):EtfResearchProfile(instrument_id=UUID(int=n),fund_id=UUID(int=n),fund_name='fixture',
+        ticker=f'X{n}',exchange='NSE',mic='XNSE',subtype=EtfSubtype.EQUITY_INDEX,
+        asset_class=asset,underlying_index='Nifty 50') for n,asset in [(1,'Equity'),(2,' EQUITY ')]}
+    candidates=[dict(global_instrument_id=key,recommendation='OPPORTUNITY',
+        rule_engine_result={'overall_score':50},disposition='EVALUATED') for key in profiles]
+    ranked=peer_results(candidates,profiles)
+    assert {candidate['peer_group'] for candidate in ranked}=={'EQUITY:nifty 50'}
+    assert [candidate['rank'] for candidate in ranked]==[1,2]
+
+
+@pytest.mark.parametrize('record_symbol,expected', [
+    (' fixture1 ', 'EQUITY_INDEX'),
+    ('fixture1', 'EQUITY_INDEX'),
+    ('FIXTURE10', None),
+    (None, None),
+    (123, None),
+])
+def test_verified_peer_classification_normalizes_watch_record_symbol(record_symbol,expected):
+    from decimal import Decimal
+    from app.etf_full_universe import official_peer_profile
+    from app.etf_evidence import EtfFact,EtfMetric
+    from app.nse_etf_market import MARKET_URL
+    rows,_=universe(1); row=rows[0]
+    provenance=EtfProvenance(provider='NSE',source_type='NSE_ETF_MARKET_WATCH',source_identity='fixture',
+        source_url=MARKET_URL,retrieved_at=NOW,authority=EtfAuthority.OFFICIAL_EXCHANGE,reliability_level='LEVEL_A',
+        source_metadata={'record':{'symbol':record_symbol,'assets':'Equity','mainCatagory':'EQUITY','subCatagory':'Nifty 50'},
+            'metadata':{'symbol':row['primarySymbol'],'isin':row['isin'],'isETFSec':'true','isDelisted':'false',
+                'isSuspended':'false','activeSeries':['EQ'],'marketType':'N'}})
+    fact=EtfFact(instrument_id=UUID(row['globalInstrumentId']),metric=EtfMetric.MARKET_PRICE,
+        value=Decimal(100),unit='INR',as_of_date=NOW.date(),provenance=provenance)
+    profile=official_peer_profile({'canonical':row},fact)
+    assert (str(profile.subtype) if profile else None)==expected

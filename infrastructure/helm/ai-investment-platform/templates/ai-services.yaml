@@ -3,6 +3,14 @@
 {{ $imageOverride := default (dict) (index (default (dict) $.Values.aiServiceImageOverrides) $service.name) -}}
 {{ $config := mergeOverwrite (deepCopy $.Values.aiServiceDefaults) (deepCopy $service) (deepCopy $imageOverride) (deepCopy $workloadOverride) -}}
 {{ $strategy := default $.Values.global.rolloutStrategy $config.rolloutStrategy -}}
+{{- /* A workload-level rolloutStrategy override (e.g. a DEV tweak to
+   maxSurge/maxUnavailable) can carry a stray rollingUpdate block forward
+   via the mergeOverwrite above even when type stays Recreate. Kubernetes
+   ignores rollingUpdate under Recreate, but we still want the manifest
+   itself to state only what Recreate actually uses. */ -}}
+{{- if eq $strategy.type "Recreate" -}}
+{{- $strategy = dict "type" "Recreate" -}}
+{{- end -}}
 {{ $isResearch := eq $service.name "research-engine" -}}
 {{ $databaseSecretName := default $.Values.database.passwordSecretName $.Values.research.persistence.passwordSecretName -}}
 {{ $databaseSecretKey := default $.Values.database.passwordSecretKey $.Values.research.persistence.passwordSecretKey -}}
@@ -155,8 +163,16 @@ spec:
               value: {{ $.Values.research.logLevel | quote }}
             - name: AIP_RESEARCH_PERSISTENCE_ENABLED
               value: {{ $.Values.research.persistence.enabled | quote }}
+            - name: AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED
+              value: {{ $.Values.research.opportunityRecoveryPaused | default false | quote }}
             - name: AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED
               value: {{ $.Values.research.opportunityScheduler.enabled | quote }}
+            - name: AIP_RESEARCH_EQUITY_MANUAL_EXECUTION_ENABLED
+              value: {{ $.Values.research.equityManualExecutionEnabled | default false | quote }}
+            - name: AIP_RESEARCH_ETF_MANUAL_EXECUTION_ENABLED
+              value: {{ $.Values.research.etfManualExecutionEnabled | default false | quote }}
+            - name: AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED
+              value: {{ $.Values.research.etfFullUniverseExecutionEnabled | default false | quote }}
             - name: AIP_RESEARCH_DATABASE_BACKEND
               value: {{ $.Values.research.persistence.databaseBackend | quote }}
             - name: AIP_RESEARCH_DATABASE_HOST
@@ -220,6 +236,8 @@ spec:
               value: {{ $.Values.research.providers.nseAnnouncementsUrl | quote }}
             - name: AIP_NSE_SHAREHOLDINGS_URL
               value: {{ $.Values.research.providers.nseShareholdingsUrl | quote }}
+            - name: AIP_NSE_VERIFIED_TRADING_SERIES_OVERRIDES
+              value: {{ $.Values.research.providers.nseVerifiedTradingSeriesOverrides | toJson | quote }}
             {{- if $.Values.research.providers.eodhdCredentialSecretName }}
             - name: AIP_EODHD_API_KEY
               valueFrom:

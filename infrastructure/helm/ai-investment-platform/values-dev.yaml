@@ -1,4 +1,4 @@
-﻿global:
+global:
   environment: LOCAL
   springProfile: LOCAL
   imageRegistry: localhost:5001
@@ -57,9 +57,40 @@ research:
     databaseSchema: research
     passwordSecretName: dev-postgres
     passwordSecretKey: POSTGRES_PASSWORD
+  # LOCAL/DEV: paused so the worker never auto-resumes/schedules and manual
+  # submission endpoints are reachable for controlled validation. See
+  # research_opportunity_recovery_paused in app/settings.py.
+  opportunityRecoveryPaused: true
   # Explicit for DEV visibility/audit; matches the chart default.
   opportunityScheduler:
     enabled: false
+  # LOCAL/DEV: explicit ADMIN-gated manual Equity Radar execution.
+  # Does not by itself resume automatic/historical work -- the
+  # application-layer admission gate still independently requires
+  # environment==LOCAL, the scheduler disabled (set above) and
+  # recovery paused (research_opportunity_recovery_paused; not
+  # currently set anywhere in this chart -- see deployment
+  # prerequisites in the handoff report before relying on this flag
+  # alone to unblock manual Equity submission).
+  equityManualExecutionEnabled: true
+  # LOCAL/DEV: kept explicitly false unless a controlled validation run
+  # has been expressly approved. Flip to true only for that run, and only
+  # with recovery paused and the scheduler disabled (both set above); see
+  # research_etf_manual_execution_enabled in app/settings.py.
+  etfManualExecutionEnabled: false
+  # LOCAL/DEV: independent full-NSE-universe permission, also kept
+  # explicitly false unless expressly approved for a controlled run; see
+  # research_etf_full_universe_execution_enabled in app/settings.py.
+  etfFullUniverseExecutionEnabled: false
+  # LOCAL/DEV: one explicit, independently-verified NSE trading-series
+  # override, confirmed against the official NSE Security-wise Archives
+  # page for this single instrument only (Triveni Power Transmission
+  # Limited, symbol TRIVENIPT). Scoped to exactly this instrument_id; no
+  # other instrument is affected, and this is never auto-derived -- see
+  # app.settings.Settings.nse_verified_trading_series_overrides.
+  providers:
+    nseVerifiedTradingSeriesOverrides:
+      0030eb97-ec3c-493a-9933-8cd91469baec: BE
   portfolioServiceBaseUrl: http://portfolio-service
   mcpAcquisition:
     enabled: true
@@ -199,3 +230,17 @@ marketData:
 workloadOverrides:
   portfolio-service:
     imageTagOverride: dev-20261008-213512
+  # Explicit DEV safety pin: research-engine uses a process-local lock
+  # (research.distributedLock.backend: process), so it must never run more
+  # than one replica or be autoscaled here, regardless of what
+  # aiServiceDefaults/aiServices/aiServiceImageOverrides say. This is the
+  # workload-level override templates/validate.yaml checks for at Helm-
+  # template time (see the "process-local lock requires" guard) -- a lower
+  # layer accidentally set to an unsafe value is still caught by that
+  # guard everywhere this pin is NOT also present (e.g. in values.yaml,
+  # which intentionally ships no such pin so non-DEV renders fail closed
+  # instead of silently self-correcting).
+  research-engine:
+    replicaCount: 1
+    autoscaling:
+      enabled: false

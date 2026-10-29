@@ -14,3 +14,14 @@ __pycache__
 .env
 .env.*
 secrets
+
+# Added: exclude credential/JWT-signing helper scripts and admin-grant
+# artifacts from any Docker build context (yahoo-finance-mcp's Dockerfile
+# COPYs the whole ai/research-engine directory, which would otherwise
+# bake these into the image). No git operation performed; additive only.
+ai/research-engine/create_jwt.py
+ai/research-engine/create_jwt_manual.py
+ai/research-engine/save_jwt.py
+ai/research-engine/activate_user.sql
+auth-admin-grant-once.json
+.dockerignore.bak-*

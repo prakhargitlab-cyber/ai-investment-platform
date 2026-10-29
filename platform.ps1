@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet("up", "deploy", "down", "clean", "status", "url", "components", "backup", "backups", "backup-verify", "restore")]
+    [ValidateSet("up", "deploy", "down", "clean", "status", "url", "components", "backup", "backups", "backup-verify", "restore", "reconcile-rollback-baseline", "approve-rollback-baseline", "recover-interrupted-promotion", "validate-research-migration")]
     [string]$Command = "up",
 
     # For `deploy`, choose individual components. Example:
@@ -13,6 +13,8 @@
     [switch]$DryRun,
     [switch]$AcceptBootstrapRisk,
     [switch]$ConfirmCallerFreeze,
+    # Resume only the explicitly reviewed, still-isolated LOCAL deployment.
+    [string]$ResumeAuditTag,
     [switch]$SkipBuild,
     [switch]$NoCache,
     [switch]$KeepOldImages,
@@ -28,10 +30,38 @@
     [string]$TargetDatabase,
     [switch]$AuthorizeDestructiveRestore,
     [switch]$SkipSafetyBackup,
-    [switch]$ConfirmSafetyBackup
+    [switch]$ConfirmSafetyBackup,
+
+    # Rollback-baseline reconciliation and approval.
+    [string[]]$ReconcileComponent,
+    [string]$ReconciliationReason,
+    [switch]$AuthorizeRollbackBaselineReconciliation,
+    [string]$RollbackBaselineCandidatePath,
+    [switch]$AuthorizeRollbackBaselineApproval,
+
+    # One-time interrupted-promotion recovery (never deploys/builds/patches;
+    # see Invoke-InterruptedPromotionRecovery in rollback-baseline.ps1).
+    [string]$RecoveryTag,
+    [string[]]$RecoveryComponent,
+    [switch]$AuthorizeRecovery,
+
+    # Research migration validation.
+    [switch]$AuthorizeMigrationCleanup
 )
 
 $ErrorActionPreference = "Stop"
+
+# StrictMode safety net: this script is sometimes invoked (via '&') from a
+# caller that has already set Set-StrictMode -Version Latest in its own
+# scope -- that setting cascades into this script's execution. A handful of
+# existing guards below (e.g. "if ($script:DeploymentRun)",
+# "if (-not $script:VerifiedDeploymentDigests)") rely on PowerShell's normal,
+# non-strict treatment of an unset variable as falsy/empty. Initializing
+# them here makes those same guards StrictMode-safe without changing their
+# behavior under ordinary (non-strict) execution and without altering any
+# risk-classification decision logic.
+$script:DeploymentRun = $null
+$script:VerifiedDeploymentDigests = @{}
 $ProgressPreference = "SilentlyContinue"
 
 # -----------------------------------------------------------------------------
@@ -109,6 +139,8 @@ Import-Module (Join-Path $ProjectRoot "scripts\database\RadarBootstrapEligibilit
 . (Join-Path $ProjectRoot "scripts\database\list-backups.ps1")
 . (Join-Path $ProjectRoot "scripts\database\verify-backup.ps1")
 . (Join-Path $ProjectRoot "scripts\database\restore.ps1")
+. (Join-Path $ProjectRoot "scripts\database\rollback-baseline.ps1")
+. (Join-Path $ProjectRoot "scripts\database\validate-research-migration.ps1")
 
 $DatabaseConfig = @{
     Name     = "investment"
@@ -254,24 +286,27 @@ function Test-ClusterExists {
 
 function Select-ClusterContext {
     Invoke-Checked "Selecting kube context for '$ClusterName'" {
-        k3d kubeconfig merge $ClusterName --kubeconfig-switch-context
+        # --kubeconfig-merge-default is REQUIRED so k3d writes the live API endpoint
+        # (including the current host port for the load balancer) into the default
+        # kubeconfig file ($HOME/.kube/config). Without it, k3d v5.x silently writes
+        # only to its own ~/.config/k3d/kubeconfig-<cluster>.yaml and exits 0,
+        # leaving a stale ~/.kube/config server URL that causes "connection refused"
+        # on cluster restarts that change the LB host port.
+        k3d kubeconfig merge $ClusterName --kubeconfig-merge-default --kubeconfig-switch-context
     }
 }
 
 function Ensure-Cluster {
-    $existing = @()
-    try {
-        $json = k3d cluster list -o json
-        if ($LASTEXITCODE -eq 0 -and $json) {
-            $existing = @($json | ConvertFrom-Json)
-        }
-    }
-    catch {
-        $existing = @()
-    }
-
-    $cluster = $existing | Where-Object { $_.name -eq $ClusterName } | Select-Object -First 1
-    if ($cluster) {
+    # Reuses Test-ClusterExists instead of re-running its own
+    # k3d-cluster-list-and-match check (the two were previously
+    # independent copies of the same validation).
+    #
+    # Also records whether the cluster was just created vs. already
+    # existed, so Invoke-FirstAdminBootstrapIfNeeded can tell a genuinely
+    # fresh install apart from a routine re-run of `up` without
+    # duplicating auth-service's own CREATED/ADMIN_ALREADY_PRESENT logic.
+    $script:ClusterWasJustCreated = $false
+    if (Test-ClusterExists) {
         Invoke-Checked "Starting existing k3d cluster '$ClusterName'" {
             k3d cluster start $ClusterName
         }
@@ -280,6 +315,7 @@ function Ensure-Cluster {
         Invoke-Checked "Creating k3d cluster '$ClusterName'" {
             k3d cluster create --config $K3dConfig
         }
+        $script:ClusterWasJustCreated = $true
     }
 
     Select-ClusterContext
@@ -689,6 +725,21 @@ function Deploy-Helm {
     }
 }
 
+# Strict-mode-safe init-container lookup. Under Set-StrictMode, a direct
+# '.initContainers' property access THROWS "The property 'initContainers'
+# cannot be found on this object" for any Deployment JSON that has no
+# initContainers key at all (true for mcp-gateway and yahoo-finance-mcp --
+# only research-engine has one). .psobject.Properties[...] lookup is always
+# safe, strict mode or not, and returns an empty array rather than throwing
+# when the property is absent.
+function Get-DeploymentInitContainers {
+    param($Deployment)
+    $specNode = $Deployment.spec.template.spec
+    $prop = $specNode.psobject.Properties['initContainers']
+    if ($null -eq $prop -or $null -eq $prop.Value) { return @() }
+    return @($prop.Value)
+}
+
 function Set-ImmutableDeploymentImages {
     param([Parameter(Mandatory = $true)][string[]]$Names)
 
@@ -712,7 +763,7 @@ function Set-ImmutableDeploymentImages {
                 $containerPatch += @{ name = $container.name; image = (Get-DeploymentImage $image) }
             }
         }
-        foreach ($container in @($deployment.spec.template.spec.initContainers)) {
+        foreach ($container in (Get-DeploymentInitContainers $deployment)) {
             if ($null -ne $container -and ($container.name -eq $deploymentName -or $container.image -like "$($image.Repo):*" -or $container.image -like "$($image.Repo.Replace('localhost:5001/', 'ai-investment-registry:5000/')):*")) {
                 $initContainerPatch += @{ name = $container.name; image = (Get-DeploymentImage $image) }
             }
@@ -763,7 +814,7 @@ function Assert-ImmutableDeploymentImages {
         foreach ($container in @($deployment.spec.template.spec.containers)) {
             if ($container.name -eq $image.Name -or $container.image -like "$($image.Repo):*" -or $container.image -like "$($image.Repo.Replace('localhost:5001/', 'ai-investment-registry:5000/')):*") { $matchingImages += $container.image }
         }
-        foreach ($container in @($deployment.spec.template.spec.initContainers)) {
+        foreach ($container in (Get-DeploymentInitContainers $deployment)) {
             if ($null -ne $container -and ($container.name -eq $image.Name -or $container.image -like "$($image.Repo):*" -or $container.image -like "$($image.Repo.Replace('localhost:5001/', 'ai-investment-registry:5000/')):*")) { $matchingImages += $container.image }
         }
 
@@ -1186,170 +1237,23 @@ function Invoke-InitialOpportunityCycleAfterCleanDeploy {
         return
     }
 
-    Write-Host "New provisioning marker claimed, no existing Radar cycle, and user state verified; proceeding to the universe-readiness-gated initial cycle." -ForegroundColor Green
+    Write-Host "New provisioning marker claimed, no existing Radar cycle, and user state verified." -ForegroundColor Green
 
-    # Kubernetes readiness is not sufficient here. portfolio-service can be Ready
-    # while CanonicalIdentityBootstrap is still populating the active NSE equity
-    # universe. Starting the production cycle before that bootstrap is populated
-    # can produce universe_count=0 and an empty Global Opportunity Radar.
-    #
-    # Use the exact canonical-universe API consumed by GlobalScanner and wait for
-    # a production-sized active EQUITY universe before submitting the one-time
-    # initial cycle. This is a data-readiness gate, not an arbitrary sleep.
-    Write-Step "Waiting for canonical NSE equity universe before initial opportunity cycle"
-
-    $universeReadyCode = @'
-import json
-import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-
-base_url = "http://portfolio-service"
-params = urllib.parse.urlencode({"status": "ACTIVE", "assetType": "EQUITY", "page": 0, "size": 1})
-url = f"{base_url}/api/v1/instruments?{params}"
-minimum_universe = 2500
-poll_seconds = 10
-deadline = time.monotonic() + (20 * 60)
-last_count = None
-last_error = None
-
-while time.monotonic() < deadline:
-    try:
-        # portfolio-service protects /api/v1/instruments with the same
-        # X-AIP-User-* identity contract used by research-engine.  A Kubernetes
-        # Ready pod can therefore still return 401 to an anonymous readiness
-        # probe.  Use a deterministic server-owned UUID identity for this
-        # read-only bootstrap check; do not bypass portfolio authentication.
-        headers = {
-            "X-AIP-User-Id": "00000000-0000-0000-0000-000000000001",
-            "X-AIP-User-Issuer": "platform-bootstrap",
-            "X-AIP-User-Subject": "global-opportunity-bootstrap",
-            "Accept": "application/json",
-        }
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-
-        if not isinstance(payload, dict) or not isinstance(payload.get("instruments"), list):
-            raise ValueError("Invalid canonical universe response")
-
-        count = int(payload.get("totalElements", len(payload["instruments"])))
-        if count != last_count:
-            print(f"Canonical active EQUITY universe count: {count}", flush=True)
-            last_count = count
-
-        if count >= minimum_universe:
-            print(f"Canonical NSE equity universe ready: {count} instruments", flush=True)
-            sys.exit(0)
-
-        last_error = f"canonical universe contains only {count} active EQUITY instruments"
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        message = f"HTTP {exc.code}: {body[:500]}"
-        if message != last_error:
-            print(f"Canonical universe not ready yet: {message}", flush=True)
-        last_error = message
-    except Exception as exc:
-        message = str(exc)
-        if message != last_error:
-            print(f"Canonical universe not ready yet: {message}", flush=True)
-        last_error = message
-
-    time.sleep(poll_seconds)
-
-print(
-    f"Timed out waiting for canonical NSE equity universe; last_count={last_count}, last_error={last_error}",
-    file=sys.stderr,
-)
-sys.exit(1)
-'@
-
-    $universeReadyBytes = [System.Text.Encoding]::UTF8.GetBytes($universeReadyCode)
-    $universeReadyBase64 = [Convert]::ToBase64String($universeReadyBytes)
-    $universeReadyLauncher = "import base64;exec(base64.b64decode('$universeReadyBase64'))"
-
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        kubectl exec deployment/research-engine -n $Namespace -c research-engine -- python -c $universeReadyLauncher
-        $universeReadyExitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-
-    if ($universeReadyExitCode -ne 0) {
-        throw "Canonical NSE equity universe did not become ready. Initial opportunity cycle was NOT submitted and the bootstrap marker was NOT written."
-    }
-
-    Write-Step "Triggering initial opportunity cycle for fresh LOCAL runtime"
-
-    # Execute the request from inside the research-engine pod so platform.ps1
-    # does not need to create or maintain a local port-forward.
-    $pythonCode = @'
-import json
-import sys
-import urllib.error
-import urllib.request
-
-url = "http://127.0.0.1:8000/api/v1/research/opportunities/cycles"
-payload = json.dumps({"candidate_ids": None, "shortlist_limit": 25, "top_n": 4}).encode("utf-8")
-request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-try:
-    with urllib.request.urlopen(request, timeout=15) as response:
-        print(response.read().decode("utf-8"))
-except urllib.error.HTTPError as exc:
-    body = exc.read().decode("utf-8", errors="replace")
-    # If another valid production cycle became active after the universe readiness
-    # gate, treat HTTP 409 as handled rather than creating a duplicate.
-    if exc.code == 409:
-        print(body)
-        sys.exit(10)
-    print(body, file=sys.stderr)
-    sys.exit(1)
-except Exception as exc:
-    print(str(exc), file=sys.stderr)
-    sys.exit(1)
-'@
-
-    # PowerShell 5 / kubectl can corrupt quotes and newlines when a multiline
-    # Python program is passed directly to `python -c`. Encode the program first
-    # and pass only a shell-safe Base64 token through kubectl.
-    $pythonBytes = [System.Text.Encoding]::UTF8.GetBytes($pythonCode)
-    $pythonBase64 = [Convert]::ToBase64String($pythonBytes)
-    $pythonLauncher = "import base64;exec(base64.b64decode('$pythonBase64'))"
-
-    # Native stderr is surfaced as PowerShell error records on Windows PowerShell
-    # 5 when ErrorActionPreference=Stop. Temporarily allow the native process to
-    # finish so its explicit exit code (0 / 10 / failure) remains authoritative.
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $result = kubectl exec deployment/research-engine -n $Namespace -c research-engine -- python -c $pythonLauncher 2>&1
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    $result | Out-Host
-
-    if ($exitCode -eq 0) {
-        Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
-        Write-Host "Initial opportunity cycle submitted after canonical universe readiness. Future cycles are scheduler-owned." -ForegroundColor Green
-        return
-    }
-
-    if ($exitCode -eq 10) {
-        # Another production cycle became active only after canonical-universe
-        # readiness. Never submit a duplicate.
-        Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
-        Write-Host "An opportunity cycle is already active after canonical universe readiness; no duplicate was submitted. Future cycles are scheduler-owned." -ForegroundColor Yellow
-        return
-    }
-
-    throw "Unable to submit the initial opportunity cycle after canonical universe readiness. The bootstrap marker was not written, so a later full 'up' can retry safely."
+    # research-engine requires authenticated caller identity (the same
+    # X-AIP-User-* contract portfolio-service enforces) on this endpoint, and
+    # correctly rejects an unauthenticated POST with HTTP 401 ("Market data
+    # population access denied"). platform.ps1 has no ADMIN/user credential to
+    # present here, and must never fabricate or inject one -- doing so would
+    # weaken backend authentication rather than work within it. So `up` no
+    # longer submits an initial Radar cycle automatically; it only records that
+    # the one-time bootstrap window was observed and handled, and leaves
+    # submitting the first cycle to an authenticated ADMIN/user workflow
+    # (UI action or an authenticated API call) after setup completes. The
+    # research-engine scheduler and recovery configuration are unchanged and
+    # continue to own subsequent Radar executions exactly as before.
+    Set-Content -Path $OpportunityBootstrapMarkerFile -Value (Get-Date).ToString("o") -Encoding ASCII
+    Write-Host "Initial Radar cycle was NOT auto-submitted (requires an authenticated ADMIN/user request)." -ForegroundColor Yellow
+    Write-Host "Submit the first Equity/ETF Radar cycle via an authenticated workflow once setup finishes; the scheduler owns all cycles after that." -ForegroundColor DarkGray
 }
 
 function Invoke-FirstAdminBootstrapIfNeeded {
@@ -1394,16 +1298,47 @@ function Invoke-FirstAdminBootstrapIfNeeded {
              elseif ($env:AIP_FIRST_ADMIN_EMAIL) { $env:AIP_FIRST_ADMIN_EMAIL }
              else { "prakhar.gitlab@gmail.com" }
 
-    # Generated locally, kept only in memory, never written to a persistent
-    # file and never embedded as a literal in the submitted Job manifest or
-    # on any command line (New-OrReplaceSecretFromDataValues builds the
+    # The ADMIN password is either entered securely by the operator (masked,
+    # with confirmation) or, if left blank, generated locally. Either way it
+    # is kept only in memory, never written to a persistent file, never
+    # logged, and never embedded as a literal in the submitted Job manifest
+    # or on any command line (New-OrReplaceSecretFromDataValues builds the
     # Secret's base64 "data" directly and applies it via a temp-file
     # manifest, exactly like New-OrReplaceLiteralSecret does for its own
     # rendered manifest -- it just never puts the value on a kubectl
-    # argument in the first place).
-    $passwordBytes = New-Object byte[] 24
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($passwordBytes)
-    $generatedPassword = ([Convert]::ToBase64String($passwordBytes) -replace '[+/=]', '9') + "Aa1!"
+    # argument in the first place). This prompt runs before the bootstrap
+    # attempt itself decides CREATED vs. ADMIN_ALREADY_PRESENT, so it has no
+    # effect -- and the password is never used -- when an ADMIN already exists.
+    # Only prompt on a genuinely fresh install (this `up` just created the
+    # k3d cluster). On a routine re-run against an already-existing cluster,
+    # an ADMIN almost certainly already exists, and this call is a no-op
+    # (see ADMIN_ALREADY_PRESENT below) -- prompting there would block every
+    # ordinary `up` for no reason. If that heuristic is ever wrong (e.g. the
+    # auth database was reset on an existing cluster), this falls back to
+    # the same auto-generated-password behavior this script already had.
+    $enteredAdminPassword = $null
+    if ($script:ClusterWasJustCreated) {
+        $enteredAdminPassword = Convert-SecureStringToPlainText (Read-Host "ADMIN password (leave blank to auto-generate)" -AsSecureString)
+    }
+    $adminBootstrapPassword = $null
+    $adminPasswordWasGenerated = $false
+    if ([string]::IsNullOrEmpty($enteredAdminPassword)) {
+        $passwordBytes = New-Object byte[] 24
+        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($passwordBytes)
+        $adminBootstrapPassword = ([Convert]::ToBase64String($passwordBytes) -replace '[+/=]', '9') + "Aa1!"
+        $adminPasswordWasGenerated = $true
+    }
+    else {
+        $confirmAdminPassword = Convert-SecureStringToPlainText (Read-Host "Confirm ADMIN password" -AsSecureString)
+        if ($confirmAdminPassword -cne $enteredAdminPassword) {
+            $enteredAdminPassword = $null
+            $confirmAdminPassword = $null
+            throw "ADMIN password entries did not match. Re-run '.\platform.ps1 up' and enter the same password twice, or leave both blank to auto-generate one."
+        }
+        $confirmAdminPassword = $null
+        $adminBootstrapPassword = $enteredAdminPassword
+        $enteredAdminPassword = $null
+    }
 
     $secretName = "first-admin-bootstrap-credentials"
     $jobName = "first-admin-bootstrap"
@@ -1414,7 +1349,7 @@ function Invoke-FirstAdminBootstrapIfNeeded {
     try {
         New-OrReplaceSecretFromDataValues $secretName @{
             FIRST_ADMIN_BOOTSTRAP_EMAIL    = $email
-            FIRST_ADMIN_BOOTSTRAP_PASSWORD = $generatedPassword
+            FIRST_ADMIN_BOOTSTRAP_PASSWORD = $adminBootstrapPassword
         }
         $secretCreated = $true
 
@@ -1479,11 +1414,17 @@ function Invoke-FirstAdminBootstrapIfNeeded {
                     $script:FirstAdminCreatedThisStartup = $true
                     Write-Host ""
                     Write-Host "============================================================" -ForegroundColor Yellow
-                    Write-Host " FIRST ADMIN ACCOUNT CREATED - SAVE THIS PASSWORD NOW" -ForegroundColor Yellow
+                    Write-Host " FIRST ADMIN ACCOUNT CREATED" -ForegroundColor Yellow
                     Write-Host "============================================================" -ForegroundColor Yellow
                     Write-Host " Email    : $email"
-                    Write-Host " Password : $generatedPassword"
-                    Write-Host " This password will not be shown again. Only its hash is stored." -ForegroundColor Yellow
+                    if ($adminPasswordWasGenerated) {
+                        Write-Host " Password : $adminBootstrapPassword"
+                        Write-Host " This password will not be shown again. Only its hash is stored." -ForegroundColor Yellow
+                    }
+                    else {
+                        Write-Host " Password : (the one you entered)"
+                        Write-Host " It will not be echoed again. Only its hash is stored." -ForegroundColor Yellow
+                    }
                     Write-Host "============================================================" -ForegroundColor Yellow
                     Write-Host ""
                 }
@@ -1509,7 +1450,9 @@ function Invoke-FirstAdminBootstrapIfNeeded {
         if ($secretCreated -or (kubectl get secret $secretName -n $Namespace --ignore-not-found -o name 2>$null)) {
             kubectl delete secret $secretName -n $Namespace --ignore-not-found | Out-Null
         }
-        $generatedPassword = $null
+        $adminBootstrapPassword = $null
+        $enteredAdminPassword = $null
+        $confirmAdminPassword = $null
     }
 }
 
@@ -1822,6 +1765,7 @@ function Get-VerifiedRegistryImage {
     $seen = @{}
     $rootDigest = $null
     $runnable = $false
+    $verifiedConfigDigests = @()
     while ($pending.Count -gt 0) {
         $ref = $pending.Dequeue()
         if ($seen.ContainsKey($ref)) { continue }
@@ -1841,8 +1785,9 @@ function Get-VerifiedRegistryImage {
             if (-not $manifest.manifests) { throw 'Empty image index' }
             foreach ($child in $manifest.manifests) {
                 if ($child.digest -notmatch '^sha256:[a-f0-9]{64}$') { throw 'Invalid child digest' }
-                if ($child.platform.os -eq 'linux' -and $child.platform.architecture -eq 'amd64') { $runnable = $true }
-                $pending.Enqueue($child.digest)
+                if ($child.platform.os -eq 'linux' -and $child.platform.architecture -eq 'amd64') {
+                    $pending.Enqueue($child.digest)
+                }
             }
         } elseif ($manifest.mediaType -in @('application/vnd.oci.image.manifest.v1+json','application/vnd.docker.distribution.manifest.v2+json')) {
             if (-not $manifest.config -or -not $manifest.layers) { throw 'Incomplete image manifest' }
@@ -1852,23 +1797,42 @@ function Get-VerifiedRegistryImage {
                 $head = Invoke-WebRequest -Uri "$base/blobs/$($blob.digest)" -Method Head -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
                 if ($head.StatusCode -ne 200 -or [long]$head.Headers['Content-Length'] -ne [long]$blob.size) { throw 'Missing or incomplete image blob' }
             }
-            # Direct manifests need explicit platform evidence from their config.
-            if ($ref -eq $Reference) {
-                $configResponse = Invoke-WebRequest -Uri "$base/blobs/$($manifest.config.digest)" -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
-                $configBytes = if ($configResponse.Content -is [byte[]]) { $configResponse.Content } else { [Text.Encoding]::UTF8.GetBytes([string]$configResponse.Content) }
-                $hash = [Security.Cryptography.SHA256]::Create()
-                try { $configDigest = 'sha256:' + ([BitConverter]::ToString($hash.ComputeHash($configBytes))).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
-                if ($configResponse.StatusCode -ne 200 -or $configDigest -ne $manifest.config.digest) { throw 'Config digest mismatch' }
-                $config = [Text.Encoding]::UTF8.GetString($configBytes) | ConvertFrom-Json
-                $runnable = $config.os -eq 'linux' -and $config.architecture -eq 'amd64'
+            # Every image manifest (direct or via OCI index) must have its
+            # configuration blob downloaded and SHA-256 verified against the
+            # manifest's config.digest, then parsed to confirm os=linux and
+            # architecture=amd64.
+            if ($script:DeploymentRun) { $script:DeploymentRun.LastCommand="HTTP GET $base/blobs/$($manifest.config.digest)" }
+            $configResponse = Invoke-WebRequest -Uri "$base/blobs/$($manifest.config.digest)" -UseBasicParsing -TimeoutSec 30 -MaximumRedirection 0
+            if ($configResponse.StatusCode -ne 200) { throw 'Config digest mismatch' }
+            $configBytes = if ($configResponse.Content -is [byte[]]) { $configResponse.Content } else { [Text.Encoding]::UTF8.GetBytes([string]$configResponse.Content) }
+            $hash = [Security.Cryptography.SHA256]::Create()
+            try { $configDigest = 'sha256:' + ([BitConverter]::ToString($hash.ComputeHash($configBytes))).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
+            if ($configDigest -ne $manifest.config.digest) { throw 'Config digest mismatch' }
+            $config = [Text.Encoding]::UTF8.GetString($configBytes) | ConvertFrom-Json
+            if ($config.os -eq 'linux' -and $config.architecture -eq 'amd64') {
+                $runnable = $true
+                if (-not $verifiedConfigDigests) { $verifiedConfigDigests = @() }
+                $verifiedConfigDigests += $configDigest
             }
         } else { throw 'Unsupported manifest media type' }
     }
     if (-not $runnable) { throw 'No linux/amd64 image verified' }
     $imageReference="ai-investment-registry:5000/ai-investment/${Name}@$rootDigest"
     if (-not $script:VerifiedDeploymentDigests) { $script:VerifiedDeploymentDigests=@{} }
-    $script:VerifiedDeploymentDigests[$imageReference]=@($rootDigest)+@($seen.Keys | Where-Object { $_ -match '^sha256:[a-f0-9]{64}$' })
+    $script:VerifiedDeploymentDigests[$imageReference]=@($rootDigest)+@($verifiedConfigDigests)+@($seen.Keys | Where-Object { $_ -match '^sha256:[a-f0-9]{64}$' })
     return $imageReference
+}
+
+# Targeted deployments do not invoke Helm upgrade. Read the explicitly selected
+# LOCAL values file instead of hardcoding the Full ETF feature flag.
+# Fail closed on missing or ambiguous configuration; do not silently enable it.
+function Get-LocalFullEtfExecutionFlag {
+    if (-not (Test-Path -LiteralPath $HelmValues -PathType Leaf)) { throw 'Missing LOCAL Helm values' }
+    $lines = @(Get-Content -LiteralPath $HelmValues -ErrorAction Stop)
+    $matches = @($lines | Where-Object { $_ -match '^  etfFullUniverseExecutionEnabled:\s*(true|false)\s*(?:#.*)?$' })
+    if ($matches.Count -ne 1) { throw 'LOCAL Full ETF feature flag missing or ambiguous' }
+    if ($matches[0] -notmatch '^  etfFullUniverseExecutionEnabled:\s*(true|false)\s*(?:#.*)?$') { throw 'Invalid LOCAL Full ETF feature flag' }
+    return $Matches[1].ToLowerInvariant()
 }
 
 function New-VerifiedDeploymentPatch {
@@ -1886,7 +1850,8 @@ function New-VerifiedDeploymentPatch {
         $spec.initContainers = @(@{ name='wait-for-research-migrations'; image=$Image })
         $container.env = @(
             @{ name='AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED'; value='true'; valueFrom=$null },
-            @{ name='AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED'; value='false'; valueFrom=$null }
+            @{ name='AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED'; value='false'; valueFrom=$null },
+            @{ name='AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED'; value=(Get-LocalFullEtfExecutionFlag); valueFrom=$null }
         )
     }
     return @{ metadata=@{resourceVersion=$Deployment.metadata.resourceVersion}; spec=@{template=@{spec=$spec}} }
@@ -1914,12 +1879,73 @@ function Get-DeploymentInventory {
     $pods=Invoke-DeploymentKubectl @('get','pods','--all-namespaces','-o','json') | ConvertFrom-Json
     if (@($pods.items | Where-Object {$_.metadata.namespace -notin @('ai-investment','kube-system')}).Count) { throw 'Unreviewed cross-namespace callers' }
     $jobs=Invoke-DeploymentKubectl @('get','jobs,cronjobs','--all-namespaces','-o','json') | ConvertFrom-Json
-    if (@($jobs.items | Where-Object { ($_.kind -eq 'CronJob' -and -not $_.spec.suspend) -or ($_.kind -eq 'Job' -and $_.status.active -gt 0) }).Count) { throw 'Scheduled/internal work is not frozen' }
-    if (@($pods.items | Where-Object { $_.spec.hostNetwork -and $_.metadata.namespace -ne 'kube-system' }).Count) { throw 'Host-network caller cannot be isolated' }
+    # Strict-mode-safe: a Kubernetes Job's status.active is 'omitempty' --
+    # a Job with zero currently-active pods has NO 'active' key in its JSON
+    # at all, so a direct '.status.active' access throws under
+    # Set-StrictMode instead of evaluating as zero. Missing is the
+    # documented meaning of zero active pods and is genuinely safe to treat
+    # as not-active; anything present but not a clean non-negative integer
+    # is treated as active (fail-closed) rather than silently passed, so an
+    # ambiguous Job status still blocks this gate instead of being read as
+    # quiet. CronJob's spec.suspend is left exactly as-is: unlike status.active
+    # it is not reproducing any failure here.
+    if (@($jobs.items | Where-Object {
+        if ($_.kind -eq 'CronJob') { -not $_.spec.suspend }
+        elseif ($_.kind -eq 'Job') {
+            $activeRaw = Get-DeploymentOptionalProperty (Get-DeploymentOptionalProperty $_ 'status') 'active'
+            if ($null -eq $activeRaw) { $false }
+            else {
+                $parsed = 0L
+                if (-not [int64]::TryParse([string]$activeRaw, [ref]$parsed)) { $true }
+                else { $parsed -gt 0 }
+            }
+        } else { $false }
+    }).Count) { throw 'Scheduled/internal work is not frozen' }
+    # Strict-mode-safe: PodSpec.hostNetwork is 'omitempty' -- the vast
+    # majority of pods (hostNetwork=false, the safe default) omit the key
+    # entirely, so a direct '.spec.hostNetwork' access throws under
+    # Set-StrictMode. Missing is the documented meaning of false/not-host-
+    # network and is genuinely safe; anything present but not a real
+    # boolean is treated as host-network (fail-closed) rather than
+    # silently passed.
+    if (@($pods.items | Where-Object {
+        $hostNetworkRaw = Get-DeploymentOptionalProperty $_.spec 'hostNetwork'
+        $isHostNetwork = if ($null -eq $hostNetworkRaw) { $false } elseif ($hostNetworkRaw -is [bool]) { $hostNetworkRaw } else { $true }
+        $isHostNetwork -and $_.metadata.namespace -ne 'kube-system'
+    }).Count) { throw 'Host-network caller cannot be isolated' }
     # Do not terminate unrelated PIDs. Require operators to close API-server tunnels.
     $tunnels=@(Get-CimInstance Win32_Process -Filter "Name = 'kubectl.exe'" | Where-Object { $_.CommandLine -match '\b(port-forward|proxy)\b' })
     if ($tunnels.Count) { throw 'Operator kubectl tunnels must be closed before deployment' }
     return @{items=@($pods.items | Where-Object {$_.metadata.namespace -eq 'ai-investment'})}
+}
+
+# A K3s kube-router denial is an ICMP rejection, not timeout(124).
+# Only accept that outcome when the matching policy chain and terminal
+# REJECT rule exist on the node hosting this exact research pod, AND its
+# packet counter increases during the probe. This is corroborating evidence,
+# not per-connection attribution; require a frozen caller set. No generic exit-code-1 bypass.
+function Get-VerifiedResearchRejectCounter {
+    param($Gate)
+    if (-not $Gate -or $Gate.PodIP -notmatch '^10\.42\.\d+\.\d+$') { throw 'Invalid isolated research pod address' }
+    $pod = Invoke-DeploymentKubectl @('get','pod',$Gate.ResearchPod,'-o','json') | ConvertFrom-Json
+    if ($pod.metadata.uid -ne $Gate.ResearchUID -or $pod.status.podIP -ne $Gate.PodIP) { throw 'Research pod identity drift' }
+    $node = [string]$pod.spec.nodeName
+    if ($node -notmatch '^k3d-ai-investment-dev-(agent-[0-9]+|server-0)$') { throw 'Unexpected research node' }
+    $saved = Invoke-DeploymentNativeCommand docker @('exec',$node,'iptables-save','-t','filter')
+    if ($saved.ExitCode -ne 0) { throw 'Cannot verify node firewall' }
+    $ip = [regex]::Escape($Gate.PodIP)
+    $podJumps = @($saved.StdOut -split "`n" | Where-Object { $_ -match "^-A KUBE-ROUTER-FORWARD -d $ip/32 .* -j (KUBE-POD-FW-[A-Z0-9]+)" })
+    if ($podJumps.Count -lt 1) { throw 'Research firewall routing chain absent' }
+    $null = $podJumps[0] -match '-j (KUBE-POD-FW-[A-Z0-9]+)'
+    $chain = $Matches[1]
+    $jump = @($saved.StdOut -split "`n" | Where-Object { $_ -match "^-A $chain -d $ip/32 .*research-bootstrap-isolation.* -j KUBE-NWPLCY-[A-Z0-9]+" })
+    if ($jump.Count -ne 1) { throw 'Isolation policy firewall jump missing' }
+    if (-not ($saved.StdOut -split "`n" | Where-Object { $_ -match "^-A $chain .* -j REJECT --reject-with icmp-port-unreachable" })) { throw 'Expected kube-router reject rule absent' }
+    $counterResult = Invoke-DeploymentNativeCommand docker @('exec',$node,'iptables','-t','filter','-L',$chain,'-n','-v','-x')
+    if ($counterResult.ExitCode -ne 0) { throw 'Cannot inspect firewall packet counter' }
+    $reject = @($counterResult.StdOut -split "`n" | Where-Object { $_ -match '^\s*(\d+)\s+\d+\s+REJECT\s+' })
+    if ($reject.Count -ne 1 -or $reject[0] -notmatch '^\s*(\d+)\s+\d+\s+REJECT\s+') { throw 'Ambiguous reject counter' }
+    return [long]$Matches[1]
 }
 
 function Invoke-IsolationProbe {
@@ -1929,11 +1955,28 @@ function Invoke-IsolationProbe {
     # binary, refused connection, DNS failure, or unhealthy HTTP response.
     $probe="timeout 3 bash -c 'exec 3<>/dev/tcp/$HostName/$Port; printf `"GET /health HTTP/1.0\r\nHost: research-engine\r\n\r\n`" >&3; head -n 1 <&3'"
     if ($HostName -eq 'research-service') { $probe=$probe.Replace('GET /health ','GET /actuator/health/readiness ') }
-    $shell="$probe; result=`$?; if [ `$result -eq 124 ]; then echo ISOLATED; elif [ `$result -ne 0 ]; then exit `$result; fi"
-    $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($shell))
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
+    if ($Denied) {
+        if (-not $script:ActiveIsolationGate) { throw 'Missing isolation gate for denied probe' }
+        $gate=$script:ActiveIsolationGate
+        if ($Pod -notin $gate.Callers -or
+            -not (($HostName -eq $gate.ServiceIP -and $Port -eq 80) -or
+                   ($HostName -eq $gate.PodIP -and $Port -eq 8000))) {
+            throw 'Denied probe does not target the reviewed research service/pod'
+        }
+        $caller=Invoke-DeploymentKubectl @('get','pod',$Pod,'-o','json') | ConvertFrom-Json
+        if ($caller.status.phase -ne 'Running' -or -not $caller.status.podIP) { throw 'Denied probe caller unavailable' }
+        $before=Get-VerifiedResearchRejectCounter $gate
+        $result=Invoke-DeploymentNativeCommand kubectl (@('--context','k3d-ai-investment-dev','-n','ai-investment','exec',"pod/$Pod",'--','bash','-c',"echo '$encoded' | base64 -d | bash"))
+        $after=Get-VerifiedResearchRejectCounter $gate
+        $refused=($result.StdErr -match 'Connection refused' -and $result.StdErr -match 'command terminated with exit code 1|/dev/tcp/')
+        if ($result.ExitCode -ne 1 -or -not $refused -or $after -le $before) {
+            throw "Research ingress isolation REJECT proof failed: caller=$Pod target=${HostName}:$Port exit=$($result.ExitCode) refused=$refused counter=$before->$after"
+        }
+        return
+    }
     $out=(Invoke-DeploymentKubectl @('exec',"pod/$Pod",'--','bash','-c',"echo '$encoded' | base64 -d | bash") | Out-String).Trim()
-    if ($Denied) { if ($out -ne 'ISOLATED') { throw 'Research ingress isolation failed' } }
-    elseif ($out -notmatch '^HTTP/1\.[01] 200\b' -or $out -match 'ISOLATED') { throw 'Probe control or baseline unavailable' }
+    if ($out -notmatch '^HTTP/1\.[01] 200\b' -or $out -match 'ISOLATED') { throw 'Probe control or baseline unavailable' }
 }
 
 function Assert-DeploymentIsolation {
@@ -1942,8 +1985,20 @@ function Assert-DeploymentIsolation {
     $policies=Invoke-DeploymentKubectl @('get','networkpolicies','-o','json') | ConvertFrom-Json
     if (@($policies.items).Count -ne 1 -or $policies.items[0].metadata.name -ne 'research-bootstrap-isolation') { throw 'Unexpected additive network policies' }
     $spec=$policies.items[0].spec
-    if (@($spec.ingress | Where-Object {$null -ne $_}).Count -ne 0 -or @($spec.policyTypes).Count -ne 1 -or $spec.policyTypes[0] -ne 'Ingress' -or ($spec.podSelector | ConvertTo-Json -Compress -Depth 8) -ne ($Gate.Selector | ConvertTo-Json -Compress -Depth 8)) { throw 'Isolation policy drift' }
+    # Strict-mode-safe: NetworkPolicySpec.ingress is 'omitempty' on the server's
+    # response -- the deny-all policy this script itself creates has ZERO
+    # ingress rules (an empty list), and the API server omits an empty-slice
+    # field entirely when serializing 'kubectl get -o json', even though the
+    # client-submitted manifest explicitly had 'ingress: []'. A direct
+    # '.spec.ingress' access throws under Set-StrictMode on exactly the
+    # policy this check exists to approve. Missing is the correct reading of
+    # zero rules and must still pass; any ACTUAL rule present (non-empty,
+    # non-null) remains drift exactly as before -- this only changes how an
+    # omitted field is read, never what counts as safe.
+    $ingressRaw = Get-DeploymentOptionalProperty $spec 'ingress'
+    if (@($ingressRaw | Where-Object {$null -ne $_}).Count -ne 0 -or @($spec.policyTypes).Count -ne 1 -or $spec.policyTypes[0] -ne 'Ingress' -or ($spec.podSelector | ConvertTo-Json -Compress -Depth 8) -ne ($Gate.Selector | ConvertTo-Json -Compress -Depth 8)) { throw 'Isolation policy drift' }
     if ($Probe) {
+        $script:ActiveIsolationGate=$Gate
         foreach($pod in $Gate.Callers) {
             Invoke-IsolationProbe $pod 'research-service' 80
             Invoke-IsolationProbe $pod $Gate.ServiceIP 80 -Denied
@@ -1953,9 +2008,15 @@ function Assert-DeploymentIsolation {
 }
 
 function Initialize-DeploymentSafety {
-    param([string[]]$Names)
+    param([string[]]$Names,[switch]$ExistingIsolation)
     $pods=Get-DeploymentInventory
-    $research=@($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq 'research-engine'})
+    # Strict-mode-safe: ObjectMeta.Labels is 'omitempty' -- any pod in this
+    # namespace that happens to carry no 'app.kubernetes.io/component' label
+    # (e.g. a one-off job pod) throws under Set-StrictMode on direct access,
+    # exactly like the fix already used for this same lookup elsewhere
+    # (Get-DeploymentRiskLevel). A pod lacking the label is correctly excluded
+    # by this filter either way -- missing just stops it from crashing.
+    $research=@($pods.items | Where-Object { (Get-DeploymentOptionalProperty (Get-DeploymentOptionalProperty $_.metadata 'labels') 'app.kubernetes.io/component') -eq 'research-engine' })
     if ($research.Count -ne 1 -or $research[0].status.phase -ne 'Running') { throw 'Ambiguous research pod' }
     $r=$research[0]
     if (@($r.status.containerStatuses | Where-Object {-not $_.ready}).Count) { throw 'Research not ready' }
@@ -1972,16 +2033,21 @@ function Initialize-DeploymentSafety {
     $gate.ServiceIP=$service.spec.clusterIP
     $gate.Callers=@()
     foreach($name in @('api-gateway','portfolio-service','mcp-gateway')) {
-        $caller=@($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq $name})
+        $caller=@($pods.items | Where-Object { (Get-DeploymentOptionalProperty (Get-DeploymentOptionalProperty $_.metadata 'labels') 'app.kubernetes.io/component') -eq $name })
         if ($caller.Count -ne 1) { throw 'Ambiguous internal caller' }
         $gate.Callers+= $caller[0].metadata.name
     }
     $policies=Invoke-DeploymentKubectl @('get','networkpolicies','-o','json') | ConvertFrom-Json
-    if (@($policies.items).Count) { throw 'Existing network policies require separate review' }
-    foreach($pod in $gate.Callers) {
-        Invoke-IsolationProbe $pod 'research-service' 80
-        Invoke-IsolationProbe $pod $gate.ServiceIP 80
-        Invoke-IsolationProbe $pod $gate.PodIP 8000
+    if ($ExistingIsolation) {
+        # Explicit interrupted-run path: never remove or recreate the old isolation policy.
+        Assert-DeploymentIsolation $gate -Probe
+    } else {
+        if (@($policies.items).Count) { throw 'Existing network policies require separate review' }
+        foreach($pod in $gate.Callers) {
+            Invoke-IsolationProbe $pod 'research-service' 80
+            Invoke-IsolationProbe $pod $gate.ServiceIP 80
+            Invoke-IsolationProbe $pod $gate.PodIP 8000
+        }
     }
     if ($Names -contains 'portfolio-service') {
         # Flyway's SQL checksum is CRC32 over UTF-8 lines, excluding BOM/newlines.
@@ -2052,7 +2118,7 @@ function Wait-DeploymentQuiet {
         Assert-DeploymentQuietSample $Gate
         $now=Get-DeploymentMonotonicSeconds
         $elapsed=$now-$started
-        Write-Host ('Quiet observation: {0:N0}/' + $QuietPeriodSeconds + ' seconds; process-local quiescence remains unproven.' -f $elapsed)
+        Write-Host ('Quiet observation: {0:N0}/{1:N0} seconds elapsed.' -f $elapsed, $QuietPeriodSeconds)
         if ($elapsed -gt ($QuietPeriodSeconds + 60)) { throw 'Quiet observation exceeded bounded window' }
         if ($now-$next -gt 30) { throw 'Observation cannot sustain 30-second sampling' }
         if ($elapsed -ge $QuietPeriodSeconds) { break }
@@ -2066,8 +2132,8 @@ function Complete-DeploymentSafety {
     param($Gate,[string[]]$Names,$Images)
     $pods=Invoke-DeploymentKubectl @('get','pods','-o','json') | ConvertFrom-Json
     foreach($name in $Names) {
-        $items=@($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq $name})
-        if ($items.Count -ne 1 -or $items[0].metadata.deletionTimestamp) { throw 'Old/new pod overlap remains' }
+        $items=@($pods.items | Where-Object {(Get-DeploymentOptionalProperty (Get-DeploymentOptionalProperty $_.metadata 'labels') 'app.kubernetes.io/component') -eq $name})
+        if ($items.Count -ne 1 -or (Get-DeploymentOptionalProperty $items[0].metadata 'deletionTimestamp')) { throw 'Old/new pod overlap remains' }
         $status=@($items[0].status.containerStatuses | Where-Object name -eq $name)
         if ($status.Count -ne 1 -or -not $status[0].ready) { throw 'Pod image/health verification failed' }
         Assert-VerifiedPodImage $Images[$name] $status[0].imageID
@@ -2079,7 +2145,7 @@ function Complete-DeploymentSafety {
     }
     Assert-DeploymentWorkloads $Gate $Names
     # DB state must also remain unchanged through rollout. Repoint only to new research pod.
-    $Gate.ResearchPod=($pods.items | Where-Object {$_.metadata.labels.'app.kubernetes.io/component' -eq 'research-engine'}).metadata.name
+    $Gate.ResearchPod=($pods.items | Where-Object {(Get-DeploymentOptionalProperty (Get-DeploymentOptionalProperty $_.metadata 'labels') 'app.kubernetes.io/component') -eq 'research-engine'}).metadata.name
     $sample=Invoke-DeploymentObservation $Gate
     if ($sample.fingerprint -ne $Gate.Baseline.fingerprint) { throw 'Durable state changed during rollout' }
     $release=Invoke-DeploymentCommand helm @('--kube-context','k3d-ai-investment-dev','-n','ai-investment','status','ai-investment-platform','-o','json') | ConvertFrom-Json
@@ -2107,6 +2173,398 @@ function Assert-DeploymentWorkloads {
     }
 }
 
+# -----------------------------------------------------------------------------
+# Fresh DEV deployment path (code-only changes).
+#
+# Deploy-VerifiedRadarComponentsCore above is the HIGH-RISK path: mandatory
+# caller freeze, 600s quiet-period, ingress isolation, and a manually
+# pre-approved rollback baseline. It remains unchanged and is still required
+# for schema migrations, infrastructure/Helm changes, and worker-state
+# transitions.
+#
+# The functions below add a separate, additive LOW-RISK path for ordinary
+# code-only changes to the same four protected components: build, push an
+# immutable uniquely-tagged image, verify its registry digest, patch the
+# Deployment to that digest-pinned image, let Kubernetes roll the pod over
+# normally, verify the result, and record an automatic rollback reference.
+# No isolation policy is created, no quiet period is observed, and no manual
+# rollback-baseline reconciliation/approval is required. Classification below
+# fails closed to HIGH_RISK (and therefore to the existing verified path)
+# whenever a signal cannot be positively verified.
+# -----------------------------------------------------------------------------
+
+function Get-DeploymentMigrationFingerprint {
+    param([ValidateSet('api-gateway','research-engine','portfolio-service','frontend')][string]$Name)
+    $paths = @{
+        'portfolio-service' = 'services/portfolio-service/src/main/resources/db/migration'
+        'research-engine'   = 'ai/research-engine/db/migration'
+    }
+    if (-not $paths.ContainsKey($Name)) { return [pscustomobject]@{} }
+    # Flyway's SQL checksum is CRC32 over UTF-8 lines, excluding BOM/newlines --
+    # identical computation already used for portfolio-service in Initialize-DeploymentSafety.
+    $code = "import pathlib,zlib,json; print(json.dumps({p.name:((zlib.crc32(''.join(p.read_text(encoding='utf-8-sig').splitlines()).encode())+2**31)%2**32)-2**31 for p in pathlib.Path('$($paths[$Name])').glob('V*__*.sql')}))"
+    $result = (Invoke-DeploymentCommand python @('-c', $code) | Out-String) | ConvertFrom-Json
+    if ($null -eq $result) { throw "Unable to compute migration fingerprint for $Name" }
+    return $result
+}
+
+function Get-DeploymentHelmFingerprint {
+    $files = @(Get-ChildItem -LiteralPath $HelmChart -Recurse -File) + @(Get-Item -LiteralPath $HelmValues)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $entries = @($files | Sort-Object FullName | ForEach-Object {
+            $relative = $_.FullName.Substring($ProjectRoot.Length).Replace('\', '/')
+            $bytes = [IO.File]::ReadAllBytes($_.FullName)
+            "$relative=" + ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
+        })
+    }
+    finally { $sha.Dispose() }
+    $combined = [Text.Encoding]::UTF8.GetBytes(($entries -join "`n"))
+    $sha2 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha2.ComputeHash($combined))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha2.Dispose() }
+}
+
+function Get-DeploymentFreshBaselinePath {
+    param([string]$Name)
+    Join-Path (Join-Path $RuntimeDir 'fresh-deploy-state') "$Name.json"
+}
+
+function Get-DeploymentFreshBaseline {
+    param([string]$Name)
+    $path = Get-DeploymentFreshBaselinePath $Name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) } catch { return $null }
+}
+
+function Save-DeploymentFreshBaseline {
+    param([string]$Name, [string]$Image, $MigrationFingerprint, [string]$HelmFingerprint)
+    $dir = Join-Path $RuntimeDir 'fresh-deploy-state'
+    New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+    $record = @{
+        image                = $Image
+        migrationFingerprint = $MigrationFingerprint
+        helmFingerprint      = $HelmFingerprint
+        recordedAtUtc        = [DateTime]::UtcNow.ToString('o')
+    }
+    $record | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Get-DeploymentFreshBaselinePath $Name) -Encoding ASCII
+}
+
+# Approves an intentional, already-APPLIED Helm configuration change for a
+# single component, separately from any image build/deploy. Deliberately
+# split into three non-conflatable steps:
+#   1) Approval evidence  -- explicit switch + mandatory human-readable reason.
+#   2) Verification only  -- re-reads the LIVE deployment and refuses unless
+#      the running config already matches the new local values-dev.yaml.
+#      This function NEVER patches the cluster itself.
+#   3) Recording only      -- re-saves the existing fresh-deploy baseline for
+#      this component with ONLY helmFingerprint advanced; image and
+#      migrationFingerprint are carried over unchanged from the existing
+#      record, so this call cannot be used to also approve an image change.
+function Approve-DeploymentHelmConfigurationChange {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [switch]$AuthorizeHelmConfigurationReconciliation
+    )
+    if (-not $AuthorizeHelmConfigurationReconciliation -or [string]::IsNullOrWhiteSpace($Reason)) {
+        throw "Specify -AuthorizeHelmConfigurationReconciliation and -Reason '<why this Helm change is approved>'."
+    }
+    $existing = Get-DeploymentFreshBaseline -Name $Name
+    if (-not $existing) {
+        throw "No existing fresh-deploy baseline for '$Name' -- this function reconciles an existing record, it does not create one."
+    }
+    $deployment = Invoke-DeploymentKubectl @('get', 'deployment', $Name, '-o', 'json') | ConvertFrom-Json
+    $container = $deployment.spec.template.spec.containers | Where-Object { $_.name -eq $Name }
+    $liveFlag = ($container.env | Where-Object { $_.name -eq 'AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED' }).value
+    $localFlag = (Get-LocalFullEtfExecutionFlag).ToString().ToLowerInvariant()
+    if ($liveFlag -ne $localFlag) {
+        throw "Running configuration ($liveFlag) does not yet match local values-dev.yaml ($localFlag) -- apply the approved correction first. This function only records an already-applied, already-verified state; it never writes to the cluster."
+    }
+    $newHelmFingerprint = Get-DeploymentHelmFingerprint
+    Save-DeploymentFreshBaseline -Name $Name -Image $existing.image -MigrationFingerprint $existing.migrationFingerprint -HelmFingerprint $newHelmFingerprint
+    Write-Host "Helm configuration baseline for '$Name' advanced to fingerprint $newHelmFingerprint. Reason: $Reason"
+}
+
+# StrictMode-safe optional property lookup for dynamic Kubernetes JSON
+# objects (ConvertFrom-Json PSCustomObjects). An absent key here is a
+# legitimate, expected shape -- a pod with no app.kubernetes.io/* labels
+# (e.g. postgres-0), or a container/init-container state that is
+# "running"/"waiting" rather than "terminated" -- not a schema violation,
+# so this must not throw the way a direct dotted property access does
+# under Set-StrictMode. Returns $null for a missing property or a $null
+# object; never masks any validation performed on the returned value.
+function Get-DeploymentOptionalProperty {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    # IDictionary (e.g. a Hashtable built with @{}) does not expose its
+    # dynamic keys through .PSObject.Properties, so it needs its own path;
+    # ConvertFrom-Json always produces PSCustomObject, never a Hashtable.
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+# Testable, fail-closed risk classifier. Returns LOW_RISK only when every
+# signal below was positively verified and showed no schema, infrastructure,
+# or worker-state change; any unverifiable signal, query failure, or detected
+# change returns HIGH_RISK with the specific reasons.
+function Get-DeploymentRiskLevel {
+    param([string[]]$Names)
+    $reasons = @()
+    try {
+        $helmFingerprint = Get-DeploymentHelmFingerprint
+        if ($Names -contains 'research-engine') {
+            $deployment = Invoke-DeploymentKubectl @('get', 'deployment', 'research-engine', '-o', 'json') | ConvertFrom-Json
+            $envs = ($deployment.spec.template.spec.containers | Where-Object name -eq 'research-engine').env
+            $pausedOk = ($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED').value -eq 'true'
+            $schedulerOk = ($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED').value -eq 'false'
+            if (-not $pausedOk -or -not $schedulerOk) { $reasons += 'research-engine worker state is not in the known-safe paused/disabled configuration' }
+            $pods = @((Invoke-DeploymentKubectl @('get', 'pods', '-o', 'json') | ConvertFrom-Json).items | Where-Object {
+                (Get-DeploymentOptionalProperty (Get-DeploymentOptionalProperty $_.metadata 'labels') 'app.kubernetes.io/component') -eq 'research-engine'
+            })
+            foreach ($pod in $pods) {
+                $init = @($pod.status.initContainerStatuses | Where-Object name -eq 'wait-for-research-migrations')
+                if ($init.Count -ne 1 -or $null -eq (Get-DeploymentOptionalProperty $init[0].state 'terminated') -or (Get-DeploymentOptionalProperty $init[0].state 'terminated').exitCode -ne 0) {
+                    $reasons += 'research-engine migration/startup init container has not cleanly completed'
+                }
+            }
+        }
+        foreach ($name in @($Names | Where-Object { $_ -in @('research-engine', 'portfolio-service') })) {
+            $currentFingerprint = Get-DeploymentMigrationFingerprint -Name $name
+            $baseline = Get-DeploymentFreshBaseline -Name $name
+            if ($null -eq $baseline) {
+                # No prior fresh-deploy record for this component: this is a
+                # first-time bootstrap. Live worker-state being safe is NOT
+                # sufficient on its own to accept the migration/Helm
+                # configuration as trustworthy -- that would classify LOW_RISK
+                # merely because nothing has been recorded yet to disagree
+                # with. Instead, require independently verified proof that
+                # the CURRENTLY RUNNING image for this component is exactly
+                # the image recorded in the separately-approved, versioned
+                # rollback-baseline manifest (the same trust anchor the
+                # verified/recovery path relies on, re-resolved here against
+                # the registry rather than trusted as a string). Only when
+                # that holds do we treat the live fingerprint reading as a
+                # legitimate first baseline. Any failure to establish it --
+                # missing/invalid approved baseline, registry verification
+                # failure, or a running image that does not match -- fails
+                # closed to HIGH_RISK rather than silently bootstrapping trust.
+                try {
+                    $approvedBaseline = Get-ApprovedRollbackBaseline -ProjectRoot $ProjectRoot
+                    $approvedImage = Get-VerifiedRegistryImage $name $approvedBaseline.Components[$name]
+                    $bootstrapDeployment = Invoke-DeploymentKubectl @('get', 'deployment', $name, '-o', 'json') | ConvertFrom-Json
+                    $bootstrapContainer = $bootstrapDeployment.spec.template.spec.containers | Where-Object { $_.name -eq $name }
+                    $bootstrapAllowedRepositories = @("ai-investment-registry:5000/ai-investment/$name", "localhost:5001/ai-investment/$name")
+                    $bootstrapReference = $null
+                    foreach ($repository in $bootstrapAllowedRepositories) {
+                        $imagePattern = '^' + [regex]::Escape($repository) + '[:@](.+)$'
+                        if ($bootstrapContainer.image -match $imagePattern) { $bootstrapReference = $Matches[1]; break }
+                    }
+                    if (-not $bootstrapReference) { throw "Unexpected running image repository for $name" }
+                    $runningImage = Get-VerifiedRegistryImage $name $bootstrapReference
+                    if ($runningImage -ne $approvedImage) {
+                        $reasons += "first-time fresh-deploy bootstrap for ${name}: running image is not the independently-approved rollback baseline image; no trusted comparison available for migration/Helm configuration"
+                    }
+                }
+                catch {
+                    $reasons += "first-time fresh-deploy bootstrap for ${name}: could not independently verify the running image against the approved rollback baseline ($($_.Exception.Message))"
+                }
+                continue
+            }
+            if (($currentFingerprint | ConvertTo-Json -Compress) -ne ($baseline.migrationFingerprint | ConvertTo-Json -Compress)) {
+                $reasons += "schema migration change detected for $name since the last recorded fresh deployment"
+            }
+            if ($helmFingerprint -ne $baseline.helmFingerprint) {
+                $reasons += 'infrastructure (Helm chart/values) change detected since the last recorded fresh deployment'
+            }
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Level = 'HIGH_RISK'; Reasons = @("risk classification could not be completed: $($_.Exception.Message)") }
+    }
+    if ($reasons.Count -gt 0) { return [pscustomobject]@{ Level = 'HIGH_RISK'; Reasons = @($reasons | Select-Object -Unique) } }
+    return [pscustomobject]@{ Level = 'LOW_RISK'; Reasons = @() }
+}
+
+# Handles a stale deployment-owned 'research-bootstrap-isolation' NetworkPolicy
+# left over from a prior interrupted high-risk attempt. Verifies the exact
+# namespace, ownership/selector shape, and policy purpose before touching it,
+# confirms no deployment or migration is actively running, and only then
+# restores normal research ingress -- as part of this explicitly authorized
+# fresh deployment. Never deletes a policy that does not match exactly, and
+# is a no-op when no such policy exists.
+function Resolve-DeploymentStaleIsolation {
+    param([string[]]$Names)
+    $policies = Invoke-DeploymentKubectl @('get', 'networkpolicies', '-o', 'json') | ConvertFrom-Json
+    $matches = @($policies.items | Where-Object { $_.metadata.name -eq 'research-bootstrap-isolation' })
+    if ($matches.Count -eq 0) { return }
+    if ($matches.Count -gt 1 -or @($policies.items).Count -ne 1) { throw 'Unexpected additional network policies alongside research-bootstrap-isolation; refusing to modify any of them automatically' }
+    $policy = $matches[0]
+    if ($policy.metadata.namespace -ne 'ai-investment') { throw 'research-bootstrap-isolation found outside the expected namespace; refusing to modify it automatically' }
+    $deployment = Invoke-DeploymentKubectl @('get', 'deployment', 'research-engine', '-o', 'json') | ConvertFrom-Json
+    $expectedSelector = $deployment.spec.selector
+    $labels = $expectedSelector.matchLabels
+    if ($labels.'app.kubernetes.io/component' -ne 'research-engine' -or $labels.'app.kubernetes.io/instance' -ne 'ai-investment-platform' -or $labels.'app.kubernetes.io/name' -ne 'ai-investment-platform' -or @($labels.PSObject.Properties).Count -ne 3) {
+        throw 'Unexpected research-engine selector; refusing to touch research-bootstrap-isolation automatically'
+    }
+    # Strict-mode-safe: same omitted-empty-ingress risk as Assert-DeploymentIsolation
+    # above -- this reads a live NetworkPolicy via kubectl, so the server can omit
+    # an empty 'ingress' list here too. Missing still means zero rules; a real,
+    # non-null rule still refuses this policy exactly as before.
+    $policyIngressRaw = Get-DeploymentOptionalProperty $policy.spec 'ingress'
+    if (($policy.spec.podSelector | ConvertTo-Json -Depth 20 -Compress) -ne ($expectedSelector | ConvertTo-Json -Depth 20 -Compress) -or
+        @($policy.spec.policyTypes).Count -ne 1 -or $policy.spec.policyTypes[0] -ne 'Ingress' -or
+        @($policyIngressRaw | Where-Object { $null -ne $_ }).Count -ne 0) {
+        throw 'research-bootstrap-isolation does not match the expected deployment-owned shape; refusing to modify it automatically'
+    }
+    # Confirmed: exactly this one policy, right namespace, exact
+    # deployment-owned selector/ingress shape. Before removing it, confirm no
+    # deployment or migration is actively running.
+    $jobs = Invoke-DeploymentKubectl @('get', 'jobs,cronjobs', '-o', 'json') | ConvertFrom-Json
+    if (@($jobs.items | Where-Object { ($_.kind -eq 'CronJob' -and -not $_.spec.suspend) -or ($_.kind -eq 'Job' -and $_.status.active -gt 0) }).Count) {
+        throw 'Scheduled/internal work is active; refusing to restore research ingress now'
+    }
+    $researchPods = @((Invoke-DeploymentKubectl @('get', 'pods', '-o', 'json') | ConvertFrom-Json).items | Where-Object { $_.metadata.labels.'app.kubernetes.io/component' -eq 'research-engine' })
+    foreach ($pod in $researchPods) {
+        $init = @($pod.status.initContainerStatuses | Where-Object name -eq 'wait-for-research-migrations')
+        if ($init.Count -eq 1 -and ($null -eq $init[0].state.terminated -or $init[0].state.terminated.exitCode -ne 0)) {
+            throw 'A research-engine migration/startup init container has not cleanly completed; refusing to restore research ingress now'
+        }
+    }
+    Write-Host 'Detected stale research-bootstrap-isolation left by a prior interrupted deployment attempt. Verified exact namespace, ownership, selector shape, and that no deployment/migration is active.'
+    Invoke-DeploymentKubectl @('delete', 'networkpolicy', 'research-bootstrap-isolation', '--wait=true') | Out-Null
+    Write-Host 'Stale research-bootstrap-isolation removed; normal research ingress restored as part of this authorized fresh deployment.'
+}
+
+# Reuses the verified path's existing inline frontend-build-config inspection
+# (Initialize-DeploymentSafety), extracted so the fresh path can reuse it
+# without duplicating behavior-affecting logic inline.
+function Get-DeploymentFrontendBuildConfig {
+    $code = 'const fs=require("fs"),p=require("path"),v=new Set();function scan(d){for(const f of fs.readdirSync(d,{withFileTypes:true})){const n=p.join(d,f.name);if(f.isDirectory())scan(n);else if(n.endsWith(".js")){for(const m of fs.readFileSync(n,"utf8").matchAll(/apiBaseUrl:"([^"]*)",authDevLoginEnabled:(![01]|true|false)/g))v.add(JSON.stringify({apiBaseUrl:m[1],authDevLoginEnabled:["!0","true"].includes(m[2])?"true":"false"}));}}}scan("/app/.next");if(v.size!==1)process.exit(2);console.log([...v][0]);'
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($code))
+    $config = (Invoke-DeploymentKubectl @('exec', 'deployment/frontend', '--', 'node', '-e', "eval(Buffer.from('$encoded','base64').toString())") | Out-String) | ConvertFrom-Json
+    if ($config.authDevLoginEnabled -notin @('true', 'false') -or $null -eq $config.apiBaseUrl) { throw 'Frontend build configuration unknown' }
+    return $config
+}
+
+function Start-DeploymentFreshRollout {
+    param([string[]]$Names)
+    if (-not $Names -or @($Names | Where-Object { $_ -notin @('api-gateway', 'research-engine', 'portfolio-service', 'frontend') }).Count) { throw 'Invalid fresh deployment selection' }
+    if ($SkipBuild) { throw 'SkipBuild is not supported for fresh deployment' }
+    Assert-LocalPrerequisites
+    $ready = Invoke-DeploymentKubectl @('get', '--raw=/readyz', '--request-timeout=10s')
+    if (($ready | Out-String).Trim() -ne 'ok') { throw 'Cluster is not ready' }
+    $release = Invoke-DeploymentCommand 'helm' @('--kube-context', 'k3d-ai-investment-dev', '-n', 'ai-investment', 'status', 'ai-investment-platform', '-o', 'json')
+    if (-not ($release | ConvertFrom-Json).name) { throw 'Missing Helm release' }
+
+    $deployments = @{}; $oldImages = @{}; $oldReferences = @{}
+    foreach ($name in $Names) {
+        $deployment = Invoke-DeploymentKubectl @('get', 'deployment', $name, '-o', 'json') | ConvertFrom-Json
+        $containers = @($deployment.spec.template.spec.containers | Where-Object { $_.name -eq $name })
+        foreach ($container in $containers) {
+            $allowedRepositories = @("ai-investment-registry:5000/ai-investment/$name", "localhost:5001/ai-investment/$name")
+            $reference = $null
+            foreach ($repository in $allowedRepositories) {
+                $imagePattern = '^' + [regex]::Escape($repository) + '[:@](.+)$'
+                if ($container.image -match $imagePattern) { $reference = $Matches[1]; break }
+            }
+            if (-not $reference) { throw "Unexpected running image repository for $name" }
+            $oldReferences[$name] = $reference
+            $oldImages[$name] = Get-VerifiedRegistryImage $name $reference
+        }
+        $deployments[$name] = $deployment
+    }
+
+    $frontendConfig = $null
+    if ('frontend' -in $Names) { $frontendConfig = Get-DeploymentFrontendBuildConfig }
+
+    if ($DryRun) { Write-Host "Fresh DEV preflight only: $($Names -join ', '). No build, push, or patch performed."; return }
+
+    $risk = Get-DeploymentRiskLevel -Names $Names
+    if ($risk.Level -ne 'LOW_RISK') {
+        throw "Fresh DEV deployment refused: $($risk.Reasons -join '; '). This change requires the verified deployment path (-AcceptBootstrapRisk -ConfirmCallerFreeze)."
+    }
+
+    # Stale-isolation restoration is deliberately NOT done here. Removing it
+    # before the rollout has actually succeeded would expose research
+    # ingress on the strength of the OLD deployment merely looking
+    # quiescent, even if THIS rollout then fails partway through (build,
+    # push, patch, or rollout-status failure) -- leaving a half-updated
+    # workload with no isolation and nothing to diagnose. It is restored
+    # further down, only after every component's image/init verification
+    # and readiness wait has succeeded.
+    Ensure-RuntimeDirectory
+    $tag = 'fresh-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 12))
+    $rollbackPath = Join-Path $RuntimeDir "rollback-$tag.json"
+    $oldImages | ConvertTo-Json | Set-Content -LiteralPath $rollbackPath -Encoding ASCII
+
+    $java = @($Names | Where-Object { $_ -in @('api-gateway', 'portfolio-service') })
+    if ($java.Count) {
+        Assert-BuildPrerequisites
+        Invoke-DeploymentCommand 'mvn' @('-f', (Join-Path $ProjectRoot 'services/pom.xml'), '-pl', ($java -join ','), '-am', 'package', '-DskipTests') | Out-Host
+    }
+
+    $images = @{}
+    $contexts = @{'api-gateway' = 'services/api-gateway'; 'portfolio-service' = 'services/portfolio-service'; 'research-engine' = 'ai/research-engine'; 'frontend' = 'frontend' }
+    foreach ($name in $Names) {
+        $image = "localhost:5001/ai-investment/${name}:$tag"
+        $context = Join-Path $ProjectRoot $contexts[$name]
+        $buildArgs = @('build', '-t', $image)
+        if ($name -eq 'frontend') { $buildArgs += @('--build-arg', "NEXT_PUBLIC_API_BASE_URL=$($frontendConfig.apiBaseUrl)", '--build-arg', "NEXT_PUBLIC_AUTH_DEV_LOGIN_ENABLED=$($frontendConfig.authDevLoginEnabled)") }
+        if ($NoCache) { $buildArgs += '--no-cache' }
+        Set-DeploymentPhase "FRESH_BUILD/$name"
+        Invoke-DeploymentCommand 'docker' ($buildArgs + @($context)) | Out-Host
+        Set-DeploymentPhase "FRESH_PUSH/$name"
+        Invoke-DeploymentCommand 'docker' @('push', $image) | Out-Host
+        $images[$name] = Get-VerifiedRegistryImage $name $tag
+    }
+
+    foreach ($name in $Names) {
+        # Builds may be lengthy; recheck rollback availability immediately before rollout.
+        if ((Get-VerifiedRegistryImage $name $oldReferences[$name]) -ne $oldImages[$name]) { throw 'Rollback reference verification changed' }
+        $fresh = Invoke-DeploymentKubectl @('get', 'deployment', $name, '-o', 'json') | ConvertFrom-Json
+        if ($fresh.metadata.resourceVersion -ne $deployments[$name].metadata.resourceVersion) { throw 'Deployment drift during build' }
+        $patch = New-VerifiedDeploymentPatch $fresh $name $images[$name]
+        $patchPath = Join-Path $RuntimeDir "$name-$tag.patch.json"
+        $patch | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPath -Encoding ASCII
+        Set-DeploymentPhase "FRESH_ROLLOUT/$name"
+        Invoke-DeploymentKubectl @('patch', 'deployment', $name, '--type=strategic', '--patch-file', $patchPath) | Out-Host
+        Invoke-DeploymentKubectl @('rollout', 'status', "deployment/$name", '--timeout=420s') | Out-Host
+        $actual = Invoke-DeploymentKubectl @('get', 'deployment', $name, '-o', 'json') | ConvertFrom-Json
+        if ((($actual.spec.template.spec.containers | Where-Object { $_.name -eq $name }).image) -ne $images[$name]) { throw 'Deployment image verification failed' }
+        if ($name -eq 'research-engine' -and (($actual.spec.template.spec.initContainers | Where-Object { $_.name -eq 'wait-for-research-migrations' }).image) -ne $images[$name]) { throw 'Init image verification failed' }
+        Save-DeploymentFreshBaseline -Name $name -Image $images[$name] -MigrationFingerprint (Get-DeploymentMigrationFingerprint -Name $name) -HelmFingerprint (Get-DeploymentHelmFingerprint)
+    }
+
+    Wait-ForDeployments -Names $Names
+
+    # Only now -- after every component's image and (for research-engine)
+    # init-container identity has been verified against this rollout's own
+    # freshly-built images, and readiness has been confirmed -- is it safe
+    # to restore normal research ingress. Resolve-DeploymentStaleIsolation
+    # independently re-verifies ownership, exact policy shape, and that no
+    # migration/job is active before touching anything, and remains a no-op
+    # (and never touches an unrelated policy) when no such policy exists.
+    Resolve-DeploymentStaleIsolation -Names $Names
+
+    $url = Resolve-ApplicationUrl
+    Set-DeploymentPhase 'COMPLETE'
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host " Fresh DEV deployment completed" -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host "Components      : $($Names -join ', ')"
+    Write-Host "Image tag       : $tag"
+    Write-Host "Application URL : $url"
+    Write-Host "Rollback ref    : $rollbackPath"
+    Write-Host ""
+}
+
 function Deploy-VerifiedRadarComponents {
     param([string[]]$Names)
     Initialize-DeploymentDiagnostics $Names
@@ -2114,49 +2572,179 @@ function Deploy-VerifiedRadarComponents {
     catch { Show-DeploymentFailure $_; throw }
 }
 
+function Assert-ResumeAudit {
+    # Generalized resume audit: accepts any well-formed, explicitly-
+    # specified review tag and component set -- never a single
+    # hardcoded tag or a fixed two-component pair. Every item below is
+    # independently re-verified against saved, on-disk review evidence
+    # and live cluster state; an operator-supplied tag or component list
+    # is never trusted on its own to BE that evidence, and a saved
+    # policy/evidence file is never treated as stale merely because of
+    # its age -- only its exact recorded shape/content is checked.
+    param([string]$Tag,[string[]]$Names,$Deployments,$Gate)
+    if ($Tag -notmatch '^review-\d{8}-\d{6}-[0-9a-f]{32}$') { throw 'Resume tag is not a well-formed review tag' }
+    if (@($Names).Count -eq 0) { throw 'Resume requires at least one selected component' }
+    $dir=Join-Path $RuntimeDir $Tag
+    foreach($file in @('original-deployments.json','original-workloads.json','isolation.json','observations.jsonl')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir $file) -PathType Leaf)) { throw "Missing recovery audit: $file" }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $RuntimeDir "rollback-$Tag.json") -PathType Leaf)) { throw 'Missing rollback audit' }
+    $record=Get-Content -LiteralPath (Join-Path $dir 'original-deployments.json') -Raw | ConvertFrom-Json
+    # The resumed component selection must exactly match what the saved
+    # review audit actually covers -- never a silently-accepted subset
+    # or superset of the reviewed attempt.
+    $recordedNames=@($record.PSObject.Properties.Name)
+    $missingFromResume=@($recordedNames | Where-Object { $_ -notin $Names })
+    $extraInResume=@($Names | Where-Object { $_ -notin $recordedNames })
+    if ($missingFromResume.Count -or $extraInResume.Count) {
+        throw "Resume component selection ($($Names -join ', ')) does not match the saved review audit's component set ($($recordedNames -join ', '))"
+    }
+    foreach($name in $Names) {
+        $saved=$record.PSObject.Properties[$name].Value
+        $current=$Deployments[$name]
+        if (-not $saved -or $saved.metadata.uid -ne $current.metadata.uid -or
+            $saved.metadata.resourceVersion -ne $current.metadata.resourceVersion -or
+            ($saved.spec | ConvertTo-Json -Depth 100 -Compress) -cne ($current.spec | ConvertTo-Json -Depth 100 -Compress)) {
+            throw "Deployment drift since failed attempt: $name"
+        }
+    }
+    $auditPolicy=Get-Content -LiteralPath (Join-Path $dir 'isolation.json') -Raw | ConvertFrom-Json
+    if ($auditPolicy.metadata.name -ne 'research-bootstrap-isolation' -or
+        ($auditPolicy.spec.podSelector | ConvertTo-Json -Depth 20 -Compress) -cne ($Gate.Selector | ConvertTo-Json -Depth 20 -Compress) -or
+        @($auditPolicy.spec.policyTypes).Count -ne 1 -or $auditPolicy.spec.policyTypes[0] -ne 'Ingress' -or
+        @($auditPolicy.spec.ingress | Where-Object { $null -ne $_ }).Count -ne 0) { throw 'Saved isolation policy mismatch' }
+    $Gate.Workloads=Get-Content -LiteralPath (Join-Path $dir 'original-workloads.json') -Raw | ConvertFrom-Json
+    Assert-DeploymentWorkloads $Gate @()
+    # No deployment or migration may be actively running before resuming
+    # -- the same check already used before restoring research ingress
+    # from a stale isolation policy (Resolve-DeploymentStaleIsolation).
+    $jobs=Invoke-DeploymentKubectl @('get','jobs,cronjobs','-o','json') | ConvertFrom-Json
+    if (@($jobs.items | Where-Object { ($_.kind -eq 'CronJob' -and -not $_.spec.suspend) -or ($_.kind -eq 'Job' -and $_.status.active -gt 0) }).Count) {
+        throw 'Scheduled/internal work is active; refusing to resume now'
+    }
+    $snapshot=Get-Content -LiteralPath (Join-Path $RuntimeDir "rollback-$Tag.json") -Raw | ConvertFrom-Json
+    foreach($name in $Names) {
+        if ($snapshot.PSObject.Properties[$name].Value -ne $script:RecoveryOldImages[$name]) { throw "Rollback audit mismatch: $name" }
+    }
+    # Durable-state (PostgreSQL) consistency: the fresh observation
+    # Initialize-DeploymentSafety already took for this resume
+    # (Gate.Baseline) must match the LAST verified-quiet observation
+    # actually recorded during the interrupted run's own quiet period --
+    # never a freshly taken baseline substituted for history that was
+    # never actually observed back then.
+    $observationLines=@(Get-Content -LiteralPath (Join-Path $dir 'observations.jsonl') | Where-Object { $_.Trim().Length -gt 0 })
+    if ($observationLines.Count -eq 0) { throw 'Saved review audit records no durable-state observation from the interrupted run; refusing to synthesize one' }
+    $lastObservation=$observationLines[-1] | ConvertFrom-Json
+    if ($lastObservation.fingerprint -notmatch '^[a-f0-9]{64}$') { throw 'Saved review audit has no valid durable-state fingerprint' }
+    if ($Gate.Baseline.fingerprint -ne $lastObservation.fingerprint) {
+        throw "Durable-state fingerprint changed since the interrupted attempt's own quiet period (then: $($lastObservation.fingerprint), now: $($Gate.Baseline.fingerprint))"
+    }
+    $Gate.AuditPath=$dir
+    $Gate.Started=[DateTime]::UtcNow.ToString('o')
+    Write-Host 'Verified failed-run audit, workload snapshots, rollback images, isolation policy, durable-state continuity, no active scheduled/internal work, and original deployment identity.'
+}
+
 function Deploy-VerifiedRadarComponentsCore {
     param([string[]]$Names)
     if (-not $Names -or @($Names | Where-Object { $_ -notin @('api-gateway','research-engine','portfolio-service','frontend') }).Count) { throw 'Invalid safe deployment selection' }
     if ($SkipBuild) { throw 'SkipBuild is not supported for verified deployment' }
+    if ($ResumeAuditTag -and $NoCache) { throw 'NoCache is invalid for artifact-reuse recovery' }
+    if ($ResumeAuditTag -and $ResumeAuditTag -notmatch '^review-\d{8}-\d{6}-[0-9a-f]{32}$') { throw 'Unreviewed recovery tag' }
     Assert-LocalPrerequisites
     # Every operation is pinned; never rely on mutable current-context state.
     $ready = Invoke-DeploymentKubectl @('get','--raw=/readyz','--request-timeout=10s')
     if (($ready | Out-String).Trim() -ne 'ok') { throw 'Cluster is not ready' }
     $release = Invoke-DeploymentCommand 'helm' @('--kube-context','k3d-ai-investment-dev','-n','ai-investment','status','ai-investment-platform','-o','json')
     if (-not ($release | ConvertFrom-Json).name -or ($release | ConvertFrom-Json).version -lt 1) { throw 'Missing Helm release/revision' }
-    $rollback = @{
-        'api-gateway'='sha256:69895f18d6360cdc087d51b3f54c29a822d283f709a1b50ae77bb2e18239d5b5'
-        'research-engine'='sha256:c9ccb210e81c45a3152079baca8ca939e521340ed23dcace4522748eb98edff3'
-        'portfolio-service'='sha256:6d5e111a118a659bf84bdee03e2b0561feed003f7feb6b41fa9ddebef80ddd9f'
-        'frontend'='sha256:af0ddfbc03c38e44187a89382c88d717cc0b6bfa5ec199b9a0f0d519c889c60d'
-    }
+    $approvedBaseline = Get-ApprovedRollbackBaseline -ProjectRoot $ProjectRoot
+    $rollback = $approvedBaseline.Components
     $deployments = @{}
     $oldImages = @{}
+    $oldInitImages = @{}
     foreach ($name in $Names) {
-        $oldImages[$name] = Get-VerifiedRegistryImage $name $rollback[$name]
         $deployment = Invoke-DeploymentKubectl @('get','deployment',$name,'-o','json') | ConvertFrom-Json
-        $null = New-VerifiedDeploymentPatch $deployment $name $oldImages[$name]
         $containers = @($deployment.spec.template.spec.containers | Where-Object { $_.name -eq $name })
-        if ($name -eq 'research-engine') { $containers += @($deployment.spec.template.spec.initContainers | Where-Object { $_.name -eq 'wait-for-research-migrations' }) }
-        foreach ($container in $containers) {
-            $prefix = "ai-investment-registry:5000/ai-investment/$name"
-            if ($container.image -notmatch ('^' + [regex]::Escape($prefix) + '[:@](.+)$')) { throw 'Unexpected running image repository' }
-            $current = Get-VerifiedRegistryImage $name $Matches[1]
-            if ($current -ne $oldImages[$name]) { throw 'Running image differs from approved rollback baseline; review required' }
+        $containerImages = @{}
+        # Deployment-state model: the running image is trusted only when it
+        # matches one of two INDEPENDENTLY VERIFIED sources -- never an
+        # assumption that either equals the other, and never a mismatch
+        # that auto-authorizes or auto-blocks on its own:
+        #   1. the approved rollback baseline (explicitly reviewed recovery
+        #      target -- Get-ApprovedRollbackBaseline).
+        #   2. the most recent durable promotion-evidence candidate this
+        #      same tool recorded after a fully-verified prior deployment
+        #      (Save-RollbackBaselineApprovalCandidate), re-resolved against
+        #      the registry right now by Get-LatestVerifiedPromotionEvidence
+        #      -- never trusted from its recorded digest string alone.
+        # A running image matching EITHER source is trusted; matching
+        # neither fails closed before any mutation, naming both sources.
+        $rollbackImage = Get-VerifiedRegistryImage $name $rollback[$name]
+        $promotionEvidence = Get-LatestVerifiedPromotionEvidence -RuntimeDir $RuntimeDir -Name $name
+        $initName = $null
+        $initRollbackImage = $null
+        $initPromotionImage = $null
+        if ($name -eq 'research-engine') {
+            # The running migration-wait image has its own approval. Never
+            # infer approval from the main image, even when the digests agree.
+            $initName = 'wait-for-research-migrations'
+            $initDigest = if ($approvedBaseline.InitContainers) { $approvedBaseline.InitContainers[$initName] } else { $null }
+            Assert-ValidRollbackDigest -Name "init container '$initName'" -Digest $initDigest
+            $initRollbackImage = Get-VerifiedRegistryImage $name $initDigest
+            if ($promotionEvidence -and $promotionEvidence.InitImage -and $promotionEvidence.InitImage.ContainerName -eq $initName) {
+                $initPromotionImage = $promotionEvidence.InitImage.Image
+            }
+            $containers += @($deployment.spec.template.spec.initContainers | Where-Object { $_.name -eq $initName })
         }
+        foreach ($container in $containers) {
+            $allowedRepositories = @(
+                "ai-investment-registry:5000/ai-investment/$name",
+                "localhost:5001/ai-investment/$name"
+            )
+            $reference = $null
+            foreach ($repository in $allowedRepositories) {
+                $imagePattern = '^' + [regex]::Escape($repository) + '[:@](.+)$'
+                if ($container.image -match $imagePattern) {
+                    $reference = $Matches[1]
+                    break
+                }
+            }
+            if (-not $reference) { throw "Unexpected running image repository for $name" }
+            $current = Get-VerifiedRegistryImage $name $reference
+            $isInit = $container.name -ne $name
+            $trustedRollback = if ($isInit) { $initRollbackImage } else { $rollbackImage }
+            $trustedPromotion = if ($isInit) { $initPromotionImage } elseif ($promotionEvidence) { $promotionEvidence.Image } else { $null }
+            if ($current -eq $trustedRollback) {
+                $containerImages[$container.name] = $current
+            } elseif ($trustedPromotion -and $current -eq $trustedPromotion) {
+                $containerImages[$container.name] = $current
+                Write-Host "Running image for $name/$($container.name) is trusted via durable promotion evidence (tag=$($promotionEvidence.Tag), recorded=$($promotionEvidence.RecordedAtUtc.ToString('o'))), not the approved rollback baseline. Baseline advancement remains a separate, explicitly-authorized action (approve-rollback-baseline)."
+            } else {
+                $evidenceNote = if ($promotionEvidence) { "the latest re-verified promotion evidence (tag=$($promotionEvidence.Tag)) also does not match" } else { 'no durable, re-verifiable promotion evidence was found for this component' }
+                throw "Running image for $name/$($container.name) does not match the approved rollback baseline ($trustedRollback) and $evidenceNote (running: $current). Provenance is unestablished -- deployment stopped before any mutation. Review required: confirm the running image independently, then either 'approve-rollback-baseline' against a real promotion-evidence candidate, or 'reconcile-rollback-baseline' once the running image is otherwise confirmed trustworthy."
+            }
+        }
+        $oldImages[$name] = $containerImages[$name]
+        if ($initName) { $oldInitImages[$initName] = $containerImages[$initName] }
+        $null = New-VerifiedDeploymentPatch $deployment $name $oldImages[$name]
         $deployments[$name] = $deployment
         $script:DeploymentRun.BaselineImages[$name]=($deployment.spec.template.spec.containers | Where-Object name -eq $name).image
     }
+    if ($DryRun -and $ResumeAuditTag) { throw "Recovery cannot be certified by artifact-only DryRun" }
     if ($DryRun) { Write-Host "Verified artifact preflight: $($Names -join ', '). No build, push or patch. Database/isolation/quiet gates NOT executed; this is not deployment readiness."; return }
     if (-not $AcceptBootstrapRisk -or -not $ConfirmCallerFreeze) { throw 'Explicit bootstrap risk acceptance and caller freeze are required' }
     Set-DeploymentPhase 'READ_ONLY_PREFLIGHT'
-    $gate = Initialize-DeploymentSafety -Names $Names
+    $gate = Initialize-DeploymentSafety -Names $Names -ExistingIsolation:([bool]$ResumeAuditTag)
     $gate.HelmRevision=($release | ConvertFrom-Json).version
-    $tag = 'review-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N')
+    $tag = if ($ResumeAuditTag) { $ResumeAuditTag } else { 'review-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N') }
     Ensure-RuntimeDirectory
     $rollbackPath = Join-Path $RuntimeDir "rollback-$tag.json"
-    $oldImages | ConvertTo-Json | Set-Content -LiteralPath $rollbackPath -Encoding ASCII
-    Save-DeploymentBaseline -Tag $tag -Deployments $deployments -Gate $gate
+    if ($ResumeAuditTag) {
+        $script:RecoveryOldImages=$oldImages
+        Assert-ResumeAudit -Tag $tag -Names $Names -Deployments $deployments -Gate $gate
+    } else {
+        $oldImages | ConvertTo-Json | Set-Content -LiteralPath $rollbackPath -Encoding ASCII
+        Save-DeploymentBaseline -Tag $tag -Deployments $deployments -Gate $gate
+    }
     $java = @($Names | Where-Object { $_ -in @('api-gateway','portfolio-service') })
     if ($java.Count) {
         Set-DeploymentPhase 'JAVA_PACKAGE'
@@ -2165,6 +2753,12 @@ function Deploy-VerifiedRadarComponentsCore {
     }
     $images = @{}
     foreach ($name in $Names) {
+        if ($ResumeAuditTag) {
+            Set-DeploymentPhase "VERIFY_EXISTING_IMAGE/$name"
+            $images[$name]=Get-VerifiedRegistryImage $name $tag
+            # No rebuild, retag, or push: the registry digest is the immutable artifact identity.
+            continue
+        }
         $image = "localhost:5001/ai-investment/${name}:$tag"
         $contexts=@{'api-gateway'='services/api-gateway';'portfolio-service'='services/portfolio-service';'research-engine'='ai/research-engine';'frontend'='frontend'}
         $context=Join-Path $ProjectRoot $contexts[$name]
@@ -2178,15 +2772,24 @@ function Deploy-VerifiedRadarComponentsCore {
         $images[$name] = Get-VerifiedRegistryImage $name $tag
     }
     Set-DeploymentPhase 'ADMISSION_ISOLATION'
-    Start-DeploymentIsolation -Gate $gate
+    if ($ResumeAuditTag) {
+        Assert-DeploymentIsolation $gate -Probe
+        # Initialize-DeploymentSafety takes a fresh DB observation; repeat the full quiet window.
+    } else { Start-DeploymentIsolation -Gate $gate }
     Set-DeploymentPhase 'QUIET_PERIOD'
     Wait-DeploymentQuiet -Gate $gate
     # Verify every image and construct every patch before the first workload mutation.
     Set-DeploymentPhase 'FINAL_ARTIFACT_AND_PATCH_REVIEW'
     $patchPaths = @{}
     foreach ($name in $Names) {
-        # Builds may be lengthy; recheck rollback availability immediately before rollout.
-        if ((Get-VerifiedRegistryImage $name $rollback[$name]) -ne $oldImages[$name]) { throw 'Rollback verification changed' }
+        # Builds may be lengthy; recheck that the trusted image established
+        # during ARTIFACT_PREFLIGHT (from either the approved rollback
+        # baseline or re-verified promotion evidence -- never assumed to be
+        # the rollback baseline specifically) is still intact and available
+        # in the registry immediately before rollout.
+        if ($oldImages[$name] -notmatch '@(sha256:[a-f0-9]{64})$' -or (Get-VerifiedRegistryImage $name $Matches[1]) -ne $oldImages[$name]) { throw 'Rollback verification changed' }
+        if ($name -eq 'research-engine' -and
+            ($oldInitImages['wait-for-research-migrations'] -notmatch '@(sha256:[a-f0-9]{64})$' -or (Get-VerifiedRegistryImage $name $Matches[1]) -ne $oldInitImages['wait-for-research-migrations'])) { throw 'Init rollback verification changed' }
         $fresh=Invoke-DeploymentKubectl @('get','deployment',$name,'-o','json') | ConvertFrom-Json
         if ($fresh.metadata.resourceVersion -ne $deployments[$name].metadata.resourceVersion) { throw 'Deployment drift during observation' }
         $patch = New-VerifiedDeploymentPatch $fresh $name $images[$name]
@@ -2206,19 +2809,46 @@ function Deploy-VerifiedRadarComponentsCore {
             if (($actual.spec.template.spec.initContainers | Where-Object { $_.name -eq 'wait-for-research-migrations' }).image -ne $images[$name]) { throw 'Init image verification failed' }
             $envs = ($actual.spec.template.spec.containers | Where-Object { $_.name -eq $name }).env
             if (($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED').value -ne 'true' -or ($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED').value -ne 'false') { throw 'Startup pause verification failed' }
+            if (($envs | Where-Object name -eq 'AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED').value -ne (Get-LocalFullEtfExecutionFlag)) { throw 'Full ETF execution flag differs from LOCAL Helm values' }
         }
     }
     $script:DeploymentRun.Verified=@($Names)
     Set-DeploymentPhase 'POST_ROLLOUT_VERIFICATION'
     Complete-DeploymentSafety -Gate $gate -Names $Names -Images $images
     Set-DeploymentPhase 'COMPLETE'
-    Write-Host "Verified deployment completed. Old images retained; rollback references: $rollbackPath. Recovery remains paused. No automatic rollback."
+    # Only reached once Complete-DeploymentSafety has fully succeeded for
+    # every $Names component. Records durable, re-verifiable evidence that
+    # THIS run's new images were genuinely promoted -- so a subsequent
+    # normal deployment is not forced to treat a merely-newer-than-baseline
+    # running image as unestablished provenance. This never advances the
+    # approved rollback baseline itself; that remains a separate,
+    # explicitly-authorized 'approve-rollback-baseline' action.
+    $initImages = @{}
+    if ('research-engine' -in $Names) {
+        $initImages['wait-for-research-migrations'] = @{ component = 'research-engine'; image = $images['research-engine'] }
+    }
+    $candidatePath = Save-RollbackBaselineApprovalCandidate -ProjectRoot $ProjectRoot -RuntimeDir $RuntimeDir -Tag $tag -Names $Names -Images $images -InitImages $initImages
+    Write-Host "Verified deployment completed. Old images retained; rollback references: $rollbackPath. Promotion evidence recorded: $candidatePath (not yet approved as rollback baseline -- run 'approve-rollback-baseline' explicitly if desired). Recovery remains paused. No automatic rollback."
 }
 
 function Deploy-SelectedComponents {
     $safeSelection = @(Resolve-SelectedComponents -RequireSelection)
     if (@($safeSelection | Where-Object { $_ -notin @('api-gateway', 'research-engine', 'portfolio-service', 'frontend') }).Count -eq 0) {
-        Deploy-VerifiedRadarComponents -Names $safeSelection
+        # Explicitly accepting the high-risk gate always routes to the
+        # existing verified/recovery path, regardless of classification --
+        # more scrutiny is never refused. Otherwise, classify the change and
+        # fail closed to the verified path whenever it is not confirmed
+        # LOW_RISK (schema migration, infrastructure/Helm change, or
+        # worker-state transition; or classification itself was unverifiable).
+        if ($AcceptBootstrapRisk -or $ConfirmCallerFreeze -or $ResumeAuditTag) {
+            Deploy-VerifiedRadarComponents -Names $safeSelection
+            return
+        }
+        $risk = Get-DeploymentRiskLevel -Names $safeSelection
+        if ($risk.Level -ne 'LOW_RISK') {
+            throw "Fresh DEV deployment refused: $($risk.Reasons -join '; '). This change requires the verified deployment path: re-run with -AcceptBootstrapRisk -ConfirmCallerFreeze."
+        }
+        Start-DeploymentFreshRollout -Names $safeSelection
         return
     }
     if (@($safeSelection | Where-Object { $_ -in @('api-gateway','research-engine','portfolio-service','frontend') }).Count) { throw 'Protected components cannot use the general deployment path' }
@@ -2428,5 +3058,17 @@ switch ($Command) {
             -DatabaseConfig $DatabaseConfig -Backup $Backup -DatabaseWriterServices $restoreDatabaseWriterServices `
             -TargetDatabase $TargetDatabase -AuthorizeDestructiveRestore:$AuthorizeDestructiveRestore `
             -SkipSafetyBackup:$SkipSafetyBackup -ConfirmSafetyBackup:$ConfirmSafetyBackup
+    }
+    "reconcile-rollback-baseline" {
+        Invoke-PlatformReconcileRollbackBaseline -ProjectRoot $ProjectRoot -ReconcileComponent $ReconcileComponent -KubeContext "k3d-ai-investment-dev" -KubeNamespace $Namespace -AuthorizeRollbackBaselineReconciliation:$AuthorizeRollbackBaselineReconciliation -RollbackBaselineReconciliationReason $ReconciliationReason
+    }
+    "approve-rollback-baseline" {
+        Invoke-PlatformApproveRollbackBaseline -ProjectRoot $ProjectRoot -RollbackBaselineCandidatePath $RollbackBaselineCandidatePath -AuthorizeRollbackBaselineApproval:$AuthorizeRollbackBaselineApproval
+    }
+    "recover-interrupted-promotion" {
+        Invoke-PlatformRecoverInterruptedPromotion -ProjectRoot $ProjectRoot -RuntimeDir $RuntimeDir -RecoveryTag $RecoveryTag -RecoveryComponent $RecoveryComponent -AuthorizeRecovery:$AuthorizeRecovery
+    }
+    "validate-research-migration" {
+        Invoke-PlatformValidateResearchMigration -ProjectRoot $ProjectRoot -AuthorizeMigrationCleanup:$AuthorizeMigrationCleanup
     }
 }

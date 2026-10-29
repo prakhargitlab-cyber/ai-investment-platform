@@ -91,8 +91,89 @@
 {{- if .Values.ibkrConnector.packageVolumeClaim -}}
 {{- fail "The DEV_ONLY IBKR Gateway package PVC cannot be used by the AZURE profile" -}}
 {{- end -}}
-{{- $research := default (dict) (index (default (dict) .Values.workloadOverrides) "research-engine") -}}
-{{- if and (eq .Values.research.distributedLock.backend "process") (or (default false $research.autoscaling.enabled) (gt (int (default 1 $research.replicaCount)) 1)) -}}
-{{- fail "research-engine must remain single-replica while its lock backend is process-local" -}}
+{{- end -}}
+
+{{- /* -------------------------------------------------------------------
+   research-engine process-local lock safety (ALL environments, not just
+   AZURE -- a chart bug previously nested this guard inside the AZURE-only
+   block above, so it never ran for LOCAL/DEV/TEST renders at all).
+
+   Computed from the ACTUAL EFFECTIVE config: the exact same
+   aiServiceDefaults -> per-service aiServices entry -> aiServiceImageOverrides
+   -> workloadOverrides precedence chain that templates/ai-services.yaml
+   itself uses to build $config, so this guard can never be fooled by an
+   unsafe value sitting at a lower layer while a higher layer happens not
+   to mention it.
+
+   0 or 1 replicas with autoscaling disabled is safe (0 means nothing is
+   running, so there is no lock contention). More than 1, a negative
+   count, a non-numeric value, or autoscaling enabled are all unsafe: two
+   or more concurrently running processes could race for the same
+   in-process lock. A final workloadOverrides.research-engine entry (the
+   highest-precedence layer) may safely correct an unsafe lower layer --
+   values-dev.yaml ships exactly that pin; values.yaml intentionally does
+   not, so a non-DEV render with no such correction fails closed instead
+   of silently self-correcting. */ -}}
+{{- $researchServiceEntry := dict -}}
+{{- range .Values.aiServices -}}
+{{- if eq .name "research-engine" -}}
+{{- $researchServiceEntry = . -}}
+{{- end -}}
+{{- end -}}
+{{- $researchImageOverride := default (dict) (index (default (dict) .Values.aiServiceImageOverrides) "research-engine") -}}
+{{- $researchWorkloadOverride := default (dict) (index (default (dict) .Values.workloadOverrides) "research-engine") -}}
+{{- $researchConfig := mergeOverwrite (deepCopy .Values.aiServiceDefaults) (deepCopy $researchServiceEntry) (deepCopy $researchImageOverride) (deepCopy $researchWorkloadOverride) -}}
+{{- if eq .Values.research.distributedLock.backend "process" -}}
+{{- $researchAutoscalingEnabled := default false $researchConfig.autoscaling.enabled -}}
+{{- /* Helm decodes plain YAML/JSON integers in the generic values tree
+   as float64, not Go's native int (sigs.k8s.io/yaml round-trips through
+   encoding/json, and encoding/json always unmarshals numbers into
+   interface{} as float64) -- this is true for every replicaCount in this
+   chart, committed YAML or test-supplied JSON override alike. Requiring
+   kindIs "int" here rejected EVERY safe value too (replicaCount: 1 is
+   still a float64), causing helm template to fail unconditionally
+   whenever research.distributedLock.backend is "process". Accept any
+   numeric kind Helm might hand back and reject everything else
+   (string, bool, nil, map, slice -- e.g. the "bad" string test case). */ -}}
+{{- $researchReplicaValid := or (kindIs "float64" $researchConfig.replicaCount) (kindIs "int" $researchConfig.replicaCount) (kindIs "int64" $researchConfig.replicaCount) -}}
+{{- $researchReplicaOutOfRange := and $researchReplicaValid (or (lt (int $researchConfig.replicaCount) 0) (gt (int $researchConfig.replicaCount) 1)) -}}
+{{- if or $researchAutoscalingEnabled (not $researchReplicaValid) $researchReplicaOutOfRange -}}
+{{- fail "process-local lock requires research-engine to stay at 0-1 replicas with autoscaling disabled" -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* -------------------------------------------------------------------
+   Protected LOCAL/DEV research execution policy. These three settings are
+   the safety invariants a LOCAL/DEV render must never silently drift away
+   from: recovery stays paused, the in-process scheduler stays disabled,
+   and the bounded ETF manual-execution diagnostic gate stays off. Each
+   must be an actual boolean (a string like "false" is truthy in Helm
+   templates, and an explicit null must not be silently treated as the
+   safe value) equal to the one safe invariant -- this deliberately does
+   not apply outside LOCAL/DEV, where these three defaults are the
+   opposite on purpose (see the comments in values.yaml). */ -}}
+{{- /* Gate on genuine LOCAL/DEV usage (the values-dev.yaml overlay),
+   not merely on the environment string: global.environment is the
+   literal value "LOCAL" in BOTH the base values.yaml (production-posture
+   defaults: scheduler enabled, recovery not paused) and values-dev.yaml
+   (the actual DEV overlay: scheduler disabled, recovery paused) -- see
+   the "Deployment profile is intentionally separate from the Spring
+   profile" comment at the top of values.yaml. auth.devLoginEnabled is
+   only ever true when values-dev.yaml is loaded, so combining it with
+   the LOCAL environment check is what keeps this guard from firing
+   against a bare/base-values render and accidentally forcing production
+   defaults into the DEV-only paused/disabled posture. */ -}}
+{{- if and (eq (upper .Values.global.environment) "LOCAL") .Values.auth.devLoginEnabled -}}
+{{- $recoveryPaused := .Values.research.opportunityRecoveryPaused -}}
+{{- if or (not (kindIs "bool" $recoveryPaused)) (ne $recoveryPaused true) -}}
+{{- fail "protected LOCAL/DEV research.opportunityRecoveryPaused must remain the boolean true" -}}
+{{- end -}}
+{{- $schedulerEnabled := .Values.research.opportunityScheduler.enabled -}}
+{{- if or (not (kindIs "bool" $schedulerEnabled)) (ne $schedulerEnabled false) -}}
+{{- fail "protected LOCAL/DEV research.opportunityScheduler.enabled must remain the boolean false" -}}
+{{- end -}}
+{{- $etfManualExecutionEnabled := .Values.research.etfManualExecutionEnabled -}}
+{{- if or (not (kindIs "bool" $etfManualExecutionEnabled)) (ne $etfManualExecutionEnabled false) -}}
+{{- fail "protected LOCAL/DEV research.etfManualExecutionEnabled must remain the boolean false" -}}
 {{- end -}}
 {{- end -}}

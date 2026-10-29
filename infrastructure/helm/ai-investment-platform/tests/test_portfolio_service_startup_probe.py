@@ -69,11 +69,17 @@ def test_portfolio_service_readiness_and_liveness_thresholds_unchanged():
     assert defaults["liveness"]["failureThreshold"] == 3
 
 
-def test_no_other_java_service_gained_a_probe_override():
-    """The override is scoped to portfolio-service only."""
+def test_no_unexpected_java_service_gained_a_probe_override():
+    """The startup-probe override is scoped to the services it was
+    actually diagnosed and approved for: portfolio-service (original
+    fix) plus api-gateway and auth-service (2026-10-20 fix, see
+    test_api_gateway_auth_service_startup_probe.py for the evidence).
+    Any OTHER service gaining a probes override here is unreviewed scope
+    creep and must fail this test."""
+    expected_override_services = {"portfolio-service", "api-gateway", "auth-service"}
     services = _values()["javaServices"]
     for s in services:
-        if s["name"] == "portfolio-service":
+        if s["name"] in expected_override_services:
             assert "probes" in s
             # only startup is overridden, and only failureThreshold:
             assert set(s["probes"].keys()) == {"startup"}

@@ -406,11 +406,44 @@ javaServices:
     tag: latest
     port: 8080
     scalingClass: HORIZONTALLY_SCALABLE
+    # DEV startup allowance, added 2026-10-20. Live evidence (read-only
+    # diagnostic, see ops/availability-root-cause-20261020.ps1 output):
+    # restartCount=13, repeated "Startup probe failed" / "Killing" events,
+    # exit code 137 on the prior container. Resource usage was negligible
+    # (3m/500m CPU, 145Mi/768Mi memory) and node MemoryPressure/DiskPressure
+    # were both False on every node, ruling out OOMKilled and node pressure.
+    # This is the same inherited javaServiceDefaults startup
+    # failureThreshold: 36 (180s) that was already found too tight for
+    # portfolio-service's real Spring Boot boot time (see that entry's
+    # comment below). Override ONLY the startup failureThreshold, matching
+    # the already-approved portfolio-service precedent; readiness and
+    # liveness thresholds are inherited unchanged (failureThreshold: 3).
+    probes:
+      startup:
+        failureThreshold: 60
   - name: auth-service
     image: ai-investment/auth-service
     tag: latest
     port: 8080
     scalingClass: HORIZONTALLY_SCALABLE
+    # DEV startup allowance, added 2026-10-20. Live evidence (read-only
+    # diagnostic, see ops/availability-root-cause-20261020.ps1 output):
+    # restartCount=12, prior container's lastState.terminated showed
+    # reason=Error exitCode=137 after a ~183s lifespan -- within seconds of
+    # the inherited javaServiceDefaults startup failureThreshold: 36 (180s)
+    # window, strongly indicating the startup probe killed it before
+    # Hikari/Flyway (confirmed present in this service's boot sequence via
+    # its own logs: HikariPool-1 start, Flyway DB connection) finished.
+    # Resource usage was negligible (3m/500m CPU, 231Mi/768Mi memory) and
+    # node MemoryPressure/DiskPressure were both False on every node, ruling
+    # out OOMKilled and node pressure. Postgres itself was healthy
+    # (postgres-0 1/1 Running, endpoint resolvable), ruling out a DB outage.
+    # Override ONLY the startup failureThreshold, matching the
+    # already-approved portfolio-service precedent below; readiness and
+    # liveness thresholds are inherited unchanged (failureThreshold: 3).
+    probes:
+      startup:
+        failureThreshold: 60
   - name: portfolio-service
     image: ai-investment/portfolio-service
     tag: latest
@@ -502,6 +535,15 @@ aiServices:
     tag: latest
     port: 8000
     scalingClass: NEEDS_DISTRIBUTED_LOCK
+    # research-engine holds its cross-request lock in process memory
+    # (research.distributedLock.backend: process), so a RollingUpdate that
+    # briefly runs the old and new pod together would let two processes
+    # race for the same lock. Recreate guarantees the old pod is fully
+    # terminated before the new one starts. See templates/validate.yaml,
+    # which enforces single-replica/non-autoscaled at Helm-template time
+    # for the same reason.
+    rolloutStrategy:
+      type: Recreate
     # LOCAL/DEV safety ceiling for the full-market Global Opportunity Scanner
     # cycle. The baseline acquisition worker-pool is bounded to
     # _BASELINE_CONCURRENCY and NSE PDF *extraction* is already capped to 1, but
@@ -593,8 +635,29 @@ research:
   # persistence is enabled). Deliberately independent of the broad,
   # chart-wide featureFlags.scheduledJobsEnabled, which no service in
   # this codebase currently reads.
+  # Operator-controlled recovery pause (see research_opportunity_recovery_paused
+  # in app/settings.py). Must stay false in production: true blocks worker
+  # resume-at-startup, scheduler submissions and manual POST /opportunities/cycles.
+  opportunityRecoveryPaused: false
   opportunityScheduler:
     enabled: true
+  # LOCAL-only manual Equity Radar execution gate (see
+  # research_equity_manual_execution_enabled in app/settings.py). Must
+  # stay false in production: the application-layer admission gate
+  # also requires environment==LOCAL, the scheduler disabled, and
+  # recovery paused, but this chart value is the only one of those
+  # four conditions production intentionally leaves permanently off.
+  equityManualExecutionEnabled: false
+  # LOCAL-only manual ETF Radar execution gate (paused-diagnostics flow;
+  # see research_etf_manual_execution_enabled in app/settings.py). Must
+  # stay false in production -- the diagnostic gate must be explicitly
+  # enabled, and this chart value is what production permanently leaves off.
+  etfManualExecutionEnabled: false
+  # LOCAL-only manual Full-NSE-ETF Universe execution -- an independent
+  # permission from the bounded manual gate above (see
+  # research_etf_full_universe_execution_enabled in app/settings.py).
+  # Must stay false in production.
+  etfFullUniverseExecutionEnabled: false
   distributedLock:
     backend: process
     acquireTimeoutSeconds: 30
@@ -608,6 +671,12 @@ research:
   providers:
     nseAnnouncementsUrl: https://www.nseindia.com/api/corporate-announcements
     nseShareholdingsUrl: https://www.nseindia.com/api/corporate-share-holdings-master
+    # Explicit, independently-verified NSE trading-series overrides, keyed by
+    # global_instrument_id. Empty by default -- every instrument keeps the
+    # ordinary EQ series unless an environment-specific override below adds
+    # an entry confirmed against official NSE evidence. See
+    # app.settings.Settings.nse_verified_trading_series_overrides.
+    nseVerifiedTradingSeriesOverrides: {}
     yahooSearchUrl: https://query1.finance.yahoo.com/v1/finance/search
     yahooQuoteUrl: https://query1.finance.yahoo.com/v7/finance/quote
     yahooSummaryUrl: https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}

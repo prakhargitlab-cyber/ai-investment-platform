@@ -13,7 +13,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 TOOL_SCHEMA_VERSION = "YAHOO_FINANCE_MCP_TOOL_V1"
 ADAPTER_VERSION = "FIRST_PARTY_YAHOO_MCP_V1"
-_SYMBOL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.^=_-]{0,39}$")
+# Yahoo 401/crumb fix: J&KBANK.NS (Jammu & Kashmir Bank) and M&M.NS
+# (Mahindra & Mahindra) are genuine, canonical NSE/Yahoo tickers that
+# contain a literal "&" -- confirmed real symbols, not malformed
+# input. verified_yahoo_symbol is passed as a Python string argument
+# to yfinance/httpx, never spliced into a raw URL by this codebase,
+# so allowing this one additional, documented-safe character does
+# not open any URL-injection surface.
+_SYMBOL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.^=_&-]{0,39}$")
 
 
 class StrictModel(BaseModel):

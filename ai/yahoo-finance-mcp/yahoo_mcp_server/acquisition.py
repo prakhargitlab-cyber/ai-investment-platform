@@ -44,7 +44,18 @@ class YahooAcquisitionService:
             shared_settings, ticker_factory=ticker_factory
         )
         self.ticker_factory = self.structured.ticker_factory
-        self.history = YahooHistoricalPriceProvider(self.ticker_factory)
+        # Yahoo 401/crumb retry-storm fix: share ticker_contexts with the
+        # structured provider so the session-rebuild + exponential-backoff
+        # signal (see YahooTickerContexts.note_identity_metadata_unavailable
+        # / in_backoff in app/yahoo_ticker_context.py) actually applies here
+        # too -- without this, this service built its OWN separate
+        # YahooTickerContexts with no session_refresh hook wired, so the
+        # research-engine session-recovery fix was silently inert on this
+        # path (confirmed root cause: PROVIDER_IDENTITY_UNAVAILABLE kept
+        # recurring at an undiminished rate because no session rebuild or
+        # backoff was ever actually triggered through this service).
+        self.history = YahooHistoricalPriceProvider(
+            self.ticker_factory, ticker_contexts=self.structured.ticker_contexts)
         self._concurrency = asyncio.Semaphore(settings.max_concurrency)
         self._workers = ThreadPoolExecutor(
             max_workers=settings.max_concurrency, thread_name_prefix="yahoo-mcp"

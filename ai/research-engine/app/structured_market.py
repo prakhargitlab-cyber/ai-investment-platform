@@ -17,7 +17,7 @@ import yfinance as yf
 from app import cycle_timing
 from app.models import ProvenancedValue, StructuredInstrumentResolution, StructuredMarketSnapshot
 from app.settings import Settings
-from app.yahoo_ticker_context import YahooTickerContexts
+from app.yahoo_ticker_context import YahooSessionBackoffActive, YahooTickerContexts
 
 logger = logging.getLogger(__name__)
 
@@ -406,16 +406,23 @@ class YahooFinanceProvider:
     def _collect_resolved_yfinance(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False,
                                     acquisition_context: object | None = None,
                                     data_classes: frozenset[str] | None = None) -> StructuredMarketSnapshot:
-        with self.ticker_contexts.acquire(resolution.provider_ticker, acquisition_context) as access:
-            if access.structured_failure:
-                raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{access.structured_failure}")
-            try:
-                return self._collect_ticker(resolution, access, baseline_only=baseline_only, data_classes=data_classes)
-            except Exception as exc:
-                access.structured_failure = type(exc).__name__
-                if isinstance(exc, StructuredProviderError):
-                    raise
-                raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{type(exc).__name__}") from exc
+        try:
+            with self.ticker_contexts.acquire(resolution.provider_ticker, acquisition_context) as access:
+                if access.structured_failure:
+                    raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{access.structured_failure}")
+                try:
+                    return self._collect_ticker(resolution, access, baseline_only=baseline_only, data_classes=data_classes)
+                except Exception as exc:
+                    access.structured_failure = type(exc).__name__
+                    if isinstance(exc, StructuredProviderError):
+                        raise
+                    raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{type(exc).__name__}") from exc
+        except YahooSessionBackoffActive as exc:
+            # Sustained Yahoo session failure (see yahoo_ticker_context.py's
+            # exponential backoff): fail fast, technical/retryable, WITHOUT
+            # making any Yahoo request at all -- the retry-storm fix shared
+            # with the historical-price path (same ticker_contexts).
+            raise StructuredProviderError("EXTERNAL_PROVIDER_UNAVAILABLE:YAHOO_SESSION_BACKOFF_ACTIVE") from exc
 
     def _collect_ticker(self, resolution, access, *, baseline_only=False, data_classes=None):
         ticker = resolution.provider_ticker

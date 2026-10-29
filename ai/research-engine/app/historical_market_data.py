@@ -24,7 +24,7 @@ from app.structured_market import (
     _canonical_nse_etf_identity_reason,
     verify_historical_price_identity,
 )
-from app.yahoo_ticker_context import YahooTickerContexts
+from app.yahoo_ticker_context import YahooSessionBackoffActive, YahooTickerContexts
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +206,16 @@ class YahooHistoricalPriceProvider:
         ticker = str(instrument.get("structuredProviderTicker") or instrument.get("ticker") or "").strip()
         if not ticker:
             return []
+        try:
+            return self._closes_locked(instrument, ticker, start, end, context)
+        except YahooSessionBackoffActive as exc:
+            # Sustained Yahoo session failure (see yahoo_ticker_context.py's
+            # exponential backoff): fail fast, technical/retryable, WITHOUT
+            # making any Yahoo request at all -- the actual retry-storm fix,
+            # shared with the structured-snapshot path (same ticker_contexts).
+            raise HistoricalPriceProviderError("EXTERNAL_PROVIDER_UNAVAILABLE:YAHOO_SESSION_BACKOFF_ACTIVE") from exc
+
+    def _closes_locked(self, instrument: dict[str, Any], ticker: str, start: datetime, end: datetime, context=None) -> list[MarketPriceObservation]:
         with self.ticker_contexts.acquire(ticker, context) as access:
             logger.info("radar_acquisition_count operation=historical_series_live_acquisition provider=YAHOO_FINANCE count=1")
             yf_ticker = access.ticker
@@ -254,7 +264,14 @@ class YahooHistoricalPriceProvider:
                     exc, global_instrument_id=instrument.get("globalInstrumentId"),
                     ticker=ticker, start=start, end=end,
                 )
-                raise _history_provider_error(exc) from exc
+                error = _history_provider_error(exc)
+                if isinstance(exc, YFRateLimitError):
+                    # A sustained Yahoo 429 needs the same "back off the
+                    # shared session" response as PROVIDER_IDENTITY_UNAVAILABLE
+                    # -- continuing to hammer a rate-limited session is the
+                    # same retry-storm failure mode either way.
+                    self.ticker_contexts.note_identity_metadata_unavailable()
+                raise error from exc
             rows = list(history.iterrows()) if history is not None else []
             if rows:
                 # Recheck canonical identity against the same returned info;
@@ -366,6 +383,13 @@ class YahooHistoricalPriceProvider:
             # fail-closed rejection below: the current acquisition still
             # raises and nothing is persisted either way.
             self.ticker_contexts.note_identity_metadata_unavailable()
+        else:
+            # Any other outcome -- verified, or a genuine but populated
+            # mismatch -- proves Yahoo actually responded with real
+            # identity evidence on this shared session, so a brief,
+            # genuinely transient blip must not leave acquisition
+            # throttled long after Yahoo has already recovered.
+            self.ticker_contexts.note_identity_metadata_available()
         if reason is not None:
             # Log public identity fields and the applicable trust boundary,
             # without raw provider payloads or credentials.

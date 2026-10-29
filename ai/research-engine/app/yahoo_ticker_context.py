@@ -6,9 +6,20 @@ from threading import RLock
 from typing import Any, Callable
 import asyncio
 import logging
+import random
 import time
 
 logger = logging.getLogger(__name__)
+
+
+class YahooSessionBackoffActive(RuntimeError):
+    """Raised by acquire() instead of yielding a ticker access, while a
+    sustained Yahoo session failure's exponential backoff window is still
+    active. Signals callers to fail this attempt WITHOUT making any Yahoo
+    request at all -- the whole point of backoff is fewer upstream calls
+    during a sustained outage, not just an occasional session rebuild
+    while every other attempt still reaches Yahoo."""
+    pass
 
 
 @dataclass
@@ -43,7 +54,10 @@ class YahooTickerContexts:
     """
     def __init__(self, factory, max_contexts=64, *,
                  session_refresh: Callable[[], None] | None = None,
-                 session_refresh_cooldown_seconds: float = 60.0):
+                 session_refresh_cooldown_seconds: float = 60.0,
+                 backoff_max_seconds: float = 900.0,
+                 backoff_jitter_fraction: float = 0.2,
+                 random_fn: Callable[[], float] = random.random):
         self.factory = factory
         self.max_contexts = max_contexts
         self._contexts = OrderedDict()
@@ -64,29 +78,65 @@ class YahooTickerContexts:
         # session (optional; None preserves today's behavior exactly),
         # lets exactly one signal -- "a resolved instrument's provider
         # identity metadata came back completely empty" -- request a new
-        # session. Bounded by `session_refresh_cooldown_seconds` so a
-        # whole cycle's worth of instruments hitting the same stale crumb
-        # within the same window triggers at most one rebuild, never an
-        # unbounded refresh-and-retry loop; a genuinely permanent
-        # authorization failure (e.g. the egress IP itself is blocked)
-        # just keeps failing after that one bounded attempt, exactly as
-        # intended -- this is backoff for a plausible transient session
-        # fault, not indefinite retry of a permanent one.
+        # session AND open a backoff window during which acquire() fails
+        # fast (see YahooSessionBackoffActive) instead of letting every
+        # concurrent/subsequent caller still reach Yahoo. Each further
+        # report while sustained failures continue DOUBLES the window
+        # (capped at backoff_max_seconds), with +/-backoff_jitter_fraction
+        # random jitter so many concurrent instruments don't all retry in
+        # the same instant -- this is the actual fix for a retry storm:
+        # fewer upstream requests during a sustained outage, not merely an
+        # occasional session rebuild while every other attempt still goes
+        # through. A single report of real Yahoo data (see
+        # note_identity_metadata_available) resets the window to zero, so
+        # a brief, genuinely transient blip recovers immediately rather
+        # than staying throttled. A sustained, permanent authorization
+        # failure (e.g. the egress IP itself is blocked) keeps escalating
+        # up to the cap and keeps failing after it -- never retried
+        # unboundedly, and never silently given up on either.
         self._session_refresh = session_refresh
         self._session_refresh_cooldown_seconds = session_refresh_cooldown_seconds
+        self._backoff_max_seconds = backoff_max_seconds
+        self._backoff_jitter_fraction = backoff_jitter_fraction
+        self._random_fn = random_fn
         self._last_session_refresh_monotonic: float | None = None
+        self._consecutive_failures = 0
+        self._backoff_until_monotonic: float = 0.0
         self._session_refresh_lock = RLock()
+
+    def in_backoff(self) -> bool:
+        """True while a prior sustained-failure backoff window is active."""
+        with self._session_refresh_lock:
+            return time.monotonic() < self._backoff_until_monotonic
+
+    def note_identity_metadata_available(self) -> None:
+        """Report that Yahoo returned real, usable identity evidence for a
+        resolved instrument (verified, or a genuine but populated mismatch
+        -- anything other than PROVIDER_IDENTITY_UNAVAILABLE). Proves the
+        session/crumb is currently healthy, so this resets the escalating
+        backoff -- a brief transient blip must not leave acquisition
+        throttled long after Yahoo has already recovered."""
+        with self._session_refresh_lock:
+            self._consecutive_failures = 0
+            self._backoff_until_monotonic = 0.0
 
     def note_identity_metadata_unavailable(self) -> bool:
         """Report that a provider response for a resolved instrument carried
         no identity metadata at all (see PROVIDER_IDENTITY_UNAVAILABLE in
-        structured_market.verify_identity_by_isin_or_name). Rebuilds the
+        structured_market.verify_identity_by_isin_or_name). Opens/escalates
+        the backoff window (see __init__'s docstring) and rebuilds the
         underlying session via `session_refresh`, at most once per
         `session_refresh_cooldown_seconds` regardless of how many callers
         report this within that window. Returns True iff a refresh actually
         ran; False if no refresh hook is configured, or the cooldown is
         still active (the common case for every report after the first in
         a burst)."""
+        with self._session_refresh_lock:
+            self._consecutive_failures += 1
+            base = self._session_refresh_cooldown_seconds * (2 ** (self._consecutive_failures - 1))
+            window = min(base, self._backoff_max_seconds)
+            jitter = window * self._backoff_jitter_fraction * (2 * self._random_fn() - 1)
+            self._backoff_until_monotonic = time.monotonic() + max(0.0, window + jitter)
         if self._session_refresh is None:
             return False
         with self._session_refresh_lock:
@@ -105,6 +155,10 @@ class YahooTickerContexts:
 
     @contextmanager
     def acquire(self, symbol, context=None):
+        if self.in_backoff():
+            raise YahooSessionBackoffActive(
+                "YAHOO_SESSION_BACKOFF_ACTIVE: sustained Yahoo session failure; "
+                "skipping this request without contacting Yahoo")
         with self._lock:
             # Blocking provider work can reach here after its async owner was
             # cancelled. It may finish normally, but must not repopulate reuse

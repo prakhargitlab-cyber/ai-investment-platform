@@ -244,10 +244,13 @@ async def test_provider_fills_full_range_is_ready_no_qualified_failure() -> None
     # actually runs -- not relative to the fixed NOW used elsewhere in this
     # file for the insufficient-coverage scenarios.
     real_now = datetime.now(timezone.utc)
+    from app.market_sessions import completed_sessions
+    sessions = list(completed_sessions('NSE', repository.persistence.load_market_schedules({'NSE'}), [],
+        (real_now - timedelta(days=110)).date(), real_now.date(), real_now))[-60:]
     observations = [
-        {"observedAt": (real_now - timedelta(hours=1) - timedelta(days=i * 7)).isoformat(),
+        {"observedAt": close.isoformat(),
          "price": str(90 + i), "currency": "INR"}
-        for i in range(60)
+        for i, (_day, close) in enumerate(sessions)
     ]
 
     class _FullRangeGateway:
@@ -259,8 +262,8 @@ async def test_provider_fills_full_range_is_ready_no_qualified_failure() -> None
                 "adapterVersion": "YAHOO_FINANCE_MCP_ADAPTER_V1", "providerId": "YAHOO_FINANCE_MCP",
                 "sourceTier": "APPROVED_EXTERNAL_TOOL", "sourceTool": "get_history", "region": "INDIA",
                 "requirementId": requirement_id, "globalInstrumentId": str(prof.instrument_id),
-                "symbol": "HISTGAP.NS", "exchange": "NSE", "currency": "INR", "retrievedAt": NOW,
-                "observedAt": NOW, "sourceUrl": "https://finance.yahoo.com/quote/HISTGAP.NS",
+                "symbol": "HISTGAP.NS", "exchange": "NSE", "currency": "INR", "retrievedAt": real_now,
+                "observedAt": real_now, "sourceUrl": "https://finance.yahoo.com/quote/HISTGAP.NS/history",
                 "confidence": 0.8, "freshness": "FRESH",
                 "structuredFacts": [], "financialFacts": [],
                 "marketObservations": observations,

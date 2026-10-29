@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import re
@@ -46,6 +46,68 @@ class StructuredClassProvider(Protocol):
                               *, acquisition_context: object | None = None) -> StructuredMarketSnapshot: ...
 
 
+def _build_bounded_yahoo_session(bound_seconds: float):
+    """Yfinance's own default session, with every request's timeout capped.
+
+    Root cause (research_readiness_ensure_timeout / Full Equity Radar
+    BASELINE acquisition investigation): yfinance's own YfData.get()/
+    .post() hardcode a per-request default of timeout=30 seconds for
+    every underlying HTTP call (cookie/crumb bootstrap, quote, info,
+    financial statements, history). That 30s per-call ceiling is itself
+    LARGER than ResearchReadinessRuntime's background-cycle acquisition
+    budget (ensure_timeout_seconds=25.0, see research_readiness_runtime.py).
+    Worse, when that 25s budget expires, the readiness runtime can only
+    abandon the awaiting coroutine -- it cannot cancel the underlying OS
+    thread running this synchronous yfinance call (see
+    _dispatch_yfinance_in_thread's own docstring), so a slow/stalled
+    Yahoo request keeps running for up to its own ~30s (or a multiple of
+    it, across a cookie/crumb bootstrap plus the actual quote/info/history
+    request) while continuing to hold one of only
+    structured_provider_max_concurrent_threads thread-dispatch slots --
+    starving brand-new acquisitions for OTHER instruments of a free slot.
+    Forcing every request's timeout down to structured_provider_timeout_seconds
+    (the same per-call budget this provider already applies to its other,
+    httpx-based HTTP client) makes a slow/stalled Yahoo call fail fast and
+    release its slot well inside the 25s observation window, instead of
+    silently outliving it. This narrows the timeout that was already
+    missing from this one unbounded call site; it does not touch
+    ensure_timeout_seconds or any other shared/global timeout.
+
+    Deployment-readiness correction: an earlier version of this fix
+    subclassed requests.Session directly. That is WRONG for this
+    codebase's installed yfinance (confirmed via yfinance._http
+    .new_session / HAS_CURL_CFFI): when curl_cffi is installed --
+    which it is here, and is yfinance's own preferred backend --
+    yfinance builds its default session as a curl_cffi Session with
+    impersonate="chrome" (Chrome TLS/JA3 fingerprinting, specifically to
+    get past Yahoo's anti-bot detection). Explicitly constructing a
+    plain requests.Session instead would still be ACCEPTED by yfinance
+    (YfData._set_session only checks isinstance against either backend),
+    but would silently drop that Chrome impersonation on every request --
+    trading a timeout fix for a worse, unbounded-impact bot-detection
+    regression. This builds the REAL session yfinance would have built
+    for itself (yfinance._http.new_session(), re-exported as
+    yfinance.data.new_session -- curl_cffi+impersonation when available,
+    the documented requests fallback otherwise) and only wraps its
+    bound .request method (both backends' .get()/.post() delegate to
+    .request(), confirmed by inspecting curl_cffi.requests.session
+    .Session.get's source) so every call's timeout is capped, whichever
+    backend is actually active in this environment.
+    """
+    session = yf.data.new_session()
+    original_request = session.request
+
+    def bounded_request(method, url, *args, **kwargs):
+        requested = kwargs.get("timeout")
+        kwargs["timeout"] = (bound_seconds if requested is None
+                              else min(requested, bound_seconds))
+        return original_request(method, url, *args, **kwargs)
+
+    session.request = bounded_request
+    session._bound_seconds = bound_seconds  # introspection/testing only
+    return session
+
+
 class YahooFinanceProvider:
     """Provider-neutral adapter over Yahoo's public structured market responses."""
 
@@ -66,7 +128,14 @@ class YahooFinanceProvider:
             follow_redirects=True,
         )
         self._cache: dict[str, tuple[datetime, StructuredMarketSnapshot]] = {}
-        self.ticker_factory = ticker_factory or yf.Ticker
+        # See _BoundedYahooSession's docstring: this is the fix for the
+        # confirmed research_readiness_ensure_timeout root cause. Shared
+        # across tickers/threads (bounded by _thread_dispatch_semaphore
+        # below) for connection-pool reuse; requests.Session.request is
+        # safe to call concurrently from multiple threads.
+        self._bounded_session = _build_bounded_yahoo_session(settings.structured_provider_timeout_seconds)
+        self.ticker_factory = ticker_factory or (
+            lambda symbol: yf.Ticker(symbol, session=self._bounded_session))
         self.ticker_contexts = YahooTickerContexts(self.ticker_factory)
         self.use_yfinance = client is None or ticker_factory is not None
         # The shared pool serializes access to each mutable ticker and bounds
@@ -307,25 +376,26 @@ class YahooFinanceProvider:
         return await self._collect_resolved(resolution)
 
     def _collect_resolved_yfinance(self, resolution: StructuredInstrumentResolution, *, baseline_only: bool = False,
-                                    acquisition_context: object | None = None) -> StructuredMarketSnapshot:
+                                    acquisition_context: object | None = None,
+                                    data_classes: frozenset[str] | None = None) -> StructuredMarketSnapshot:
         with self.ticker_contexts.acquire(resolution.provider_ticker, acquisition_context) as access:
             if access.structured_failure:
                 raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{access.structured_failure}")
             try:
-                return self._collect_ticker(resolution, access, baseline_only=baseline_only)
+                return self._collect_ticker(resolution, access, baseline_only=baseline_only, data_classes=data_classes)
             except Exception as exc:
                 access.structured_failure = type(exc).__name__
                 if isinstance(exc, StructuredProviderError):
                     raise
                 raise StructuredProviderError(f"STRUCTURED_PROVIDER_UNAVAILABLE:{type(exc).__name__}") from exc
 
-    def _collect_ticker(self, resolution, access, *, baseline_only=False):
+    def _collect_ticker(self, resolution, access, *, baseline_only=False, data_classes=None):
         ticker = resolution.provider_ticker
         retrieved = datetime.now(timezone.utc)
         logger.info("radar_acquisition_count operation=%s source=CONTEXT count=1",
                     "yahoo_structured_live_acquisition" if access._info is None else "yahoo_structured_reuse")
         provider, info = access.ticker, access.info
-        raw_news = [] if baseline_only else provider.news or []
+        raw_news = (provider.news or []) if not baseline_only and (data_classes is None or 'NEWS' in data_classes) else []
         if not isinstance(info, dict):
             raise StructuredProviderError("STRUCTURED_PROVIDER_UNAVAILABLE:INVALID_INFO")
         _validate_returned_identity(
@@ -345,12 +415,14 @@ class YahooFinanceProvider:
         income_statement = balance_sheet = quarterly_income = quarterly_balance = cashflow = quarterly_cashflow = None
         if not baseline_only and returned_type in {"EQUITY", "STOCK"}:
             try:
-                income_statement = getattr(provider, "income_stmt", None)
-                balance_sheet = getattr(provider, "balance_sheet", None)
-                quarterly_income = getattr(provider, "quarterly_income_stmt", None)
-                quarterly_balance = getattr(provider, "quarterly_balance_sheet", None)
-                cashflow = getattr(provider, "cashflow", None)
-                quarterly_cashflow = getattr(provider, "quarterly_cashflow", None)
+                if data_classes is None or 'ANNUAL' in data_classes:
+                    income_statement = getattr(provider, "income_stmt", None)
+                    balance_sheet = getattr(provider, "balance_sheet", None)
+                    cashflow = getattr(provider, "cashflow", None)
+                if data_classes is None or 'QUARTERLY' in data_classes:
+                    quarterly_income = getattr(provider, "quarterly_income_stmt", None)
+                    quarterly_balance = getattr(provider, "quarterly_balance_sheet", None)
+                    quarterly_cashflow = getattr(provider, "quarterly_cashflow", None)
             except Exception:
                 # Statement-derived ROCE is optional; quote retrieval remains usable.
                 pass
@@ -610,6 +682,10 @@ def verify_identity_by_isin_or_name(
     return None
 
 
+def _bare_symbol(value: Any) -> str:
+    return str(value or "").strip().upper().split(".", 1)[0]
+
+
 def verify_historical_price_identity(
     *,
     expected_isin: Any,
@@ -620,6 +696,10 @@ def verify_historical_price_identity(
     returned_name: Any,
     returned_exchange: Any,
     returned_currency: Any,
+    expected_symbol: Any = None,
+    expected_asset_type: Any = None,
+    returned_symbol: Any = None,
+    returned_quote_type: Any = None,
 ) -> str | None:
     """Pre-persistence identity gate for Yahoo historical-price acquisition.
 
@@ -632,6 +712,31 @@ def verify_historical_price_identity(
     path already enforces (_exchange_family, verify_identity_by_isin_or_name)
     rather than a second, conflicting definition. Returns None when
     verified, else a stable rejection reason string.
+
+    ETF-specific fallback (new): Yahoo frequently omits ISIN for Indian-
+    listed ETFs, and its longName/shortName for these is often the raw
+    ticker, a truncated AMC prefix, or the underlying benchmark index name
+    rather than the fund's own registered name -- fuzzy name similarity
+    then rejects a genuinely correct match
+    (see historical_price_identity_rejected diagnostics, e.g. "Nippon India
+    ETF Nifty 50 BeES" vs Yahoo's "NIFTY 50"). This fallback is consulted
+    ONLY when the shared ISIN-or-name gate above would otherwise reject on
+    COMPANY_NAME_MISMATCH specifically -- never on a genuine ISIN conflict,
+    which is returned above unchanged and still fails closed. It requires
+    THREE independent signals to all agree, not symbol matching alone: the
+    exact canonical NSE symbol (ignoring a ".NS" suffix), Yahoo's own
+    returned quoteType confirming the ticker still resolves to an ETF (not
+    silently reassigned to another instrument type), and Yahoo actually
+    having returned a matching exchange and currency (not merely failing to
+    conflict by omitting them -- see the explicit presence check below).
+    The
+    asset-type requirement is the caller's explicit, already-verified
+    canonical classification (expected_asset_type) -- never guessed from
+    the name. When any of expected_symbol/expected_asset_type/
+    returned_symbol/returned_quote_type is unavailable, or
+    expected_asset_type is not "ETF", this falls through unchanged to the
+    original COMPANY_NAME_MISMATCH rejection -- equities take no asset-type
+    signal here and are completely unaffected by this fallback.
     """
     returned_listing = _exchange_family(returned_exchange, "")
     if expected_exchange_family and returned_listing and expected_exchange_family != returned_listing:
@@ -640,7 +745,27 @@ def verify_historical_price_identity(
     returned_currency_u = str(returned_currency or "").upper()
     if expected_currency_u and returned_currency_u and expected_currency_u != returned_currency_u:
         return "CURRENCY_MISMATCH"
-    return verify_identity_by_isin_or_name(expected_isin, expected_name, returned_isin, returned_name)
+    reason = verify_identity_by_isin_or_name(expected_isin, expected_name, returned_isin, returned_name)
+    if reason != "COMPANY_NAME_MISMATCH":
+        return reason  # None (verified) or ISIN_MISMATCH (fail closed) -- unchanged.
+    # The exchange/currency checks above no-op (do not raise) when the
+    # PROVIDER side is simply absent, not merely non-conflicting -- that is
+    # the correct, pre-existing behavior for the general gate (an absent
+    # field is not a mismatch), but it means "exchange-family/currency
+    # agreement already established above" is only actually true when
+    # Yahoo returned BOTH fields. Require their presence explicitly here so
+    # a maximally ambiguous provider response (no ISIN, no exchange, no
+    # currency -- only a bare symbol and quoteType) cannot pass on two
+    # signals while silently missing the third; this does not change the
+    # general EXCHANGE_MISMATCH/CURRENCY_MISMATCH behavior used by every
+    # other path (equities, the ISIN path, or a genuine mismatch), only
+    # this fallback's own three-signals-required bar.
+    if (str(expected_asset_type or "").upper() == "ETF" and expected_symbol and returned_symbol
+            and returned_quote_type and returned_exchange and returned_currency
+            and _bare_symbol(returned_symbol) == _bare_symbol(expected_symbol)
+            and str(returned_quote_type).strip().upper() == "ETF"):
+        return None
+    return reason
 
 
 def _candidate_score(instrument: dict[str, Any], identity: str, candidate: dict[str, Any]) -> float:
@@ -891,7 +1016,11 @@ def _normalize_statement_facts(income: Any, balance: Any, cashflow: Any, period_
             continue
         for period in frame.columns:
             period_end = period.isoformat() if hasattr(period, "isoformat") else str(period)
-            if not period_end:
+            try:
+                # Statement columns identify reporting dates, not instants.
+                # Keep their calendar date; converting zones can change it.
+                period_end = datetime.fromisoformat(period_end).date().isoformat()
+            except (TypeError, ValueError):
                 continue
             for label, metric in labels.items():
                 if label not in frame.index:

@@ -1,4 +1,4 @@
-"""Durable per-cycle / per-instrument progress for resumable production cycles.
+﻿"""Durable per-cycle / per-instrument progress for resumable production cycles.
 
 Slices 2, 3 and 8. A production opportunity cycle (the full NSE universe) is
 long-running; a worker restart previously discarded all traversal progress
@@ -57,7 +57,19 @@ FINAL_STATES = frozenset({CandidateState.COMPLETED, CandidateState.EVIDENCE_UNAV
 
 PHASE_BASELINE = "BASELINE"
 PHASE_DEEP = "DEEP"
+PHASE_ETF_ONBOARD = "ETF_ONBOARD"
 ACTIVE_RUN_STATUSES = ("ACCEPTED", "RUNNING", "PUBLISHED", "CANCEL_REQUESTED")
+
+# The external resumed_candidates / executed_candidates fields on a completed
+# cycle's job record are a long-standing response contract, established and
+# asserted only by Equity Radar, with exactly the two keys {PHASE_BASELINE,
+# PHASE_DEEP}. PHASE_ETF_ONBOARD is registered for internal strictness (the
+# checkpoint dict always carries all three phases, the SQL CHECK constraint
+# accepts it, and strict KeyError protection applies), but it is intentionally
+# NOT leaked through this external field -- ETF onboarding's own progress is
+# surfaced separately via coverage.stages.onboarding
+# (app.main._etf_onboarding_stage_progress), never duplicated here.
+EXTERNAL_RESPONSE_PHASES: tuple[str, ...] = (PHASE_BASELINE, PHASE_DEEP)
 
 # Existing orchestrator dispositions (global_opportunity_orchestration.py) ->
 # checkpoint state. Technical failures are never business rejections.
@@ -106,7 +118,7 @@ CREATE TABLE IF NOT EXISTS global_opportunity_cycle_active (
 );
 CREATE TABLE IF NOT EXISTS global_opportunity_cycle_progress (
     cycle_id TEXT NOT NULL REFERENCES global_opportunity_cycle_run(cycle_id),
-    phase TEXT NOT NULL CHECK (phase IN ('BASELINE','DEEP')),
+    phase TEXT NOT NULL CHECK (phase IN ('BASELINE','DEEP','ETF_ONBOARD')),
     global_instrument_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('PENDING','IN_PROGRESS','COMPLETED','RETRYABLE_FAILURE','EVIDENCE_UNAVAILABLE','TERMINAL_OUTCOME')),
     disposition TEXT,
@@ -483,6 +495,96 @@ class CycleRunPersistenceMixin:
                      or CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE
                      and int(row.get("attempts") or 0) >= DEFAULT_MAX_ATTEMPTS]
         technical = [row for row in scoped if CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE]
+        # A cycle that records a flat selection['universe'] list (the
+        # ETF-onboarding convention -- see app/etf_full_universe.py) but never
+        # advances past BASELINE still has a genuinely known universe size and
+        # a genuinely reconstructible baseline-evaluated count from durable
+        # BASELINE-phase rows. This fallback activates ONLY when that key is
+        # present -- every other cycle shape keeps baseline_evaluated/
+        # universe_count as None exactly as before, never inventing a count
+        # when no selection evidence names a universe at all.
+        universe_list = selection.get('universe')
+        baseline_evaluated = selection.get('baseline_evaluated')
+        universe_count = selection.get('universe_count')
+        baseline_terminal_count = None
+        if universe_list is not None:
+            if universe_count is None:
+                universe_count = len(universe_list)
+            baseline_rows = self.cycle_progress(cycle_id, PHASE_BASELINE)
+            baseline_terminal_count = sum(
+                1 for row in baseline_rows.values()
+                if CandidateState(row["state"]) in FINAL_STATES
+                or CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE
+                and int(row.get("attempts") or 0) >= DEFAULT_MAX_ATTEMPTS)
+            if baseline_evaluated is None:
+                baseline_evaluated = baseline_terminal_count
+        # Root cause (status-reporting correction): baseline_evaluated
+        # above is, for a cycle shaped like Equity Radar's (deep_ids/
+        # shortlist_ids selection, no flat 'universe' list), a STATIC
+        # value written once at admission time (len(scan.candidates) --
+        # see global_opportunity_orchestration.py's save_selection calls),
+        # not a live count of BASELINE acquisition actually finishing.
+        # Reporting the BASELINE stage's progress from that static value
+        # (as the stage percentage below used to) shows 100% the instant
+        # the full universe is admitted, regardless of how much BASELINE
+        # evidence acquisition has genuinely completed. baseline_completed
+        # is therefore always reconstructed from the durable, per-
+        # instrument PHASE_BASELINE rows actually finished so far --
+        # unconditionally, not only for the ETF-onboarding 'universe' list
+        # shape above (which already happened to compute a live count by
+        # a different route and is left untouched: baseline_terminal_count
+        # is reused there instead of being recomputed twice).
+        if baseline_terminal_count is not None:
+            baseline_completed = baseline_terminal_count
+            baseline_rows_for_counts = baseline_rows
+        else:
+            baseline_rows_for_counts = self.cycle_progress(cycle_id, PHASE_BASELINE)
+            baseline_completed = sum(
+                1 for row in baseline_rows_for_counts.values()
+                if CandidateState(row["state"]) in FINAL_STATES
+                or CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE
+                and int(row.get("attempts") or 0) >= DEFAULT_MAX_ATTEMPTS)
+        # Baseline failures: a terminal/attempts-exhausted BASELINE row
+        # whose own payload did not record readiness (payload['ready'] is
+        # not truthy) or that has no payload at all (e.g. a restorable
+        # failure_reason-only row) -- distinct from baseline_completed,
+        # which counts every terminal row regardless of outcome.
+        baseline_failed = sum(
+            1 for row in baseline_rows_for_counts.values()
+            if (CandidateState(row["state"]) in FINAL_STATES
+                or CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE
+                and int(row.get("attempts") or 0) >= DEFAULT_MAX_ATTEMPTS)
+            and not ((row.get("payload") or {}).get("ready")))
+        # BASELINE state breakdown (Equity Radar progress-accounting
+        # follow-up, Part 2): baseline_completed/baseline_failed above are
+        # both terminal-only counts (CandidateState in FINAL_STATES, or
+        # RETRYABLE_FAILURE with attempts exhausted). They say nothing
+        # about a row that is RETRYABLE_FAILURE but has NOT yet exhausted
+        # its repair budget (the just-finished-first-pass BASELINE_INCOMPLETE
+        # case), nor about a row currently IN_PROGRESS, nor about an
+        # instrument with no BASELINE row at all (never yet claimed by a
+        # worker -- start() is what first writes a row, as IN_PROGRESS).
+        # Previously the frontend inferred all three as a single
+        # 'in progress' bucket via universe_count - baseline_completed -
+        # baseline_failed, which silently folded 'awaiting a bounded
+        # repair retry' into 'actively processing right now'. These three
+        # explicit counts let the UI partition the universe exactly,
+        # mirroring the existing DEEP-phase 'technical' field (ALL current
+        # RETRYABLE_FAILURE rows, exhausted or not) alongside
+        # deep_technical_failure (exhausted-only) -- same established
+        # pattern, now made available for BASELINE too, additive only:
+        # baseline_completed/baseline_failed keep their exact prior values
+        # and are not recomputed here.
+        baseline_in_progress = sum(
+            1 for row in baseline_rows_for_counts.values()
+            if CandidateState(row["state"]) == CandidateState.IN_PROGRESS)
+        baseline_awaiting_retry = sum(
+            1 for row in baseline_rows_for_counts.values()
+            if CandidateState(row["state"]) == CandidateState.RETRYABLE_FAILURE
+            and int(row.get("attempts") or 0) < DEFAULT_MAX_ATTEMPTS)
+        baseline_not_started = (None if universe_count is None else
+            max(universe_count - len(baseline_rows_for_counts), 0))
+
         ready = eligible = failed = 0
         deep_ready = deep_readiness_failed = deep_technical_failure = 0
         for row in terminal:
@@ -497,10 +599,87 @@ class CycleRunPersistenceMixin:
             deep_ready += int(is_ready)
             deep_readiness_failed += int(is_readiness_failed)
             deep_technical_failure += int(is_technical)
+        # The data-processing phase marker (BASELINE/CANDIDATE_SELECTION/DEEP)
+        # only ever advances forward while the cycle is actively running --
+        # once the durable run itself reaches a terminal status (set
+        # independently via update_cycle_run, e.g. a cycle that completes
+        # without ever recording deep_ids), that terminal status is the
+        # authoritative phase a caller should see, not whatever
+        # data-processing marker happened to be last recorded. Otherwise a
+        # completed cycle can be reconstructed as permanently "BASELINE".
+        phase = 'DEEP' if 'deep_ids' in selection else selection.get('phase', 'BASELINE')
+        if run.get('status') in ('COMPLETED', 'FAILED', 'CANCELLED'):
+            phase = run['status']
+
+        def _stage_percentage(completed: int, total: int | None) -> int | None:
+            # Deterministic and bounded: None (never fabricated) when the
+            # stage's scope is unknown or not yet applicable; otherwise an
+            # exact evidence ratio clamped to [0, 100]. Never derived from
+            # elapsed time or worker heartbeats.
+            if total is None:
+                return None
+            if total <= 0:
+                return 100
+            return max(0, min(100, round(100 * completed / total)))
+
+        deep_total = len(admitted) if admitted else None
+        # Distinct from deep_total/deep_denominator (the TRUE admitted
+        # count this cycle actually used): requested_shortlist_limit is
+        # only the shortlist_limit parameter the caller submitted (or its
+        # request-schema default), which the orchestrator deliberately
+        # does not apply once analysis_scope=FULL requests an unbounded,
+        # whole-universe deep pass (see global_opportunity_cycle.py's
+        # effective_shortlist_limit override). shortlist_limit_applied is
+        # a plain empirical comparison of the two -- never a re-derivation
+        # of that override rule -- so a caller can tell a genuinely-
+        # unbounded admission (2605 of 2605, by design) apart from a
+        # shortlist that should have been capped but wasn't. None when
+        # there is nothing yet to compare (no admission, or no requested
+        # limit on record), never a fabricated True/False.
+        parameters = run.get('parameters') or {}
+        analysis_scope = parameters.get('analysis_scope')
+        requested_shortlist_limit = parameters.get('shortlist_limit')
+        shortlist_limit_applied = (None if not admitted or requested_shortlist_limit is None
+                                    else len(admitted) <= requested_shortlist_limit)
+        stages = [
+            {"phase": PHASE_BASELINE, "completed": baseline_completed or 0, "total": universe_count,
+             "percentage": _stage_percentage(baseline_completed or 0, universe_count)},
+            {"phase": PHASE_DEEP, "completed": len(terminal), "total": deep_total,
+             "percentage": _stage_percentage(len(terminal), deep_total)},
+        ]
+        # Overall progress is a genuine evidence-weighted combination across
+        # every stage that has actually started or whose scope is known --
+        # the instant ANY applicable stage's scope is still unknown (not
+        # merely zero), overall stays None rather than reporting a number
+        # that silently ignores a stage nobody has measured yet. A terminal
+        # run status alone (COMPLETED/FAILED/CANCELLED) is therefore never
+        # sufficient on its own to report 100% -- that reading must still be
+        # earned by every stage's own completed/total evidence, and FAILED or
+        # CANCELLED never gets reported through this field as if it were a
+        # successful completion.
+        if run.get('status') in ('FAILED', 'CANCELLED') or any(s["percentage"] is None for s in stages):
+            overall_percentage = None
+        else:
+            known = [s for s in stages if s["total"] is not None and s["total"] > 0]
+            total_scope = sum(s["total"] for s in known)
+            overall_percentage = 100 if not known or total_scope <= 0 else \
+                max(0, min(100, round(100 * sum(s["completed"] for s in known) / total_scope)))
+
         return {
-            "phase": ('DEEP' if 'deep_ids' in selection else selection.get('phase', 'BASELINE')),
-            "baseline_evaluated": selection.get('baseline_evaluated'),
-            "universe_count": selection.get('universe_count'),
+            "phase": phase,
+            "baseline_evaluated": baseline_evaluated,
+            # Live, durable-row-derived progress -- distinct from
+            # baseline_evaluated (for Equity-shaped cycles, a static
+            # admitted/scheduled count set once at admission time; see
+            # the comment above). Never equals 100% merely because the
+            # full universe was admitted -- it reflects only rows that
+            # have actually reached a terminal/attempts-exhausted state.
+            "baseline_completed": baseline_completed,
+            "baseline_failed": baseline_failed,
+            "baseline_in_progress": baseline_in_progress,
+            "baseline_awaiting_retry": baseline_awaiting_retry,
+            "baseline_not_started": baseline_not_started,
+            "universe_count": universe_count,
             "deep_attempted": sum(int(row.get('attempts') or 0) > 0 for row in scoped),
             "deep_completed": len(terminal),
             "deep_denominator": len(admitted),
@@ -511,6 +690,11 @@ class CycleRunPersistenceMixin:
             "failed": failed,
             "technical": len(technical),
             "eligible": eligible,
+            "stages": stages,
+            "overall_percentage": overall_percentage,
+            "analysis_scope": analysis_scope,
+            "requested_shortlist_limit": requested_shortlist_limit,
+            "shortlist_limit_applied": shortlist_limit_applied,
         }
 
 
@@ -528,8 +712,8 @@ class CycleCheckpoint:
         self.max_attempts = max_attempts
         self._run_blocking = run_blocking
         self._progress: dict[tuple[str, str], dict[str, Any]] = {}
-        self.restored: dict[str, int] = {PHASE_BASELINE: 0, PHASE_DEEP: 0}
-        self.executed: dict[str, int] = {PHASE_BASELINE: 0, PHASE_DEEP: 0}
+        self.restored: dict[str, int] = {PHASE_BASELINE: 0, PHASE_DEEP: 0, PHASE_ETF_ONBOARD: 0}
+        self.executed: dict[str, int] = {PHASE_BASELINE: 0, PHASE_DEEP: 0, PHASE_ETF_ONBOARD: 0}
 
     async def _call(self, operation, *args, **kwargs):
         if self._run_blocking is not None:

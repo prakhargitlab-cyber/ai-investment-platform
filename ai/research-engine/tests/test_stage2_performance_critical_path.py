@@ -102,7 +102,7 @@ class _RecordingRuntime:
         return self.readiness
 
     async def ensure(self, instrument_id, *, jurisdiction, requirement_ids, identity_headers=None,
-                      correlation_id=None, wait_for_completion=True):
+                      correlation_id=None, wait_for_completion=True, timeout_seconds=None):
         from dataclasses import replace
         from app.research_readiness_runtime import TargetedEnsureResult
         self.ensure_calls.append(tuple(requirement_ids))

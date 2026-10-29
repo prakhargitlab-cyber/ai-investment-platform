@@ -556,3 +556,109 @@ class TestDerivedSupportingRequirementsAreVisible:
         by_requirement = {s.requirement: s for s in statuses}
         for requirement in ("HISTORICAL_RETURNS", "VOLATILITY", "DRAWDOWN", "INDEX_MOMENTUM"):
             assert by_requirement[requirement].status in {EtfReadinessStatus.READY_FRESH, EtfReadinessStatus.READY_STALE}
+
+
+class TestEtfReadinessNavAccessor:
+    """NAV is persisted via the dedicated EtfNavObservation evidence model
+    (store.etf_navs), not the generic EtfFact model (store.etf_facts) used
+    by every other SUPPORTING metric -- these tests prove readiness reads
+    NAV from the correct accessor rather than the one every other
+    supporting metric uses."""
+
+    def test_nav_fresh_ready(self, store):
+        """A fresh NAV observation (as_of today) reports READY_FRESH."""
+        listing = EtfListing(instrument_id=ID, isin="IN0000000001", symbol="NIFTYBEES",
+            name="Nifty BeES ETF", underlying_reference="Nifty 50", provenance=provenance())
+        store.save_etf_evidence(listing)
+
+        price = EtfFact(instrument_id=ID, metric=EtfMetric.MARKET_PRICE, value=Decimal("100"), unit="INR",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(price)
+
+        volume = EtfFact(instrument_id=ID, metric=EtfMetric.TRADING_VOLUME, value=Decimal("500000"), unit="shares",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(volume)
+
+        nav = EtfNavObservation(instrument_id=ID, nav=Decimal("100"), currency="INR",
+            nav_date=NOW.date(), provenance=provenance())
+        store.save_etf_evidence(nav)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        nav_status = next(s for s in statuses if s.requirement == "NAV")
+        assert nav_status.status == EtfReadinessStatus.READY_FRESH
+
+    def test_nav_stale_reports_stale_not_ready_fresh(self, store):
+        """A NAV observation older than the 1-day max age reports READY_STALE,
+        not READY_FRESH, and never MISSING -- an existing stale observation
+        is not discarded."""
+        listing = EtfListing(instrument_id=ID, isin="IN0000000001", symbol="NIFTYBEES",
+            name="Nifty BeES ETF", underlying_reference="Nifty 50", provenance=provenance())
+        store.save_etf_evidence(listing)
+
+        price = EtfFact(instrument_id=ID, metric=EtfMetric.MARKET_PRICE, value=Decimal("100"), unit="INR",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(price)
+
+        volume = EtfFact(instrument_id=ID, metric=EtfMetric.TRADING_VOLUME, value=Decimal("500000"), unit="shares",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(volume)
+
+        nav = EtfNavObservation(instrument_id=ID, nav=Decimal("100"), currency="INR",
+            nav_date=(NOW - timedelta(days=10)).date(), provenance=provenance())
+        store.save_etf_evidence(nav)
+
+        statuses, summary = evaluate_etf_readiness(store, ID)
+        nav_status = next(s for s in statuses if s.requirement == "NAV")
+        assert nav_status.status == EtfReadinessStatus.READY_STALE
+        assert summary.ready_for_analysis is True  # supporting, non-blocking either way
+
+    def test_nav_missing_reports_missing(self, store):
+        """No NAV observation at all reports MISSING (supporting, non-blocking)."""
+        listing = EtfListing(instrument_id=ID, isin="IN0000000001", symbol="NIFTYBEES",
+            name="Nifty BeES ETF", underlying_reference="Nifty 50", provenance=provenance())
+        store.save_etf_evidence(listing)
+
+        price = EtfFact(instrument_id=ID, metric=EtfMetric.MARKET_PRICE, value=Decimal("100"), unit="INR",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(price)
+
+        volume = EtfFact(instrument_id=ID, metric=EtfMetric.TRADING_VOLUME, value=Decimal("500000"), unit="shares",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(volume)
+
+        statuses, summary = evaluate_etf_readiness(store, ID)
+        nav_status = next(s for s in statuses if s.requirement == "NAV")
+        assert nav_status.status == EtfReadinessStatus.MISSING
+        assert summary.ready_for_analysis is True
+
+    def test_nav_found_with_no_corresponding_etf_facts_row(self, store):
+        """This is the regression case: a successfully acquired NAV
+        observation must be found via store.etf_navs even when no row for
+        NAV exists in etf_fact_observations (the table store.etf_facts
+        reads) -- proving readiness no longer silently misses NAV evidence
+        that acquisition actually persisted."""
+        listing = EtfListing(instrument_id=ID, isin="IN0000000001", symbol="NIFTYBEES",
+            name="Nifty BeES ETF", underlying_reference="Nifty 50", provenance=provenance())
+        store.save_etf_evidence(listing)
+
+        price = EtfFact(instrument_id=ID, metric=EtfMetric.MARKET_PRICE, value=Decimal("100"), unit="INR",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(price)
+
+        volume = EtfFact(instrument_id=ID, metric=EtfMetric.TRADING_VOLUME, value=Decimal("500000"), unit="shares",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(volume)
+
+        # Confirm, directly against the store, that no etf_facts row for
+        # NAV exists -- store.etf_facts is the accessor the pre-fix code
+        # used and would have found nothing through.
+        assert store.etf_facts(ID, EtfMetric.NAV) == []
+
+        nav = EtfNavObservation(instrument_id=ID, nav=Decimal("104.32"), currency="INR",
+            nav_date=NOW.date(), provenance=provenance())
+        store.save_etf_evidence(nav)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        nav_status = next(s for s in statuses if s.requirement == "NAV")
+        assert nav_status.status == EtfReadinessStatus.READY_FRESH
+        assert nav_status.provider == "NSE"

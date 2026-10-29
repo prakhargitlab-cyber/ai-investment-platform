@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from uuid import NAMESPACE_URL, UUID, uuid5
 from decimal import Decimal
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import re
 import logging
 
@@ -157,15 +157,28 @@ class PortfolioResearchOrchestrator:
             raise PortfolioServiceUnavailableError("Portfolio service unavailable for instrument enumeration") from exc
 
     async def sector_benchmark_contexts(self, instrument_ids: set[UUID], *, correlation_id=None, identity_headers=None):
-        """Read-only canonical dependencies, prepared before pure Stage-B computation."""
+        """Read-only canonical dependencies, prepared before pure Stage-B computation.
+
+        The /api/v1/instruments/benchmarks read below is wrapped in the same
+        (httpx.HTTPError, ValueError) -> PortfolioServiceUnavailableError contract as
+        every other portfolio-service read on this class (active_global_equities,
+        active_global_etfs, india_nifty500_universe): a transient portfolio-service
+        failure here must surface as the established, sanitized domain error, not an
+        unwrapped httpx exception reaching the opportunity-cycle worker's generic
+        failure handler.
+        """
         if not instrument_ids:
             return {}
         from app.sector_benchmarks import build_sector_contexts
         classifications = await self.india_nifty500_universe(correlation_id=correlation_id, identity_headers=identity_headers)
-        response = await self._client.get(f"{self.settings.portfolio_service_base_url}/api/v1/instruments/benchmarks",
-            headers={k:v for k,v in (identity_headers or {}).items() if v})
-        response.raise_for_status()
-        registered = response.json()
+        try:
+            response = await self._client.get(f"{self.settings.portfolio_service_base_url}/api/v1/instruments/benchmarks",
+                headers={k:v for k,v in (identity_headers or {}).items() if v})
+            response.raise_for_status()
+            registered = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            _log_portfolio_service_failure(logger, "sector_benchmark_contexts", "/api/v1/instruments/benchmarks", exc, correlation_id=correlation_id)
+            raise PortfolioServiceUnavailableError("Portfolio service unavailable for benchmark identity") from exc
         if not isinstance(registered, list):
             raise PortfolioServiceUnavailableError('BENCHMARK_IDENTITY_UNAVAILABLE')
         return build_sector_contexts(classifications, registered, instrument_ids)
@@ -533,6 +546,11 @@ class PortfolioResearchOrchestrator:
         if profile is None:
             return False
         _refresh_profile_from_global_instrument(profile, instrument)
+        if payload.get('listingDate'):
+            try:
+                profile.listing_date = date.fromisoformat(str(payload['listingDate']))
+            except ValueError:
+                pass  # Invalid metadata cannot move the historical coverage boundary.
         return True
 
     async def reconcile_global_profile(

@@ -1010,6 +1010,14 @@ def _wire_cancel_contract_api(monkeypatch, store, worker):
     monkeypatch.setattr(main, 'repository', worker.repository)
     monkeypatch.setattr(main, '_opportunity_worker', lambda: worker)
     monkeypatch.setattr(main.settings, 'research_opportunity_recovery_paused', False)
+    # These cancellation-contract tests exercise submit/coalesce/finalize
+    # behavior, not the LOCAL-only admission gate. Patch the gate so the
+    # POST /opportunities/cycles endpoint does not 503 RECOVERY_PAUSED before
+    # reaching the coalescing path under test. submit_manual_equity_async's
+    # own admission check is likewise bypassed: the test wires up an
+    # in-memory active cycle that must coalesce, not reject.
+    monkeypatch.setattr(main, '_manual_equity_enabled', lambda: True)
+    monkeypatch.setattr(worker, 'submit_manual_equity_async', worker.submit_async)
     # Exercise submission/state only. The ASGI transport does not start the
     # application lifespan, and this worker never launches a research runner.
     monkeypatch.setattr(worker, 'start', lambda: None)

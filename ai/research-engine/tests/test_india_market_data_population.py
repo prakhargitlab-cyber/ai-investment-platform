@@ -114,9 +114,20 @@ class _HistoricalProvider:
             raise RuntimeError("fixture provider failure")
         if symbol in self.empty_symbols:
             return []
+        # HistoricalPricePopulationService.populate() now discards any
+        # observation outside the requested [start, end) window (identity/
+        # fail-closed hardening -- see app.historical_market_data.
+        # HistoricalPricePopulationService.populate). This fixture's fixed
+        # "yesterday" default stays within that window for every call whose
+        # window reaches back that far, but a narrow incremental window that
+        # starts AFTER yesterday (e.g. a YEAR-capable series resuming from
+        # its own latest observed day) would have it silently discarded.
+        # Clamp forward to the window's start in that case so the returned
+        # observation is always genuinely within what was asked for.
+        observed_at = max(start, NOW - timedelta(days=1))
         return [MarketPriceObservation(
             instrument_id=UUID(instrument["globalInstrumentId"]),
-            observed_at=NOW - timedelta(days=1),
+            observed_at=observed_at,
             price=Decimal("100"),
             currency="INR",
             provider=self.provider_name,

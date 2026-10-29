@@ -1,6 +1,7 @@
 """ETF-2 tests: local SQLite and mocked transports only."""
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -104,6 +105,30 @@ async def test_timeout_is_technical(store):
     result = await EtfAcquisitionService(store, clock=lambda: NOW).discover_nse(client)
     assert result.outcome == Outcome.TECHNICAL_FAILURE
 
+@pytest.mark.asyncio
+async def test_discovery_sends_browser_identity_headers(store):
+    """NSE's archive host silently stalls (ReadTimeout) requests whose
+    User-Agent identifies a non-browser client, rather than returning an
+    explicit 403/429. discover_nse must identify itself as a browser on
+    every request, matching every other NSE-calling module in this codebase
+    (nse_etf_market.HEADERS, nse_historical_daily.HEADERS) and the already-
+    working portfolio-service Java client (OfficialNseEtfSecurityListClient)
+    against this identical URL.
+    """
+    captured = {}
+
+    def handler(request):
+        captured.update(request.headers)
+        return httpx.Response(200, text=CSV)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await EtfAcquisitionService(store, clock=lambda: NOW).discover_nse(client)
+
+    assert result.outcome == Outcome.SUCCESS_WITH_DATA
+    assert "user-agent" in captured
+    assert "python-httpx" not in captured["user-agent"].lower()
+    assert "mozilla" in captured["user-agent"].lower()
+
 
 @pytest.mark.parametrize("metric,value,unit", [
     (M.SUBTYPE, "DEBT", None), (M.ASSET_CLASS, "Debt", None), (M.BENCHMARK_INDEX, "Example Index", None),
@@ -205,10 +230,25 @@ def test_unavailable_requires_authoritative_declaration():
 
 
 def official_document(text):
+    text = "Scheme: Example fund\nISIN: IN0000000001\n" + text
     return ResearchDocument(instrument_id=ID, canonical_url="https://fund.example/factsheet", original_url="https://fund.example/factsheet",
         source_type="COMPANY_WEBSITE", source_classification="OFFICIAL_COMPANY", source_name="Fund",
-        content_type="text/html", document_type="HTML", normalized_text=text, content_hash="fixture",
+        content_type="text/html", document_type="HTML", normalized_text=text, content_hash=sha256(text.encode()).hexdigest(),
         status="PROCESSED", reliability_level="LEVEL_A", retrieved_at=NOW, source_mode="REAL")
+
+
+def acquire_fixture_document(store, text, metric):
+    from app.etf_document_discovery import OfficialDocumentRegistry, register_official_document
+    from app.etf_evidence import EtfListing
+    doc = official_document(text)
+    registry = OfficialDocumentRegistry()
+    register_official_document(ID, doc.original_url, registry=registry, canonical_url=doc.canonical_url,
+        source_name=doc.source_name, normalized_text_sha256=doc.content_hash, scheme_isin="IN0000000001",
+        approval_reference="offline-fixture-review", retrieved_at=NOW)
+    store.save_etf_evidence(EtfListing(instrument_id=ID, isin="IN0000000001", symbol="EXAMPLE",
+        name="Example fund", provenance=provenance()))
+    return EtfAcquisitionService(store, clock=lambda: NOW, document_registry=registry).acquire_official_document(
+        profile(known_domains=["fund.example"], isin="IN0000000001"), doc, metric)
 
 
 # INR AUM formats (tested separately below)
@@ -247,8 +287,7 @@ TEST_TER_FORMATS = [
 ]
 @pytest.mark.parametrize("metric,text,outcome,value", TEST_AUM_TER_FORMATS)
 def test_document_acquisition_distinguishes_missing_unsupported_and_failure(store, metric, text, outcome, value):
-    result = EtfAcquisitionService(store, clock=lambda: NOW).acquire_official_document(
-        profile(known_domains=["fund.example"]), official_document(text), metric)
+    result = acquire_fixture_document(store, text, metric)
     assert result.outcome == outcome
     rows = store.etf_facts(ID)
     if value is not None:
@@ -263,8 +302,7 @@ def test_document_acquisition_distinguishes_missing_unsupported_and_failure(stor
 @pytest.mark.parametrize("metric,text,outcome,value", TEST_AUM_INR_FORMATS)
 def test_inr_aum_formats(store, metric, text, outcome, value):
     """INR AUM parsing: ₹, INR, Rs, Rs. with crore/lakh scales."""
-    result = EtfAcquisitionService(store, clock=lambda: NOW).acquire_official_document(
-        profile(known_domains=["fund.example"]), official_document(text), metric)
+    result = acquire_fixture_document(store, text, metric)
     assert result.outcome == outcome
     rows = store.etf_facts(ID)
     if value is not None:
@@ -278,8 +316,7 @@ def test_inr_aum_formats(store, metric, text, outcome, value):
 @pytest.mark.parametrize("metric,text,outcome,value", TEST_TER_FORMATS)
 def test_ter_formats(store, metric, text, outcome, value):
     """TER/expense ratio parsing with explicit percentage."""
-    result = EtfAcquisitionService(store, clock=lambda: NOW).acquire_official_document(
-        profile(known_domains=["fund.example"]), official_document(text), metric)
+    result = acquire_fixture_document(store, text, metric)
     assert result.outcome == outcome
     rows = store.etf_facts(ID)
     if value is not None:

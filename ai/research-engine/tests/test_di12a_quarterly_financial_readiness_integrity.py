@@ -217,6 +217,7 @@ class _Repo:
 
 def _nse_quarterly_facts(profile):
     return [
+        *[_fact(profile, m, "80", p, "QUARTERLY") for p in ("2026-02-28", "2025-11-30") for m in ("revenue", "pat")],
         _fact(profile, "revenue", "100", "2026-08-31", "QUARTERLY"),
         _fact(profile, "pat", "12", "2026-08-31", "QUARTERLY"),
         _fact(profile, "eps", "5", "2026-08-31", "QUARTERLY"),
@@ -229,6 +230,7 @@ def _nse_quarterly_facts(profile):
 
 def _yahoo_quarterly_facts(profile):
     return [
+        *[_yahoo_fact(profile, m, "80", p, "QUARTERLY") for p in ("2026-02-28", "2025-11-30") for m in ("revenue", "pat")],
         _yahoo_fact(profile, "revenue", "100", "2026-08-31", "QUARTERLY"),
         _yahoo_fact(profile, "pat", "12", "2026-08-31", "QUARTERLY"),
         _yahoo_fact(profile, "eps", "5", "2026-08-31", "QUARTERLY"),

@@ -315,6 +315,36 @@ class OpportunityPersistenceMixin:
                 job["authoritative_progress"] = snapshot
         return list(latest.values())
 
+    def recent_opportunity_cycles(self, *, limit=20, market='NSE'):
+        """Bounded lifecycle discovery; checkpoint payloads stay on the status read.
+
+        Read the active slot separately so an older active run remains discoverable
+        even when it falls outside the recent-history window.
+        """
+        if not 1 <= limit <= 50:
+            raise ValueError('Cycle history limit must be between 1 and 50')
+
+        def summary(row):
+            value = dict(row)
+            parameters = json.loads(value.pop('parameters'))
+            value['analysis_scope'] = parameters.get('analysis_scope')
+            return value
+
+        columns = 'cycle_id, status, created_at, updated_at, error_code, parameters'
+        with self._connection:
+            rows = self._connection.execute(
+                f'SELECT {columns} FROM global_opportunity_cycle_run WHERE market = ? '
+                'ORDER BY created_at DESC, cycle_id DESC LIMIT ?', (market, limit)).fetchall()
+            active = self._connection.execute(
+                'SELECT ' + ', '.join('r.' + column.strip() for column in columns.split(',')) +
+                ' FROM global_opportunity_cycle_active a '
+                'JOIN global_opportunity_cycle_run r ON r.cycle_id = a.cycle_id '
+                'WHERE a.market = ? AND r.market = ? '
+                "AND r.status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED')",
+                (market, market)).fetchone()
+        return {'cycles': [summary(row) for row in rows],
+                'active_cycle': summary(active) if active is not None else None}
+
     def opportunity_job(self, cycle_id):
         """Return one cycle's status without rebuilding every cycle snapshot."""
         cycle_id = str(cycle_id)

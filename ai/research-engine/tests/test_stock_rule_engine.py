@@ -52,6 +52,7 @@ from app.stock_rule_engine import (
     StockRuleEngineInput,
     StockRuleEngineService,
     StockRuleEngineV1,
+    _fact_series,
     _structured_data,
 )
 
@@ -155,6 +156,69 @@ def _fact(metric: str, value, period: datetime, period_type: str = "ANNUAL") -> 
         f"filing:{period.date()}:{metric}",
         SourceMode.REAL,
     )
+
+
+def _labelled_unit_fact(metric: str, value, period: datetime, unit: str, period_type: str = "ANNUAL") -> FinancialFact:
+    """Like _fact(), but with an explicitly labelled (non-canonical) currency
+    unit such as "INR crore" instead of _pv()'s hardcoded "INR"."""
+    pv = ProvenancedValue(
+        value=value,
+        unit=unit,
+        as_of_date=period,
+        source_url="https://www.nseindia.com/filing.pdf",
+        source_name="NSE",
+        source_type="EXCHANGE_FILING",
+        published_at=period,
+        retrieved_at=NOW,
+        confidence=0.95,
+    )
+    return FinancialFact(
+        FinancialFactKey(INSTRUMENT_ID, metric, period.date().isoformat(), period_type, "CONSOLIDATED"),
+        pv,
+        FactSourceTier.OFFICIAL_NSE,
+        "NSE",
+        f"filing:{period.date()}:{metric}:{unit}",
+        SourceMode.REAL,
+    )
+
+
+def test_fact_series_normalizes_labelled_units_to_canonical_currency() -> None:
+    """Regression pin for the Group A fix's downstream composition.
+
+    app.repository.financial_facts_for{,_instruments} no longer wrap results
+    in normalize_financial_fact() (that wrap was an introduced regression
+    that double-scaled already-canonical facts). Removing it means raw
+    labelled-unit facts -- e.g. "INR crore" from an NSE filing -- now reach
+    app.stock_rule_engine unscaled. _fact_series is responsible for calling
+    normalize_financial_amount() itself at the point of use (see its
+    `from app.normalization import normalize_financial_amount` import at its
+    call site). This test pins that composition: a labelled-unit fact and
+    its canonical-unit equivalent must resolve to the same numeric value
+    through _fact_series, so a future change to either side cannot silently
+    reintroduce double-scaling or drop scaling entirely.
+    """
+    period = datetime(2026, 3, 31, tzinfo=timezone.utc)
+    canonical = _fact_series(
+        _inputs(facts=(_fact("revenue", Decimal("1750"), period),)), ("revenue",), "ANNUAL",
+    )
+    crore = _fact_series(
+        _inputs(facts=(_labelled_unit_fact("revenue", Decimal("1750"), period, "INR crore"),)),
+        ("revenue",), "ANNUAL",
+    )
+    lakh = _fact_series(
+        _inputs(facts=(_labelled_unit_fact("revenue", Decimal("175000"), period, "INR lakh"),)),
+        ("revenue",), "ANNUAL",
+    )
+    assert len(canonical) == 1 and len(crore) == 1 and len(lakh) == 1
+    # 1750 INR crore == 1750 * 10,000,000 plain INR == the canonical fixture's
+    # raw 1750 (both fixtures express the same real-world magnitude; _fact()'s
+    # hardcoded "INR" unit is treated as already being in absolute units).
+    assert crore[0].value == Decimal("1750") * Decimal("10000000")
+    assert crore[0].unit == "INR"
+    assert lakh[0].value == Decimal("175000") * Decimal("100000")
+    assert lakh[0].unit == "INR"
+    # Both labelled-unit variants normalize to the same absolute magnitude.
+    assert crore[0].value == lakh[0].value
 
 
 def _structured(**updates) -> StructuredMarketSnapshotRecord:
@@ -646,6 +710,27 @@ async def test_analysis_service_is_provider_free_non_held_safe_and_reuses_exact_
     assert second.cache_hit
     assert first.input_fingerprint == second.input_fingerprint
     assert first.overall_score == second.overall_score
+    assert repository.provider_calls == repository.portfolio_mutations == repository.watchlist_mutations == 0
+
+
+@pytest.mark.asyncio
+async def test_new_analysis_reuses_exact_rule_inputs_but_reassesses_changed_evidence_and_date():
+    inputs = _inputs()
+    repository = _CacheRepository(inputs)
+    first = await StockRuleEngineService(repository, _Metadata()).analyze(
+        inputs.profile, inputs.readiness, allow_partial=False, now=NOW)
+    # A separate analysis service can reuse the source-derived calculation.
+    service = StockRuleEngineService(repository, _Metadata())
+    reused = await service.analyze(inputs.profile, inputs.readiness, allow_partial=False, now=NOW)
+    assert reused.cache_hit
+    assert reused.input_fingerprint == first.input_fingerprint
+    repository.inputs = _inputs(structured=(_structured(trailingPE=17),))
+    changed = await service.analyze(inputs.profile, inputs.readiness, allow_partial=False, now=NOW)
+    assert not changed.cache_hit
+    assert changed.input_fingerprint != first.input_fingerprint
+    later = await service.analyze(inputs.profile, inputs.readiness, allow_partial=False, now=NOW + timedelta(days=1))
+    assert not later.cache_hit
+    assert later.input_fingerprint != changed.input_fingerprint
     assert repository.provider_calls == repository.portfolio_mutations == repository.watchlist_mutations == 0
 
 

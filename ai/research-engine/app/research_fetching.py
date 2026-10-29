@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import itertools
 import logging
 import time
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -19,7 +21,7 @@ from io import BytesIO
 
 from app.settings import Settings
 from app.url_security import validate_public_http_url
-from app.pdf_structure import PdfTextStructure, preserve_pdf_structure
+from app.pdf_structure import PdfTextStructure, extract_pdf_page_layout, preserve_pdf_structure
 from app import cycle_timing
 
 logger = logging.getLogger(__name__)
@@ -159,6 +161,13 @@ class HttpResearchFetcher:
         self._oversize_cache: "OrderedDict[str, tuple[float, int | None, int]]" = OrderedDict()
         self._oversize_cache_max = 256
         self._oversize_cache_ttl_seconds = 300.0
+        # Original bytes only, never reconstructed text. Bound total retention
+        # independently of document/structure caches and expire idle entries.
+        self._pdf_byte_cache: OrderedDict[str, tuple[float, NetworkFetchResult]] = OrderedDict()
+        self._pdf_byte_cache_lock = threading.Lock()
+        self._pdf_byte_cache_bytes = 0
+        self._pdf_byte_cache_max_bytes = _PDF_DOCUMENT_MAX_BYTES
+        self._pdf_byte_cache_ttl_seconds = 300.0
         # Track A — OOM mitigation: pypdf's PdfReader<->PageObject references
         # are cyclic, so CPython refcounting cannot reclaim them immediately
         # on ``del reader``. A targeted gc.collect() every N extractions breaks
@@ -172,6 +181,36 @@ class HttpResearchFetcher:
         # tests/test_gc_collect_measurement.py.
         self._gc_counter = itertools.count()
         self._gc_interval = settings.research_pdf_extraction_gc_interval
+
+    def cached_pdf_response(self, url: str) -> NetworkFetchResult | None:
+        from app.normalization import canonicalize_url
+        key = canonicalize_url(url)
+        with self._pdf_byte_cache_lock:
+            now = time.monotonic()
+            for old_key, (saved, response) in list(self._pdf_byte_cache.items()):
+                if now - saved >= self._pdf_byte_cache_ttl_seconds:
+                    self._pdf_byte_cache.pop(old_key)
+                    self._pdf_byte_cache_bytes -= len(response.content)
+            entry = self._pdf_byte_cache.get(key)
+            if entry is None:
+                return None
+            self._pdf_byte_cache.move_to_end(key)
+            return entry[1]
+
+    def _cache_pdf_response(self, response: NetworkFetchResult) -> None:
+        from app.normalization import canonicalize_url
+        if len(response.content) > self._pdf_byte_cache_max_bytes:
+            return
+        key = canonicalize_url(response.final_url)
+        with self._pdf_byte_cache_lock:
+            old = self._pdf_byte_cache.pop(key, None)
+            if old:
+                self._pdf_byte_cache_bytes -= len(old[1].content)
+            self._pdf_byte_cache[key] = (time.monotonic(), response)
+            self._pdf_byte_cache_bytes += len(response.content)
+            while self._pdf_byte_cache_bytes > self._pdf_byte_cache_max_bytes or len(self._pdf_byte_cache) > 16:
+                _, (_, evicted) = self._pdf_byte_cache.popitem(last=False)
+                self._pdf_byte_cache_bytes -= len(evicted.content)
 
     def _raise_if_known_oversize(self, url: str, max_bytes: int | None) -> None:
         if max_bytes is None:
@@ -584,12 +623,22 @@ class HttpResearchFetcher:
                     if effective_max_bytes is None and _is_pdf_content_type(response.headers.get("content-type")):
                         effective_max_bytes = _PDF_DOCUMENT_MAX_BYTES
                     if effective_max_bytes is not None and content_length is not None and content_length > effective_max_bytes:
+                        logger.info(
+                            "fetch_size_rejected host=%s path=%s configured_limit_bytes=%s declared_content_length=%s "
+                            "bytes_received=0 rejection_check=HEADER reason=DOCUMENT_SIZE_LIMIT_EXCEEDED",
+                            _safe_host(url), _safe_path(url), effective_max_bytes, content_length,
+                        )
                         raise DocumentSizeLimitExceeded(content_length, effective_max_bytes)
                     content_parts: list[bytes] = []
                     bytes_read = 0
                     async for chunk in response.aiter_bytes():
                         bytes_read += len(chunk)
                         if effective_max_bytes is not None and bytes_read > effective_max_bytes:
+                            logger.info(
+                                "fetch_size_rejected host=%s path=%s configured_limit_bytes=%s declared_content_length=%s "
+                                "bytes_received=%s rejection_check=STREAMING reason=DOCUMENT_SIZE_LIMIT_EXCEEDED",
+                                _safe_host(url), _safe_path(url), effective_max_bytes, content_length, bytes_read,
+                            )
                             raise DocumentSizeLimitExceeded(content_length, effective_max_bytes)
                         content_parts.append(chunk)
                     content = b"".join(content_parts)
@@ -704,6 +753,7 @@ class HttpResearchFetcher:
                 from pypdf.errors import PdfReadError as _PypdfReadError
                 reader = PdfReader(BytesIO(content))
                 extracted_pages: list[str] = []
+                page_layouts = []
                 for page in reader.pages:
                     # Bounded work (cooperative, between pages): see the
                     # `extraction_deadline_monotonic` docstring above --
@@ -720,7 +770,9 @@ class HttpResearchFetcher:
                         budget_exceeded = True
                         total_page_count_at_budget_exceeded = len(reader.pages)
                         break
-                    extracted_pages.append(page.extract_text() or "")
+                    page_text, page_layout = extract_pdf_page_layout(page)
+                    extracted_pages.append(page_text)
+                    page_layouts.append(page_layout)
                 if not budget_exceeded:
                     text = "\n".join(f"[PDF_PAGE {index}]\n{page}" for index, page in enumerate(extracted_pages, start=1))
             except _PypdfReadError as exc:
@@ -817,11 +869,8 @@ class HttpResearchFetcher:
                 extraction_status = "PDF_SCANNED_OCR_REQUIRED"
             # extracted_pages (the list of per-page strings) is no longer
             # needed after the scanned-PDF check above. The full ``text``
-            # string (built from these same pages) is already in FetchResult,
-            # and preserve_pdf_structure() builds its structures from ``text``
-            # (not from extracted_pages). Capture the page count we still
-            # need for metrics/FetchResult, then drop the list to release its
-            # memory before the FetchResult is constructed.
+            # string is already in FetchResult. Preserve the optional page
+            # layouts separately, then release the redundant per-page strings.
             page_count = len(extracted_pages)
             logger.info("radar_acquisition_count operation=pdf_parsed count=1")
             del extracted_pages
@@ -830,11 +879,8 @@ class HttpResearchFetcher:
                 response, document_bytes=document_bytes, page_count=page_count, worker_elapsed_ms=_elapsed_ms(started),
                 rss_before_kb=rss_before_kb, rss_after_kb=rss_after_kb, parse_outcome="SUCCESS",
             )
-        # bytes_read is computed from response.content, which is still held
-        # by the NetworkFetchResult. The caller in process_network_response_async
-        # releases the NetworkFetchResult via `del network_result` in repository.py
-        # (_run_official_filing_flight, line ~3090), which is the actual release
-        # point for the raw PDF bytes buffer.
+            self._cache_pdf_response(response)
+        # Only the worker/caller and the bounded recovery cache retain bytes.
         bytes_read = len(response.content)
         return FetchResult(
             final_url=response.final_url,
@@ -843,7 +889,9 @@ class HttpResearchFetcher:
             text=text,
             bytes_read=bytes_read,
             extraction_status=extraction_status,
-            pdf_structure=preserve_pdf_structure(text) if content_type == "application/pdf" else None,
+            pdf_structure=preserve_pdf_structure(text, page_layouts=tuple(page_layouts),
+                source_reference=response.final_url, content_hash=hashlib.sha256(content).hexdigest())
+                if content_type == "application/pdf" else None,
             page_count=page_count if content_type == "application/pdf" else None,
             extraction_elapsed_ms=_elapsed_ms(started) if content_type == "application/pdf" else None,
             rss_before_kb=rss_before_kb if content_type == "application/pdf" else None,

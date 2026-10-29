@@ -229,8 +229,16 @@ async def test_stage_b_bounded_queries(count, multiple):
     store._connection.set_trace_callback(queries.append)
     enriched = GlobalScanner(None, store).enrich_candidates(initial, sector_contexts=contexts)
     assert len(enriched) == count
-    assert len(queries) == 2 * count
-    assert all(sum(str(key) in query for key in ids) == 1 for query in queries)
+    # enrich_candidates eagerly loads NSE market schedules + calendar exceptions
+    # (2 extra SQL queries) when any candidate is on NSE/XNSE. With count=0
+    # there are no candidates, so no extra queries are issued.
+    expected_queries = 2 * count + (2 if count else 0)
+    assert len(queries) == expected_queries
+    # The first 2 queries (when count > 0) are the eagerly loaded NSE market
+    # schedules + calendar exceptions; they reference no instrument IDs. The
+    # remaining queries each load bars/observations for exactly one candidate.
+    bar_queries = queries[2:] if count else queries
+    assert all(sum(str(key) in query for key in ids) == 1 for query in bar_queries)
     assert all('SELECT' in q for q in queries)
 
 
@@ -306,6 +314,29 @@ async def test_metadata_adapter_is_batched_read_only():
         result = await obj.sector_benchmark_contexts({STOCK})
         assert result[STOCK].sector_mapping_status == 'AVAILABLE'
         assert len(requests) == obj.india_nifty500_universe.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_benchmark_identity_http_failure_raises_portfolio_service_unavailable():
+    # Regression: /api/v1/instruments/benchmarks used to be the one read on
+    # PortfolioResearchOrchestrator NOT wrapped in the class's own
+    # (httpx.HTTPError, ValueError) -> PortfolioServiceUnavailableError contract
+    # (unlike active_global_equities/active_global_etfs/india_nifty500_universe).
+    # A transient portfolio-service failure here used to escape as a raw httpx
+    # exception, which the opportunity-cycle worker's generic exception handler
+    # then persisted as an undifferentiated OPPORTUNITY_CYCLE_FAILED instead of
+    # the established, sanitized PortfolioServiceUnavailableError path every
+    # sibling method already uses.
+    from app.portfolio_orchestration import PortfolioResearchOrchestrator, PortfolioServiceUnavailableError
+    def handler(request):
+        assert request.url.path == '/api/v1/instruments/benchmarks'
+        return httpx.Response(503, json={'error': 'portfolio service unavailable'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        obj = PortfolioResearchOrchestrator(None, Settings(), client=client)
+        obj.india_nifty500_universe = AsyncMock(return_value=[classification()])
+        with pytest.raises(PortfolioServiceUnavailableError) as captured:
+            await obj.sector_benchmark_contexts({STOCK})
+        assert isinstance(captured.value.__cause__, httpx.HTTPStatusError)
 
 
 def test_india_market_benchmark_never_assigned_to_foreign_or_unknown_stock():

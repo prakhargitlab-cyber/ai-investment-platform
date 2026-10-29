@@ -285,7 +285,7 @@ def test_canonical_wins_on_disagreement_with_structured() -> None:
     )
 
     result = _append(
-        canonical_metadata={"sector": "Industrials"},
+        canonical_metadata={"sector": "Industrials", "verifiedAt": NOW.isoformat()},
         structured=structured,
         profile=profile,
     )
@@ -471,6 +471,83 @@ def test_no_additional_request_when_canonical_already_satisfies_readiness() -> N
     assert repository.provider_calls == 0
 
 
+# ---------------------------------------------------------------------------
+# 8. Canonical sector present without any timestamp field still wins.
+#    Regression test for DI-8B: _append_canonical_sector must NOT fall through
+#    to the structured-market fallback when canonical metadata carries a
+#    sector value but no recognizable timestamp (sectorVerifiedAt /
+#    verifiedAt / updatedAt / retrievedAt). The canonical sector is
+#    authoritative regardless of timestamp availability. An unknown age
+#    cannot establish fresh evidence or authorize a structured replacement.
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_sector_wins_without_timestamp_field() -> None:
+    """Unknown-age canonical metadata blocks lower-authority fresh evidence."""
+    profile = _profile()
+    structured = (
+        _structured_record_with_sector(profile, sector="Technology"),
+    )
+
+    result = _append(
+        canonical_metadata={"sector": "Industrials"},  # no timestamp field at all
+        structured=structured,
+        profile=profile,
+    )
+
+    assert result == []
+
+
+def test_canonical_sector_uses_sector_verified_at_when_present() -> None:
+    """When sectorVerifiedAt is present in canonical metadata, it is used as
+    the evidence timestamp (the most precise registry-provided timestamp)."""
+    profile = _profile()
+    verified_at = NOW - timedelta(minutes=30)
+    structured = (
+        _structured_record_with_sector(profile, sector="Technology"),
+    )
+
+    result = _append(
+        canonical_metadata={"canonicalSector": "Industrials", "sectorVerifiedAt": verified_at.isoformat()},
+        structured=structured,
+        profile=profile,
+    )
+
+    assert len(result) == 1
+    assert result[0].value_fingerprint == "Industrials"
+    assert result[0].retrieved_at == verified_at
+    assert result[0].as_of == verified_at
+
+
+def test_canonical_sector_uses_verified_at_when_present() -> None:
+    """When verifiedAt is present (but not sectorVerifiedAt), it is used."""
+    profile = _profile()
+    verified_at = NOW - timedelta(minutes=30)
+
+    result = _append(
+        canonical_metadata={"sector": "Industrials", "verifiedAt": verified_at.isoformat()},
+        structured=(),
+        profile=profile,
+    )
+
+    assert len(result) == 1
+    assert result[0].value_fingerprint == "Industrials"
+    assert result[0].retrieved_at == verified_at
+
+
+def test_canonical_sector_keeps_unknown_freshness_when_no_timestamp() -> None:
+    """Evaluation time must never masquerade as verification of the sector."""
+    profile = _profile()
+
+    result = _append(
+        canonical_metadata={"sector": "Industrials"},  # no timestamp at all
+        structured=(),
+        profile=profile,
+    )
+
+    assert result == []
+
+
 def test_append_canonical_sector_never_iterates_structured_when_canonical_present() -> None:
     """A stronger, implementation-level guarantee for scenario 7: prove the
     structured-market fallback branch is structurally unreachable once a
@@ -495,5 +572,4 @@ def test_append_canonical_sector_never_iterates_structured_when_canonical_presen
         profile=profile,
     )
 
-    assert len(result) == 1
-    assert result[0].value_fingerprint == "Industrials"
+    assert result == []

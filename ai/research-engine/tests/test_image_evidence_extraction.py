@@ -13,6 +13,7 @@ import subprocess
 
 import pytest
 from PIL import Image, ImageDraw
+from ocr_prerequisites import requires_image_ocr, requires_ocr_toolchain
 
 from app.image_evidence_extraction import (
     MAX_IMAGE_BYTES,
@@ -40,6 +41,7 @@ def _jpeg_with_text(text: str, size=(400, 120)) -> bytes:
     return buffer.getvalue()
 
 
+@requires_image_ocr
 def test_valid_png_extracts_real_text():
     result = extract_text_from_image(_png_with_text("HELLO EVIDENCE"), "image/png")
     assert result.status == "EXTRACTED"
@@ -47,6 +49,7 @@ def test_valid_png_extracts_real_text():
     assert result.content_hash  # provenance always present
 
 
+@requires_image_ocr
 def test_valid_jpeg_extracts_real_text():
     result = extract_text_from_image(_jpeg_with_text("SAMPLE TEXT"), "image/jpeg")
     assert result.status == "EXTRACTED"
@@ -89,6 +92,7 @@ def test_empty_file_is_rejected():
     assert result.reason == "EMPTY_FILE"
 
 
+@requires_image_ocr
 def test_blank_image_yields_truthful_empty_extraction_not_fabricated_text():
     blank = Image.new("RGB", (200, 80), color="white")
     buffer = io.BytesIO()
@@ -118,6 +122,7 @@ def test_ocr_process_failure_is_surfaced_truthfully(monkeypatch):
     assert result.reason == "OCR_PROCESS_FAILED"
 
 
+@requires_ocr_toolchain
 def test_scanned_pdf_with_no_text_layer_is_ocrd():
     png_bytes = _png_with_text("SCANNED PDF EVIDENCE")
     pdf_bytes = subprocess.run(
@@ -129,6 +134,7 @@ def test_scanned_pdf_with_no_text_layer_is_ocrd():
     assert result.page_count == 1
 
 
+@requires_ocr_toolchain
 def test_scanned_pdf_exceeding_max_pages_is_rejected_not_silently_truncated():
     png_bytes = _png_with_text("PAGE")
     pages = [png_bytes] * 6  # MAX_PDF_PAGES is 5
@@ -148,6 +154,7 @@ def test_scanned_pdf_exceeding_max_pages_is_rejected_not_silently_truncated():
     assert result.page_count == 6
 
 
+@requires_ocr_toolchain
 def test_invalid_pdf_bytes_are_rejected_truthfully():
     result = extract_text_from_scanned_pdf(b"not a pdf at all")
     assert result.status == "REJECTED"

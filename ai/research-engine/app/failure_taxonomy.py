@@ -37,9 +37,9 @@ PERMANENT_REASONS = frozenset({
     "DISCOVERY_ALL_CANDIDATES_REUSED_OR_UNSUPPORTED",
     "EVIDENCE_INSUFFICIENT_WITHIN_PLAN",
     "PRIMARY_FINANCIAL_PROVIDER_RETURNED_NO_FACTS",
-    # Exact, deterministic parser outcomes for the same source/content and
-    # parser version. Bare PARSER_FAILED, unknown subtypes and network failures
-    # remain technical; a composite containing any of them remains retryable.
+    # Deterministic for unchanged content/capability. Per-document receipts
+    # authorize a new bounded attempt after a capability/content/gap change;
+    # making this globally technical would retry the same parse indefinitely.
     "PARSER_FAILED:NO_SUPPORTED_FINANCIAL_FACTS",
     "PARSER_FAILED:NSE_SHAREHOLDING_XBRL_NO_SUPPORTED_VALUES",
     "NOT_APPLICABLE",

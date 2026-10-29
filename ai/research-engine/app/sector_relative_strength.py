@@ -124,7 +124,8 @@ class SectorRelativeStrengthEngine:
                 context: SectorContext | None = None, currency: str | None = None,
                 benchmark_histories: Mapping[UUID, Iterable[MarketPriceObservation]] | None = None,
                 trusted_providers: frozenset[str] | None = None,
-                daily_bar_histories: Mapping[UUID, Iterable[DailyMarketBar]] | None = None) -> SectorRelativeStrengthSnapshot:
+                daily_bar_histories: Mapping[UUID, Iterable[DailyMarketBar]] | None = None,
+                history_options=None) -> SectorRelativeStrengthSnapshot:
         cfg, context = self.config, context or SectorContext()
         histories = benchmark_histories or {}
         daily = daily_bar_histories or {}
@@ -139,7 +140,8 @@ class SectorRelativeStrengthEngine:
         if not classification_valid:
             result.missing_inputs.append("AUTHORITATIVE_SECTOR_CLASSIFICATION")
         stock_dates, stock_conflict, stock_stale, source = _dated_history(instrument_id, stock_history,
-            daily.get(instrument_id, ()), as_of, currency, trusted_providers, cfg.max_age_days, stock=True)
+            daily.get(instrument_id, ()), as_of, currency, trusted_providers, cfg.max_age_days, stock=True,
+            history_options=history_options)
         result.history_sources['stock'] = source
         if stock_stale:
             result.stale_inputs.append("STOCK_HISTORY")
@@ -231,8 +233,17 @@ class SectorRelativeStrengthEngine:
         return result
 
 
-def _dated_history(key, closes, bars, as_of, currency, providers, max_age, stock=False):
+def _dated_history(key, closes, bars, as_of, currency, providers, max_age, stock=False, history_options=None):
     """Keep daily DATEs intact; no timestamp shift, filling, or nearest-date match."""
+    if history_options:
+        from app.technical_features import select_price_history
+        history, _, daily, _ = select_price_history(key, closes, daily_bar_history=bars,
+            as_of=as_of, currency=currency, trusted_providers=providers, **history_options)
+        return ({day: float(row.close if daily else row.price)
+                 for day, row in zip(history.session_dates, history.observations)},
+                history.current_conflict or bool(history.missing_dates),
+                bool(history.observations) and (history.valid_until is None or as_of > history.valid_until),
+                'DAILY_MARKET_BAR_NSE' if daily else 'CLOSE_ONLY_FALLBACK')
     history, present = normalize_daily_history(key, bars, as_of=as_of, currency=currency, trusted_providers=providers)
     today = utc(as_of).astimezone(ZoneInfo('Asia/Kolkata')).date()
     stale = bool(history.observations) and today - history.observations[-1].trading_date > timedelta(days=max_age)

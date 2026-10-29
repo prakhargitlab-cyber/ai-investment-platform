@@ -1,4 +1,4 @@
-"""ETF_RULE_ENGINE_V1 tests: pure deterministic scoring, risk gates, and
+﻿"""ETF_RULE_ENGINE_V1 tests: pure deterministic scoring, risk gates, and
 recommendation derivation. No DB, no provider, no LLM -- hand-built fixtures
 only, mirroring the fixture style of tests/test_etf_readiness.py."""
 from datetime import date, datetime, timedelta, timezone
@@ -129,6 +129,40 @@ class TestScoreEtfFullEvidence:
         result = score_etf(self._full_input(nav=stale_nav))
         nav_factor = next(r for r in result.factor_results if r.factor == "NAV_PREMIUM_DISCOUNT")
         assert nav_factor.status == EtfFactorStatus.UNAVAILABLE
+
+    def test_nav_premium_discount_unavailable_reason_distinguishes_root_cause(self):
+        """Investigation regression (ETF-radar data-completeness review): a
+        NAV that is itself fresh (readiness-level READY_FRESH) does not
+        guarantee this factor can score -- it additionally requires a fresh
+        MARKET_PRICE dated on the exact same calendar day. NSE's NAV
+        publishing (nav_date, from the market-watch envelope's "navDate")
+        legitimately lags the live quote date ("as_of_date") until the
+        day's NAV computation completes -- a real timing gap, not a wiring
+        bug. The reason string must distinguish this case (and a plain
+        missing-NAV case) rather than collapsing every cause into one
+        undifferentiated code; status/availability must not change."""
+        # Case 1: NAV itself stale/missing (readiness-level gap).
+        stale_nav = EtfNavObservation(instrument_id=ID, nav=Decimal("100"), currency="INR",
+            nav_date=(NOW - timedelta(days=10)).date(), provenance=provenance(provider="AMC"))
+        result = score_etf(self._full_input(nav=stale_nav))
+        nav_factor = next(r for r in result.factor_results if r.factor == "NAV_PREMIUM_DISCOUNT")
+        assert nav_factor.status == EtfFactorStatus.UNAVAILABLE
+        assert nav_factor.reason == "NO_FRESH_NAV_EVIDENCE"
+
+        # Case 2: NAV is itself fresh (same freshness check readiness uses),
+        # but its nav_date genuinely differs from the fresh MARKET_PRICE's
+        # as_of_date -- the real-world NSE navDate-lag scenario.
+        fresh_but_lagging_nav = EtfNavObservation(instrument_id=ID, nav=Decimal("100"), currency="INR",
+            nav_date=(NOW - timedelta(days=1)).date(), provenance=provenance(provider="AMC"))
+        result = score_etf(self._full_input(nav=fresh_but_lagging_nav))
+        nav_factor = next(r for r in result.factor_results if r.factor == "NAV_PREMIUM_DISCOUNT")
+        assert nav_factor.status == EtfFactorStatus.UNAVAILABLE
+        assert nav_factor.reason == "NAV_AND_MARKET_PRICE_AS_OF_DATE_MISMATCH"
+
+        # Control: matching dates still scores exactly as before.
+        result = score_etf(self._full_input())
+        nav_factor = next(r for r in result.factor_results if r.factor == "NAV_PREMIUM_DISCOUNT")
+        assert nav_factor.status == EtfFactorStatus.SCORED
 
 
 class TestRiskGates:

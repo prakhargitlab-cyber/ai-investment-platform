@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from app.pdf_structure import SourceRegion
+from app.pdf_structure import PdfTextTable, SourceRegion
 
 PARSER_VERSION = "DI20C-1"
 
@@ -18,6 +18,7 @@ class FinancialColumn:
     group_evidence: tuple[SourceRegion, ...] = ()
     source_region: SourceRegion | None = None
     resolution_state: str = "LEGACY"
+    source_column: int | None = None  # one-based financial column in the PDF
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class FinancialStatementCandidate:
     header: HeaderResolution
     validation_state: str
     structural_fingerprint: str
+    table: PdfTextTable | None = None
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,26 @@ from test_stock_rule_engine import _readiness
 
 
 @pytest.mark.asyncio
+async def test_full_scope_admits_all_2605_instruments_independently_of_top_four(monkeypatch):
+    # The providers, readiness and rule engine are local fakes; no live Radar run.
+    service, rows, _, store, tracker = setup_acquisition(monkeypatch, count=2605)
+
+    async def read(key, **kwargs):
+        return replace(_readiness(), global_instrument_id=key)
+
+    service.readiness.read = read
+    try:
+        result = await service.run(rows, as_of=NOW, shortlist_limit=None, top_n=4)
+        assert result.universe_count == result.baseline_evaluated_count == 2605
+        assert result.deep_candidate_count == result.deep_attempted_count == 2605
+        assert result.rule_analyzed_count == 2605
+        assert len(tracker.baseline_calls) == 2605
+        assert len(result.top_n) == 4
+    finally:
+        store._connection.close()
+
+
+@pytest.mark.asyncio
 async def test_late_unready_nominee_reaches_rules_and_wins_despite_earlier_failure(monkeypatch):
     service, rows, pairs, _, tracker = setup_acquisition(monkeypatch, count=40)
     late = UUID(int=40)

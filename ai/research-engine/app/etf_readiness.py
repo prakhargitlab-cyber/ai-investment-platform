@@ -274,6 +274,39 @@ def _check_supporting_ready(store: SqliteResearchPersistence, instrument_id, met
     )
 
 
+def _check_nav_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
+    """NAV is persisted via the dedicated EtfNavObservation evidence model
+    (store.etf_navs), not the generic EtfFact model (store.etf_facts) that
+    _check_supporting_ready reads for every other ETC3_SUPPORTING metric --
+    route NAV separately so acquired NAV observations are actually seen."""
+    navs = store.etf_navs(instrument_id)
+
+    if not navs:
+        return EtfRequirementStatus(
+            requirement="NAV",
+            role="SUPPORTING",
+            applicability="APPLICABLE",
+            status=EtfReadinessStatus.MISSING,
+        )
+
+    nav = navs[0]
+    now = now or datetime.now(timezone.utc)
+    freshness = etf_freshness(nav, EtfMetric.NAV, now=now)
+
+    return EtfRequirementStatus(
+        requirement="NAV",
+        role="SUPPORTING",
+        applicability="APPLICABLE",
+        status=EtfReadinessStatus.READY_FRESH if freshness == "FRESH"
+               else EtfReadinessStatus.READY_STALE if freshness == "STALE"
+               else EtfReadinessStatus.MISSING,
+        evidence_id=nav.provenance.provider if nav.provenance else None,
+        provider=nav.provenance.provider if nav.provenance else None,
+        as_of_date=nav.nav_date,
+        freshness=freshness,
+    )
+
+
 # Derived price-history metrics (HISTORICAL_RETURNS/VOLATILITY/DRAWDOWN/
 # INDEX_MOMENTUM) have no EtfMetric/EtfFact evidence model of their own --
 # they are computed deterministically from DailyMarketBar, never acquired
@@ -417,6 +450,13 @@ def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id, *, n
     # requirement that silently matches none of these previously vanished
     # from the returned status list instead of being reported as missing.
     for metric in ETC3_SUPPORTING:
+        if metric == "NAV":
+            # NAV uses a dedicated evidence model (EtfNavObservation /
+            # store.etf_navs), not the generic EtfFact model that the
+            # EtfMetric(metric)/_check_supporting_ready branch below reads --
+            # route it separately rather than falling through that branch.
+            statuses.append(_check_nav_ready(store, instrument_id, now=now))
+            continue
         try:
             m = EtfMetric(metric)
             statuses.append(_check_supporting_ready(store, instrument_id, m, now=now))

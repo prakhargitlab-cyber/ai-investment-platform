@@ -1,0 +1,83 @@
+[
+  {
+    "fixture": "20microns_20250331.xml",
+    "sha256": "3fae7371073450de5d78cdd44f973967c9c519bd66bf215f630d7e7774ab3d82",
+    "bytes": 51982,
+    "metadata": {
+      "attFileSize": null,
+      "audited": "Audited",
+      "broadcast_Date": "23-May-2025 18:05:44",
+      "cmName": "20 Microns Limited",
+      "consolidated": "Consolidated",
+      "creation_Date": "23-May-2025 18:05:45",
+      "diff": "00:00:01",
+      "ixbrl": "https://nsearchives.nseindia.com/corporate/ixbrl/INTEGRATED_FILING_INDAS_93280_23052025180545_iXBRL_WEB.html",
+      "ixbrlFileSize": null,
+      "pdf_attach": "https://nsearchives.nseindia.com/corporate/20MICRONS_23052025180447_BseNseUpload.pdf",
+      "qe_Date": "31-MAR-2025",
+      "revised_Date": null,
+      "revision_Remark": null,
+      "seq_Id": "93280",
+      "smName": "20 Microns Limited",
+      "symbol": "20MICRONS",
+      "type": "Integrated Filing- Financials",
+      "type_Sub": "Original",
+      "xbrl": "https://nsearchives.nseindia.com/corporate/xbrl/INTEGRATED_FILING_INDAS_1448983_23052025060544_WEB.xml",
+      "xbrlFileSize": null
+    }
+  },
+  {
+    "fixture": "20microns_20250930.xml",
+    "sha256": "56f75c0847a4147495e1eae6d4a9576d564f4c70718fd96cffe461117f27654c",
+    "bytes": 51821,
+    "metadata": {
+      "attFileSize": "7.42 MB",
+      "audited": "Un-Audited",
+      "broadcast_Date": "07-Nov-2025 17:34:55",
+      "cmName": "20 Microns Limited",
+      "consolidated": "Consolidated",
+      "creation_Date": "07-Nov-2025 17:34:55",
+      "diff": "00:00:00",
+      "ixbrl": "https://nsearchives.nseindia.com/corporate/ixbrl/INTEGRATED_FILING_INDAS_125138_07112025173455_iXBRL_WEB.html",
+      "ixbrlFileSize": "72.10 KB",
+      "pdf_attach": "https://nsearchives.nseindia.com/corporate/20MICRONS_07112025173351_BseNseOutcomeUploadSept2025Sign.pdf",
+      "qe_Date": "30-SEP-2025",
+      "revised_Date": null,
+      "revision_Remark": null,
+      "seq_Id": "125138",
+      "smName": "20 Microns Limited",
+      "symbol": "20MICRONS",
+      "type": "Integrated Filing- Financials",
+      "type_Sub": "Original",
+      "xbrl": "https://nsearchives.nseindia.com/corporate/xbrl/INTEGRATED_FILING_INDAS_1568130_07112025053455_WEB.xml",
+      "xbrlFileSize": "50.61 KB"
+    }
+  },
+  {
+    "fixture": "20microns_20251231.xml",
+    "sha256": "9e0a1f2c64592ba68e6facdba2a6125e7da6ad00715d03310807470a296fadc6",
+    "bytes": 26195,
+    "metadata": {
+      "attFileSize": "0 Bytes",
+      "audited": "Un-Audited",
+      "broadcast_Date": "24-Jan-2026 17:39:07",
+      "cmName": "20 Microns Limited",
+      "consolidated": "Consolidated",
+      "creation_Date": "24-Jan-2026 17:39:13",
+      "diff": "00:00:06",
+      "ixbrl": "https://nsearchives.nseindia.com/corporate/ixbrl/INTEGRATED_FILING_INDAS_137288_24012026173913_iXBRL_WEB.html",
+      "ixbrlFileSize": "37.81 KB",
+      "pdf_attach": "https://nsearchives.nseindia.com/corporate/null",
+      "qe_Date": "31-DEC-2025",
+      "revised_Date": null,
+      "revision_Remark": null,
+      "seq_Id": "137288",
+      "smName": "20 Microns Limited",
+      "symbol": "20MICRONS",
+      "type": "Integrated Filing- Financials",
+      "type_Sub": "Original",
+      "xbrl": "https://nsearchives.nseindia.com/corporate/xbrl/INTEGRATED_FILING_INDAS_1609943_24012026053913_WEB.xml",
+      "xbrlFileSize": "25.58 KB"
+    }
+  }
+]

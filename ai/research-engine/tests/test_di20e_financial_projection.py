@@ -39,7 +39,7 @@ def test_zero_and_failed_parse_cannot_delete_even_with_complete_scope():
                                         frozenset({'ANNUAL'}), 'COMPLETE_FOR_SOURCE_SCOPE')
     assert repo._persistence.reconcile_financial_facts_for_source(doc.instrument_id, str(doc.document_id), [], complete_scopes=(scope,)) == 0
     assert repo._reconcile_persisted_official_financial_document(doc) == (False, 0)
-    assert repo.financial_facts_for(doc.instrument_id) == [old]
+    assert repo.persistence.load_financial_facts({doc.instrument_id}) == [old]
 
 
 def test_partial_row_upserts_without_deleting_missing_cell_or_other_family():
@@ -53,7 +53,7 @@ def test_partial_row_upserts_without_deleting_missing_cell_or_other_family():
     assert values(result, 'revenue') == [Decimal('101.01')]
     assert not result.scopes
     assert repo._reconcile_persisted_official_financial_document(doc)[0]
-    facts = repo.financial_facts_for(doc.instrument_id)
+    facts = repo.persistence.load_financial_facts({doc.instrument_id})
     assert old in facts and cash in facts and len(facts) == 3
 
 
@@ -71,7 +71,7 @@ def test_complete_scope_deletes_only_owned_obsolete_keys_in_exact_dates_basis_fa
     for fact in [obsolete, *outside]:
         repo._persistence.upsert_financial_fact(fact)
     assert repo._reconcile_persisted_official_financial_document(doc)[0]
-    facts = repo.financial_facts_for(doc.instrument_id)
+    facts = repo.persistence.load_financial_facts({doc.instrument_id})
     assert obsolete not in facts
     assert all(f in facts for f in outside)
 
@@ -82,7 +82,7 @@ def test_nonempty_without_explicit_scope_is_non_destructive():
     old = _document_fact(doc, 'revenue', '2026-03-31', 'QUARTERLY', 'STANDALONE', '777')
     repo._persistence.upsert_financial_fact(old)
     repo._persistence.reconcile_financial_facts_for_source(doc.instrument_id, str(doc.document_id), list(result.facts))
-    assert old in repo.financial_facts_for(doc.instrument_id)
+    assert old in repo.persistence.load_financial_facts({doc.instrument_id})
 
 
 @pytest.mark.parametrize('change', [
@@ -106,10 +106,10 @@ def test_weaker_source_cannot_overwrite_or_delete_stronger_facts():
     for fact in (stronger, obsolete_stronger):
         repo._persistence.upsert_financial_fact(fact)
     repo._reconcile_persisted_official_financial_document(doc)
-    persisted = next(f for f in repo.financial_facts_for(doc.instrument_id) if f.key == stronger.key)
+    persisted = next(f for f in repo.persistence.load_financial_facts({doc.instrument_id}) if f.key == stronger.key)
     assert persisted.value.value == Decimal('999')
     assert persisted.source_tier == FactSourceTier.OFFICIAL_REGULATORY
-    assert obsolete_stronger in repo.financial_facts_for(doc.instrument_id)
+    assert obsolete_stronger in repo.persistence.load_financial_facts({doc.instrument_id})
 
 
 def test_revenue_is_operations_only_never_total_income():
@@ -143,7 +143,7 @@ def test_accounting_parentheses_survive_projection_and_storage():
     doc = _document('Standalone Statement of Cash Flows (Rs. in Crore) Particulars Year ended '
                     '31.03.2026 31.03.2025 Net cash from operating activities (458.51) 741.70')
     assert repo._persist_official_financial_facts(doc)[0]
-    assert Decimal('-458.51') in [f.value.value for f in repo.financial_facts_for(doc.instrument_id)]
+    assert Decimal('-458.51') in [f.value.value for f in repo.persistence.load_financial_facts({doc.instrument_id})]
 
 
 def test_conflicting_statement_versions_are_not_first_wins():
@@ -156,6 +156,36 @@ def test_conflicting_statement_versions_are_not_first_wins():
 def test_duplicate_row_is_not_a_first_match_subtotal():
     _, result = projected(annual('Revenue from operations 101.01 90.02 Revenue from operations 999.99 900.09'))
     assert not values(result, 'revenue')
+
+
+def _balance_sheet(rows):
+    return 'Balance Sheet Particulars As at 31 March 2026 31 March 2025 ' + rows
+
+
+def test_total_equity_is_not_falsely_duplicated_by_total_equity_and_liabilities():
+    # "Total Equity" is a literal text-prefix of "Total Equity and
+    # Liabilities" -- a distinct, unrelated balance-sheet total that many
+    # NSE balance sheets also report. The duplicate-row guard previously
+    # counted that unrelated line as a second occurrence of this row's own
+    # label and suppressed the genuine total_equity fact (the ROE
+    # denominator) with a false DUPLICATE_METRIC_ROW.
+    _, result = projected(annual() + ' ' + _balance_sheet(
+        'Total Assets 500.00 450.00 Total Equity 120.00 110.00 '
+        'Total Equity and Liabilities 500.00 450.00 '
+        'Total Liabilities 380.00 340.00'))
+    assert Decimal('120.00') in values(result, 'total_equity')
+    assert not any(d.startswith('DUPLICATE_METRIC_ROW:total_equity') for d in result.diagnostics)
+
+
+def test_total_equity_genuine_duplicate_is_still_detected():
+    # A real repeated "Total Equity" row (e.g. a restated/duplicated table)
+    # must still be suppressed -- the fix only excludes the unrelated
+    # "...and Liabilities" line, not genuine repetition of this row.
+    _, result = projected(annual() + ' ' + _balance_sheet(
+        'Total Assets 500.00 450.00 Total Equity 120.00 110.00 '
+        'Total Liabilities 380.00 340.00 Total Equity 999.99 900.09'))
+    assert not values(result, 'total_equity')
+    assert any(d.startswith('DUPLICATE_METRIC_ROW:total_equity') for d in result.diagnostics)
 
 
 def test_bare_semantic_facts_without_row_evidence_cannot_be_persisted():
@@ -209,7 +239,7 @@ def test_failure_during_deletion_rolls_back_upserts_and_deletions():
     with pytest.raises(RuntimeError, match='delete failure'):
         repo._reconcile_persisted_official_financial_document(doc)
     repo._persistence._connection = connection
-    assert {f.key: f.value.value for f in repo.financial_facts_for(doc.instrument_id)} == {f.key: f.value.value for f in prior}
+    assert {f.key: f.value.value for f in repo.persistence.load_financial_facts({doc.instrument_id})} == {f.key: f.value.value for f in prior}
 
 
 def test_ncc_march_durable_identity_values_and_partial_investing_preservation():
@@ -226,11 +256,21 @@ def test_ncc_march_durable_identity_values_and_partial_investing_preservation():
         ('CONSOLIDATED', 'ANNUAL'): ('20823.00', '723.96', '10.76'),
     }
     repo._persist_official_financial_facts(doc)
-    facts = {f.key: f for f in repo.financial_facts_for(doc.instrument_id)}
+    facts = {f.key: f for f in repo.persistence.load_financial_facts({doc.instrument_id})}
     for (basis, kind), numbers in expected.items():
         for metric, number in zip(('revenue', 'pat', 'eps'), numbers):
             key = _document_fact(doc, metric, '2026-03-31', kind, basis, number).key
             assert facts[key].value.value == Decimal(number)
+    # Consumers see base currency, while the source-owned durable audit values
+    # above retain their reported scale. Per-share values must never be scaled.
+    normalized = {f.key: f for f in repo.financial_facts_for(doc.instrument_id)}
+    for key, fact in facts.items():
+        if fact.value.unit == "INR crore":
+            assert normalized[key].value.value == fact.value.value * Decimal("10000000")
+            assert normalized[key].value.unit == "INR"
+            assert "source_unit=INR crore" in normalized[key].value.calculation_basis
+        elif key.metric == "eps":
+            assert normalized[key].value.value == fact.value.value
 
 
 def test_ncc_june_zero_output_preserves_historical_source_facts():
@@ -239,7 +279,7 @@ def test_ncc_june_zero_output_preserves_historical_source_facts():
     old = _document_fact(doc, 'eps', '2026-06-30', 'QUARTERLY', 'STANDALONE', '5315.71')
     repo._persistence.upsert_financial_fact(old)
     assert repo._reconcile_persisted_official_financial_document(doc) == (False, 0)
-    assert repo.financial_facts_for(doc.instrument_id) == [old]
+    assert repo.persistence.load_financial_facts({doc.instrument_id}) == [old]
 
 
 def test_irfc_eps_values_are_proven_diluted_cells():
@@ -267,9 +307,9 @@ def test_idempotence_and_complete_transaction_rollback(monkeypatch):
     monkeypatch.setattr(repo._persistence, '_write_financial_fact', fail_second)
     with pytest.raises(RuntimeError, match='injected failure'):
         repo._reconcile_persisted_official_financial_document(doc)
-    assert repo.financial_facts_for(doc.instrument_id) == [old]
+    assert repo.persistence.load_financial_facts({doc.instrument_id}) == [old]
     monkeypatch.setattr(repo._persistence, '_write_financial_fact', original)
     assert repo._reconcile_persisted_official_financial_document(doc)[1] > 0
-    before = repo.financial_facts_for(doc.instrument_id)
+    before = repo.persistence.load_financial_facts({doc.instrument_id})
     assert repo._reconcile_persisted_official_financial_document(doc) == (True, 0)
-    assert repo.financial_facts_for(doc.instrument_id) == before
+    assert repo.persistence.load_financial_facts({doc.instrument_id}) == before

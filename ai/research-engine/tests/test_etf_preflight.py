@@ -154,6 +154,139 @@ async def test_controlled_endpoint_uses_durable_worker_and_pause(repo, monkeypat
     submit.assert_awaited_once_with({'top_n': None, 'candidate_ids': [str(ID)], 'verify_canonical_candidates': True})
 
 
+def _paused_controlled_cycle_request():
+    from starlette.requests import Request
+    return Request({'type': 'http', 'headers': [(k.lower().encode(), v.encode()) for k, v in ADMIN.items()]})
+
+
+async def _run_controlled_cycle(repo, monkeypatch, *, environment, scheduler_enabled, manual_enabled,
+                                 full_universe_enabled=False):
+    """Shared harness for the bounded-manual-execution authorization matrix
+    below: wires a mocked worker exposing BOTH submit_async and
+    submit_manual_etf_async, drives /controlled-cycles with the given
+    settings, and returns (response_or_exception, submit_async_mock,
+    submit_manual_etf_async_mock) so each test asserts exactly which one
+    (if either) was actually invoked."""
+    import app.main as main
+    import app.etf_ingestion as module
+    await ingest(repo)
+    original = module.etf_preflight
+    monkeypatch.setattr(module, 'etf_preflight', lambda store, rows: original(store, rows, now=NOW))
+    monkeypatch.setattr(main, 'repository', repo)
+    monkeypatch.setattr(main, 'portfolio_orchestrator', SimpleNamespace(global_instrument_metadata=AsyncMock(return_value=META)))
+    submit_async = AsyncMock(return_value={'cycle_id': str(UUID(int=90)), 'status': 'ACCEPTED'})
+    submit_manual = AsyncMock(return_value={'cycle_id': str(UUID(int=91)), 'status': 'ACCEPTED'})
+    monkeypatch.setattr(main, '_etf_radar_worker',
+        lambda: SimpleNamespace(submit_async=submit_async, submit_manual_etf_async=submit_manual))
+    monkeypatch.setattr(main.settings, 'research_opportunity_recovery_paused', True)
+    monkeypatch.setattr(main.settings, 'environment', environment)
+    monkeypatch.setattr(main.settings, 'research_opportunity_scheduler_enabled', scheduler_enabled)
+    monkeypatch.setattr(main.settings, 'research_etf_manual_execution_enabled', manual_enabled)
+    monkeypatch.setattr(main.settings, 'research_etf_full_universe_execution_enabled', full_universe_enabled)
+    request = _paused_controlled_cycle_request()
+    try:
+        response = await main.controlled_etf_cycle(main.EtfEvidenceRequest(instrument_ids=[ID]), request)
+    except HTTPException as exc:
+        response = exc
+    return response, submit_async, submit_manual
+
+
+@pytest.mark.asyncio
+async def test_controlled_cycle_manual_gate_admits_bounded_execution_while_paused(repo, monkeypatch):
+    """Positive case: LOCAL environment, scheduler disabled, manual flag
+    enabled -- a controlled (explicit-candidate) ETF cycle is admitted
+    through the worker's own BOUNDED manual-admission path even though the
+    scheduler is paused, exactly mirroring Equity's existing LOCAL-only
+    manual-execution design. The generic submit_async path must NOT be
+    used for this authorized paused submission."""
+    response, submit_async, submit_manual = await _run_controlled_cycle(
+        repo, monkeypatch, environment='LOCAL', scheduler_enabled=False, manual_enabled=True)
+    assert not isinstance(response, HTTPException)
+    assert response.status_code == 202
+    submit_manual.assert_awaited_once_with(
+        {'top_n': None, 'candidate_ids': [str(ID)], 'verify_canonical_candidates': True})
+    submit_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_controlled_cycle_rejects_paused_execution_when_manual_flag_disabled(repo, monkeypatch):
+    """Negative case: the deployed flag stays false -> paused execution
+    remains rejected, exactly as before this gate existed."""
+    response, submit_async, submit_manual = await _run_controlled_cycle(
+        repo, monkeypatch, environment='LOCAL', scheduler_enabled=False, manual_enabled=False)
+    assert isinstance(response, HTTPException) and response.status_code == 503
+    assert response.detail == 'RECOVERY_PAUSED'
+    submit_async.assert_not_called()
+    submit_manual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_controlled_cycle_rejects_paused_execution_outside_local_environment(repo, monkeypatch):
+    """Negative case: every other precondition satisfied, but the
+    environment is not LOCAL -- paused execution remains rejected."""
+    response, submit_async, submit_manual = await _run_controlled_cycle(
+        repo, monkeypatch, environment='PRODUCTION', scheduler_enabled=False, manual_enabled=True)
+    assert isinstance(response, HTTPException) and response.status_code == 503
+    assert response.detail == 'RECOVERY_PAUSED'
+    submit_async.assert_not_called()
+    submit_manual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_controlled_cycle_rejects_paused_execution_when_scheduler_enabled(repo, monkeypatch):
+    """Negative case: the scheduler being enabled blocks the manual override
+    even with LOCAL environment and the flag enabled."""
+    response, submit_async, submit_manual = await _run_controlled_cycle(
+        repo, monkeypatch, environment='LOCAL', scheduler_enabled=True, manual_enabled=True)
+    assert isinstance(response, HTTPException) and response.status_code == 503
+    assert response.detail == 'RECOVERY_PAUSED'
+    submit_async.assert_not_called()
+    submit_manual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_controlled_cycle_full_universe_flag_never_authorizes_bounded_execution(repo, monkeypatch):
+    """Cross-check (the reverse of the existing full-universe-side
+    isolation test): enabling ONLY the full-universe flag must never admit
+    a bounded controlled-cycle submission while paused -- the two scopes
+    stay independently authorizable."""
+    response, submit_async, submit_manual = await _run_controlled_cycle(
+        repo, monkeypatch, environment='LOCAL', scheduler_enabled=False, manual_enabled=False,
+        full_universe_enabled=True)
+    assert isinstance(response, HTTPException) and response.status_code == 503
+    assert response.detail == 'RECOVERY_PAUSED'
+    submit_async.assert_not_called()
+    submit_manual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_reports_manual_execution_authorized_flag(repo, monkeypatch):
+    """The preflight response itself exposes manual_execution_authorized so
+    a caller (or the UI) can distinguish 'paused, no override' from 'paused,
+    override active' without inferring it from a 503 vs 202 outcome."""
+    import app.main as main
+    import app.etf_ingestion as module
+    await ingest(repo)
+    original = module.etf_preflight
+    monkeypatch.setattr(module, 'etf_preflight', lambda store, rows: original(store, rows, now=NOW))
+    monkeypatch.setattr(main, 'repository', repo)
+    monkeypatch.setattr(main, 'portfolio_orchestrator', SimpleNamespace(global_instrument_metadata=AsyncMock(return_value=META)))
+    monkeypatch.setattr(main.settings, 'research_opportunity_recovery_paused', True)
+    monkeypatch.setattr(main.settings, 'research_opportunity_scheduler_enabled', False)
+    monkeypatch.setattr(main.settings, 'environment', 'LOCAL')
+    monkeypatch.setattr(main.settings, 'research_etf_manual_execution_enabled', False)
+    request = _paused_controlled_cycle_request()
+    blocked = await main._controlled_etf_preflight([ID], request)
+    assert blocked['recovery_paused'] is True
+    assert blocked['manual_execution_authorized'] is False
+    assert blocked['can_submit'] is False
+    monkeypatch.setattr(main.settings, 'research_etf_manual_execution_enabled', True)
+    authorized = await main._controlled_etf_preflight([ID], request)
+    assert authorized['recovery_paused'] is True
+    assert authorized['manual_execution_authorized'] is True
+    assert authorized['can_submit'] is True
+
+
 @pytest.mark.asyncio
 async def test_worker_close_exits_when_cleanup_consumes_cancellation(repo, monkeypatch):
     worker = OpportunityCycleWorker(repo, AsyncMock(), market='ETF')

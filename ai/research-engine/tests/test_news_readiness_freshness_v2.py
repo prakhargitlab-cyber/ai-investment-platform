@@ -48,7 +48,15 @@ def valuation_fixture():
     for key in ('trailingEps','bookValue'):
         record.snapshot.facts[key]=record.snapshot.facts[key].model_copy(update={
             'as_of_date':NOW-timedelta(days=75),'retrieved_at':NOW-timedelta(days=7)})
-    price=_prices(1)[0].model_copy(update={'price':Decimal('200'),'observed_at':NOW,'retrieved_at':NOW})
+    # _prices()'s shared fixture URL ends in "/history" (a genuine Yahoo
+    # daily-history page, used elsewhere to represent an actual historical
+    # series). app.session_history.is_daily_history now excludes such rows
+    # from "latest usable price" evidence (RepositoryResearchReadinessAdapter
+    # ._append_market_observations), which is correct for a real daily-bar
+    # provenance URL but wrong for this fixture's intent: a single current
+    # quote. Use a plain Yahoo quote URL (no "/history") to match that intent.
+    price=_prices(1)[0].model_copy(update={'price':Decimal('200'),'observed_at':NOW,'retrieved_at':NOW,
+        'source_url':'https://finance.yahoo.com/quote/DET.NS'})
     return record,price
 
 

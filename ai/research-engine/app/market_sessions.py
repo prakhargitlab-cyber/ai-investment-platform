@@ -73,6 +73,8 @@ def _session_bounds(market, schedules, exceptions, day):
     exception = next((e for e in exceptions if e.market_code.upper() == first.market_code.upper() and e.trading_date == day), None)
     if exception and exception.exception_type == "CLOSED":
         return None
+    if exception and exception.exception_type == "SPECIAL_SESSION" and (exception.open_time is None or exception.close_time is None):
+        return None
     schedule = next((s for s in matches if s.trading_day == day.weekday()), None)
     if schedule is None and not (exception and exception.exception_type == "SPECIAL_SESSION"):
         return None
@@ -122,3 +124,42 @@ def price_session_valid_until(
     if session is None or abs((session - observation_as_of).total_seconds()) > 15 * 60:
         return None
     return next_session_open(market, schedules, exceptions, session)
+
+
+def session_bounds(market, schedules, exceptions, day):
+    """The configured exchange session for a DATE, including exceptions."""
+    return _session_bounds(market, schedules, exceptions, day)
+
+
+def completed_sessions(market, schedules, exceptions, start, end, as_of):
+    """Actual configured sessions only; end is inclusive, no candle filling."""
+    day = start
+    while day <= end:
+        bounds = session_bounds(market, schedules, exceptions, day)
+        if bounds and bounds[1] <= as_of:
+            yield day, bounds[1]
+        day += timedelta(days=1)
+
+
+def unresolved_session_dates(market, schedules, exceptions, start, as_of):
+    """Known trading dates with unverified hours cannot imply closed sessions."""
+    matches = [s for s in schedules if s.enabled and market.upper() in {s.market_code.upper(), (s.mic or '').upper()}]
+    if not matches:
+        return ()
+    try:
+        end = as_of.astimezone(ZoneInfo(matches[0].timezone)).date()
+    except (ValueError, ZoneInfoNotFoundError):
+        return ()
+    return tuple(sorted(e.trading_date for e in exceptions
+        if e.market_code.upper() == matches[0].market_code.upper()
+        and e.exception_type == 'SPECIAL_SESSION'
+        and (e.open_time is None or e.close_time is None)
+        and start <= e.trading_date <= end))
+
+
+def next_session_close(market, schedules, exceptions, after):
+    for offset in range(16):
+        bounds = session_bounds(market, schedules, exceptions, after.date() + timedelta(days=offset))
+        if bounds and bounds[1] > after:
+            return bounds[1]
+    return None

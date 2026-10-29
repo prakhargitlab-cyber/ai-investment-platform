@@ -208,9 +208,15 @@ def test_growth_facts_ready_only_when_all_four_inputs_genuinely_covered():
     # and NOW is 2026-09-10) so this test isolates coverage completeness
     # from freshness staleness -- a separate, already-correct axis.
     full_facts = quarterly_only + [
+        # ANNUAL_CAGR_INPUTS requires ANNUAL_CAGR_MIN_PERIODS (3) annual
+        # periods -- matching stock_rule_engine._series_cagr's own minimum
+        # for computing a CAGR -- so three distinct annual periods are
+        # needed here, not two, to reach READY_FRESH.
         _fact(profile, "revenue", "360", "2026-08-31", "ANNUAL", unit="INR"),
+        _fact(profile, "revenue", "330", "2026-07-01", "ANNUAL", unit="INR"),
         _fact(profile, "revenue", "300", "2026-05-20", "ANNUAL", unit="INR"),
         _fact(profile, "eps", "18", "2026-08-31", "ANNUAL", unit="INR per share"),
+        _fact(profile, "eps", "16", "2026-07-01", "ANNUAL", unit="INR per share"),
         _fact(profile, "eps", "15", "2026-05-20", "ANNUAL", unit="INR per share"),
     ]
     full_repo = _Repo(profile, facts=full_facts)
@@ -257,7 +263,9 @@ def test_kpigreen_shaped_nse_fixture_produces_all_four_growth_facts_inputs_per_b
     # As above: period markers stay inside GROWTH_FACTS's 120-day freshness
     # window so this test isolates coverage completeness from freshness.
     quarters = ["2026-08-31", "2026-07-15", "2026-06-01"]
-    years = ["2026-08-31", "2026-05-20"]
+    # ANNUAL_CAGR_INPUTS requires ANNUAL_CAGR_MIN_PERIODS (3) annual
+    # periods -- matching stock_rule_engine._series_cagr's own minimum.
+    years = ["2026-08-31", "2026-07-01", "2026-05-20"]
     facts = []
     for basis in ("CONSOLIDATED", "STANDALONE"):
         for i, q in enumerate(quarters):

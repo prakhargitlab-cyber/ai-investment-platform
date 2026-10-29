@@ -5,7 +5,7 @@ from uuid import UUID
 import httpx
 import pytest
 from app.cycle_checkpoint import CycleCheckpoint, CycleOwnershipLost
-from app.etf_full_universe import run_full_etf_cycle, reconcile, peer_results
+from app.etf_full_universe import run_full_etf_cycle, reconcile, peer_results, _ensure_etf_history
 from app.etf_evidence import EtfAcquisitionAttempt, EtfAcquisitionOutcome, EtfProvenance, EtfAuthority
 from app.etf_acquisition import parse_nse_etf_list
 from test_etf_ingestion import repo, META, NOW
@@ -41,9 +41,15 @@ async def test_complete_fixture_coverage(repo,size):
         return httpx.Response(200,json=dict(symbol=symbol,isin=row['isin'],isETFSec='true',isDelisted='false',
             isSuspended='false',activeSeries=['EQ'],marketType='N'))
     cp=await checkpoint(repo)
+    # No-op history acquirer: this test is about BASELINE/identity/NAV
+    # coverage, not Yahoo history acquisition -- avoid a real network call.
+    async def history_acquirer(repository,row,*,now,checkpoint):
+        return await _ensure_etf_history(repository,row,now=now,checkpoint=checkpoint,
+            provider=SimpleNamespace(closes=AsyncMock(return_value=[])))
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result=await run_full_etf_cycle(repo,SimpleNamespace(active_global_etfs=AsyncMock(return_value=rows)),
-            checkpoint=cp,cycle_id=cp.cycle_id,identity_headers={},client=client,clock=lambda:NOW,sleep=AsyncMock())
+            checkpoint=cp,cycle_id=cp.cycle_id,identity_headers={},client=client,clock=lambda:NOW,sleep=AsyncMock(),
+            history_acquirer=history_acquirer)
     saved=repo.persistence.etf_radar_cycle(cp.cycle_id)
     assert result['coverage']['official']==result['coverage']['attempted']==result['coverage']['acquired']==size
     assert len(saved['outcomes'])==len(saved['candidates'])==size
@@ -51,8 +57,59 @@ async def test_complete_fixture_coverage(repo,size):
     assert saved['coverage']['evaluated']==size and saved['coverage']['eligible']==0
     assert saved['coverage']['analysis_incomplete']==size and saved['coverage']['unclassified']==size
     assert saved['excluded_by_reason']=={'UNVERIFIED_PEER_CLASSIFICATION':size}
-    assert len(calls)==size+2 and len(cp._progress)==size
+    assert len(calls)==size+2
+    # Each identity-resolved instrument now has both a BASELINE and an
+    # independent ETF_ONBOARD (history) checkpoint row (Workstream 1).
+    assert len(cp._progress)==size*2
+    assert all(cp._progress[('ETF_ONBOARD',r['isin'])]['disposition']=='SUCCESS_EMPTY' for r in rows)
     assert repo.persistence.active_cycle_run('NSE') is None
+
+
+@pytest.mark.asyncio
+async def test_full_universe_list_request_sends_browser_identity_headers(repo):
+    """Regression for the Full ETF Radar's silent NSE_ETF_LIST_URL ReadTimeout.
+
+    NSE's archive host silently stalls (ReadTimeout) requests whose headers
+    don't identify a browser (see app.etf_acquisition.NSE_ETF_LIST_HEADERS).
+    run_full_etf_cycle's own transport.get(NSE_ETF_LIST_URL) call previously
+    sent none at all, even though every other NSE call reachable from this
+    cycle (MARKET_URL/META_URL, and the single-instrument
+    etf_acquisition.discover_nse) already attaches browser-identity headers.
+    """
+    rows,csv=universe(1); seen={}
+    def handler(request):
+        if request.url.path.endswith('.csv'):
+            seen['headers']=request.headers
+            return httpx.Response(200,text=csv)
+        if 'marketWatchApi' in request.url.path:
+            return httpx.Response(200,json={'data':{'timestamp':NOW.strftime('%d-%b-%Y %H:%M:%S'),
+                'navDate':NOW.strftime('%d-%b-%Y'),'data':[dict(symbol=r['primarySymbol'],series='EQ',
+                identifier=r['primarySymbol']+'EQN',lastPrice=100,totalTradedVolume=500000,nav=100) for r in rows]}})
+        symbol=request.url.params['symbol']; row=next(r for r in rows if r['primarySymbol']==symbol)
+        return httpx.Response(200,json=dict(symbol=symbol,isin=row['isin'],isETFSec='true',isDelisted='false',
+            isSuspended='false',activeSeries=['EQ'],marketType='N'))
+    cp=await checkpoint(repo)
+    async def history_acquirer(repository,row,*,now,checkpoint):
+        return await _ensure_etf_history(repository,row,now=now,checkpoint=checkpoint,
+            provider=SimpleNamespace(closes=AsyncMock(return_value=[])))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await run_full_etf_cycle(repo,SimpleNamespace(active_global_etfs=AsyncMock(return_value=rows)),
+            checkpoint=cp,cycle_id=cp.cycle_id,identity_headers={},client=client,clock=lambda:NOW,sleep=AsyncMock(),
+            history_acquirer=history_acquirer)
+    assert 'headers' in seen, 'NSE_ETF_LIST_URL was never requested'
+    from app.etf_acquisition import NSE_ETF_LIST_HEADERS
+    for key,value in NSE_ETF_LIST_HEADERS.items():
+        assert seen['headers'].get(key)==value
+
+
+def test_full_universe_reuses_single_instrument_discovery_nse_list_headers():
+    """Guards against the two NSE ETF-list acquisition paths drifting apart
+    again into separately-maintained (and silently incompatible) header
+    dicts -- etf_full_universe must keep importing the one definition.
+    """
+    from app.etf_acquisition import NSE_ETF_LIST_HEADERS as acquisition_headers
+    from app.etf_full_universe import NSE_ETF_LIST_HEADERS as full_universe_headers
+    assert full_universe_headers is acquisition_headers
 
 
 def test_reconcile_conflicts_missing_and_duplicates():
@@ -121,6 +178,12 @@ async def test_full_endpoint_authorization_and_pause(monkeypatch):
     worker=SimpleNamespace(submit_async=AsyncMock(return_value={'cycle_id':str(UUID(int=33))}))
     monkeypatch.setattr(main,'_etf_radar_worker',lambda:worker)
     monkeypatch.setattr(main.settings,'research_opportunity_recovery_paused',False)
+    # The full-universe flag now gates the production (recovery_paused=False)
+    # branch too -- see test_full_universe_gate_enforced_on_every_submission_branch
+    # in test_etf_manual_execution.py for the authorization-matrix regression.
+    # This test is about admin auth / validation / worker wiring, not the gate
+    # itself, so it explicitly authorizes to keep exercising the 202 path.
+    monkeypatch.setattr(main.settings,'research_etf_full_universe_execution_enabled',True)
     client=TestClient(main.app)
     path='/api/v1/etf-radar/full-universe-cycles'
     assert client.post(path,json={}).status_code==401
@@ -156,10 +219,16 @@ async def test_recovery_and_no_partial_publication(repo,monkeypatch,mode):
             repo.persistence.request_cycle_cancel(cp.cycle_id)
             publish(*args,**kwargs)
         monkeypatch.setattr(repo.persistence,'save_etf_radar_cycle',race)
+    # No-op history acquirer: this test is about BASELINE recovery/cancellation
+    # semantics, not Yahoo history acquisition -- avoid a real network call.
+    async def history_acquirer(repository,row,*,now,checkpoint):
+        return await _ensure_etf_history(repository,row,now=now,checkpoint=checkpoint,
+            provider=SimpleNamespace(closes=AsyncMock(return_value=[])))
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:httpx.Response(200,text=csv))) as client:
         async def run(handle):
             return await module.run_full_etf_cycle(repo,source,checkpoint=handle,cycle_id=cp.cycle_id,
-                identity_headers={},client=client,clock=lambda:NOW,sleep=AsyncMock())
+                identity_headers={},client=client,clock=lambda:NOW,sleep=AsyncMock(),
+                history_acquirer=history_acquirer)
         if mode=='resume':
             with pytest.raises(asyncio.CancelledError): await run(cp)
             assert repo.persistence.latest_etf_radar_cycle() is None
@@ -168,10 +237,95 @@ async def test_recovery_and_no_partial_publication(repo,monkeypatch,mode):
             assert [len(b) for b in batches]==[5,2]
             assert source.active_global_etfs.await_count==1
             assert len(repo.persistence.etf_radar_cycle(cp.cycle_id)['outcomes'])==7
+        elif mode=='partial_failure':
+            # Regression: ONE instrument's genuine BASELINE technical failure
+            # (rows[0]) must no longer discard the other 6 reconciled
+            # instruments' results -- only a failure across EVERY reconciled
+            # instrument fails the whole cycle (see etf_full_universe.py's
+            # publication gate: counts['failed'] >= counts['reconciled']).
+            await run(cp)
+            saved=repo.persistence.etf_radar_cycle(cp.cycle_id)
+            assert len(saved['outcomes'])==7
+            assert saved['coverage']['failed']==1
+            failed_candidate=next(c for c in saved['candidates'] if c.get('disposition')=='TECHNICAL_FAILURE')
+            assert failed_candidate['global_instrument_id']==rows[0]['globalInstrumentId']
+            assert failed_candidate['recommendation'] is None
+            assert all(c.get('global_instrument_id')!=rows[0]['globalInstrumentId'] for c in saved['ranked'])
+            assert len(saved['candidates'])==7
         else:
             with pytest.raises((ValueError,CycleOwnershipLost)): await run(cp)
             assert repo.persistence.latest_etf_radar_cycle() is None
-            assert len(cp._progress)==7
+            # BASELINE (7) plus the decoupled ETF_ONBOARD history pass (7),
+            # which now runs to completion before the ValueError/CycleOwnershipLost
+            # raised downstream of it (acquisition-unavailable / publication race).
+            assert len(cp._progress)==14
+
+
+@pytest.mark.asyncio
+async def test_partial_technical_failure_does_not_discard_verified_results(repo,monkeypatch):
+    """Regression for the all-or-nothing publication gate: a technical
+    failure on ONE instrument must not discard the other, genuinely
+    verified instruments' results, and must not itself enter ranking.
+    """
+    import app.etf_full_universe as module
+    rows,csv=universe(5)
+    async def acquire(repository,orchestrator,selected,client,**kwargs):
+        return {'instruments':[{'instrument_id':r['globalInstrumentId'],
+            'status':'BLOCKED' if r==rows[0] else 'READY',
+            'attempts':[{'outcome':'TECHNICAL_FAILURE'}] if r==rows[0] else []} for r in selected]}
+    monkeypatch.setattr(module,'ingest_quotes',acquire)
+    cp=await checkpoint(repo); source=SimpleNamespace(active_global_etfs=AsyncMock(return_value=rows))
+    async def history_acquirer(repository,row,*,now,checkpoint):
+        return await _ensure_etf_history(repository,row,now=now,checkpoint=checkpoint,
+            provider=SimpleNamespace(closes=AsyncMock(return_value=[])))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:httpx.Response(200,text=csv))) as client:
+        await module.run_full_etf_cycle(repo,source,checkpoint=cp,cycle_id=cp.cycle_id,
+            identity_headers={},client=client,clock=lambda:NOW,sleep=AsyncMock(),
+            history_acquirer=history_acquirer)
+    saved=repo.persistence.etf_radar_cycle(cp.cycle_id)
+    assert saved['coverage']['official']==5
+    assert saved['coverage']['failed']==1
+    assert saved['coverage']['acquired']==4
+    failed=[c for c in saved['candidates'] if c.get('disposition')=='TECHNICAL_FAILURE']
+    assert len(failed)==1 and failed[0]['global_instrument_id']==rows[0]['globalInstrumentId']
+    assert failed[0]['recommendation'] is None
+    # The 4 non-failed instruments have no quote/history facts in this
+    # fixture (ingest_quotes and history_acquirer are both faked with no
+    # persisted evidence), so the rule engine correctly reports
+    # INSUFFICIENT_DATA rather than fabricating a recommendation -- the
+    # substantive check is that they are NOT the technically-failed
+    # instrument and did go through real evaluation (not silently dropped).
+    not_failed=[c for c in saved['candidates'] if c.get('disposition')!='TECHNICAL_FAILURE']
+    assert len(not_failed)==4
+    assert all(c.get('global_instrument_id')!=rows[0]['globalInstrumentId'] for c in not_failed)
+    assert all(c.get('disposition')!='TECHNICAL_FAILURE' for c in not_failed)
+    assert all(c.get('global_instrument_id')!=rows[0]['globalInstrumentId'] for c in saved['ranked'])
+    assert saved['excluded_by_reason'].get('BASELINE_ACQUISITION_TECHNICAL_FAILURE')==1
+
+
+@pytest.mark.asyncio
+async def test_total_acquisition_failure_still_fails_the_whole_cycle(repo,monkeypatch):
+    """The partial-success relaxation must not suppress a genuine
+    universe-wide acquisition outage: if EVERY reconciled instrument
+    technically fails, the cycle must still raise rather than publish an
+    all-failed, zero-opportunity result as if it were a normal cycle.
+    """
+    import app.etf_full_universe as module
+    rows,csv=universe(3)
+    async def acquire(repository,orchestrator,selected,client,**kwargs):
+        return {'instruments':[{'instrument_id':r['globalInstrumentId'],'status':'BLOCKED',
+            'attempts':[{'outcome':'TECHNICAL_FAILURE'}]} for r in selected]}
+    monkeypatch.setattr(module,'ingest_quotes',acquire)
+    cp=await checkpoint(repo); source=SimpleNamespace(active_global_etfs=AsyncMock(return_value=rows))
+    async def history_acquirer(repository,row,*,now,checkpoint):
+        return await _ensure_etf_history(repository,row,now=now,checkpoint=checkpoint,
+            provider=SimpleNamespace(closes=AsyncMock(return_value=[])))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:httpx.Response(200,text=csv))) as client:
+        with pytest.raises(ValueError,match='ETF_UNIVERSE_OR_ACQUISITION_UNAVAILABLE'):
+            await module.run_full_etf_cycle(repo,source,checkpoint=cp,cycle_id=cp.cycle_id,
+                identity_headers={},client=client,clock=lambda:NOW,sleep=AsyncMock(),
+                history_acquirer=history_acquirer)
+    assert repo.persistence.latest_etf_radar_cycle() is None
 
 
 @pytest.mark.asyncio

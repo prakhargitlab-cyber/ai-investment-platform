@@ -248,9 +248,9 @@ def _prior_readiness_executor_verdict(runtime, instrument_id, requirement_id):
     repair pass does not rerun an identical acquisition for a requirement
     whose last completed plan already proved the gap permanent, while an
     already-satisfied readiness state (checked by the caller BEFORE this)
-    still always takes priority -- this only short-circuits the "still
-    unresolved" case, on the assumption that a requirement whose status has
-    not advanced to satisfied has not had its evidence meaningfully change.
+    still always takes priority. For an empty financial-provider verdict,
+    the caller also checks current authority/recovery eligibility: PARTIAL
+    alone does not prove that sources or parser capabilities are unchanged.
     """
     loader = getattr(getattr(runtime, "repository", None), "acquisition_observations_for", None)
     if not callable(loader):
@@ -575,6 +575,10 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
                 attempted.extend(result.planned_requirement_ids)
                 capabilities.extend(result.executed_capabilities)
                 failures.update(result.failures)
+                # Dispatched capabilities do not prove successful acquisition.
+                # TargetedEnsureResult has no per-attempt completion outcome;
+                # retain explicit/current or durable failures rather than infer
+                # a completed-empty history response from dispatch metadata.
             except Exception as exc:
                 cycle_timing.record_runtime_ensure_elapsed((time.monotonic() - ensure_started) * 1000)
                 failures[requirement_id] = type(exc).__name__
@@ -695,9 +699,47 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
                 # per-operation fields at 0.0 despite non-zero cycle totals.
                 span_token = cycle_timing.bind_span(member_records[0] if member_records else None)
                 try:
+                    # CD-1 fix: execute_primary services this whole group with
+                    # ONE shared, internally-unbounded provider pass (no
+                    # per-target deadline -- see the wait_for_completion
+                    # contract in ResearchReadinessRuntime._execute_plan_bounded),
+                    # bounded only by the single external wait below. The
+                    # document/query ceiling for that pass is already scaled to
+                    # len(members) * singleton_default (see the budget
+                    # construction above) precisely because batching members
+                    # together increases the amount of sequential provider/
+                    # document work the ONE shared pass may legitimately need
+                    # to do. Without a matching scale-up here, a 4-member group
+                    # given 4x the document budget but only the SAME flat
+                    # single-member wall-clock budget would convert what used
+                    # to be independent per-requirement successes into one
+                    # shared ACQUISITION_TIMEOUT for every member whenever the
+                    # now-larger document allowance is actually used -- this is
+                    # the confirmed CD-1 mechanism (diagnostics/
+                    # equity_radar_deep_validation.md). Scale proportionally to
+                    # member_count, capped so a future larger group cannot grow
+                    # this unboundedly; this does NOT touch
+                    # self.ensure_timeout_seconds itself, so every other caller
+                    # of this runtime (BASELINE, singleton DEEP acquisition via
+                    # _acquire, the interactive API route) keeps its existing
+                    # flat budget unchanged.
+                    # getattr with a default: test doubles / stub runtimes that
+                    # do not expose ensure_timeout_seconds (most of this
+                    # module's existing test surface) must keep working
+                    # unchanged -- they fall back to the real
+                    # ResearchReadinessRuntime's own default of 25.0 rather
+                    # than raising AttributeError into the shared-call except
+                    # below, which would misclassify every member as a
+                    # technical failure instead of exercising the real path.
+                    base_timeout_seconds = getattr(runtime, "ensure_timeout_seconds", 25.0)
+                    group_timeout_seconds = min(
+                        base_timeout_seconds * member_count,
+                        base_timeout_seconds * 4,
+                    )
                     result = await runtime.ensure(instrument_id, jurisdiction=jurisdiction,
                         requirement_ids=tuple(requirement_ids), identity_headers=identity_headers,
-                        correlation_id=correlation_id, wait_for_completion=True)
+                        correlation_id=correlation_id, wait_for_completion=True,
+                        timeout_seconds=group_timeout_seconds)
                     ensure_elapsed_ms = (time.monotonic() - ensure_started) * 1000
                     attempted.extend(result.planned_requirement_ids)
                     capabilities.extend(result.executed_capabilities)
@@ -744,7 +786,7 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
             "excluded_inputs": dict(row.not_applicable_input_reasons), "missing": list(row.missing_input_ids),
             "source": row.source, "failure": None}
 
-    def _requires_acquisition(requirement_id, row):
+    async def _requires_acquisition(requirement_id, row, readiness):
         if row.status == Status.NOT_APPLICABLE:
             logger.info("deep_requirement_not_applicable instrument_id=%s requirement=%s reason=%s",
                         instrument_id, requirement_id, row.applicability_reason)
@@ -755,18 +797,26 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
             return False
         if requirement_id not in selected:
             return False
-        # Stage-2 final closure (Root Cause B/D, Invariant 2): this
-        # requirement is still unresolved by CURRENT durable evidence (the
-        # checks above already re-read it fresh), but a previous completed
-        # plan for this exact requirement already proved EVIDENCE_UNAVAILABLE
-        # (deterministic, permanent) and nothing has advanced it to
-        # satisfied since. Re-running the identical authorized acquisition
-        # against unchanged evidence cannot discover a different answer, so
-        # a repair pass must not spend budget on it again -- reuse the
-        # durable verdict instead. A TECHNICAL_RETRYABLE prior verdict is
-        # deliberately NOT short-circuited here: that is exactly the case
-        # that must keep getting a fresh attempt.
+        # Reuse terminal verdicts for unchanged evidence. An empty financial
+        # provider response does not rule out a newly eligible authority or
+        # parser recovery; let the existing source gate decide that case.
         prior_permanent = _prior_readiness_executor_verdict(runtime, instrument_id, requirement_id)
+        if (((prior_permanent == "PRIMARY_FINANCIAL_PROVIDER_RETURNED_NO_FACTS"
+                  and requirement_id in {"BUSINESS_QUALITY_FACTS", "GROWTH_FACTS"})
+                 or (prior_permanent == "DOCUMENT_SIZE_LIMIT_EXCEEDED"
+                     and requirement_id in {"BUSINESS_QUALITY_FACTS", "GROWTH_FACTS",
+                                            "BALANCE_SHEET_FACTS", "QUARTERLY_FINANCIALS"}))
+                and jurisdiction == "INDIA" and row.missing_input_ids):
+            # A size verdict still rejects its URL/limit pair. Other financial
+            # sources may run only through the existing authority/backoff gate.
+            upgrade_due = getattr(runtime.repository, "financial_authority_upgrade_due", None)
+            if callable(upgrade_due) and await runtime.repository._run_blocking_persistence(
+                    upgrade_due, runtime.repository.profile(instrument_id), readiness.generated_at, row):
+                logger.info(
+                    "deep_requirement_financial_retry_eligible instrument_id=%s requirement=%s prior_reason=%s",
+                    instrument_id, requirement_id, prior_permanent,
+                )
+                return True
         if prior_permanent is not None:
             logger.info(
                 "deep_requirement_skipped_permanent_verdict instrument_id=%s requirement=%s reason=%s",
@@ -787,7 +837,7 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
         row = readiness.for_requirement(requirement_id)
         _snapshot(requirement_id, row)
         handled.add(requirement_id)
-        if not _requires_acquisition(requirement_id, row):
+        if not await _requires_acquisition(requirement_id, row, readiness):
             continue
         if requirement_id == "CURRENT_NEWS" and background_tasks is not None:
             # Optional/non-blocking: start concurrently instead of awaiting
@@ -829,7 +879,7 @@ async def investigate(runtime, instrument_id, *, jurisdiction, nomination_paths=
             other_row = other_readiness.for_requirement(other_id)
             _snapshot(other_id, other_row)
             handled.add(other_id)
-            if _requires_acquisition(other_id, other_row):
+            if await _requires_acquisition(other_id, other_row, other_readiness):
                 member_rows[other_id] = other_row
         await _acquire_group(tuple(member_rows), member_rows, readiness)
     readiness = await runtime.read(instrument_id, jurisdiction=jurisdiction)

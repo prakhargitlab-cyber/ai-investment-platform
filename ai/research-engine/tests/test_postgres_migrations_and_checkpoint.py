@@ -77,7 +77,7 @@ def test_v1_to_v16_apply_and_engine_schema_check_passes(database):
     files = _migrations()
     versions = [int(f.name[1:].split("__")[0]) for f in files]
     assert 17 in versions
-    assert versions[-1] == 23
+    assert versions[-1] == 25
     _apply(conn, files)
     tables = {r[0] for r in conn.execute(
         "SELECT table_name FROM information_schema.tables WHERE table_schema='research'").fetchall()}
@@ -97,7 +97,7 @@ def test_v10_upgrade_to_v16_preserves_existing_rows(database):
     conn.commit()
     _apply(conn, rest)
     versions = [int(f.name[1:].split("__")[0]) for f in rest]
-    assert versions == list(range(11, 24))
+    assert versions == list(range(11, 26))
     assert conn.execute("SELECT COUNT(*) FROM global_market_price_observations").fetchone()[0] == 1
 
 
@@ -212,7 +212,7 @@ def test_v1_to_v17_url_columns_become_text(database):
     files = _migrations()
     versions = [int(f.name[1:].split("__")[0]) for f in files]
     assert 17 in versions
-    assert versions[-1] == 23
+    assert versions[-1] == 25
     _apply(conn, files)
     doc_rows = conn.execute(
         "SELECT column_name, data_type FROM information_schema.columns "

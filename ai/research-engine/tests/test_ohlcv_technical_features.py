@@ -149,7 +149,14 @@ def test_deterministic_duplicates_corrections_conflicts_and_asof():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('count,queries',[(0,0),(1,2),(18,36)])
+@pytest.mark.parametrize('count,queries',[
+    # enrich_candidates() now loads the NSE market calendar
+    # (market_trading_schedules + market_trading_calendar_exceptions) ONCE
+    # per batch call -- not once per instrument -- whenever at least one
+    # candidate is NSE/XNSE (app/global_scanner.py::enrich_candidates), so
+    # a non-empty batch carries a fixed +2-query overhead regardless of
+    # candidate count; an empty batch issues no queries at all.
+    (0,0),(1,4),(18,38)])
 async def test_stage_b_batch_queries_and_no_network(count,queries,monkeypatch):
     from app.global_scanner import GlobalScanner
     from app.persistence import SqliteResearchPersistence
@@ -160,7 +167,12 @@ async def test_stage_b_batch_queries_and_no_network(count,queries,monkeypatch):
     for item in items:
         persisted(store,item)
         key=UUID(item['globalInstrumentId'])
-        for b in candles(range(100,140)):
+        # provider_symbol must match the instrument's verified YAHOO_FINANCE
+        # mapping ("ABC.NS" -> "ABC" per select_price_history's identity
+        # check), not the helper's generic 'TEST' default, or every bar is
+        # excluded as an identity mismatch and enrich_candidates falls back
+        # to CLOSE_ONLY_FALLBACK instead of DAILY_MARKET_BAR_NSE.
+        for b in candles(range(100,140),provider_symbol='ABC'):
             store.upsert_daily_market_bar(b.model_copy(update={'global_instrument_id':key}))
     initial=await scan(items,store)
     before=initial.model_dump()
@@ -232,18 +244,35 @@ def test_stale_candles_expose_diagnostics_but_do_not_score():
 @pytest.mark.asyncio
 async def test_stage_b_score_change_is_volume_evidence_only_and_fallback_works():
     from app.global_scanner import GlobalScanner
+    from app.market_sessions import session_bounds
     from app.persistence import SqliteResearchPersistence
     from test_global_scanner import instrument,persisted,scan
     store=SqliteResearchPersistence(); items=[instrument(1),instrument(2)]
     values=[100]*60+[104]
+    # NSE's Yahoo price-only fallback is now validated against the session
+    # calendar (app/session_history.py::validate_daily_closes): the source
+    # URL must be a genuine Yahoo /quote/<SYMBOL>/history page, the symbol
+    # must match the instrument's verified YAHOO_FINANCE mapping ("ABC.NS",
+    # see instrument() in test_global_scanner.py), and observed/retrieved
+    # timestamps must land on the session close -- a generic
+    # provider="YAHOO_FINANCE" override with a non-Yahoo URL and arbitrary
+    # timestamps (as before this validation existed) is rejected outright.
+    schedules=store.load_market_schedules({'NSE','XNSE'})
+    exceptions=store.load_market_calendar_exceptions({'NSE','XNSE'})
     for item in items:
         persisted(store,item,price=False)
         for p in history(values,UUID(item['globalInstrumentId'])):
-            store.upsert_market_price_observation(p.model_copy(update={'provider':'YAHOO_FINANCE'}))
+            close=session_bounds('NSE',schedules,exceptions,p.observed_at.date())[1]
+            store.upsert_market_price_observation(p.model_copy(update={
+                'provider':'YAHOO_FINANCE', 'observed_at':close, 'retrieved_at':close,
+                'source_url':'https://finance.yahoo.com/quote/ABC.NS/history'}))
     initial=await scan(items,store)
     scanner=GlobalScanner(None,store)
     before={r.global_instrument_id:r for r in scanner.enrich_candidates(initial)}
-    store.upsert_daily_market_bars(candles(values,volumes=[100]*60+[200]))
+    # provider_symbol must match the instrument's verified YAHOO_FINANCE
+    # mapping ("ABC.NS" -> "ABC"); see the comment in
+    # test_stage_b_batch_queries_and_no_network above.
+    store.upsert_daily_market_bars(candles(values,volumes=[100]*60+[200],provider_symbol='ABC'))
     after={r.global_instrument_id:r for r in scanner.enrich_candidates(initial)}
     assert after[UUID(int=2)]==before[UUID(int=2)]
     assert before[STOCK].pre_score==after[STOCK].pre_score

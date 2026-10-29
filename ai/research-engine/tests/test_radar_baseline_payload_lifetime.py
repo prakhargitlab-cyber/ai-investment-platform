@@ -102,7 +102,8 @@ async def test_full_baseline_releases_completed_provider_graphs(timeouts):
     assert sum(item.timed_out for item in results.values()) == timed_out
     assert sum(item.failed for item in results.values()) == timed_out
     assert all(type(item) is _BaselineOutcome for item in results.values())
-    assert all(set(vars(item)) == {'planned_requirement_ids', 'ready', 'attempted', 'timed_out', 'failed'}
+    assert all(set(vars(item)) == {'planned_requirement_ids', 'ready', 'attempted', 'timed_out', 'failed',
+                                   'failure_reasons', 'readiness_shortfall_reasons'}
                for item in results.values())
     assert len(created) == count and set(created.values()) == {1}
     assert len(samples) == count and samples[-1][0] > 50

@@ -217,6 +217,7 @@ class CompanyResearchProfile(ResearchBaseModel):
     mic: str
     country: str
     currency: str
+    listing_date: date | None = None
     known_domains: list[str] = Field(default_factory=list)
     official_website: AnyHttpUrl | None = None
     investor_relations_url: AnyHttpUrl | None = None

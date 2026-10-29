@@ -111,6 +111,21 @@ class _ThreadSafeFakeStore:
     def load_market_price_observations(self, ids):
         return [row for key in ids for row in self._prices_by_id.get(key, [])]
 
+    def load_market_schedules(self, markets=None):
+        # The _seeded_items helper above does not persist daily-bar or schedule
+        # records, so the real SqliteResearchPersistence returns an empty
+        # exceptions list and (for schedules) its hardcoded NSE defaults. Tests
+        # here do not assert on technical history readiness, only on scan
+        # results/order and event-loop offload behavior, so an empty return is
+        # sufficient and keeps the fake store free of any DB-backed defaults.
+        return []
+
+    def load_market_calendar_exceptions(self, markets=None):
+        return []
+
+    def load_daily_market_bars(self, instrument_ids, *, start_date=None, end_date=None, provider=None):
+        return []
+
 
 def _seeded_items(count):
     """Populate a real (single-thread) SqliteResearchPersistence with `count`

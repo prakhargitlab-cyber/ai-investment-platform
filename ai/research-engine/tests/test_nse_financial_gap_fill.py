@@ -1,6 +1,7 @@
 """NSE-first financial input gaps through real SQLite persistence/readiness."""
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -44,7 +45,10 @@ async def case(*, omit=(), gateway_failure=None):
     async def collect(_profile):
         calls.append('NSE')
         return [f for f in official if f.key.metric not in omit]
-    provider.collect = AsyncMock(side_effect=collect)
+    # Exercise the provider-neutral collect protocol at this mock boundary;
+    # real collect_planned acquisition is covered by the structured/history tests.
+    provider = SimpleNamespace(provider_name='NSE', collect=AsyncMock(side_effect=collect))
+    legacy.official_financial_provider = provider
     async def acquire(_profile, **kwargs):
         calls.append('YAHOO')
         assert kwargs['financial_gap_fill'] is True
@@ -152,7 +156,7 @@ async def test_nse_failure_cleared_only_after_actual_yahoo_readiness_and_remains
     provider.collect.side_effect = TimeoutError()
     gateway.acquire_requirement.side_effect = None
     gateway.acquire_requirement.return_value = wire(profile, 'QUARTERLY_FINANCIALS', [
-        fact(metric, '1', period=period) for period in ('2026-06-30', '2026-03-31')
+        fact(metric, '1', period=period) for period in ('2026-06-30', '2026-03-31', '2025-12-31', '2025-09-30')
         for metric in ('revenue', 'pat', 'eps')])
     progress = CapabilityExecutionProgress()
     outcome = await execute(executor, profile, 'QUARTERLY_FINANCIALS', progress=progress)

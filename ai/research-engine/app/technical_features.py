@@ -7,7 +7,7 @@ use observed-session offsets; all percentages are percentage units, not ratios.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from math import isfinite
@@ -106,6 +106,9 @@ class PriceHistory:
     # here for diagnostics/provenance and to truthfully reduce confidence
     # (see TechnicalFeatureEngine.compute's conflict_factor).
     quarantined_dates: tuple[date, ...] = ()
+    session_dates: tuple[date, ...] = ()
+    missing_dates: tuple[date, ...] = ()
+    valid_until: datetime | None = None
 
 
 def utc(value: datetime) -> datetime:
@@ -181,14 +184,27 @@ def _quarantine_implausible_indices(values: list[float]) -> set[int]:
 
 def normalize_price_history(instrument_id: UUID, observations: Iterable[MarketPriceObservation], *,
                             as_of: datetime, currency: str | None = None,
-                            trusted_providers: frozenset[str] | None = None) -> PriceHistory:
-    """Latest timestamp per UTC date; identical ties collapse, unequal ties fail.
+                            trusted_providers: frozenset[str] | None = None,
+                            market=None, schedules=(), exceptions=(), provider_symbol=None) -> PriceHistory:
+    """Configured markets use validated daily sessions, excluding quotes.
 
-    This extends Phase 1's latest-timestamp conflict gate to each historical day.
+    Legacy generic consumers retain their timestamp-per-UTC-date contract.
     Conflicted historical dates are omitted with diagnostics. A conflicted latest
     date blocks current features instead of silently falling back to yesterday.
     Retrieval timestamps must also be known at as_of (no look-ahead).
     """
+    if market is not None:
+        from app.session_history import validate_daily_closes
+        sessions = validate_daily_closes(instrument_id, list(observations), as_of=as_of, currency=currency,
+            market=market, schedules=schedules, exceptions=exceptions, provider_symbol=provider_symbol,
+            trusted_providers=trusted_providers)
+        quarantined = _quarantine_implausible_indices([float(row.price) for row in sessions.observations])
+        dates = tuple(day for index, day in enumerate(sessions.session_dates) if index not in quarantined)
+        quarantine_dates = tuple(sessions.session_dates[index] for index in sorted(quarantined))
+        return PriceHistory(tuple(row for index, row in enumerate(sessions.observations) if index not in quarantined),
+            sessions.conflicting_dates, sessions.current_conflict, sessions.rejected_count, sessions.duplicate_count,
+            currency, quarantine_dates, dates, tuple(sorted(set(sessions.missing_dates) | set(quarantine_dates))),
+            sessions.valid_until)
     grouped = defaultdict(list)
     rejected = 0
     currencies = set()
@@ -465,6 +481,55 @@ def _confirmed_swing_points(prices: list[float], window: int) -> tuple[list[tupl
     return highs, lows
 
 
+def select_price_history(instrument_id, observations, *, as_of, currency, trusted_providers=None,
+                         daily_bar_history=(), market=None, schedules=(), exceptions=(),
+                         provider_symbol=None, max_age_days=7):
+    """Shared readiness/technical selection, preserving whole NSE candles."""
+    from app.market_sessions import completed_sessions, next_session_close, session_bounds, unresolved_session_dates
+    bars = list(daily_bar_history)
+    if market:
+        eligible = []
+        for bar in bars:
+            bounds = session_bounds(market, schedules, exceptions, bar.trading_date)
+            expected_symbol = provider_symbol[:-3] if provider_symbol and provider_symbol.endswith('.NS') else provider_symbol
+            if (bounds and bounds[1] <= as_of and bounds[1] <= bar.retrieved_at <= as_of
+                    and (not expected_symbol or bar.provider_symbol == expected_symbol)):
+                eligible.append(bar)
+        bars = eligible
+    daily, use_daily = normalize_daily_history(instrument_id, bars, as_of=as_of,
+        currency=currency, trusted_providers=trusted_providers)
+    if market and daily.observations:
+        dates = tuple(row.trading_date for row in daily.observations)
+        expected = dict(completed_sessions(market, schedules, exceptions, dates[0], dates[-1], as_of))
+        close = session_bounds(market, schedules, exceptions, dates[-1])[1]
+        daily = replace(daily, session_dates=dates,
+            missing_dates=tuple(sorted((set(expected) - set(dates)) | set(
+                unresolved_session_dates(market, schedules, exceptions, dates[0], as_of)))),
+            valid_until=next_session_close(market, schedules, exceptions, close))
+    kwargs = dict(as_of=as_of, currency=currency, trusted_providers=trusted_providers,
+                  market=market, schedules=schedules, exceptions=exceptions, provider_symbol=provider_symbol)
+    fallback, reason = None, None
+    if use_daily and not daily.current_conflict:
+        stale = (daily.valid_until is None or as_of > daily.valid_until) if market else (
+            bool(daily.observations) and utc(as_of).astimezone(ZoneInfo('Asia/Kolkata')).date()
+            - daily.observations[-1].trading_date > timedelta(days=max_age_days))
+        if len(daily.observations) < 20 or stale or daily.missing_dates:
+            fallback = normalize_price_history(instrument_id, observations, **kwargs)
+            fresh = (fallback.valid_until is not None and as_of <= fallback.valid_until) if market else (
+                bool(fallback.observations) and utc(as_of) - utc(fallback.observations[-1].observed_at) <= timedelta(days=max_age_days))
+            # An immature NSE series must not discard a longer current Yahoo
+            # history solely because Yahoo still has a session gap. Keep that
+            # gap on the selected history so readiness/technicals stay blocked;
+            # no NSE candle is spliced into the close-only series.
+            if (len(fallback.observations) >= 20 and not fallback.current_conflict and fresh
+                    and (not fallback.missing_dates or len(daily.observations) < 20)):
+                use_daily = False
+                reason = 'NSE_DAILY_HISTORY_STALE' if stale else ('NSE_DAILY_HISTORY_INCOMPLETE'
+                    if daily.missing_dates else 'NSE_DAILY_HISTORY_BELOW_20')
+    history = daily if use_daily else fallback or normalize_price_history(instrument_id, observations, **kwargs)
+    return history, daily, use_daily, reason
+
+
 class TechnicalFeatureEngine:
     def __init__(self, config: TechnicalConfig | None = None):
         self.config = config or TechnicalConfig()
@@ -472,24 +537,13 @@ class TechnicalFeatureEngine:
     def compute(self, instrument_id: UUID, observations: Iterable[MarketPriceObservation], *, as_of: datetime,
                 currency: str | None = None, trusted_providers: frozenset[str] | None = None,
                 volume_history: Iterable[PersistedVolumeObservation] = (),
-                daily_bar_history: Iterable[DailyMarketBar] = ()) -> TechnicalFeatureSnapshot:
+                daily_bar_history: Iterable[DailyMarketBar] = (), market=None, schedules=(), exceptions=(),
+                provider_symbol=None) -> TechnicalFeatureSnapshot:
         cfg = self.config
-        daily_history, use_daily = normalize_daily_history(instrument_id, daily_bar_history,
-            as_of=as_of, currency=currency, trusted_providers=trusted_providers)
-        fallback = None
-        selection_reason = None
-        if use_daily and not daily_history.current_conflict:
-            daily_stale = bool(daily_history.observations) and (utc(as_of).astimezone(ZoneInfo('Asia/Kolkata')).date()
-                - daily_history.observations[-1].trading_date > timedelta(days=cfg.max_age_days))
-            if len(daily_history.observations) < 20 or daily_stale:
-                fallback = normalize_price_history(instrument_id, observations, as_of=as_of,
-                    currency=currency, trusted_providers=trusted_providers)
-                if (len(fallback.observations) >= 20 and not fallback.current_conflict and
-                        utc(as_of) - utc(fallback.observations[-1].observed_at) <= timedelta(days=cfg.max_age_days)):
-                    use_daily = False
-                    selection_reason = 'NSE_DAILY_HISTORY_STALE' if daily_stale else 'NSE_DAILY_HISTORY_BELOW_20'
-        history = daily_history if use_daily else fallback or normalize_price_history(instrument_id,
-            observations, as_of=as_of, currency=currency, trusted_providers=trusted_providers)
+        history, daily_history, use_daily, selection_reason = select_price_history(instrument_id, observations,
+            as_of=as_of, currency=currency, trusted_providers=trusted_providers, daily_bar_history=daily_bar_history,
+            market=market, schedules=schedules, exceptions=exceptions, provider_symbol=provider_symbol,
+            max_age_days=cfg.max_age_days)
         rows = history.observations
         prices = [float(row.close if use_daily else row.price) for row in rows]
         # Display metadata only; candle calculations use the exchange DATE directly.
@@ -525,9 +579,16 @@ class TechnicalFeatureEngine:
             result.source_diagnostics.append('QUARANTINED_IMPLAUSIBLE_OBSERVATIONS_EXCLUDED')
         # A latest-price conflict invalidates current features, even with a long
         # historical tail. History metadata and conflict diagnostics are retained.
-        usable = bool(rows) and not history.current_conflict
+        if market and not use_daily:
+            result.price_basis = 'PERSISTED_YAHOO_DAILY_CLOSE_UNADJUSTED'
+        if history.missing_dates:
+            result.missing_inputs.append('HISTORY_SESSION_GAPS')
+            result.history_readiness = 'INCOMPLETE_HISTORY'
+        usable = bool(rows) and not history.current_conflict and not history.missing_dates
         stale = bool(rows) and ((utc(as_of).astimezone(ZoneInfo('Asia/Kolkata')).date() - rows[-1].trading_date
             if use_daily else utc(as_of) - utc(rows[-1].observed_at)) > timedelta(days=cfg.max_age_days))
+        if market:
+            stale = bool(rows) and (history.valid_until is None or as_of > history.valid_until)
         if stale:
             result.stale_inputs.append("PRICE_HISTORY")
         if usable:

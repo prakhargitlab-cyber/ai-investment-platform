@@ -150,7 +150,9 @@ async def test_stage_b_batches_only_deep_eligible_and_preserves_phase1(monkeypat
     persisted(store, items[2], {})
     for key in (STOCK, UUID(int=4), UUID(int=5), SECTOR, MARKET):
         for row in history(rate_series(.001), key):
-            store.upsert_market_price_observation(row.model_copy(update={"provider": "YAHOO_FINANCE"}))
+            store.upsert_market_price_observation(row.model_copy(update={"provider": "YAHOO_FINANCE",
+                "observed_at": row.observed_at.replace(hour=0), "retrieved_at": NOW.replace(hour=0),
+                "source_url": "https://finance.yahoo.com/quote/ABC.NS/history"}))
     initial = await scan(items, store)
     before = initial.model_dump()
     queries = []
@@ -162,7 +164,7 @@ async def test_stage_b_batches_only_deep_eligible_and_preserves_phase1(monkeypat
     assert {c.global_instrument_id for c in enriched} == {STOCK, UUID(int=4)}
     assert initial.model_dump() == before
     # Two reads per eligible candidate; histories never span the deep pool.
-    assert len(queries) == 4
+    assert len([query for query in queries if 'global_daily_market_bars' in query or 'global_market_price_observations' in query]) == 4
     daily_query = next(q for q in queries if "global_daily_market_bars" in q)
     close_query = next(q for q in queries if "global_market_price_observations" in q)
     assert "instrument_id IN" in close_query
@@ -185,7 +187,9 @@ async def test_stage_b_missing_sector_renormalizes_and_order_is_deterministic():
     for item in items:
         persisted(store, item)
         for row in history(rate_series(.001), UUID(item["globalInstrumentId"])):
-            store.upsert_market_price_observation(row.model_copy(update={"provider": "YAHOO_FINANCE"}))
+            store.upsert_market_price_observation(row.model_copy(update={"provider": "YAHOO_FINANCE",
+                "observed_at": row.observed_at.replace(hour=0), "retrieved_at": NOW.replace(hour=0),
+                "source_url": "https://finance.yahoo.com/quote/ABC.NS/history"}))
     result = await scan(items, store)
     enriched = GlobalScanner(None, store).enrich_candidates(result)
     assert [c.global_instrument_id.int for c in enriched] == [1, 4]

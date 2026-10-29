@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 import pytest
+from ocr_prerequisites import requires_image_ocr, requires_ocr_toolchain
 from PIL import Image, ImageDraw
 
 from app.manual_evidence import AcceptanceError, ManualEvidenceAcceptor, ManualEvidenceIngestor
@@ -96,6 +97,7 @@ def acceptor(repository):
 
 
 class TestImageIngestExtraction:
+    @requires_image_ocr
     def test_png_is_a_supported_file_type(self, ingestor):
         draft = ingestor.ingest(
             evidence_type="CURRENT_NEWS", file_bytes=_png_with_text("ANNOUNCEMENT"),
@@ -104,6 +106,7 @@ class TestImageIngestExtraction:
         assert draft.content_type == "image/png"
         assert "PNG" in draft.extraction_method
 
+    @requires_image_ocr
     def test_jpeg_is_a_supported_file_type(self, ingestor):
         draft = ingestor.ingest(
             evidence_type="CURRENT_NEWS", file_bytes=_jpeg_with_text("ANNOUNCEMENT"),
@@ -112,6 +115,7 @@ class TestImageIngestExtraction:
         assert draft.content_type == "image/jpeg"
         assert "JPG" in draft.extraction_method
 
+    @requires_ocr_toolchain
     def test_scanned_pdf_with_no_text_layer_is_ocrd_through_the_normal_pdf_path(self, ingestor):
         draft = ingestor.ingest(
             evidence_type="CURRENT_NEWS", file_bytes=_scanned_pdf_with_text("SCANNED NOTICE"),

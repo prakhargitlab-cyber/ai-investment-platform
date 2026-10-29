@@ -25,6 +25,12 @@ HEADERS = {
 }
 REQUIRED = {"date", "symbol", "series", "open", "high", "low", "close"}
 ALIASES = {f"{name} price": name for name in ("open", "high", "low", "close")}
+# The only NSE trading series this acquisition path is permitted to request:
+# "EQ" (ordinary listed equity, the default for every instrument) and "BE"
+# (trade-for-trade, enabled only via an explicit, independently-verified
+# per-instrument override -- see Settings.nse_verified_trading_series_overrides).
+# Never derived from a response; never expanded automatically.
+SUPPORTED_TRADING_SERIES = {"EQ", "BE"}
 # Accept ungrouped, Western grouping, or Indian grouping; never strip arbitrary commas.
 NUMBER = re.compile(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})(?:\.[0-9]+)?\Z")
 MONTHS = {name: i for i, name in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
@@ -37,6 +43,7 @@ class NseHistoricalResult:
     request_to: date
     retrieved_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     provider_symbol: str | None = None
+    requested_series: str = "EQ"
     http_status: int | None = None
     status: str = "UNAVAILABLE"
     failure_reason: str | None = None
@@ -85,6 +92,22 @@ def verified_identity(metadata: dict, key: UUID) -> tuple[str, str]:
     return symbol, currencies.pop()
 
 
+def verified_trading_series(settings, key: UUID) -> str:
+    """The NSE trading series this acquisition path is authorized to request.
+
+    Defaults to "EQ" -- ordinary listed equity -- for every instrument. This
+    is never inferred from an acquisition outcome: an empty or zero-row
+    response under one series proves nothing about any other series, and
+    must never cause an automatic switch. The only way a non-EQ series is
+    ever requested is an explicit entry in
+    Settings.nse_verified_trading_series_overrides, which itself only
+    accepts values independently confirmed against official NSE evidence
+    (see app.settings.Settings.validate_nse_verified_trading_series_overrides).
+    """
+    override = settings.nse_verified_trading_series_overrides.get(str(key))
+    return override if override in SUPPORTED_TRADING_SERIES else "EQ"
+
+
 def number(value: str | None, *, integer=False, required=False):
     value = (value or "").strip()
     if value in {"", "-"} and not required:
@@ -99,7 +122,7 @@ def trading_date(value: str) -> date:
     return date(int(year), MONTHS[month.title()] if month.isalpha() else int(month), int(day))
 
 
-def parse_csv(content: bytes, result: NseHistoricalResult, currency: str) -> None:
+def parse_csv(content: bytes, result: NseHistoricalResult, currency: str, series: str = "EQ") -> None:
     """Header aliases are explicit; symbol/series normalization is strip + uppercase.
 
     Turnover ₹ is rupees (live fixture 2026-09-13), with no scaling. Other
@@ -132,7 +155,7 @@ def parse_csv(content: bytes, result: NseHistoricalResult, currency: str) -> Non
         if row["symbol"].upper() != result.provider_symbol:
             reject("SYMBOL_MISMATCH")
             continue
-        if row["series"].upper() != "EQ":
+        if row["series"].upper() != series:
             reject("UNSUPPORTED_SERIES")
             continue
         try:
@@ -212,6 +235,7 @@ class NseHistoricalDailyProvider:
             metadata = await self.orchestrator.global_instrument_metadata(global_instrument_id,
                 identity_headers=identity_headers, correlation_id=correlation_id)
             result.provider_symbol, currency = verified_identity(metadata, global_instrument_id)
+            result.requested_series = verified_trading_series(self.settings, global_instrument_id)
             async with self._lock:
                 if not self._bootstrapped:
                     stage = "BOOTSTRAP"
@@ -220,12 +244,13 @@ class NseHistoricalDailyProvider:
                 stage = "HISTORICAL"
                 response = await self._get(ENDPOINT, result, params={
                     "from": start.strftime("%d-%m-%Y"), "to": end.strftime("%d-%m-%Y"),
-                    "symbol": result.provider_symbol, "type": "priceVolumeDeliverable", "series": "EQ", "csv": "true"})
+                    "symbol": result.provider_symbol, "type": "priceVolumeDeliverable",
+                    "series": result.requested_series, "csv": "true"})
                 result.retrieved_at = datetime.now(timezone.utc)
                 result.source_url = str(response.url)
                 if any(t in response.headers.get("content-type", "").lower() for t in ("html", "json")):
                     raise ValueError("NON_CSV_RESPONSE")
-                parse_csv(response.content, result, currency)
+                parse_csv(response.content, result, currency, result.requested_series)
             result.status = "SUCCESS" if result.bars else "UNAVAILABLE"
             result.failure_reason = None if result.bars else "NO_VALID_HISTORY"
         except httpx.HTTPStatusError as exc:

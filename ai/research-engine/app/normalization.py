@@ -245,3 +245,20 @@ def normalize_financial_amount(value: Decimal, unit: str | None) -> tuple[Decima
     multiplier = {"thousand": 1000, "lakh": 100000, "million": 1000000,
         "crore": 10000000, "billion": 1000000000}[scale]
     return value * multiplier, match.group(1).upper()
+
+
+def normalize_financial_fact(fact):
+    """Normalize a read projection once, retaining reported units in provenance.
+
+    Durable facts and their precedence keys remain unchanged. Base-currency,
+    per-share and ratio facts are already normalized and are returned intact.
+    """
+    from dataclasses import replace
+    normalized_unit = normalize_financial_amount(Decimal(0), fact.value.unit)[1]
+    if normalized_unit == fact.value.unit or fact.value.value is None:
+        return fact
+    amount, unit = normalize_financial_amount(Decimal(str(fact.value.value)), fact.value.unit)
+    provenance = ';'.join(filter(None, (fact.value.calculation_basis,
+        f'source_value={fact.value.value};source_unit={fact.value.unit}')))
+    return replace(fact, value=fact.value.model_copy(update={
+        'value': amount, 'unit': unit, 'calculation_basis': provenance}))

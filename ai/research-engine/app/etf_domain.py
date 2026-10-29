@@ -91,6 +91,16 @@ def _normalized(value: str | None) -> str:
 
 
 _CATEGORY_SUBTYPES = {_normalized(s.value): s for s in EtfSubtype}
+
+# Broad asset-class tokens that classify_etf's asset-family branching
+# already recognizes (equity/debt/gold/...). Used to tell a genuine
+# broad-asset-class field from an unrelated free-text field (e.g. NSE
+# market-watch's 'assets' description text) before it is trusted as
+# the classification input.
+_BROAD_ASSET_CLASS_TOKENS = {
+    "equity", "debt", "fixed income", "bonds", "gold", "silver",
+    "money market", "hybrid", "multi asset",
+}
 _CATEGORY_SUBTYPES.update({
     "sector thematic": EtfSubtype.EQUITY_SECTOR_THEMATIC,
     "smart beta": EtfSubtype.EQUITY_SMART_BETA,
@@ -98,6 +108,33 @@ _CATEGORY_SUBTYPES.update({
     "money market": EtfSubtype.MONEY_MARKET,
     "multi asset": EtfSubtype.HYBRID,
 })
+
+
+# Known NSE benchmark-index family names (stable, publicly documented NSE
+# index taxonomy -- read from the already identity-verified
+# subCatagory/mainCatagory metadata field, never from a fund's own name or
+# ticker). A plain index-tracking ETF's subCatagory is typically the
+# literal benchmark name itself (e.g. "Nifty 50"), not a generic strategy
+# label like "equity index" -- classify_etf's exact-match strategy
+# vocabulary previously had no entry for this, so such an ETF fell through
+# to OTHER/unclassified even though it is an ordinary, textbook index fund.
+_NSE_SECTOR_INDEX_KEYWORDS = (
+    "bank", "it", "pharma", "auto", "fmcg", "energy", "metal", "realty",
+    "psu", "infrastructure", "infra", "media", "financial services",
+    "consumer durables", "healthcare", "oil gas",
+)
+
+
+def _nse_benchmark_strategy_bucket(strategy: str) -> str | None:
+    """Map a normalized, already-verified NSE subCatagory benchmark-index
+    name to the same strategy buckets classify_etf's exact-match vocabulary
+    already understands. Returns None for anything not recognizably an NSE
+    index-family name, so callers fall back to their existing behavior."""
+    if not strategy or not strategy.split(" ")[0] in {"nifty", "sensex", "bse"}:
+        return None
+    if any(keyword in strategy for keyword in _NSE_SECTOR_INDEX_KEYWORDS):
+        return "sector thematic"
+    return "broad market index"
 
 
 def classify_etf(
@@ -118,6 +155,7 @@ def classify_etf(
     asset = _normalized(profile.asset_class)
     region = _normalized(exposure_region)
     strategy = _normalized(investment_strategy)
+    strategy = _nse_benchmark_strategy_bucket(strategy) or strategy
     international = region in {"international", "global", "overseas"}
     if asset == "equity":
         if international:

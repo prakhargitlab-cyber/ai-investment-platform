@@ -99,7 +99,7 @@ async def test_full_universe_streams_evidence_and_releases_baseline(monkeypatch,
         peaks["scan"] = max(peaks["scan"], len(scan_live))
         return [SimpleNamespace(instrument_id=next(iter(ids)), payload=payload)]
 
-    def score(self, row, snapshots, facts, prices, *, as_of):
+    def score(self, row, snapshots, facts, prices, *, as_of, history_options=None, daily_bars=None):
         assert len(snapshots) == 1
         key = UUID(row["globalInstrumentId"])
         return template.model_copy(update={

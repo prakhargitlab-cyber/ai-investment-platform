@@ -63,6 +63,15 @@ class _DiscoveryPersistence:
     def load_market_price_observations(self, instrument_ids):
         return []
 
+    def load_market_schedules(self, markets=None):
+        return []
+
+    def load_market_calendar_exceptions(self, markets=None):
+        return []
+
+    def load_daily_market_bars(self, instrument_ids, *, start_date=None, end_date=None, provider=None):
+        return []
+
     def opportunity_job(self, cycle_id: str):
         self.status_thread_id = threading.get_ident()
         if cycle_id != self.cycle_id:

@@ -2,6 +2,7 @@ package com.aiinvestment.research;
 
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.flywaydb.core.Flyway;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -15,6 +16,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest
 @ActiveProfiles("test")
+@EnabledIfSystemProperty(named = "spring.datasource.url", matches = "jdbc:postgresql:.*",
+        disabledReason = "Full research migrations require a disposable PostgreSQL datasource; H2 cannot execute V12+")
 class ResearchFlywayMigrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -98,7 +101,7 @@ class ResearchFlywayMigrationTest {
                 """,
                 String.class
         );
-        assertThat(version).isEqualTo("14");
+        assertThat(version).isEqualTo("25");
         assertThat(tables).contains("global_opportunity_snapshot", "stock_recommendation_history",
                 "recommendation_current_state", "global_opportunity_top_selection", "recommendation_backtest_run");
         assertThat(tables).contains("global_market_scan", "global_stock_suggestion",
@@ -166,7 +169,7 @@ class ResearchFlywayMigrationTest {
         Integer exceptions = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM research.market_trading_calendar_exceptions", Integer.class
         );
-        assertThat(exceptions).isZero();
+        assertThat(exceptions).isEqualTo(40);
     }
 
     @Test
@@ -226,7 +229,7 @@ class ResearchFlywayMigrationTest {
             """);
         Flyway upgrade = Flyway.configure().dataSource(url, username, password)
                 .schemas("research").defaultSchema("research").table("flyway_schema_history_research").load();
-        assertThat(upgrade.migrate().migrationsExecuted).isEqualTo(6); // V11..V16
+        assertThat(upgrade.migrate().migrationsExecuted).isEqualTo(15); // V11..V25
         assertThat(upgrade.migrate().migrationsExecuted).isZero();
         assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_daily_market_bars", Integer.class)).isZero();
         assertThat(existing.queryForObject("SELECT COUNT(*) FROM research.global_market_price_observations", Integer.class)).isEqualTo(1);

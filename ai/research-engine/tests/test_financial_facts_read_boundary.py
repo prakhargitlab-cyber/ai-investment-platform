@@ -17,6 +17,7 @@ import asyncio
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
@@ -261,3 +262,60 @@ async def test_incomplete_window_documents_reads_bounded():
     assert calls, "incomplete-window path did not consult financial facts"
     assert all(call == {profile.instrument_id} for call in calls), calls
     assert all(call is not None for call in calls), calls
+
+
+@pytest.mark.asyncio
+async def test_financial_facts_for_returns_unscaled_stored_magnitude():
+    """Regression pin for an introduced crore double-scaling defect.
+
+    ``ResearchRepository.financial_facts_for``/``financial_facts_for_instruments``
+    briefly wrapped every persisted fact in
+    ``app.normalization.normalize_financial_fact``, which rescales a
+    labelled-unit value (e.g. "INR crore" -> up to 10,000,000x) to an
+    absolute-currency canonical unit. That rescaling belongs only to the
+    specific call sites that need a canonical absolute value (financial_
+    authority, financial_evidence_plan, financial_gap_fill,
+    stock_rule_engine, research_readiness_runtime -- each of which already
+    normalizes explicitly at its own point of use); applying it inside this
+    generic, otherwise-plain read accessor silently rewrote every other
+    caller's view of a stored fact's magnitude. This pins the accessor to
+    return the fact exactly as persisted.
+    """
+    persistence = SqliteResearchPersistence()
+    repository, profile = _build_repo(persistence)
+    # Persist directly, with no document ingestion/parsing involved: this
+    # isolates the accessor's own (de)scaling behavior from the unrelated
+    # fact-precedence rules that apply when multiple sources report the same
+    # metric/period (a concern of _ingest_nse_financial_results's fixture
+    # text, not of this regression).
+    key = FinancialFactKey(profile.instrument_id, "revenue", "2026-06-30", "QUARTERLY", None)
+    fact = FinancialFact(
+        key,
+        ProvenancedValue(
+            value=Decimal("90000"),
+            unit="INR crore",
+            source_url="https://nsearchives.nseindia.com/corporate/di7c-revenue-direct.pdf",
+            source_name="NSE",
+            source_type="EXCHANGE_ANNOUNCEMENT",
+            retrieved_at=datetime(2026, 6, 30, tzinfo=timezone.utc),
+            confidence=None,
+        ),
+        FactSourceTier.OFFICIAL_NSE,
+        "NSE",
+        str(uuid4()),
+        SourceMode.REAL,
+    )
+    repository._persistence.upsert_financial_fact(fact)
+
+    facts = repository.financial_facts_for(profile.instrument_id)
+    revenue = next(item for item in facts if item.key == fact.key)
+    assert revenue.value.value == Decimal("90000"), (
+        "financial_facts_for must return the stored magnitude unscaled, "
+        f"got {revenue.value.value} instead of the persisted {fact.value.value}"
+    )
+    assert revenue.value.unit == "INR crore"
+
+    facts_by_instrument = await repository.financial_facts_for_instruments({profile.instrument_id})
+    revenue_batch = next(item for item in facts_by_instrument[profile.instrument_id] if item.key == fact.key)
+    assert revenue_batch.value.value == Decimal("90000")
+    assert revenue_batch.value.unit == "INR crore"

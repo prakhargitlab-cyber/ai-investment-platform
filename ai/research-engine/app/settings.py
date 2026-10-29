@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import re
 import traceback
@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     research_request_timeout_seconds: float = 10.0
     research_connect_timeout_seconds: float = 3.0
     research_max_content_bytes: int = 1_500_000
+    # Four structured documents normally; extra slots require distinct unmet
+    # periods. This is a ceiling, never a compulsory download count.
+    research_financial_max_documents: int = Field(default=6, ge=4, le=8)
+    research_financial_acquisition_seconds: float = Field(default=20.0, ge=1.0, le=30.0)
     # Bounded retention of full ResearchDocument bodies (raw/normalized text,
     # PDF structure) after durable persistence; see app/document_cache.py.
     # Sized for active work (Stage2 concurrency x per-candidate document
@@ -230,11 +234,48 @@ class Settings(BaseSettings):
     # Cancellation finalization of an unowned CANCEL_REQUESTED cycle is
     # still possible via a dedicated fenced operator endpoint while paused.
     research_opportunity_recovery_paused: bool = False
+    # LOCAL-only manual ETF Radar execution (paused-diagnostics flow). When
+    # recovery is paused and the scheduler is disabled, an authorized ADMIN may
+    # submit a single bounded ETF cycle for controlled validation. Defaults
+    # False -- the diagnostic gate must be explicitly enabled.
+    research_etf_manual_execution_enabled: bool = False
+    # LOCAL-only manual Full-NSE-ETF Universe execution -- an independent
+    # permission from the bounded manual gate. Defaults False.
+    research_etf_full_universe_execution_enabled: bool = False
+    # LOCAL-only manual Equity Radar execution -- an authorized ADMIN may
+    # submit a single equity cycle for controlled validation while recovery
+    # is paused. Defaults False.
+    research_equity_manual_execution_enabled: bool = False
+    # Automated fetch of official ETF documents (app.etf_official_document_*)
+    # against the explicit, human-reviewed allowlist in
+    # app.etf_official_document_sources, for at most two ETFs in this bounded
+    # rollout. Does not relax or bypass the existing identity/metric gates in
+    # app.etf_document_parser -- it only supplies them with an automatically
+    # fetched document instead of a manually uploaded one. Defaults False --
+    # automatic acquisition must be explicitly enabled.
+    research_etf_official_document_fetch_enabled: bool = False
     research_mcp_first_enabled: bool = False
     research_mcp_gateway_base_url: str = "http://mcp-gateway"
     research_mcp_gateway_timeout_seconds: float = 10.0
     research_mcp_service_identity: str = "research-engine"
     research_readiness_ensure_timeout_seconds: float = 25.0
+    # Global (process-wide) cap on concurrent HTTP requests the single
+    # shared HttpExternalResearchToolGateway singleton issues to the
+    # mcp-gateway service, across every baseline worker and every
+    # concurrently-dispatched requirement within each worker combined.
+    # Bounded concurrency within one instrument's execute_primary call
+    # (see app/yahoo_mcp_acquisition.py's _CONCURRENT_ELIGIBLE_REQUIREMENTS)
+    # means up to 4 MCP calls can now be in flight for a single instrument
+    # at once; with _BASELINE_CONCURRENCY=8 instruments processed
+    # concurrently, the theoretical worst case is 8*4=32 simultaneous
+    # requests against the same downstream service -- 4x the previously
+    # tolerated ceiling of 8 (one sequential call per instrument-worker).
+    # This semaphore keeps the actual simultaneous load against that
+    # service at the same previously-encountered level regardless of how
+    # much per-instrument concurrency is enabled, so this performance
+    # change cannot itself make the downstream service's own load worse
+    # than before. Default intentionally matches _BASELINE_CONCURRENCY.
+    research_mcp_gateway_max_concurrency: int = 8
     portfolio_service_base_url: str = "http://portfolio-service"
     market_data_nifty_refresh_timeout_seconds: float = 30.0
     market_data_population_batch_size: int = 50
@@ -258,6 +299,16 @@ class Settings(BaseSettings):
     market_data_internal_user_id: str = "00000000-0000-0000-0000-000000000101"
     market_data_internal_issuer: str = "aip-internal"
     market_data_internal_subject: str = "research-engine-market-data"
+    # Explicit, independently-verified NSE trading-series overrides, keyed by
+    # global_instrument_id (string UUID) -> series code. Research-engine
+    # assumes ordinary listed-equity series "EQ" for every instrument unless
+    # an entry exists here. This must never be populated by inference from
+    # an empty or failed acquisition response -- it exists only to record a
+    # fact independently confirmed against official NSE evidence (e.g. the
+    # NSE Security-wise Archives page) for a specific instrument whose
+    # verified trading series is not EQ. Default empty: zero behavior change
+    # for every instrument until an operator explicitly adds one.
+    nse_verified_trading_series_overrides: dict[str, str] = {}
 
     @field_validator("portfolio_refresh_instrument_concurrency")
     @classmethod
@@ -265,6 +316,28 @@ class Settings(BaseSettings):
         if not 1 <= value <= 8:
             raise ValueError("portfolio_refresh_instrument_concurrency must be between 1 and 8")
         return value
+
+    @field_validator("nse_verified_trading_series_overrides")
+    @classmethod
+    def validate_nse_verified_trading_series_overrides(cls, value: dict) -> dict:
+        from uuid import UUID as _UUID
+        allowed = {"EQ", "BE"}
+        normalized: dict[str, str] = {}
+        for key, series in dict(value or {}).items():
+            try:
+                normalized_key = str(_UUID(str(key)))
+            except (ValueError, AttributeError, TypeError) as exc:
+                raise ValueError(
+                    f"nse_verified_trading_series_overrides key {key!r} is not a valid instrument UUID"
+                ) from exc
+            normalized_series = str(series or "").strip().upper()
+            if normalized_series not in allowed:
+                raise ValueError(
+                    f"nse_verified_trading_series_overrides value {series!r} for {key!r} "
+                    f"must be one of {sorted(allowed)}"
+                )
+            normalized[normalized_key] = normalized_series
+        return normalized
 
     @field_validator("market_data_population_batch_size")
     @classmethod

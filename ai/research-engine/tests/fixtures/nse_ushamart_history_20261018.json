@@ -1,0 +1,2483 @@
+{
+  "source_snapshot": "diagnostics/target-history-20261018.json (read-only export)",
+  "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+  "as_of": "2026-10-17 22:36:28.504176+00:00",
+  "provider_symbol": "USHAMART.NS",
+  "observations": [
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-10 00:00:00",
+      "price": "384.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442822",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-11 00:00:00",
+      "price": "383.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442875",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-12 00:00:00",
+      "price": "387.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442893",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-15 00:00:00",
+      "price": "386.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442906",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-16 00:00:00",
+      "price": "407.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442918",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-17 00:00:00",
+      "price": "402.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442930",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-18 00:00:00",
+      "price": "415.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442942",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-19 00:00:00",
+      "price": "426.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442954",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-22 00:00:00",
+      "price": "431.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442966",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-23 00:00:00",
+      "price": "442.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442976",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-24 00:00:00",
+      "price": "445.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.442989",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-25 00:00:00",
+      "price": "448.70001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443001",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-26 00:00:00",
+      "price": "448.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443013",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-29 00:00:00",
+      "price": "476.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443026",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-09-30 00:00:00",
+      "price": "459.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443038",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-01 00:00:00",
+      "price": "452.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443049",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-03 00:00:00",
+      "price": "462.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443060",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-06 00:00:00",
+      "price": "450.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443072",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-07 00:00:00",
+      "price": "450.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443084",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-08 00:00:00",
+      "price": "446.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443096",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-09 00:00:00",
+      "price": "481.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443107",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-10 00:00:00",
+      "price": "469.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443119",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-13 00:00:00",
+      "price": "458.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443130",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-14 00:00:00",
+      "price": "480.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443143",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-15 00:00:00",
+      "price": "469.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443155",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-16 00:00:00",
+      "price": "468.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443166",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-17 00:00:00",
+      "price": "455.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443178",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-20 00:00:00",
+      "price": "453.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443190",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-21 00:00:00",
+      "price": "460.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443203",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-23 00:00:00",
+      "price": "458.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443214",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-24 00:00:00",
+      "price": "448.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443225",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-27 00:00:00",
+      "price": "455.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443237",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-28 00:00:00",
+      "price": "463.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443248",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-29 00:00:00",
+      "price": "462.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443259",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-30 00:00:00",
+      "price": "459.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443270",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-10-31 00:00:00",
+      "price": "464.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443281",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-03 00:00:00",
+      "price": "478.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443292",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-04 00:00:00",
+      "price": "474.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443304",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-06 00:00:00",
+      "price": "464.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443315",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-07 00:00:00",
+      "price": "472.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443326",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-10 00:00:00",
+      "price": "481.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443337",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-11 00:00:00",
+      "price": "469.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443348",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-12 00:00:00",
+      "price": "467.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443359",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-13 00:00:00",
+      "price": "448.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443372",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-14 00:00:00",
+      "price": "459.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443382",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-17 00:00:00",
+      "price": "449.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443394",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-18 00:00:00",
+      "price": "452.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443405",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-19 00:00:00",
+      "price": "448.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443416",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-20 00:00:00",
+      "price": "438.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443428",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-21 00:00:00",
+      "price": "432.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443439",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-24 00:00:00",
+      "price": "416.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443450",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-25 00:00:00",
+      "price": "412.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443463",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-26 00:00:00",
+      "price": "425.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443474",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-27 00:00:00",
+      "price": "421.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443486",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-11-28 00:00:00",
+      "price": "427.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443497",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-01 00:00:00",
+      "price": "422.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443508",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-02 00:00:00",
+      "price": "426.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443518",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-03 00:00:00",
+      "price": "424.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443530",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-04 00:00:00",
+      "price": "436.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443540",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-05 00:00:00",
+      "price": "432.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443551",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-08 00:00:00",
+      "price": "417.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443562",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-09 00:00:00",
+      "price": "435.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443573",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-10 00:00:00",
+      "price": "431.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443584",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-11 00:00:00",
+      "price": "429.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443595",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-12 00:00:00",
+      "price": "440.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443606",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-15 00:00:00",
+      "price": "461.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443617",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-16 00:00:00",
+      "price": "455.70001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443628",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-17 00:00:00",
+      "price": "455.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443639",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-18 00:00:00",
+      "price": "447.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443685",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-19 00:00:00",
+      "price": "452.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443703",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-22 00:00:00",
+      "price": "451.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443717",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-23 00:00:00",
+      "price": "463.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443730",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-24 00:00:00",
+      "price": "453.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443741",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-26 00:00:00",
+      "price": "442.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443752",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-29 00:00:00",
+      "price": "450.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443764",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-30 00:00:00",
+      "price": "450.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443775",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2025-12-31 00:00:00",
+      "price": "454.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443786",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-01 00:00:00",
+      "price": "443.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443799",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-02 00:00:00",
+      "price": "451.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443810",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-05 00:00:00",
+      "price": "456.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443822",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-06 00:00:00",
+      "price": "454.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443832",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-07 00:00:00",
+      "price": "453.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443843",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-08 00:00:00",
+      "price": "450.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443854",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-09 00:00:00",
+      "price": "440.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443866",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-12 00:00:00",
+      "price": "437.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443877",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-13 00:00:00",
+      "price": "431.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443887",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-14 00:00:00",
+      "price": "434.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443898",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-15 00:00:00",
+      "price": "434.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443909",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-16 00:00:00",
+      "price": "425.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443920",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-19 00:00:00",
+      "price": "428.70001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443932",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-20 00:00:00",
+      "price": "420.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443942",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-21 00:00:00",
+      "price": "414.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443953",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-22 00:00:00",
+      "price": "420.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443964",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-23 00:00:00",
+      "price": "408.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443976",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-27 00:00:00",
+      "price": "409.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443987",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-28 00:00:00",
+      "price": "415.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.443999",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-29 00:00:00",
+      "price": "408.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444009",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-01-30 00:00:00",
+      "price": "409.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444020",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-02 00:00:00",
+      "price": "397.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444114",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-03 00:00:00",
+      "price": "409.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444126",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-04 00:00:00",
+      "price": "421.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444138",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-05 00:00:00",
+      "price": "414.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444149",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-06 00:00:00",
+      "price": "416.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444160",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-09 00:00:00",
+      "price": "437.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444171",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-10 00:00:00",
+      "price": "428.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444182",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-11 00:00:00",
+      "price": "421.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444194",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-12 00:00:00",
+      "price": "423.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444204",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-13 00:00:00",
+      "price": "408.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444215",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-16 00:00:00",
+      "price": "414.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444226",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-17 00:00:00",
+      "price": "418.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444237",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-18 00:00:00",
+      "price": "418.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444247",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-19 00:00:00",
+      "price": "405.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444258",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-20 00:00:00",
+      "price": "402.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444269",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-23 00:00:00",
+      "price": "405.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444280",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-24 00:00:00",
+      "price": "406.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444292",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-25 00:00:00",
+      "price": "425.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444303",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-26 00:00:00",
+      "price": "425.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444315",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-02-27 00:00:00",
+      "price": "418.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444326",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-02 00:00:00",
+      "price": "420.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444338",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-04 00:00:00",
+      "price": "413.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444355",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-05 00:00:00",
+      "price": "422.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444366",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-06 00:00:00",
+      "price": "419.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444376",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-09 00:00:00",
+      "price": "405.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444387",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-10 00:00:00",
+      "price": "420.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444398",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-11 00:00:00",
+      "price": "425.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444408",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-12 00:00:00",
+      "price": "421.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444419",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-13 00:00:00",
+      "price": "407.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444430",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-16 00:00:00",
+      "price": "397.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444440",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-17 00:00:00",
+      "price": "399.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444450",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-18 00:00:00",
+      "price": "412.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444461",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-19 00:00:00",
+      "price": "397.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444472",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-20 00:00:00",
+      "price": "400.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444483",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-23 00:00:00",
+      "price": "387.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444493",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-24 00:00:00",
+      "price": "393.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444503",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-25 00:00:00",
+      "price": "414.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444514",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-27 00:00:00",
+      "price": "408.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444525",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-03-30 00:00:00",
+      "price": "391.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444536",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-01 00:00:00",
+      "price": "406.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444547",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-02 00:00:00",
+      "price": "405.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444558",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-06 00:00:00",
+      "price": "408.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444569",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-07 00:00:00",
+      "price": "405.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444579",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-08 00:00:00",
+      "price": "423.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444590",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-09 00:00:00",
+      "price": "431.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444601",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-10 00:00:00",
+      "price": "440.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444611",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-13 00:00:00",
+      "price": "435.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444622",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-15 00:00:00",
+      "price": "441.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444634",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-16 00:00:00",
+      "price": "446.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444645",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-17 00:00:00",
+      "price": "448.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444656",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-20 00:00:00",
+      "price": "445.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444666",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-21 00:00:00",
+      "price": "443.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444677",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-22 00:00:00",
+      "price": "444.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444688",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-23 00:00:00",
+      "price": "439.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444697",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-24 00:00:00",
+      "price": "444.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444708",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-27 00:00:00",
+      "price": "460.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444719",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-28 00:00:00",
+      "price": "457.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444729",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-29 00:00:00",
+      "price": "461.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444740",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-04-30 00:00:00",
+      "price": "451.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444750",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-04 00:00:00",
+      "price": "463.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444762",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-05 00:00:00",
+      "price": "454.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444773",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-06 00:00:00",
+      "price": "469.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444783",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-07 00:00:00",
+      "price": "477.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444794",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-08 00:00:00",
+      "price": "472.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444805",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-11 00:00:00",
+      "price": "477.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444816",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-12 00:00:00",
+      "price": "457.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444828",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-13 00:00:00",
+      "price": "475.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444839",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-14 00:00:00",
+      "price": "476.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444850",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-15 00:00:00",
+      "price": "472.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444861",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-18 00:00:00",
+      "price": "469.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444872",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-19 00:00:00",
+      "price": "469.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444883",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-20 00:00:00",
+      "price": "465.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444894",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-21 00:00:00",
+      "price": "463.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444904",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-22 00:00:00",
+      "price": "465.70001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444915",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-25 00:00:00",
+      "price": "473.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444925",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-26 00:00:00",
+      "price": "480.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444937",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-27 00:00:00",
+      "price": "510.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444949",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-05-29 00:00:00",
+      "price": "506.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444961",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-01 00:00:00",
+      "price": "490.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444972",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-02 00:00:00",
+      "price": "492.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444982",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-03 00:00:00",
+      "price": "497.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.444993",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-04 00:00:00",
+      "price": "519.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445005",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-05 00:00:00",
+      "price": "513.09997559",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445016",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-08 00:00:00",
+      "price": "493.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445027",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-09 00:00:00",
+      "price": "496.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445038",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-10 00:00:00",
+      "price": "480.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445049",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-11 00:00:00",
+      "price": "480.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445060",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-12 00:00:00",
+      "price": "486.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445070",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-15 00:00:00",
+      "price": "494.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445081",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-16 00:00:00",
+      "price": "499.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445091",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-17 00:00:00",
+      "price": "494.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445102",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-18 00:00:00",
+      "price": "490.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445113",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-19 00:00:00",
+      "price": "476.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445124",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-22 00:00:00",
+      "price": "480.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445135",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-23 00:00:00",
+      "price": "470.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445145",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-24 00:00:00",
+      "price": "465.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445156",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-25 00:00:00",
+      "price": "473.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445167",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-29 00:00:00",
+      "price": "484.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445177",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-06-30 00:00:00",
+      "price": "496.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445188",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-01 00:00:00",
+      "price": "492.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445199",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-02 00:00:00",
+      "price": "502.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445210",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-03 00:00:00",
+      "price": "514.09997559",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445221",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-06 00:00:00",
+      "price": "514.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445232",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-07 00:00:00",
+      "price": "507.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445243",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-08 00:00:00",
+      "price": "489.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445254",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-09 00:00:00",
+      "price": "502.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445265",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-10 00:00:00",
+      "price": "510.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445276",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-13 00:00:00",
+      "price": "510.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445287",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-14 00:00:00",
+      "price": "497.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445298",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-15 00:00:00",
+      "price": "497.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445310",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-16 00:00:00",
+      "price": "500.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445320",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-17 00:00:00",
+      "price": "494.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445331",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-20 00:00:00",
+      "price": "508.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445342",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-21 00:00:00",
+      "price": "500.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445352",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-22 00:00:00",
+      "price": "496.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445362",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-23 00:00:00",
+      "price": "496.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445373",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-24 00:00:00",
+      "price": "495.70001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445384",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-27 00:00:00",
+      "price": "502.10000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445394",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-28 00:00:00",
+      "price": "512.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445405",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-29 00:00:00",
+      "price": "511.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445415",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-30 00:00:00",
+      "price": "502.39999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445426",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-07-31 00:00:00",
+      "price": "495.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445437",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-03 00:00:00",
+      "price": "504.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445447",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-04 00:00:00",
+      "price": "503.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445459",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-05 00:00:00",
+      "price": "520.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445469",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-06 00:00:00",
+      "price": "515.65002441",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445480",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-07 00:00:00",
+      "price": "515.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445490",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-10 00:00:00",
+      "price": "516.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445501",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-11 00:00:00",
+      "price": "509.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445512",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-12 00:00:00",
+      "price": "502.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445523",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-13 00:00:00",
+      "price": "497.35000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445534",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-14 00:00:00",
+      "price": "487.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445545",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-17 00:00:00",
+      "price": "498.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445555",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-18 00:00:00",
+      "price": "498.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445566",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-19 00:00:00",
+      "price": "501.54998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445576",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-20 00:00:00",
+      "price": "495.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445587",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-21 00:00:00",
+      "price": "481.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445597",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-24 00:00:00",
+      "price": "490.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445608",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-25 00:00:00",
+      "price": "487.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445618",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-26 00:00:00",
+      "price": "496.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445628",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-27 00:00:00",
+      "price": "489.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445766",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-28 00:00:00",
+      "price": "492.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445850",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-08-31 00:00:00",
+      "price": "498.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445866",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-01 00:00:00",
+      "price": "499.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445878",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-02 00:00:00",
+      "price": "501.60000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445887",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-03 00:00:00",
+      "price": "515.65002441",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445897",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-04 00:00:00",
+      "price": "514.15002441",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445906",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-07 00:00:00",
+      "price": "500.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445917",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-08 00:00:00",
+      "price": "499.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445926",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-09 00:00:00",
+      "price": "498.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445936",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-10 00:00:00",
+      "price": "495.75000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445945",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-11 00:00:00",
+      "price": "494.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445954",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-15 00:00:00",
+      "price": "480.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.445962",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-16 00:00:00",
+      "price": "478.85000610",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446057",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-17 00:00:00",
+      "price": "495.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446095",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-18 00:00:00",
+      "price": "507.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446111",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-21 00:00:00",
+      "price": "533.90002441",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446122",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-22 00:00:00",
+      "price": "531.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446133",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-23 00:00:00",
+      "price": "535.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446142",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-24 00:00:00",
+      "price": "523.20001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446151",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-25 00:00:00",
+      "price": "518.79998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446161",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-28 00:00:00",
+      "price": "508.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446170",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-29 00:00:00",
+      "price": "498.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446180",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-09-30 00:00:00",
+      "price": "498.64999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446189",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-01 00:00:00",
+      "price": "491.70001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446199",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-05 00:00:00",
+      "price": "510.50000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446245",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-06 00:00:00",
+      "price": "516.70001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446257",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-07 00:00:00",
+      "price": "520.25000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446267",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-08 00:00:00",
+      "price": "503.95001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446276",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-09 00:00:00",
+      "price": "502.04998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446284",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-12 00:00:00",
+      "price": "483.14999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446292",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-13 00:00:00",
+      "price": "486.45001221",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446303",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-14 00:00:00",
+      "price": "487.00000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 20:35:22.446311",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-15 00:00:00",
+      "price": "482.89999390",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 23:13:19.745462",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-15 09:59:55",
+      "price": "482.90000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-15 23:36:24.322891",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-16 00:00:00",
+      "price": "491.29998779",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-17 16:57:31.278726",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS/history"
+    },
+    {
+      "currency": "INR",
+      "instrument_id": "0b3a675e-18c3-4cb2-9d63-02f881f56e4b",
+      "observed_at": "2026-10-16 09:59:56",
+      "price": "491.30000000",
+      "provider": "YAHOO_FINANCE",
+      "retrieved_at": "2026-10-16 16:21:31.344638",
+      "source_url": "https://finance.yahoo.com/quote/USHAMART.NS"
+    }
+  ]
+}

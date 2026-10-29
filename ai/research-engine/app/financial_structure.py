@@ -1,4 +1,4 @@
-"""Opt-in structural shadow parser. No metric binding, I/O, or persistence."""
+"""Financial structure: verified PDF tables and conservative text diagnostics."""
 from __future__ import annotations
 
 import hashlib
@@ -63,8 +63,14 @@ def parse_financial_structure(text: str = '', *, structure: PdfTextStructure | N
     if not text.strip():
         diagnostic = StatementDiagnostic('INPUT', 'NO_NORMALIZED_TEXT', structure.locate(0, 0), severity='ERROR')
         return FinancialParseResult((), (), (diagnostic,), _hash(['EMPTY']), 'INPUT_UNAVAILABLE')
+    layout_accepted, layout_rejected, layout_diagnostics, handled_pages = _layout_statements(structure)
+    accepted.extend(layout_accepted)
+    rejected.extend(layout_rejected)
+    diagnostics.extend(layout_diagnostics)
     headings = list(HEADING.finditer(text))
     for index, heading in enumerate(headings):
+        if structure.locate(heading.start(), heading.end()).page in handled_pages:
+            continue
         end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
         section = SECTION_END.search(text, heading.end(), end)
         if section:
@@ -163,6 +169,159 @@ def parse_financial_structure(text: str = '', *, structure: PdfTextStructure | N
     state = 'SUCCESS_PARTIAL' if accepted and rejected else 'SUCCESS_COMPLETE' if accepted else 'REJECTED' if rejected else 'NO_STATEMENT'
     fingerprint = _hash([c.structural_fingerprint for c in sorted(accepted + rejected, key=lambda c: c.source_region.start)])
     return FinancialParseResult(tuple(accepted), tuple(rejected), tuple(diagnostics), fingerprint, state)
+
+
+def _physical_column(table, box):
+    """A word must fit wholly inside exactly one ruled physical column."""
+    owners = [i for i, (left, right) in enumerate(zip(table.column_edges, table.column_edges[1:]))
+              if left - 1 <= box[0] and box[2] <= right + 1]
+    return owners[0] if len(owners) == 1 else None
+
+
+def _layout_unit(structure, page, heading, last_header_row, basis, period_end):
+    """A damaged scale needs a unique exact INR scale in same-basis result notes.
+
+    Corroboration cannot supply a missing currency or a missing unit label, nor
+    cross reporting bases. The damaged label must independently identify the
+    same scale within two character edits. Every supporting span is retained.
+    """
+    from app.structured_research import _edit_distance
+    from app.financial_headers import parse_date
+    scales = ('lakh', 'crore', 'million', 'billion', 'thousand')
+    labels = []
+    for line in page.lines:
+        if heading.ordinal < line.ordinal < last_header_row:
+            for match in re.finditer(r'\b(?:Rs\.?|INR|rupees?)\s+in\s+([A-Za-z.]+)', line.original_text, re.I):
+                raw = match.group(1).lower().replace('.', '')
+                exact = next((s for s in scales if raw in {s, s + 's'}), None)
+                labels.append((line, match, raw, exact))
+    if not labels:
+        return None, ()
+    evidence, resolved = [], set()
+    for line, match, raw, exact in labels:
+        region = structure.locate(line.region.start + match.start(), line.region.start + match.end())
+        support = []
+        if exact is None:
+            possibilities = {s for s in scales if min(_edit_distance(raw, s), _edit_distance(raw, s + 's')) <= 2}
+            for notes_page in structure.pages:
+                body = structure.extracted_text[notes_page.region.start:notes_page.region.end]
+                note = re.search(r'\bnotes\s+to\s+(?:the\s+)?statement\s+of\s+(?:audited\s+|unaudited\s+)?'
+                                 + basis + r'\s+financial\s+results\b', body, re.I)
+                title = body[note.end():note.end() + 180] if note else ''
+                title = re.sub(r'(?<=[A-Za-z]),(?=\s*\d{4})', '', title)
+                if not note or period_end not in {parse_date(m.group()) for m in DATE.finditer(title)}:
+                    continue
+                for corroboration in re.finditer(r'\b(?:Rs\.?|INR|rupees?)\s+[0-9][0-9,.]*\s+'
+                                                  r'(lakhs?|crores?|millions?|billions?|thousands?)\b', body[note.end():], re.I):
+                    scale = corroboration.group(1).lower().rstrip('s')
+                    start = notes_page.region.start + note.end() + corroboration.start()
+                    support.append(HeaderTokenEvidence('UNIT_CORROBORATION', corroboration.group(), 'INR ' + scale,
+                                                       structure.locate(start, start + len(corroboration.group()))))
+            corroborated = {s.value.removeprefix('INR ') for s in support}
+            if len(corroborated) == 1 and corroborated <= possibilities:
+                exact = next(iter(corroborated))
+        value = 'INR ' + exact if exact else None
+        evidence.append(HeaderTokenEvidence('UNIT', match.group(), value, region))
+        evidence.extend(support)
+        resolved.add(value)
+    return (next(iter(resolved)) if len(resolved) == 1 else None), tuple(evidence)
+
+
+def _layout_statements(structure):
+    from app.financial_headers import parse_date
+    from app.financial_structure_types import FinancialColumn
+
+    accepted, rejected, diagnostics, handled = [], [], [], set()
+    for page in structure.pages:
+        titles = [(line, HEADING.search(line.original_text)) for line in page.lines]
+        titles = [(line, match) for line, match in titles if match and not line.original_text[:match.start()].strip()]
+        if not page.tables or not titles:
+            continue
+        handled.add(page.ordinal)
+        diagnostics.append(StatementDiagnostic('LAYOUT', 'LAYOUT_STATEMENT_PAGE', page.region))
+        for title, heading in titles:
+            bases = {b.group().upper() for b in BASIS.finditer(heading.group())}
+            basis = next(iter(bases)) if len(bases) == 1 else None
+            source = structure.locate(title.region.start, page.region.end)
+            if not basis or len(titles) != 1:
+                diagnostics.append(StatementDiagnostic('BASIS', 'REPORTING_BASIS_AMBIGUOUS', source, severity='ERROR'))
+                continue
+            for table in page.tables:
+                for group in table.cells:
+                    label = re.sub(r'\s+on\s*$', '', group.text, flags=re.I)
+                    if not title.ordinal < group.row <= title.ordinal + 6 or not GROUP.fullmatch(label):
+                        continue
+                    group_columns = set(range(group.column, group.column + group.column_span))
+                    date_lines = [line for line in page.lines if group.row < line.ordinal <= group.row + 4
+                                  and any(re.fullmatch(r'\d{1,2}[-./<]+[0-9A-Za-z?]{1,2}[-./]+[0-9A-Za-z?]{4}', w.text)
+                                          for w in line.words)]
+                    reason, columns, tokens, audit_tokens = None, [], [], []
+                    if group.quality != 'RESOLVED' or len(date_lines) != 1:
+                        reason = 'HEADER_GROUP_SPAN_AMBIGUOUS'
+                    else:
+                        date_line = date_lines[0]
+                        dates = {}
+                        all_date_columns = []
+                        for word in date_line.words:
+                            owner = _physical_column(table, word.region.geometry)
+                            if re.search(r'\d', word.text) and owner is not None:
+                                all_date_columns.append(owner)
+                            if owner in group_columns:
+                                dates.setdefault(owner, []).append(word)
+                        if set(dates) != group_columns or any(len(v) != 1 for v in dates.values()):
+                            reason = 'HEADER_DATE_SLOT_MISMATCH'
+                        else:
+                            statuses = {}
+                            audit_lines = [line for line in page.lines
+                                           if date_line.ordinal < line.ordinal <= date_line.ordinal + 2
+                                           and any(AUDIT.fullmatch(w.text.replace('-', '')) for w in line.words)]
+                            for line in audit_lines:
+                                for word in line.words:
+                                    owner = _physical_column(table, word.region.geometry)
+                                    if owner in group_columns:
+                                        statuses.setdefault(owner, []).append(word)
+                            date_values, audit_values = [], []
+                            for owner in sorted(group_columns):
+                                word = dates[owner][0]
+                                # Repeated separators change no date digits.
+                                value = parse_date(re.sub(r'(?<=\d)--(?=\d)', '-', word.text))
+                                status = statuses.get(owner, [])
+                                audit = status[0].text.upper().replace('-', '') if len(status) == 1 else None
+                                tokens.append(HeaderTokenEvidence('DATE', word.text, value, replace(word.region, column=owner)))
+                                if len(status) == 1:
+                                    audit_tokens.append(HeaderTokenEvidence('AUDIT', status[0].text, audit,
+                                                                           replace(status[0].region, column=owner)))
+                                if value is None or audit not in {'AUDITED', 'UNAUDITED'}:
+                                    reason = 'PERIOD_DATE_INVALID' if value is None else 'AUDIT_STATUS_UNRESOLVED'
+                                date_values.append(value)
+                                audit_values.append(audit)
+                            if reason is None:
+                                raw_dates = [re.sub(r'(?<=\d)--(?=\d)', '-', dates[owner][0].text)
+                                             for owner in sorted(group_columns)]
+                                header = resolve_financial_header(label + '\n' + ' '.join(raw_dates)
+                                                                  + '\n' + ' '.join(audit_values))
+                                if not header.columns or any(a <= b for a, b in zip(date_values, date_values[1:])):
+                                    reason = 'HEADER_EVIDENCE_CONFLICT'
+                                else:
+                                    first = min(all_date_columns)
+                                    columns = [replace(c, source_region=tokens[i].region, group_evidence=(group.region,),
+                                                       source_column=owner - first + 1, resolution_state='LAYOUT_RESOLVED')
+                                               for i, (c, owner) in enumerate(zip(header.columns, sorted(group_columns)))]
+                    tokens = [HeaderTokenEvidence('GROUP', group.text, columns[0].period_type if columns else None,
+                                                   group.region), *tokens, *audit_tokens]
+                    header = HeaderResolution(tuple(columns), HeaderEvidence(tuple(tokens), ('RULED_PDF_COLUMNS',)), ())
+                    current_period = max(c.period_end for c in columns) if columns else ''
+                    unit, unit_evidence = _layout_unit(structure, page, title, date_lines[0].ordinal if date_lines else group.row,
+                                                      basis, current_period)
+                    candidate = FinancialStatementCandidate('INCOME_STATEMENT', basis, source, group.region,
+                        source, unit_evidence, header, 'REJECTED' if reason else 'RESOLVED',
+                        _hash(['RULED_PDF_COLUMNS', basis, [(c.source_column, c.period_type) for c in columns]]), table)
+                    (rejected if reason else accepted).append(candidate)
+                    diagnostics.append(StatementDiagnostic('HEADER', reason or 'COLUMN_MODEL_RESOLVED', group.region,
+                                                           severity='ERROR' if reason else 'INFO'))
+                    if not unit:
+                        diagnostics.append(StatementDiagnostic('UNIT', 'UNIT_UNRESOLVED', source, severity='WARNING'))
+    return accepted, rejected, diagnostics, handled
 
 
 def inspect_financial_document_structure(document, *, compare_legacy: bool = True) -> FinancialParseResult:

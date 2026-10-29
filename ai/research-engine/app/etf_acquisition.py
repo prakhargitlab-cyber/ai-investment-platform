@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import io
 import re
-from urllib.parse import urlparse
 from uuid import UUID
 
 from app.etf_evidence import (
@@ -19,6 +18,17 @@ from app.models import EtfResearchProfile, ResearchDocument, StructuredMarketSna
 
 
 NSE_ETF_LIST_URL = "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"
+
+# NSE's archive host silently stalls (ReadTimeout) a request whose headers do
+# not identify a browser, rather than returning an explicit 403/429 -- shared
+# by every caller of NSE_ETF_LIST_URL (both the single-instrument discovery
+# below and the Full ETF Radar's universe discovery in etf_full_universe.py)
+# so the two acquisition paths never drift out of sync on this requirement.
+NSE_ETF_LIST_HEADERS = {
+    "Accept": "text/csv", "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+}
 
 
 def parse_nse_etf_list(text: str, provenance: EtfProvenance, master_rows=()) -> list[EtfListing]:
@@ -57,8 +67,9 @@ def parse_nse_etf_list(text: str, provenance: EtfProvenance, master_rows=()) -> 
 
 
 class EtfAcquisitionService:
-    def __init__(self, persistence, *, clock=None, run_blocking=None, fence=None):
+    def __init__(self, persistence, *, clock=None, run_blocking=None, fence=None, document_registry=None):
         self.persistence = persistence
+        self.document_registry = document_registry
         self.fence = fence
         self.run_blocking = run_blocking
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -92,9 +103,18 @@ class EtfAcquisitionService:
         return self._record(*args, **kwargs)
 
     async def discover_nse(self, client, *, master_rows=(), instrument_ids=None):
-        """One explicit list request; never loops over fund/provider endpoints."""
+        """One explicit list request; never loops over fund/provider endpoints.
+
+        NSE's archive host silently stalls (ReadTimeout) requests whose
+        User-Agent identifies a non-browser HTTP client, rather than returning
+        an explicit 403/429 -- the same browser-identity headers are already
+        required for every other NSE call in this codebase (see nse_etf_market
+        .HEADERS and nse_historical_daily.HEADERS) and for the equivalent,
+        already-working portfolio-service Java client against this identical
+        URL (OfficialNseEtfSecurityListClient).
+        """
         try:
-            response = await client.get(NSE_ETF_LIST_URL, headers={"Accept": "text/csv", "Referer": "https://www.nseindia.com/"})
+            response = await client.get(NSE_ETF_LIST_URL, headers=NSE_ETF_LIST_HEADERS)
             response.raise_for_status()
             provenance = EtfProvenance(provider="NSE", source_type="NSE_OFFICIAL_ETF_SECURITY_LIST",
                 source_identity=NSE_ETF_LIST_URL, source_url=NSE_ETF_LIST_URL,
@@ -167,76 +187,41 @@ class EtfAcquisitionService:
         return await self._record_async(profile.instrument_id, metric, provider.provider_name, [fact])
 
     def acquire_official_document(self, profile: EtfResearchProfile, document: ResearchDocument, metric: EtfMetric):
-        """Parse only demonstrated legacy TER/AUM labels from a validated document.
-
-        The caller uses the existing document fetcher. No new website discovery,
-        guessed AMC URL, legacy inferred provider/index, or named holdings list.
-        Missing effective dates remain unknown; publication is not an as-of date.
-        """
+        """Acquire one authorized metric; unsupported or unverified inputs fail closed."""
         if metric not in {EtfMetric.EXPENSE_RATIO, EtfMetric.AUM}:
             return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT", outcome=Outcome.NOT_IMPLEMENTED,
                 reason="NO_PROVEN_OFFICIAL_FIELD_PARSER")
+        from app.etf_document_parser import verified_scheme_section, parse_metric
         try:
-            host = (urlparse(document.canonical_url).hostname or "").lower()
-            nse = host in {"nsearchives.nseindia.com", "www.nseindia.com", "nseindia.com"}
-            amc = host in {domain.lower() for domain in profile.known_domains}
-            if (document.instrument_id != profile.instrument_id or document.source_mode != "REAL"
-                    or document.status != "PROCESSED" or document.reliability_level not in {"LEVEL_A", "LEVEL_B"}
-                    or not ((nse and document.source_classification == "EXCHANGE")
-                            or (amc and document.source_classification == "OFFICIAL_COMPANY"))):
-                raise ValueError("UNVERIFIED_ETF_OFFICIAL_DOCUMENT")
-            text = document.normalized_text or ""
-            if not text.strip() or re.search(r"captcha|access denied|too many requests", text, re.I):
-                raise ValueError("EMPTY_OR_BLOCKED_DOCUMENT")
-            if metric == EtfMetric.EXPENSE_RATIO:
-                label = r"\b(?:total expense ratio|expense ratio|TER)\b"
-                matches = re.findall(label + r"\s*[:=-]?\s*(\d+(?:\.\d+)?)\s*%", text, re.I)
-                values = {(Decimal(number), "percent") for number in matches}
-            else:
-                label = r"\b(?:AUM|assets under management|fund size)\b"
-                values = set()
-                # EUR/USD/GBP with billion/million scales
-                matches = re.findall(label + r"\s*[:=-]?\s*(EUR|USD|GBP)\s*(\d+(?:[,.]\d+)?)\s*(bn|billion|mn|million)\b", text, re.I)
-                for currency, number, scale in matches:
-                    num = Decimal(number.replace(",", ""))
-                    factor = Decimal("1000000000") if scale.lower() in {"bn", "billion"} else Decimal("1000000")
-                    values.add((num * factor, currency.upper()))
-                # INR with crore/lakh scales (₹, INR, Rs, Rs.)
-                # Handles Indian comma notation: 1,00,00,000 or international: 10,000,000
-                matches_inr = re.findall(r"(?:₹|INR|Rs\.?)\s*(\d{1,3}(?:,\d{2})*(?:,\d{3})?|[\d.,]+)\s*(crore|crores|lakh|lakhs)\b", text, re.I)
-                for number, scale in matches_inr:
-                    # Handle Indian comma notation: 1,00,00,000 -> remove commas
-                    num = Decimal(number.replace(",", "").replace(" ", ""))
-                    factor = Decimal("10000000") if scale.lower() in {"crore", "crores"} else Decimal("100000")
-                    values.add((num * factor, "INR"))
-                # INR with million (not crore/lakh)
-                matches_inr_mn = re.findall(r"(?:₹|INR|Rs\.?)\s*(\d+(?:[,.]\d+)?)\s*(million|mn)\b", text, re.I)
-                for number, _ in matches_inr_mn:
-                    num = Decimal(number.replace(",", ""))
-                    values.add((num * Decimal("1000000"), "INR"))
-                # Explicit INR with bn/mn (same as other currencies)
-                matches_inr2 = re.findall(label + r"\s*[:=-]?\s*INR\s*(\d+(?:[,.]\d+)?)\s*(bn|billion|mn|million)\b", text, re.I)
-                for number, scale in matches_inr2:
-                    num = Decimal(number.replace(",", ""))
-                    factor = Decimal("1000000000") if scale.lower() in {"bn", "billion"} else Decimal("1000000")
-                    values.add((num * factor, "INR"))
-            provenance = EtfProvenance(provider="NSE" if nse else host, source_type=str(document.source_type),
-                source_identity=str(document.document_id), source_url=document.canonical_url,
-                source_locator=f"normalized_text:{metric}", published_at=document.published_at,
-                retrieved_at=document.retrieved_at, reliability_level=document.reliability_level,
-                authority=EtfAuthority.OFFICIAL_EXCHANGE if nse else EtfAuthority.OFFICIAL_FUND)
-            declaration = re.search(label + r"\s*:\s*(not published|not disclosed)\b", text, re.I)
-            if not values and declaration:
-                return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT", outcome=Outcome.GENUINELY_UNAVAILABLE,
-                    reason=f"SOURCE_DECLARATION:{declaration.group(0)}", unavailability_evidence=provenance)
-            if len(values) > 1 or (not values and re.search(label, text, re.I)):
-                raise ValueError("AMBIGUOUS_OR_UNPARSEABLE_METRIC")
-            if not values:
-                return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT", reason="VALID_DOCUMENT_FIELD_ABSENT")
-            value, unit = next(iter(values))
+            source = (self.document_registry.source_for(profile.instrument_id, document.original_url)
+                      if self.document_registry is not None else None)
+            section, host, authority, metadata = verified_scheme_section(
+                self.persistence, profile, document, source, now=self.clock())
+            value, unit, as_of, lines, reason = parse_metric(
+                section, metric, source, now=self.clock(), retrieved_at=document.retrieved_at)
+            metadata.update(metric_lines=lines, metric_as_of_date=as_of.isoformat() if as_of else None)
+            provenance = EtfProvenance(provider="NSE" if authority == EtfAuthority.OFFICIAL_EXCHANGE else host,
+                source_type=str(document.source_type),
+                source_identity=f"{document.canonical_url}#sha256={source.normalized_text_sha256}",
+                source_url=document.canonical_url, source_metadata=metadata,
+                source_locator=f"normalized_text:{metadata['section_span']}:{metric}",
+                published_at=document.published_at, retrieved_at=document.retrieved_at,
+                reliability_level=document.reliability_level, authority=authority)
+            if reason == "SOURCE_DECLARATION":
+                return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT",
+                    outcome=Outcome.GENUINELY_UNAVAILABLE, reason=reason, unavailability_evidence=provenance)
+            if value is None:
+                return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT", reason=reason)
             fact = EtfFact(instrument_id=profile.instrument_id, metric=metric, value=value, unit=unit,
-                provenance=provenance)
-        except Exception as exc:
+                as_of_date=as_of, provenance=provenance)
+            # Same-period primary-source corrections need an explicit reconciliation
+            # workflow. Do not silently choose one by publication/retrieval time.
+            if any(old.as_of_date == as_of and old.provenance.authority in {
+                    EtfAuthority.OFFICIAL_EXCHANGE, EtfAuthority.OFFICIAL_FUND}
+                    and (old.value, old.unit) != (value, unit)
+                    for old in self.persistence.etf_facts(profile.instrument_id, metric)):
+                raise ValueError("CONFLICTING_OFFICIAL_METRIC_FOR_PERIOD")
+        except ValueError as exc:
             return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT", outcome=Outcome.TECHNICAL_FAILURE,
-                reason=f"OFFICIAL_DOCUMENT_FAILED:{type(exc).__name__}:{str(exc)[:160]}")
+                reason=f"OFFICIAL_DOCUMENT_FAILED:{str(exc)[:160]}")
         return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT", [fact])

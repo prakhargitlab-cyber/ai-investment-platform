@@ -123,3 +123,36 @@ def test_holdings_preserve_explicit_amounts_and_provenance():
 def test_holdings_reject_invalid_ranges(invalid):
     with pytest.raises(ValidationError):
         EtfHolding(etf_instrument_id=UUID(int=1), as_of_date=date(2026, 6, 30), source_provider="fixture", **invalid)
+
+
+@pytest.mark.parametrize("asset,strategy,expected", [
+    # Regression: NSE's own subCatagory field for a plain index-tracking
+    # ETF is typically the literal benchmark name (e.g. "Nifty 50"), not a
+    # generic label like "equity index" -- this reproduces that real shape
+    # (see ai/research-engine/tests/test_etf_research_reliability.py:151,
+    # which already fixtures subCatagory="Nifty 50") rather than only the
+    # "Broad market index"/"Sector thematic" labels tested above.
+    ("Equity", "Nifty 50", EtfSubtype.EQUITY_INDEX),
+    ("Equity", "Nifty Next 50", EtfSubtype.EQUITY_INDEX),
+    ("Equity", "Nifty 500", EtfSubtype.EQUITY_INDEX),
+    ("Equity", "Sensex", EtfSubtype.EQUITY_INDEX),
+    ("Equity", "BSE Sensex", EtfSubtype.EQUITY_INDEX),
+    ("Equity", "Nifty Bank", EtfSubtype.EQUITY_SECTOR_THEMATIC),
+    ("Equity", "Nifty IT", EtfSubtype.EQUITY_SECTOR_THEMATIC),
+    ("Equity", "Nifty Pharma", EtfSubtype.EQUITY_SECTOR_THEMATIC),
+    # Not an NSE index name at all -- must NOT be swept into EQUITY_INDEX.
+    ("Equity", "Some Other Fund Strategy", EtfSubtype.OTHER),
+])
+def test_nse_benchmark_index_name_classification(asset, strategy, expected):
+    assert classify_etf(profile(asset_class=asset), investment_strategy=strategy) == expected
+
+
+def test_nse_benchmark_index_name_is_read_from_metadata_not_guessed():
+    """The recognizer only ever reads the explicit investment_strategy
+    argument (the verified subCatagory field) -- never the profile's own
+    ticker or fund_name -- matching test_identifiers_and_names_never_classify
+    above."""
+    candidate = profile(asset_class="Equity").model_copy(
+        update={"ticker": "NIFTYBEES", "fund_name": "Nifty 50 ETF"})
+    assert classify_etf(candidate) == EtfSubtype.OTHER
+    assert classify_etf(candidate, investment_strategy="Nifty 50") == EtfSubtype.EQUITY_INDEX

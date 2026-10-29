@@ -20,6 +20,9 @@ from test_official_nse_financial_parsing import JUNE
 from test_yahoo_mcp_acquisition import result as mcp_result
 
 
+pytestmark = pytest.mark.usefixtures("financial_fixture_clock")
+
+
 @pytest.fixture(autouse=True)
 def no_live_http(monkeypatch):
     original = httpx.AsyncClient.send
@@ -148,6 +151,9 @@ def test_production_executor_attempts_nse_before_accepting_fresh_yahoo(mode):
 def test_production_executor_discovers_parses_persists_and_reuses_authority():
     repo, profile = _repo()
     _seed(repo, _facts(repo))
+    # Reuse a durable historical quarter beside the three explicit quarters
+    # in the new filing; the authority upgrade still has to replace Yahoo.
+    _seed(repo, [fact for fact in _facts(repo, official=True) if fact.key.period_end == "2025-09-30"])
     order = []
     _nse(repo, profile, order, "valid")
     runtime = _runtime(repo, profile, order)

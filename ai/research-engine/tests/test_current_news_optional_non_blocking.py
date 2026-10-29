@@ -70,7 +70,7 @@ class _FakeInvestigateRuntime:
         return self.readiness
 
     async def ensure(self, instrument_id, *, jurisdiction, requirement_ids, identity_headers=None,
-                     correlation_id=None, wait_for_completion=True):
+                     correlation_id=None, wait_for_completion=True, timeout_seconds=None):
         requirement_id = requirement_ids[0]
         delay = self.delays.get(requirement_id, 0)
         if delay:

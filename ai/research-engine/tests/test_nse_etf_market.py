@@ -75,6 +75,62 @@ def test_unverified_market_snapshot_rejected(case):
         market_snapshot(payload, LISTINGS, NOW)
 
 
+def test_unrelated_duplicate_or_unknown_symbol_elsewhere_in_the_shared_feed_does_not_block_a_bounded_request():
+    # Root cause of the GOLDBEES PARTIAL_FAILURE that persisted even after
+    # the case/whitespace normalization fix: getETFData's parent=all&child=
+    # all feed (and the official security-list CSV) cover NSE's ENTIRE ETF
+    # universe, but market_snapshot() validated ALL of it for every call,
+    # so a totally unrelated ETF's duplicate/unknown-symbol row anywhere in
+    # that shared universe aborted the whole snapshot -- failing the
+    # bounded, single-instrument request too, even though the requested
+    # instrument's own row was perfectly fine. requested_symbols scopes
+    # strict uniqueness/format validation to only the instrument(s) actually
+    # being ingested; unrelated rows/listings are skipped, never fatal.
+    payload = deepcopy(PAYLOAD)
+    payload["data"]["data"].append({"symbol": "UNRELATEDETF", "series": "EQ",
+        "identifier": "UNRELATEDETFEQN", "lastPrice": 50, "totalTradedVolume": 1000, "nav": 49})
+    payload["data"]["data"].append({"symbol": "UNRELATEDETF", "series": "EQ",  # duplicate, unrelated
+        "identifier": "UNRELATEDETFEQN", "lastPrice": 51, "totalTradedVolume": 900, "nav": 49.2})
+    stamp, rows, envelope = market_snapshot(payload, LISTINGS, NOW, requested_symbols={"SILVERBEES"})
+    assert set(rows) == {"SILVERBEES"}
+
+
+@pytest.mark.parametrize("case", ["duplicate", "unknown", "series", "identifier"])
+def test_requested_instruments_still_get_strict_checks_when_scoped(case):
+    # requested_symbols must never weaken validation for the instrument(s)
+    # actually being requested -- only unrelated rows are skipped.
+    payload = deepcopy(PAYLOAD)
+    if case == "duplicate": payload["data"]["data"].append(dict(ROW))
+    if case == "unknown": payload["data"]["data"][0]["symbol"] = "OTHER"
+    if case == "series": payload["data"]["data"][0]["series"] = "BE"
+    if case == "identifier": payload["data"]["data"][0]["identifier"] = "OTHER"
+    requested = {"SILVERBEES"} if case != "unknown" else {"SILVERBEES", "OTHER"}
+    with pytest.raises(ValueError):
+        market_snapshot(payload, LISTINGS, NOW, requested_symbols=requested)
+
+
+@pytest.mark.parametrize("live_symbol", ["silverbees", " SILVERBEES", "SILVERBEES "])
+def test_live_feed_symbol_case_or_whitespace_does_not_block_a_verified_instrument(live_symbol):
+    # Root cause of the reported GOLDBEES PARTIAL_FAILURE/NSE_ACQUISITION_FAILED
+    # incident (UNVERIFIED_OR_DUPLICATE_MARKET_SYMBOL on all three metrics):
+    # the official-list symbol (by_symbol's keys) is normalized to
+    # .strip().upper() by parse_nse_etf_list, but the live getETFData
+    # market-watch feed's own "symbol" field was compared to that key with
+    # no equivalent normalization. NSE maintains the official ETF security
+    # list and the live market-watch feed as two separately-sourced
+    # endpoints; incidental case/whitespace drift between them for a
+    # genuinely verified, unambiguous instrument must not be treated as an
+    # unverified or duplicate symbol. A row that still names a different or
+    # duplicated symbol (test_unverified_market_snapshot_rejected's
+    # "duplicate"/"unknown" cases, above) must keep being rejected -- this
+    # test only covers the same canonical symbol, differently cased/padded.
+    payload = deepcopy(PAYLOAD)
+    payload["data"]["data"][0]["symbol"] = live_symbol
+    payload["data"]["data"][0]["identifier"] = "SILVERBEESEQN"
+    stamp, rows, envelope = market_snapshot(payload, LISTINGS, NOW)
+    assert "SILVERBEES" in rows
+
+
 def test_zero_volume_does_not_make_carried_price_fresh():
     stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
     row = ROW | {"totalTradedVolume": 0}

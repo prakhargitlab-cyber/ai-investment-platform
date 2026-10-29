@@ -115,15 +115,25 @@ def _business_quality_facts(period_a: str, period_b: str, source: str = "https:/
     ]
 
 
-def _growth_facts(q1: str, q2: str, a1: str, a2: str, source: str = "https://example.com/filing") -> list[dict]:
+def _growth_facts(q1: str, q2: str, a1: str, a2: str, a3: str | None = None,
+                   source: str = "https://example.com/filing") -> list[dict]:
     rows = []
+    periods = [
+        (q1, "QUARTERLY", "50000", "9000"),
+        (q2, "QUARTERLY", "52000", "9500"),
+        (a1, "ANNUAL", "190000", "35000"),
+        (a2, "ANNUAL", "205000", "38000"),
+    ]
+    if a3 is not None:
+        # ANNUAL_CAGR_INPUTS requires ANNUAL_CAGR_MIN_PERIODS (3) annual
+        # periods, matching stock_rule_engine._series_cagr's own minimum
+        # for computing a CAGR -- two annual periods alone leave
+        # ANNUAL_CAGR_INPUTS genuinely missing (see
+        # test_missing_annual_periods_blocks_annual_cagr_inputs below).
+        periods.append((a3, "ANNUAL", "175000", "32000"))
     for metric in ("revenue", "pat"):
-        for period, ptype, value in (
-            (q1, "QUARTERLY", "50000" if metric == "revenue" else "9000"),
-            (q2, "QUARTERLY", "52000" if metric == "revenue" else "9500"),
-            (a1, "ANNUAL", "190000" if metric == "revenue" else "35000"),
-            (a2, "ANNUAL", "205000" if metric == "revenue" else "38000"),
-        ):
+        for period, ptype, revenue_value, pat_value in periods:
+            value = revenue_value if metric == "revenue" else pat_value
             rows.append({"metric": metric, "value": value, "periodEnd": period, "periodType": ptype, "unit": "INR crore", "sourceUrl": source})
     return rows
 
@@ -396,9 +406,9 @@ class TestGrowthFacts:
     @pytest.mark.asyncio
     async def test_complete_current_upload_reaches_ready_fresh(self, ingestor, acceptor, repository):
         q1, q2 = _days_ago(100), _days_ago(10)
-        a1, a2 = _days_ago(400), _days_ago(30)
+        a1, a2, a3 = _days_ago(400), _days_ago(150), _days_ago(30)
         draft = ingestor.ingest(evidence_type="GROWTH_FACTS", file_bytes=b"x", filename="g.txt", instrument_id=RELIANCE_ID)
-        result = await acceptor.accept(draft_id=draft.draft_id, corrections={"facts": _growth_facts(q1, q2, a1, a2)})
+        result = await acceptor.accept(draft_id=draft.draft_id, corrections={"facts": _growth_facts(q1, q2, a1, a2, a3)})
         req = next(r for r in result["readiness"]["requirements"] if r["requirementId"] == "GROWTH_FACTS")
         assert req["status"] == "READY_FRESH"
         assert set(req["coveredInputIds"]) == {

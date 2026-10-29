@@ -1,4 +1,4 @@
-"""ETF_RULE_ENGINE_V1: a new, dedicated, deterministic ETF scoring model.
+﻿"""ETF_RULE_ENGINE_V1: a new, dedicated, deterministic ETF scoring model.
 
 This is NOT a reuse of ``app.stock_rule_engine.StockRuleEngineV1`` -- an ETF
 is not a company, and nothing here treats it as one (no profitability,
@@ -277,13 +277,39 @@ def _score_cost(data: EtfRuleEngineInput) -> EtfFactorScoreResult:
 
 
 def _score_nav_premium_discount(data: EtfRuleEngineInput) -> EtfFactorScoreResult:
+    """Investigated (ETF-radar data-completeness review): NAV showing
+    READY_FRESH in readiness statuses does not by itself guarantee this
+    factor can score, because readiness only checks NAV's OWN freshness --
+    scoring additionally requires a fresh MARKET_PRICE fact dated on the
+    SAME calendar day as the NAV. Those two dates come from genuinely
+    different NSE fields (NAV's nav_date from the market-watch envelope's
+    "navDate", which NSE often still publishes for the PRIOR session until
+    today's NAV computation completes after close; MARKET_PRICE's
+    as_of_date from the live quote "stamp") -- a same-day mismatch is a
+    real, legitimate publishing-timing gap, not a wiring defect, and
+    comparing a live price to a stale NAV would misreport premium/discount,
+    so this intentionally stays UNAVAILABLE rather than scoring across the
+    gap. No scoring/availability behavior changes here -- only the reason
+    string is specific enough to confirm which real-world condition
+    applies, in place of one undifferentiated code covering four distinct
+    causes."""
     weight = ETF_RULE_ENGINE_FACTOR_WEIGHTS[EtfRuleEngineFactor.NAV_PREMIUM_DISCOUNT]
     nav = data.nav if data.nav is not None and etf_freshness(data.nav, EtfMetric.NAV, now=data.now) == "FRESH" else None
     price = _fresh_fact(data.market_price_fact, EtfMetric.MARKET_PRICE, now=data.now)
     if nav is None or price is None or nav.nav == 0 or nav.nav_date != price.as_of_date or nav.currency != price.unit:
+        if nav is None:
+            reason = "NO_FRESH_NAV_EVIDENCE"
+        elif price is None:
+            reason = "NO_FRESH_MARKET_PRICE_EVIDENCE"
+        elif nav.nav == 0:
+            reason = "NAV_VALUE_ZERO"
+        elif nav.nav_date != price.as_of_date:
+            reason = "NAV_AND_MARKET_PRICE_AS_OF_DATE_MISMATCH"
+        else:
+            reason = "NAV_AND_MARKET_PRICE_CURRENCY_MISMATCH"
         return EtfFactorScoreResult(factor=EtfRuleEngineFactor.NAV_PREMIUM_DISCOUNT, weight=weight,
             status=EtfFactorStatus.UNAVAILABLE, raw_metric=None, normalized_score=None, weighted_contribution=None,
-            freshness=None, source_provenance=None, confidence=None, reason="NAV_OR_MARKET_PRICE_UNAVAILABLE")
+            freshness=None, source_provenance=None, confidence=None, reason=reason)
     premium_pct = float((price.value - nav.nav) / nav.nav * 100)
     score = _lower_better(abs(premium_pct), [(0.0, 100.0), (1.0, 70.0), (5.0, 0.0)])
     return EtfFactorScoreResult(factor=EtfRuleEngineFactor.NAV_PREMIUM_DISCOUNT, weight=weight,

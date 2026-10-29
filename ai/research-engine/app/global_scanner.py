@@ -62,6 +62,7 @@ class GlobalScanCandidate(ResearchBaseModel):
     asset_type: str | None = None
     status: str | None = None
     symbol: str | None = None
+    history_provider_symbol: str | None = None
     company_name: str | None = None
     verified_provider_mapping_status: str
     pre_score: float | None
@@ -174,7 +175,7 @@ class GlobalPreScore:
         self.financial_max_age = financial_max_age
         self.history_points = history_points
 
-    def score(self, instrument, snapshots, facts, prices, *, as_of):
+    def score(self, instrument, snapshots, facts, prices, *, as_of, history_options=None, daily_bars=()):
         as_of = _utc(as_of)
         missing, stale = set(), set()
         evidence = defaultdict(list)
@@ -269,14 +270,25 @@ class GlobalPreScore:
         elif not fresh_price and not price_conflict:
             stale.add("price")
         days = len({_utc(p.observed_at).date() for p in usable})
+        fresh_history = fresh_price
+        history_symbol = next((m.get('providerSymbol') or m.get('providerInstrumentId') for m in mappings
+                               if m['provider'] == 'YAHOO_FINANCE'), None)
+        if history_options:
+            from app.technical_features import select_price_history
+            history, _, _, _ = select_price_history(UUID(str(instrument['globalInstrumentId'])), prices,
+                as_of=as_of, currency=currency, daily_bar_history=daily_bars,
+                provider_symbol=history_symbol, **history_options)
+            days = len(history.observations)
+            fresh_history = (history.valid_until is not None and as_of <= history.valid_until
+                             and not history.missing_dates and not history.conflicting_dates)
         dimensions = {
             "PRICE_DATA_QUALITY": PreScoreDimension(state=price_state, score=100 if usable and not price_conflict else None, coverage=float(fresh_price)),
             "VALUATION_AVAILABILITY": dimension(["trailingPE", "priceToBook"], max_age=self.price_max_age),
             "PROFITABILITY_QUALITY": dimension(["profitMargin", "roe", "pat"], quality=True),
             "GROWTH_QUALITY": dimension(["revenueGrowth", "earningsGrowth"], quality=True),
             "BALANCE_SHEET_QUALITY": dimension(["total_equity"], quality=True),
-            "TECHNICAL_DATA_READINESS": PreScoreDimension(state=EvidenceState.MISSING if not days else EvidenceState.STALE if not fresh_price else EvidenceState.AVAILABLE if days >= self.history_points else EvidenceState.PARTIAL,
-                score=100 if days >= self.history_points else None, coverage=min(1, days/self.history_points) if fresh_price else 0),
+            "TECHNICAL_DATA_READINESS": PreScoreDimension(state=EvidenceState.MISSING if not days else EvidenceState.STALE if not fresh_history else EvidenceState.AVAILABLE if days >= self.history_points else EvidenceState.PARTIAL,
+                score=100 if days >= self.history_points else None, coverage=min(1, days/self.history_points) if fresh_history else 0),
             "SECTOR_DATA_READINESS": dimension(["sector"], text=True),
         }
         if days < self.history_points:
@@ -305,6 +317,7 @@ class GlobalPreScore:
         if not financial_ready: reasons.append("CRITICAL_FINANCIAL_EVIDENCE_UNREADY")
         scores = [d.score for d in dimensions.values() if d.score is not None and d.state in {"AVAILABLE", "PARTIAL"}]
         return GlobalScanCandidate(global_instrument_id=instrument["globalInstrumentId"], market=instrument.get("exchange"),
+            history_provider_symbol=history_symbol,
             region=instrument.get("region"), country=instrument.get("country"), exchange=instrument.get("exchange"),
             currency=currency, asset_type=instrument.get("assetType"), status=instrument.get("status"), symbol=symbol, company_name=name,
             verified_provider_mapping_status="VERIFIED" if mappings else "MISSING", pre_score=round(sum(scores)/len(scores), 6) if scores else None,
@@ -341,6 +354,9 @@ class GlobalScanner:
             return self._enrich_candidate_batch(scan, **kwargs)
         kwargs["technical_engine"] = kwargs.get("technical_engine") or TechnicalFeatureEngine()
         kwargs["sector_engine"] = kwargs.get("sector_engine") or SectorRelativeStrengthEngine()
+        if any((candidate.exchange or candidate.market) in {'NSE', 'XNSE'} for candidate in scan.candidates):
+            kwargs['history_calendar'] = (self.persistence.load_market_schedules({'NSE', 'XNSE'}),
+                                          self.persistence.load_market_calendar_exceptions({'NSE', 'XNSE'}))
         output = []
         for candidate in scan.candidates:
             output.extend(self._enrich_candidate_batch(
@@ -354,7 +370,8 @@ class GlobalScanner:
                           trusted_providers: dict[UUID, frozenset[str]] | None = None,
                           technical_engine: TechnicalFeatureEngine | None = None,
                           sector_engine: SectorRelativeStrengthEngine | None = None,
-                          technical_weight: float = 0.7, sector_weight: float = 0.3) -> list[StageBCandidate]:
+                          technical_weight: float = 0.7, sector_weight: float = 0.3,
+                          history_calendar=None) -> list[StageBCandidate]:
         """Optional Stage B; no universe enumeration, providers, refresh or V1.
 
         Enrich all deep-eligible candidates (not the entire canonical universe).
@@ -394,11 +411,21 @@ class GlobalScanner:
         total_weight = technical_weight + sector_weight
         for candidate in sorted(candidates, key=lambda c: str(c.global_instrument_id)):
             key = candidate.global_instrument_id
+            market = candidate.exchange or candidate.market
+            session_options = {}
+            if market in {'NSE', 'XNSE'}:
+                schedules, exceptions = history_calendar if history_calendar is not None else (
+                    self.persistence.load_market_schedules({'NSE', 'XNSE'}),
+                    self.persistence.load_market_calendar_exceptions({'NSE', 'XNSE'}))
+                session_options = dict(market=market, schedules=schedules, exceptions=exceptions)
+                if candidate.history_provider_symbol:
+                    session_options['provider_symbol'] = candidate.history_provider_symbol
             technical = technical_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
-                                                 trusted_providers=providers.get(key), daily_bar_history=daily_histories[key])
+                                                 trusted_providers=providers.get(key), daily_bar_history=daily_histories[key],
+                                                 **session_options)
             sector = sector_engine.compute(key, histories[key], as_of=scan.as_of, currency=candidate.currency,
                 context=contexts.get(key), benchmark_histories=histories, trusted_providers=providers.get(key),
-                daily_bar_histories=daily_histories)
+                daily_bar_histories=daily_histories, **({'history_options': session_options} if session_options else {}))
             scores = [(technical.technical_score, technical_weight), (sector.relative_strength_score, sector_weight)]
             available = [(score, weight) for score, weight in scores if score is not None and weight > 0]
             available_weight = sum(weight for _, weight in available)
@@ -424,7 +451,16 @@ class GlobalScanner:
         for row in self.persistence.load_structured_market_snapshots(ids): snapshots[row.instrument_id].append(row)
         for row in self.persistence.load_financial_facts(ids): facts[row.key.instrument_id].append(row)
         for row in self.persistence.load_market_price_observations(ids): prices[row.instrument_id].append(row)
-        return [self.pre_score.score(by_id[key], snapshots[key], facts[key], prices[key], as_of=as_of)
+        calendars = {}
+        bars = defaultdict(list)
+        if any(by_id[key].get('exchange') in {'NSE', 'XNSE'} for key in ids):
+            calendars = dict(market='NSE', schedules=self.persistence.load_market_schedules({'NSE', 'XNSE'}),
+                             exceptions=self.persistence.load_market_calendar_exceptions({'NSE', 'XNSE'}))
+            for row in self.persistence.load_daily_market_bars(ids, provider='NSE'):
+                bars[row.global_instrument_id].append(row)
+        return [self.pre_score.score(by_id[key], snapshots[key], facts[key], prices[key], as_of=as_of,
+                **({'history_options': calendars, 'daily_bars': bars[key]}
+                   if calendars and by_id[key].get('exchange') in {'NSE', 'XNSE'} else {}))
                 for key in sorted(ids, key=str)]
 
     async def scan(self, *, as_of: datetime, top_n: int, progress_label="scan", **universe_context) -> GlobalScanResult:

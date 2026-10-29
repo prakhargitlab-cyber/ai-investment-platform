@@ -10,6 +10,9 @@ from test_di15_financial_authority_upgrade import _repo, _facts
 from test_research_readiness_runtime import _target
 
 
+pytestmark = pytest.mark.usefixtures("financial_fixture_clock")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["complete", "partial", "failure", "invalid_identity", "invalid_source"])
 async def test_optional_official_structured_provider_only_avoids_pdf_when_actual_evidence_suffices(state):

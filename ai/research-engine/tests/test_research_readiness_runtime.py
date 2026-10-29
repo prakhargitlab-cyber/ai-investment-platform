@@ -276,6 +276,12 @@ def _shareholding(profile: CompanyResearchProfile) -> ShareholdingSnapshot:
 
 class DurableRepositoryFixture:
     def __init__(self, profile: CompanyResearchProfile, *, complete: bool = True) -> None:
+        calendar_store = SqliteResearchPersistence()
+        schedules = calendar_store.load_market_schedules({'NSE'})
+        calendar_store._connection.close()
+        # Immutable fixture calendar is safe in TestClient's separate thread.
+        self.persistence = SimpleNamespace(load_market_schedules=lambda _markets: schedules,
+                                          load_market_calendar_exceptions=lambda _markets: [])
         self.profiles = {profile.instrument_id: profile}
         self.provider_calls = 0
         self.portfolio_mutations = 0
@@ -288,6 +294,8 @@ class DurableRepositoryFixture:
         self.shareholding = []
         if complete:
             self.facts = [
+                *[_fact(profile, m, "80", p, "QUARTERLY") for p in ("2026-02-28", "2025-11-30") for m in ("revenue", "pat")],
+                *[_fact(profile, m, "30", "2024-03-31", "ANNUAL") for m in ("revenue", "pat")],
                 _fact(profile, "revenue", "100", "2026-08-31", "QUARTERLY"),
                 _fact(profile, "pat", "12", "2026-08-31", "QUARTERLY"),
                 _fact(profile, "eps", "5", "2026-08-31", "QUARTERLY"),
@@ -302,17 +310,20 @@ class DurableRepositoryFixture:
                 _fact(profile, "cash_and_cash_equivalents", "500", "2026-03-31", "ANNUAL"),
             ]
             self.structured = [_structured_record(profile)]
+            from app.market_sessions import completed_sessions
+            sessions = list(completed_sessions('NSE', self.persistence.load_market_schedules({'NSE'}), [],
+                (NOW - timedelta(days=230)).date(), NOW.date(), NOW))[-150:]
             self.observations = [
                 MarketPriceObservation(
                     instrument_id=profile.instrument_id,
-                    observed_at=NOW - timedelta(days=149 - index, hours=1),
+                    observed_at=close,
                     price=Decimal(100 + index),
                     currency="INR",
                     provider="YAHOO_FINANCE",
                     source_url="https://finance.yahoo.com/quote/READY.NS/history",
                     retrieved_at=NOW - timedelta(minutes=3),
                 )
-                for index in range(150)
+                for index, (_day, close) in enumerate(sessions)
             ]
             self.events = [
                 _event(profile, ResearchEventType.NEW_ORDER, age_days=2, title="Major order"),

@@ -43,11 +43,14 @@ class _EnsureTracker:
 
     def __init__(self):
         self.calls = []  # list of (global_instrument_id, requirement_ids or None)
+        self.wait_for_completion_by_call = []  # parallel list: wait_for_completion kwarg per call
 
     async def __call__(self, global_instrument_id, *, jurisdiction=None,
-                       requirement_ids=None, identity_headers=None, **kwargs):
+                       requirement_ids=None, identity_headers=None,
+                       wait_for_completion=False, **kwargs):
         self.calls.append((global_instrument_id, tuple(sorted(requirement_ids))
                            if requirement_ids is not None else None))
+        self.wait_for_completion_by_call.append(wait_for_completion)
         # DI-10B: a real readiness snapshot (matching what the real production
         # ResearchReadinessRuntime.ensure() always returns) so the Stage-2
         # eligibility gate permits rule_engine.analyze() for deep-ready
@@ -477,6 +480,17 @@ async def test_K_http_get_opportunities_current_is_dashboard_only():
     mock_repo.persistence = fake_store
     mock_repo._persistence_worker_lock = main_module.repository._persistence_worker_lock.__class__()
     mock_repo.list_profiles = main_module.repository.list_profiles
+    # Test-fixture-only fix (no production behavior change): a bare
+    # MagicMock()'s auto-generated attributes are plain MagicMocks, not
+    # awaitable -- main.py's _radar_read does
+    # `await repository._run_blocking_persistence(operation, ...)`, which
+    # previously failed with "object MagicMock can't be used in 'await'
+    # expression" because that attribute was never configured. Mirror the
+    # real repository's contract (run the operation and return its result)
+    # with an awaitable so the endpoint under test behaves exactly like
+    # production, synchronously, with no thread dispatch needed here.
+    mock_repo._run_blocking_persistence = AsyncMock(
+        side_effect=lambda operation, *a, **kw: operation(*a, **kw))
 
     main_module.repository = mock_repo
 
@@ -771,7 +785,7 @@ async def test_R_all_eligible_enter_baseline_before_shortlist_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_S_profile_identity_mismatch_isolated_and_labeled(monkeypatch):
+async def test_S_profile_identity_mismatch_isolated_and_labeled(monkeypatch, caplog):
     """A PROFILE_IDENTITY_MISMATCH (repository profile's instrument_id != key)
     must be surfaced as PROFILE_IDENTITY_MISMATCH -- distinct from
     PROFILE_HYDRATION_FAILED and from the generic BASELINE_ACQUISITION_FAILED --
@@ -787,11 +801,12 @@ async def test_S_profile_identity_mismatch_isolated_and_labeled(monkeypatch):
 
     result = await service.run(rows, as_of=NOW, shortlist_limit=25, top_n=4)
 
-    # Key 1's Phase-1 baseline was rejected with the distinct identity-mismatch label.
-    diag_mismatch = [d for d in result.diagnostics
-                     if d.global_instrument_id == UUID(int=1)
-                     and d.failure_reason == "PROFILE_IDENTITY_MISMATCH"]
-    assert diag_mismatch, "expected a PROFILE_IDENTITY_MISMATCH diagnostic for key 1"
+    # The BASELINE failure is explicitly labeled. This test's DEEP stub
+    # supplies its own outcome for key 1, so the existing post-DEEP guard must
+    # not append a duplicate SUPPRESSED diagnostic just to repeat that label.
+    assert any('baseline_acquisition_failed' in record.message
+               and 'reason=PROFILE_IDENTITY_MISMATCH' in record.message for record in caplog.records)
+    assert len([d for d in result.diagnostics if d.global_instrument_id == UUID(int=1)]) == 1
     # Others were NOT aborted by key 1's identity mismatch.
     assert result.baseline_ready_count == 2
     assert result.baseline_incomplete_count == 1
@@ -827,3 +842,35 @@ def test_Z_baseline_requirement_ids_are_cheap_structured_set_only():
     assert expensive.isdisjoint(BASELINE_REQUIREMENT_IDS)
     # Genuine trim: the cheap set is strictly smaller than the expensive union.
     assert len(BASELINE_REQUIREMENT_IDS) < len(expensive)
+
+
+# --- Test AA: BASELINE acquisition identifies itself as a background-cycle
+# owner to ResearchReadinessRuntime.ensure(), not an interactive caller ---
+
+@pytest.mark.asyncio
+async def test_AA_baseline_ensure_uses_background_cycle_wait_for_completion(monkeypatch):
+    """Regression for the research_readiness_ensure_timeout root cause.
+
+    BASELINE's self.readiness.ensure(...) call previously omitted
+    wait_for_completion, so it defaulted to False and ran on
+    ResearchReadinessRuntime.ensure's INTERACTIVE/API budget path (a bare
+    asyncio.timeout(ensure_timeout_seconds) with no bounded drain --
+    the exact path that logs research_readiness_ensure_timeout on expiry),
+    instead of the background-cycle-owner path DEEP stage already uses
+    everywhere else (asyncio.wait + explicit cancel + a bounded drain
+    window, logging orchestration_wait_expired / orchestration_drain_timeout).
+    A persisted BASELINE cycle worker has no interactive caller whose
+    short latency budget it should inherit, so every BASELINE ensure()
+    call must pass wait_for_completion=True, exactly like DEEP's calls.
+    """
+    service, rows, pairs, store, tracker = setup_acquisition(monkeypatch, count=5)
+    await service.run(rows, as_of=NOW, shortlist_limit=5)
+
+    assert tracker.baseline_calls, "expected at least one BASELINE ensure() call"
+    for call, waited in zip(tracker.calls, tracker.wait_for_completion_by_call):
+        if call[1] is not None and set(call[1]) == BASELINE_REQUIREMENT_IDS:
+            assert waited is True, (
+                "BASELINE ensure() call missing wait_for_completion=True -- it will "
+                "run on the interactive 25s-timeout path instead of the background "
+                "cycle-owner path that correctly bounds-and-drains a slow acquisition"
+            )

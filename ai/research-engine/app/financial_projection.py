@@ -13,7 +13,7 @@ from itertools import combinations
 from urllib.parse import urlparse
 
 from app.fact_precedence import FinancialFact, FinancialFactKey, FactSourceTier
-from app.financial_metric_extraction import ExtractionResult, extract_semantic_facts
+from app.financial_metric_extraction import ExtractionResult, _layout_metric_rows, extract_semantic_facts
 from app.models import ProvenancedValue, SourceMode
 
 
@@ -28,6 +28,21 @@ class FinancialReconciliationScope:
 
     def contains(self, key: FinancialFactKey) -> bool:
         return (self.completeness == "COMPLETE_FOR_SOURCE_SCOPE"
+                and key.metric == self.metric and key.reporting_basis == self.reporting_basis
+                and key.period_end in self.period_ends and key.period_type in self.period_types)
+
+    def invalidates(self, key: FinancialFactKey) -> bool:
+        """Confirmed-unreliable extraction, never merely-incomplete extraction.
+
+        Kept as a distinct completeness value from COMPLETE_FOR_SOURCE_SCOPE
+        (never conflated with it) so a persistence-layer deletion authorized
+        by this method can never be mistaken for the "proven complete"
+        guarantee COMPLETE_FOR_SOURCE_SCOPE/contains() makes. A row that is
+        merely incomplete (missing cells, unresolved layout, a conflicting
+        duplicate) never reaches this -- only a row whose own formatting is
+        internally self-contradictory (AMBIGUOUS_DECIMAL_SCALE) does.
+        """
+        return (self.completeness == "INVALIDATED_FOR_SOURCE_SCOPE"
                 and key.metric == self.metric and key.reporting_basis == self.reporting_basis
                 and key.period_end in self.period_ends and key.period_type in self.period_types)
 
@@ -63,13 +78,23 @@ def nse_authority_rejection(document) -> str | None:
     return None
 
 
-def _column_contract(evidence):
+def _column_contract(evidence, *, verified_layout=(), structure=None):
     """Validate legacy compatibility columns independently of assumed widths.
 
     Explicit ordered groups plus strictly
     descending comparative periods must yield ONE partition. No 3+2 rule.
     Pure annual/as-at tables need no mixed-group partition inference.
     """
+    if evidence.layout_candidate is not None:
+        candidate = evidence.layout_candidate
+        units = {u.value for u in candidate.unit_evidence if u.kind == 'UNIT'}
+        valid = (candidate in verified_layout and candidate.table is not None
+                 and evidence.statement.columns == candidate.header.columns
+                 and all(c.audit_status in {'AUDITED', 'UNAUDITED'} for c in candidate.header.columns)
+                 and evidence.unit == (next(iter(units)) if len(units) == 1 else None)
+                 and evidence.source_region == candidate.source_region
+                 and evidence.rows == tuple(_layout_metric_rows(candidate, structure)))
+        return candidate.reporting_basis, valid, 'LAYOUT_EVIDENCE_UNPROVEN'
     from app.structured_research import (_PARTICULARS_RE, _GROUP_RE, _deduplicate_header_groups,
         _normalize_nse_header_ocr, _nse_header_dates, _STATEMENT_HEADING,
         _BALANCE_SHEET_HEADING, _CASH_FLOW_HEADING, _NSE_DAY_MONTH, _nse_date)
@@ -149,6 +174,14 @@ def project_semantic_financial_facts(document, extraction: ExtractionResult | No
     text = document.normalized_text or ''
     extraction = extraction or extract_semantic_facts(text, evidence_at=document.published_at or document.retrieved_at,
                                                      structure=document.pdf_structure)
+    structure = document.pdf_structure
+    verified_layout = ()
+    if structure is not None and any(e.layout_candidate is not None for e in extraction.statements):
+        from app.financial_structure import parse_financial_structure
+        from app.normalization import normalize_text
+        if normalize_text(structure.extracted_text) != (document.normalized_text or ''):
+            return FinancialProjectionResult((), (), ('SOURCE_REGION_MISMATCH',), 'FAILED')
+        verified_layout = parse_financial_structure(structure=structure).accepted_statements
     diagnostics, candidates, complete_rows, blocked = [], {}, [], set()
     from app.structured_research import _financial_number, _structural_row_text
     seen_regions = set()
@@ -157,18 +190,21 @@ def project_semantic_financial_facts(document, extraction: ExtractionResult | No
     # Propagate the unit from any statement that carries it to statements
     # that don't, rather than dropping facts due to a missing per-statement
     # unit on a subsidiary statement (balance sheet, cash flow).
-    shared_unit = next((evidence.unit for evidence in extraction.statements if evidence.unit), None)
+    shared_unit = next((evidence.unit for evidence in extraction.statements
+                        if evidence.layout_candidate is None and evidence.unit), None)
     for evidence in extraction.statements:
         statement = evidence.statement
         region = evidence.source_region
-        if region is None or text[region.start:region.end] != statement.region:
+        source_text = structure.extracted_text if evidence.layout_candidate is not None and structure is not None else text
+        if region is None or source_text[region.start:region.end] != statement.region:
             diagnostics.append('SOURCE_REGION_MISMATCH')
             continue
-        identity = (evidence.statement_type, region.start, region.end)
+        identity = (evidence.statement_type, region.start, region.end,
+                    evidence.layout_candidate.header_region if evidence.layout_candidate is not None else None)
         if identity in seen_regions:
             continue
         seen_regions.add(identity)
-        basis, valid, reason = _column_contract(evidence)
+        basis, valid, reason = _column_contract(evidence, verified_layout=verified_layout, structure=structure)
         if not valid:
             diagnostics.append(reason)
             blocked.update((MAPPING[r.canonical_metric], r.reporting_scope) for r in evidence.rows if r.canonical_metric in MAPPING)
@@ -195,11 +231,69 @@ def project_semantic_financial_facts(document, extraction: ExtractionResult | No
                 diagnostics.append('VALUE_COLUMN_MISMATCH')
                 blocked.add(scope_key)
                 continue
+            # A PDF text layer can drop the decimal point for some cells in a
+            # row while rendering it correctly for others (observed on a real
+            # NSE filing: "27347 7303 373.08 50183" for one profit row).
+            # A magnitude/ratio comparison between the bare-looking cells and
+            # the decimal cell was tried and rejected during review: columns
+            # in the same row are different reporting periods, which
+            # legitimately differ in magnitude by far more than any fixed
+            # band can safely bound -- a prior version's min/10..max*10 band
+            # (effectively +-100x around a single decimal sibling) flagged
+            # ordinary bare integers such as 6427 and 142851 that carry no
+            # decimal-loss defect at all, and a per-pair ~100x ratio check
+            # fails to even catch the real CORDELIA row, since its own three
+            # affected periods differ from the one intact decimal period by
+            # roughly 20x-135x, not ~100x -- there is no magnitude-based test
+            # that both catches this defect and excludes legitimate
+            # period-to-period variance, because the defect and the variance
+            # look the same in the numbers alone.
+            # The one signal that actually is evidence of the defect, rather
+            # than an inference about which value is "right", is that NSE
+            # statements format every period column of a monetary row with
+            # the same decimal precision: a row mixing a decimal-formatted
+            # cell with a bare-integer-formatted cell is internally
+            # inconsistent on its face, independent of what either value is.
+            # Never guess the intended decimal placement -- withhold the
+            # whole row instead, the same fail-closed posture as
+            # UNRESOLVED_CELL/DUPLICATE_METRIC_ROW.
+            has_decimal_cell = any(c.value is not None
+                                    and re.search(r'\.\d{1,2}\)?\s*$', c.original_token.strip())
+                                    for c in row.cells)
+            has_bare_integer_cell = any(c.value is not None
+                                        and re.fullmatch(r'\(?[+-]?\d[\d,]*\)?', c.original_token.strip())
+                                        for c in row.cells)
+            if has_decimal_cell and has_bare_integer_cell:
+                diagnostics.append('AMBIGUOUS_DECIMAL_SCALE:' + row.canonical_metric)
+                blocked.add(scope_key)
+                # This is confirmed-unreliable evidence, not merely an
+                # absence of evidence: explicitly invalidate this source's
+                # own prior claim for exactly this metric/basis/period
+                # scope, so a later reconciliation can remove a stale fact
+                # this same document previously wrote, without ever
+                # claiming (via COMPLETE_FOR_SOURCE_SCOPE) that this
+                # extraction run itself produced proven-complete evidence.
+                complete_rows.append(FinancialReconciliationScope(metric, basis,
+                    frozenset(c.period_end for c in statement.columns),
+                    frozenset({'AS_AT'} if evidence.statement_type == 'BALANCE_SHEET' else {'QUARTERLY', 'ANNUAL'}),
+                    'INVALIDATED_FOR_SOURCE_SCOPE'))
+                continue
             label = row.original_label.strip().rstrip('(').strip()
             row_text = _structural_row_text(statement.region)
+            label_pattern = re.escape(label)
+            if row.canonical_metric == 'total_equity':
+                # "Total equity" is a literal text-prefix of the unrelated
+                # balance-sheet total "Total equity and liabilities" line in
+                # the same statement. Counting that unrelated row's label as
+                # a second occurrence of this row's own "Total equity" label
+                # produced a false DUPLICATE_METRIC_ROW, suppressing the
+                # legitimate total_equity fact (the ROE denominator). Mirrors
+                # the existing total_liabilities pattern's
+                # (?!\s+and\s+equity) exclusion in financial_metric_extraction.py.
+                label_pattern += r'(?!\s+and\s+liabilities\b)'
             # First-match extraction is insufficient when a statement repeats
             # an accounting row. Do not choose one subtotal/version silently.
-            if label and len(list(re.finditer(re.escape(label), row_text, re.I))) > 1:
+            if label and len(list(re.finditer(label_pattern, row_text, re.I))) > 1:
                 diagnostics.append('DUPLICATE_METRIC_ROW:' + row.canonical_metric)
                 blocked.add(scope_key)
                 continue
@@ -219,18 +313,19 @@ def project_semantic_financial_facts(document, extraction: ExtractionResult | No
                 diagnostics.append('ROW_LABEL_BOUNDARY_AMBIGUOUS:pat')
                 blocked.add(scope_key)
                 continue
-            token_patterns = [re.escape(c.original_token).replace(r'\.', r'\s*\.\s*') for c in row.cells]
-            run = re.search(r'(?<!\S)' + r'\s+'.join(token_patterns) + r'(?!\S)',
-                            row_text[label_match.start():label_match.end() + 360]) if label_match else None
-            if run is None:
-                diagnostics.append('ROW_CELL_PROVENANCE_UNPROVEN:' + row.canonical_metric)
-                blocked.add(scope_key)
-                continue
-            after = row_text[label_match.start() + run.end():].split()[:2]
-            if len(after) == 2 and all(_financial_number(token) is not None for token in after):
-                diagnostics.append('UNSAFE_NUMERIC_RUN:' + row.canonical_metric)
-                blocked.add(scope_key)
-                continue
+            if evidence.layout_candidate is None:
+                token_patterns = [re.escape(c.original_token).replace(r'\.', r'\s*\.\s*') for c in row.cells]
+                run = re.search(r'(?<!\S)' + r'\s+'.join(token_patterns) + r'(?!\S)',
+                                row_text[label_match.start():label_match.end() + 360]) if label_match else None
+                if run is None:
+                    diagnostics.append('ROW_CELL_PROVENANCE_UNPROVEN:' + row.canonical_metric)
+                    blocked.add(scope_key)
+                    continue
+                after = row_text[label_match.start() + run.end():].split()[:2]
+                if len(after) == 2 and all(_financial_number(token) is not None for token in after):
+                    diagnostics.append('UNSAFE_NUMERIC_RUN:' + row.canonical_metric)
+                    blocked.add(scope_key)
+                    continue
             if metric == 'eps' and not re.search(r'earn(?:ing|lng)s?\s+per|\beps\b', statement.region, re.I):
                 diagnostics.append('EPS_SECTION_UNPROVEN')
                 blocked.add(scope_key)
@@ -254,22 +349,29 @@ def project_semantic_financial_facts(document, extraction: ExtractionResult | No
                     full = False
                     continue
                 key = FinancialFactKey(document.instrument_id, metric, column.period_end, period_type, basis)
-                unit = ('INR per share' if eps_currency_proven else 'per share') if metric == 'eps' else (evidence.unit or shared_unit)
+                monetary_unit = evidence.unit if evidence.layout_candidate is not None else (evidence.unit or shared_unit)
+                unit = ('INR per share' if eps_currency_proven else 'per share') if metric == 'eps' else monetary_unit
                 if not unit:
                     diagnostics.append('UNIT_UNRESOLVED')
                     full = False
                     continue
+                provenance = f'DI20E:{row.canonical_metric};region={region.start}:{region.end}'
+                if evidence.layout_candidate is not None:
+                    support = ','.join(f'{u.region.page}:{u.region.start}:{u.region.end}' for u in evidence.layout_candidate.unit_evidence)
+                    provenance += (f';page={cell.source_region.page};row={cell.source_region.line};column={column.source_column}'
+                                   f';bbox={cell.source_region.geometry};audit={column.audit_status};unit_evidence={support}'
+                                   f';pdf_sha256={structure.content_hash}')
                 fact = FinancialFact(key, ProvenancedValue(value=value, unit=unit, period=column.period_end,
                     source_url=document.canonical_url, source_name=document.source_name, source_type=str(document.source_type),
                     published_at=document.published_at, retrieved_at=document.retrieved_at, confidence=.82,
-                    calculation_basis=f'DI20E:{row.canonical_metric};region={region.start}:{region.end}'),
+                    calculation_basis=provenance),
                     FactSourceTier.OFFICIAL_NSE, 'NSE', str(document.document_id), SourceMode.REAL)
                 candidates.setdefault(key, []).append(fact)
                 emitted.append(key)
             structural = extraction.structural_result
             # Legacy compatibility permits upserts only. Destructive cleanup
             # additionally requires a matching unambiguous DI-20C statement.
-            proven_scope = bool(structural and not structural.rejected_statements and any(
+            proven_scope = bool(evidence.layout_candidate is None and structural and not structural.rejected_statements and any(
                 s.reporting_basis == basis and s.statement_type == evidence.statement_type
                 and tuple((c.period_end, c.period_type) for c in s.header.columns) ==
                     tuple((c.period_end, c.period_type) for c in statement.columns)
@@ -288,7 +390,10 @@ def project_semantic_financial_facts(document, extraction: ExtractionResult | No
             blocked.add((key.metric, key.reporting_basis))
             continue
         facts.append(alternatives[0])
-    scopes = tuple(dict.fromkeys(s for s in complete_rows if (s.metric, s.reporting_basis) not in blocked))
+    scopes = tuple(dict.fromkeys(
+        s for s in complete_rows
+        if s.completeness == 'INVALIDATED_FOR_SOURCE_SCOPE' or (s.metric, s.reporting_basis) not in blocked
+    ))
     facts.sort(key=lambda f: (f.key.metric, f.key.reporting_basis or '', f.key.period_type, f.key.period_end), reverse=True)
     state = 'FAILED' if not facts else 'PARTIAL_FOR_SOURCE_SCOPE'
     # Completeness is explicitly per scope; never claim the entire PDF complete.

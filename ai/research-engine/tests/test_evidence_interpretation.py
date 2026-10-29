@@ -12,6 +12,9 @@ from __future__ import annotations
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
+import pytest
+
+pytestmark = pytest.mark.usefixtures("news_fixture_clock")
 
 from app.evidence_interpretation import (
     CurrentNewsCandidate,

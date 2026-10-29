@@ -102,7 +102,9 @@ def test_reporting_basis_unknown_not_collapsed_to_consolidated() -> None:
             key=replace(fact.key, reporting_basis="CONSOLIDATED"),
             value=fact.value.model_copy(update={"value": Decimal("99999")}),
         )
-        for fact in official
+        # The sentinel is a base-currency amount. Normalize the prototype before
+        # replacing its value so it does not retain the reported INR crore unit.
+        for fact in _stored(official).values()
     ]
     _seed(repo, official + consolidated)
 
@@ -123,6 +125,13 @@ def test_reporting_basis_unknown_not_collapsed_to_consolidated() -> None:
     # The explicit CONSOLIDATED value is projected, proving the unknown-basis fact
     # did NOT satisfy (collapse into) the CONSOLIDATED series.
     assert latest.metrics["revenue"].value == Decimal("99999")
+    assert latest.metrics["revenue"].unit == "INR"
+    # The read boundary and _stored both normalize; the second pass is a no-op.
+    assert _stored(list(persisted.values())) == persisted
+    unknown = next(f for f in official if f.key.metric == "revenue"
+                   and f.key.period_end == "2026-06-30")
+    assert unknown.value.unit == "INR crore"
+    assert persisted[unknown.key].value.value == Decimal("82611100000")
 
 
 # --------------------------------------------------------------------------------------

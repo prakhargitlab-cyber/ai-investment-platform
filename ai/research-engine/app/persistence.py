@@ -36,6 +36,16 @@ from app.fact_precedence import FinancialFact, FinancialFactKey, FactSourceTier,
 from app.models import ProvenancedValue
 
 
+def _parse_market_calendar_date(value):
+    """Normalize market calendar dates returned by database drivers."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    raise TypeError(f"Unsupported market calendar date type: {type(value).__name__}")
+
 @dataclass(frozen=True)
 class RefreshRun:
     refresh_run_id: UUID
@@ -248,6 +258,38 @@ class DisabledResearchPersistence:
     def global_market_scans(self):
         return []
 
+    def upsert_acquisition_observation(self, instrument_id, requirement_id, provider, outcome, observed_at,
+                                        source_url, failure_reason=None, evidence_count=0):
+        # Persistence is disabled in this configuration: nothing is durably
+        # recorded, matching every other upsert_* stub on this class. Without
+        # this stub, app.repository.record_document_size_failure (via
+        # record_acquisition_observation) raises AttributeError the first
+        # time an oversized-document failure is recorded against a disabled
+        # persistence backend.
+        return None
+
+    def load_acquisition_observations(self, instrument_id):
+        return []
+
+    def reconcile_financial_facts_for_source(
+        self,
+        instrument_id,
+        source_identity,
+        facts,
+        *,
+        allow_official_revision=False,
+        complete_scopes=(),
+    ) -> int:
+        # Persistence is disabled in this configuration: nothing is durably
+        # stored or reconciled, matching every other upsert_*/reconcile_*
+        # stub on this class. Returns 0 (no facts reconciled) to match the
+        # real backend's "count of facts reconciled" return type. This is a
+        # pre-existing gap (present on baseline too, unrelated to the 27
+        # introduced regressions) -- filed here for completeness since the
+        # Protocol declares it as part of the required persistence
+        # interface.
+        return 0
+
     def persist_global_suggestion_lifecycle(self, scan, cards):
         return None
 
@@ -290,12 +332,73 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         self._connection.commit()
         self._connection.executescript(CYCLE_RUN_SCHEMA)
         self._connection.commit()
+        # SQLite's CREATE TABLE IF NOT EXISTS is a no-op against an existing
+        # table, so it cannot widen a CHECK constraint on a pre-existing
+        # database. Rebuild the cycle_progress table in place so that
+        # ETF_ONBOARD is accepted by the phase CHECK constraint, preserving all
+        # existing rows byte-for-byte (the payload column is TEXT, never JSON-
+        # parsed during the copy).
+        self._migrate_cycle_progress_phase_constraint()
         self._connection.executescript(MACRO_SCHEMA)
         self._connection.commit()
         self._connection.executescript(MACRO_EVENT_SCHEMA)
         self._connection.commit()
         self._connection.executescript(ETF_SQLITE_SCHEMA)
         self._connection.commit()
+
+    def _migrate_cycle_progress_phase_constraint(self) -> None:
+        """Widen the phase CHECK constraint to include 'ETF_ONBOARD'.
+
+        SQLite has no ALTER TABLE ... DROP CONSTRAINT. If the existing table's
+        CHECK already permits ETF_ONBOARD, this is a no-op (idempotent).
+        Otherwise the table is rebuilt with the widened constraint, copying all
+        rows through a rename-and-recreate dance that preserves the PK and
+        data exactly.
+        """
+        has_table = self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='global_opportunity_cycle_progress'").fetchone()
+        if has_table is None:
+            return  # CREATE TABLE IF NOT EXISTS in CYCLE_RUN_SCHEMA handles creation
+        probe_ok = False
+        try:
+            with self._connection:
+                self._connection.execute(
+                    "INSERT INTO global_opportunity_cycle_progress "
+                    "(cycle_id, phase, global_instrument_id, state, attempts, updated_at) "
+                    "VALUES ('__migrate_probe__', 'ETF_ONBOARD', '__probe__', 'COMPLETED', 0, '2000-01-01T00:00:00.000000+00:00')")
+            probe_ok = True
+        except Exception:
+            probe_ok = False
+        if probe_ok:
+            self._connection.execute(
+                "DELETE FROM global_opportunity_cycle_progress WHERE cycle_id = '__migrate_probe__'")
+            return
+        with self._connection:
+            self._connection.executescript(
+                "ALTER TABLE global_opportunity_cycle_progress RENAME TO _legacy_opportunity_cycle_progress;")
+            self._connection.executescript(
+                "CREATE TABLE global_opportunity_cycle_progress ("
+                " cycle_id TEXT NOT NULL REFERENCES global_opportunity_cycle_run(cycle_id),"
+                " phase TEXT NOT NULL CHECK (phase IN ('BASELINE','DEEP','ETF_ONBOARD')),"
+                " global_instrument_id TEXT NOT NULL,"
+                " state TEXT NOT NULL CHECK (state IN ('PENDING','IN_PROGRESS','COMPLETED','RETRYABLE_FAILURE','EVIDENCE_UNAVAILABLE','TERMINAL_OUTCOME')),"
+                " disposition TEXT,"
+                " failure_reason TEXT,"
+                " attempts INTEGER NOT NULL DEFAULT 0,"
+                " payload TEXT,"
+                " updated_at TEXT NOT NULL,"
+                " PRIMARY KEY (cycle_id, phase, global_instrument_id)"
+                ");")
+            self._connection.executescript(
+                "INSERT INTO global_opportunity_cycle_progress "
+                "(cycle_id, phase, global_instrument_id, state, disposition, failure_reason, attempts, payload, updated_at) "
+                "SELECT cycle_id, phase, global_instrument_id, state, disposition, failure_reason, attempts, payload, updated_at "
+                "FROM _legacy_opportunity_cycle_progress;")
+            self._connection.executescript(
+                "DROP TABLE _legacy_opportunity_cycle_progress;")
+            self._connection.executescript(
+                "CREATE INDEX IF NOT EXISTS ix_opportunity_cycle_progress_state "
+                "ON global_opportunity_cycle_progress (cycle_id, phase, state);")
 
     def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None:
         self.upsert_daily_market_bars([bar])
@@ -428,21 +531,36 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         """
         if not source_identity:
             raise ValueError("A source-owned financial fact set is required")
-        if not facts:
+        from app.financial_projection import FinancialReconciliationScope
+        if any(not isinstance(scope, FinancialReconciliationScope) for scope in complete_scopes):
+            raise ValueError("Explicit financial reconciliation scopes are required")
+        has_invalidation_scope = any(scope.completeness == "INVALIDATED_FOR_SOURCE_SCOPE" for scope in complete_scopes)
+        if not facts and not has_invalidation_scope:
             return 0
         if any(fact.key.instrument_id != instrument_id or fact.source_identity != source_identity for fact in facts):
             raise ValueError("Document reconciliation facts must share instrument and source identity")
         incoming = {fact.key: fact for fact in facts}
         if len(incoming) != len(facts):
             raise ValueError("Duplicate financial fact identities must be resolved before persistence")
-        from app.financial_projection import FinancialReconciliationScope
-        if any(not isinstance(scope, FinancialReconciliationScope) for scope in complete_scopes):
-            raise ValueError("Explicit financial reconciliation scopes are required")
         # A scope cannot authorize deleting stronger evidence or use a wholly
         # empty family as evidence of completeness.
         authorized_scopes = tuple(scope for scope in complete_scopes if any(
             scope.contains(fact.key) and fact.source_tier == FactSourceTier.OFFICIAL_NSE
             and fact.source_provider == "NSE" and fact.source_mode == SourceMode.REAL for fact in facts))
+        # INVALIDATED_FOR_SOURCE_SCOPE is authorized differently and
+        # deliberately does NOT require a corroborating incoming fact: by
+        # construction an invalidated scope has no incoming fact at all
+        # (the extraction that triggered it produced nothing). Its
+        # authority comes only from the projection run itself asserting
+        # "this exact metric/basis/period family, for this document, is
+        # confirmed unreliable" -- never from magnitude, never from
+        # guessing a corrected value. It is never conflated with
+        # authorized_scopes above, which keeps the pre-existing
+        # COMPLETE_FOR_SOURCE_SCOPE contract (and its corroboration
+        # requirement) completely unchanged.
+        invalidated_scopes = tuple(
+            scope for scope in complete_scopes if scope.completeness == "INVALIDATED_FOR_SOURCE_SCOPE"
+        )
         written = 0
         with self._connection:
             owned_rows = self._connection.execute(
@@ -478,8 +596,10 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                     written += 1
             for key in set(owned) - set(incoming):
                 if (owned[key].source_tier != FactSourceTier.OFFICIAL_NSE or owned[key].source_provider != "NSE"
-                        or owned[key].source_mode != SourceMode.REAL
-                        or not any(scope.contains(key) for scope in authorized_scopes)):
+                        or owned[key].source_mode != SourceMode.REAL):
+                    continue
+                if not (any(scope.contains(key) for scope in authorized_scopes)
+                        or any(scope.invalidates(key) for scope in invalidated_scopes)):
                     continue
                 self._connection.execute(
                     "DELETE FROM global_financial_facts WHERE instrument_id=? AND metric=? AND period_end=? AND period_type=? AND reporting_basis=? AND source_identity=?",
@@ -646,7 +766,7 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         from app.market_sessions import MarketCalendarException
         with self._connection:
             rows = self._connection.execute("SELECT * FROM market_trading_calendar_exceptions").fetchall()
-        values = [MarketCalendarException(row["market_code"], date.fromisoformat(row["trading_date"]), row["exception_type"],
+        values = [MarketCalendarException(row["market_code"], _parse_market_calendar_date(row["trading_date"]), row["exception_type"],
                   _parse_sql_time(row["open_time"]) if row["open_time"] else None, _parse_sql_time(row["close_time"]) if row["close_time"] else None, row["reason"]) for row in rows]
         return [value for value in values if not markets or value.market_code in markets]
 
@@ -880,14 +1000,14 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                 """UPDATE research_documents SET normalized_text=?, content_hash=?, status=?,
                    title=?, published_at=?, retrieved_at=?, content_type=?, source_type=?, source_classification=?,
                    discovery_provider=?, reliability_level=?, entity_resolution_confidence=?, original_url=?,
-                   source_url=?, source_name=?, document_type=?, document_subtype=?, source_independence_key=?,
+                   source_url=?, source_name=?, document_type=?, document_subtype=?, source_independence_key=?, freshness=?,
                    updated_at=? WHERE document_id=?""",
                 (document.normalized_text, document.content_hash, str(DocumentStatus.PROCESSED),
                  _bounded(document.title, RESEARCH_DOCUMENT_COLUMN_LIMITS["title"]), _dt(document.published_at),
                  _dt(document.retrieved_at), document.content_type, str(document.source_type), str(document.source_classification),
                  document.discovery_provider, str(document.reliability_level), document.entity_resolution_confidence,
                  document.original_url, document.original_url, _bounded(document.source_name, RESEARCH_DOCUMENT_COLUMN_LIMITS["source_name"]),
-                 str(document.document_type), document.document_subtype, document.source_independence_key,
+                 str(document.document_type), document.document_subtype, document.source_independence_key, document.freshness,
                  _dt(datetime.now(timezone.utc)), str(prior.document_id)),
             )
         document.document_id = prior.document_id

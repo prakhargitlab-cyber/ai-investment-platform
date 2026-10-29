@@ -89,7 +89,7 @@ async def test_transient_identity_failure_is_retryable_in_a_new_context():
     factory = Mock(side_effect=[BrokenTicker(), Ticker()])
     provider = YahooFinanceProvider(Settings(), client=object(), ticker_factory=factory)
     history = YahooHistoricalPriceProvider(factory, ticker_contexts=provider.ticker_contexts)
-    with pytest.raises(Exception, match="HISTORICAL_PRICE_PROVIDER_UNAVAILABLE:TimeoutError"):
+    with pytest.raises(Exception, match="DOWNSTREAM_TIMEOUT"):
         await history.closes(instrument(), start=NOW, end=NOW, acquisition_context=object())
     assert await history.closes(instrument(), start=NOW, end=NOW, acquisition_context=object())
     assert factory.call_count == 2

@@ -24,8 +24,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from app.financial_structure import parse_financial_structure
-from app.financial_structure_types import FinancialParseResult
+from app.financial_structure import _physical_column, parse_financial_structure
+from app.financial_structure_types import FinancialParseResult, FinancialStatementCandidate
 from app.pdf_structure import PdfTextStructure, SourceRegion, preserve_pdf_structure
 from app.structured_research import (
     _aligned_row_cells,
@@ -223,6 +223,7 @@ class SemanticStatementEvidence:
     rows: tuple[FinancialMetricRow, ...]
     source_region: SourceRegion | None
     unit: str | None
+    layout_candidate: FinancialStatementCandidate | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +540,68 @@ _CORE_METRICS = frozenset({
 })
 
 
+def _layout_metric_rows(candidate, structure):
+    """Bind the existing metric ontology to proven PDF row/column cells.
+
+    No OCR digit repairs or positional truncation: a cell must contain exactly
+    one intact numeric word wholly inside its physical column on this row.
+    """
+    table = candidate.table
+    columns = candidate.header.columns
+    first_value_column = min(c.source_region.column - c.source_column + 1 for c in columns)
+    last_header_row = max(c.source_region.line for c in columns) + 1
+    page = next(p for p in structure.pages if p.ordinal == candidate.source_region.page)
+    unit_values = {e.value for e in candidate.unit_evidence if e.kind == 'UNIT'}
+    unit = next(iter(unit_values)) if len(unit_values) == 1 else None
+    rows = []
+    for label_cell in table.cells:
+        if label_cell.row <= last_header_row or label_cell.column + label_cell.column_span > first_value_column:
+            continue
+        label = _structural_row_text(label_cell.text)
+        # Bounded label repair, corroborated by an intact operations label in
+        # this document. The original label and numeric tokens remain untouched.
+        if re.search(r"\brevenue\s+[lf]'rom\s+operations\b", label, re.I):
+            if re.search(_REVENUE_FROM_OPERATIONS_PATTERN, structure.extracted_text, re.I):
+                label = re.sub(r"\brevenue\s+[lf]'rom\s+operations\b", 'Revenue from operations', label, flags=re.I)
+        metrics = [metric for metric, pattern in _METRIC_SPECS if re.search(pattern, label, re.I)]
+        classification = _classify_financial_row(label)
+        metrics.extend(metric for kind, metric in _CLASSIFIED_METRIC_SPECS if kind == classification)
+        if not metrics:
+            continue
+        line = next(line for line in page.lines if line.ordinal == label_cell.row)
+        cells, damaged = [], label_cell.quality != 'RESOLVED'
+        for ordinal, column in enumerate(columns):
+            words = [w for w in line.words if _physical_column(table, w.region.geometry) == column.source_region.column]
+            token = ' '.join(w.text for w in words)
+            intact = bool(re.fullmatch(r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}|\d+)(?:\.\d{1,2})?'
+                                      r'|\([+-]?(?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}|\d+)(?:\.\d{1,2})?\)', token))
+            missing = token in {'-', '--', '—', '–'}
+            proven = len(words) == 1 and any(c.row == label_cell.row and c.quality == 'RESOLVED'
+                         and c.column <= column.source_region.column < c.column + c.column_span for c in table.cells)
+            value = _financial_number(token) if intact and proven else None
+            damaged |= not proven or (not intact and not missing)
+            region = replace(words[0].region, column=column.source_region.column) if len(words) == 1 else None
+            cells.append(FinancialCell(ordinal, token, value, value is not None and value < 0, value is None,
+                                       region, _normalization_ops(token, value) if intact else ('UNRESOLVED_CELL',)))
+        for metric in metrics:
+            row = FinancialMetricRow(metric, label_cell.text, _normalize_label(label), frozenset(), candidate.reporting_basis,
+                                     label_cell.region, tuple(cells), 'ACCEPTED', ())
+            state, diags, quals = _validate_metric_row(row)
+            if re.search(r'attribut|owners|non.?controlling', label, re.I):
+                quals |= frozenset({'ATTRIBUTION'})
+                state = 'REJECTED'
+                diags += ('UNREPRESENTABLE_METRIC_SCOPE',)
+            if damaged or unit is None:
+                state = 'REJECTED'
+                diags += ('UNRESOLVED_CELL' if damaged else 'UNIT_UNRESOLVED',)
+            rows.append(replace(row, resolution_state=state, diagnostics=diags, qualifiers=quals))
+    unqualified = [r for r in rows if not r.qualifiers]
+    duplicates = {r.canonical_metric for r in unqualified
+                  if sum(other.canonical_metric == r.canonical_metric for other in unqualified) > 1}
+    return [replace(r, resolution_state='AMBIGUOUS', diagnostics=(*r.diagnostics, 'DUPLICATE_METRIC_ROW'))
+            if r.canonical_metric in duplicates else r for r in rows]
+
+
 def _extract_income_metric_rows(
     statement: FinancialStatement,
     structure: PdfTextStructure | None,
@@ -701,10 +764,8 @@ def extract_semantic_facts(
 ) -> ExtractionResult:
     """Extract semantic facts and undeduplicated evidence from NSE text.
 
-    The DI-20C ``FinancialParseResult`` is retained for structural diagnostics
-    and the durable projection gate. The actual metric rows are recovered from legacy
-    ``FinancialStatement`` candidates that carry the frozen DI-20C
-    ``FinancialColumn[]`` column model.
+    Verified PDF cells take precedence. Unsupported pages retain the existing
+    flattened-text path. Both produce the same row, column and fact contracts.
     """
     evidence_at = evidence_at or datetime.now(timezone.utc)
     structure = structure or preserve_pdf_structure(text, legacy=True)
@@ -713,8 +774,18 @@ def extract_semantic_facts(
     parse_result = parse_financial_structure(text, structure=structure)
 
     # --- Legacy candidates carrying DI-20C FinancialColumn[] -------------
-    income_candidates = _nse_statement_candidates(text, evidence_at, require_quarterly=False)
-    cash_flow_statements = _nse_cash_flow_candidates(text, evidence_at)
+    layout_pages = {d.source_region.page for d in parse_result.diagnostics if d.stage == 'LAYOUT'}
+    fallback_text = text
+    for page in reversed(structure.pages):
+        if page.ordinal in layout_pages:
+            raw = structure.extracted_text[page.region.start:page.region.end]
+            from app.normalization import normalize_text
+            owned_text = raw if text == structure.extracted_text else normalize_text(raw)
+            start = fallback_text.find(owned_text)
+            if start >= 0:
+                fallback_text = fallback_text[:start] + ' ' * len(owned_text) + fallback_text[start + len(owned_text):]
+    income_candidates = _nse_statement_candidates(fallback_text, evidence_at, require_quarterly=False)
+    cash_flow_statements = _nse_cash_flow_candidates(fallback_text, evidence_at)
 
     # Shared dedup set across ALL candidates (standalone + consolidated)
     # so that when two candidates share the same column model and basis,
@@ -725,6 +796,20 @@ def extract_semantic_facts(
     all_rows: list[FinancialMetricRow] = []
     all_facts: list[SemanticFact] = []
     evidence: list[SemanticStatementEvidence] = []
+
+    for candidate in parse_result.accepted_statements:
+        if candidate.table is None:
+            continue
+        columns = candidate.header.columns
+        source = candidate.source_region
+        region = structure.extracted_text[source.start:source.end]
+        statement = FinancialStatement(region, columns, max(columns, key=lambda c: c.period_end), region)
+        units = {e.value for e in candidate.unit_evidence if e.kind == 'UNIT'}
+        unit = next(iter(units)) if len(units) == 1 else None
+        rows = _layout_metric_rows(candidate, structure)
+        all_rows.extend(rows)
+        evidence.append(SemanticStatementEvidence(candidate.statement_type, statement, tuple(rows), source, unit, candidate))
+        all_facts.extend(_build_semantic_facts(rows, statement, unit, seen=seen))
 
     def retain(kind, statement, rows, unit):
         rows = list(rows)
@@ -813,7 +898,7 @@ def extract_semantic_facts(
         "cash_and_cash_equivalents": r"\bcash\s+and\s+cash\s+equivalents?\b",
         "total_debt": r"\b(?:total\s+debt|total\s+borrowings?|outstanding\s+debt)\b",
     }
-    for statement in _nse_balance_sheet_candidates(text, evidence_at):
+    for statement in _nse_balance_sheet_candidates(fallback_text, evidence_at):
         boundary = _CASH_FLOW_HEADING.search(statement.region)
         if boundary:
             statement = replace(statement, region=statement.region[:boundary.start()])

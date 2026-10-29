@@ -1,4 +1,5 @@
 """Explicit bounded ETF ingestion using the existing acquisition and bar writers."""
+import logging
 from dataclasses import asdict
 from datetime import datetime, timezone
 from uuid import UUID
@@ -8,6 +9,7 @@ from app.etf_evidence import EtfMetric
 from app.etf_readiness import evaluate_etf_readiness
 from app.nse_historical_daily import verified_identity
 
+logger = logging.getLogger(__name__)
 MAX_ETF_INGESTION_CANDIDATES = 5
 
 
@@ -52,9 +54,11 @@ async def ingest_quotes(repository, orchestrator, rows, client, *, clock=None, f
     from app.etf_evidence import EtfAcquisitionOutcome as Outcome
     results = []
     market_error = None
+    requested_symbols = {str(row["primarySymbol"]).strip().upper() for row in rows}
     try:
         payload = await get_json(client, MARKET_URL)
-        stamp, market_rows, envelope = market_snapshot(payload, service.discovered_listings, service.clock())
+        stamp, market_rows, envelope = market_snapshot(payload, service.discovered_listings, service.clock(),
+                                                       requested_symbols=requested_symbols)
     except Exception as exc:
         # Never persist arbitrary exception text (HTTP errors can contain secrets).
         market_error = failure_code(exc)
@@ -84,8 +88,22 @@ async def ingest_quotes(repository, orchestrator, rows, client, *, clock=None, f
                 attempt = await service._record_async(key, metric, "NSE", [fact] if fact else [],
                     reason="NSE_SESSION_OBSERVATION" if fact else "FIELD_ABSENT_OR_NO_SESSION_TRADE")
             except Exception as exc:
+                reason = "NSE_ACQUISITION_FAILED:" + (failure or failure_code(exc))
+                if metric == EtfMetric.NAV and failure is None:
+                    # Diagnostic only, no behavior change: numeric() in
+                    # nse_etf_market.py already treats None/""/"-" as a
+                    # legitimately absent value (returns None, no raise),
+                    # so an exception here means the live field held some
+                    # OTHER representation. Logs the symbol (public ticker,
+                    # not a secret) and a length-capped repr of only the
+                    # "nav" field itself -- never the full row/quote, no
+                    # price/volume payload, no credentials -- so the actual
+                    # marker can be identified on a future approved run
+                    # without guessing a parser change now.
+                    logger.warning("etf_nav_parse_rejected symbol=%s raw_nav=%s",
+                                    row.get("primarySymbol"), repr(quote.get("nav"))[:80] if quote else None)
                 attempt = await service._record_async(key, metric, "NSE", outcome=Outcome.TECHNICAL_FAILURE,
-                    reason="NSE_ACQUISITION_FAILED:" + (failure or failure_code(exc)))
+                    reason=reason)
             attempts.append(attempt)
         statuses, summary = await persisted(lambda: evaluate_etf_readiness(repository.persistence, key, now=service.clock()))
         success = summary.ready_for_analysis and all(a.outcome == "SUCCESS_WITH_DATA" for a in attempts if a.metric in {"MARKET_PRICE", "TRADING_VOLUME"})

@@ -191,3 +191,106 @@ async def test_successful_dispatches_still_plateau_at_the_bound_not_at_eight_asy
     assert all(not isinstance(r, Exception) for r in results)
     assert _HangingTicker._active == 0
     assert provider._thread_dispatch_semaphore._value == 3
+
+
+# --- Regression: yfinance's own 30s-per-request default exceeds
+# ResearchReadinessRuntime's ensure_timeout_seconds=25.0 background-cycle
+# acquisition budget, and the thread-dispatch semaphore above only bounds
+# COUNT, not DURATION -- a slow-but-not-literally-hung Yahoo response still
+# holds its slot for however long it actually takes. app.structured_market
+# ._build_bounded_yahoo_session forces every underlying HTTP request's
+# timeout down to structured_provider_timeout_seconds so a stalled/slow call
+# fails fast and frees its slot well inside the 25s observation window --
+# WITHOUT discarding yfinance's own preferred transport (curl_cffi with
+# Chrome TLS impersonation when installed, confirmed installed in this
+# codebase's environment) for a plain requests.Session that would lose that
+# anti-bot fingerprinting. ---
+
+def test_bounded_yahoo_session_caps_every_request_timeout_on_whichever_backend_is_active():
+    """Backend-agnostic: must work whether yfinance.data.new_session()
+    returns a curl_cffi Session (Chrome impersonation -- the preferred
+    backend, confirmed installed in this environment) or a plain
+    requests.Session fallback. This factory deliberately reuses yfinance's
+    OWN session-construction function rather than reimplementing it, so
+    whichever backend yfinance would have picked for itself is preserved;
+    only the per-request timeout is capped on top of it.
+    """
+    import app.structured_market as sm
+
+    class _FakeRealSession:
+        """Stands in for whatever yf.data.new_session() would really
+        return (curl_cffi or requests) -- only .request matters here."""
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, *args, **kwargs):
+            self.calls.append(kwargs.get("timeout"))
+            return "stubbed-response"
+
+    fake_real_session = _FakeRealSession()
+    original_new_session = sm.yf.data.new_session
+    sm.yf.data.new_session = lambda: fake_real_session
+    try:
+        session = sm._build_bounded_yahoo_session(bound_seconds=8.0)
+    finally:
+        sm.yf.data.new_session = original_new_session
+
+    # The factory must hand back yfinance's OWN session object (so its
+    # cookies/impersonation/connection pooling are untouched), not a
+    # replacement -- only .request is wrapped on top of it.
+    assert session is fake_real_session
+
+    # yfinance's YfData.get()/.post() always pass an explicit timeout
+    # (hardcoded default 30s in yfinance's own code) -- a longer requested
+    # timeout must be clamped down to the configured bound before reaching
+    # the real transport.
+    session.request("GET", "https://example.invalid", timeout=30)
+    assert fake_real_session.calls[-1] == 8.0
+
+    # A caller that omits timeout entirely still gets the bound applied,
+    # never an unbounded request.
+    session.request("GET", "https://example.invalid")
+    assert fake_real_session.calls[-1] == 8.0
+
+    # A request that already asks for something SHORTER than the bound is
+    # left alone -- this only caps, never extends.
+    session.request("GET", "https://example.invalid", timeout=2.0)
+    assert fake_real_session.calls[-1] == 2.0
+
+
+
+def test_yahoo_finance_provider_default_ticker_factory_uses_bounded_session():
+    """The confirmed fix site: when no ticker_factory override is injected
+    (the real production path, as opposed to every other test in this
+    file, which injects its own factory), YahooFinanceProvider must hand
+    yfinance a session whose per-request timeout is capped at
+    structured_provider_timeout_seconds -- built from yfinance's own
+    preferred session (new_session()), not a hand-rolled requests.Session
+    that would silently drop curl_cffi's Chrome impersonation.
+    """
+    from app.structured_market import YahooFinanceProvider
+
+    settings = Settings()
+    provider = YahooFinanceProvider(settings, client=object())
+
+    captured = {}
+
+    def fake_ticker_ctor(symbol, session=None):
+        captured["symbol"] = symbol
+        captured["session"] = session
+        return object()
+
+    import app.structured_market as sm
+    original = sm.yf.Ticker
+    sm.yf.Ticker = fake_ticker_ctor
+    try:
+        provider.ticker_factory("RELIANCE.NS")
+    finally:
+        sm.yf.Ticker = original
+
+    assert captured["symbol"] == "RELIANCE.NS"
+    assert captured["session"] is provider._bounded_session
+    # _build_bounded_yahoo_session stamps this for introspection/testing --
+    # it is yfinance's own real session object (curl_cffi or requests,
+    # whichever new_session() picked), not a dedicated subclass.
+    assert captured["session"]._bound_seconds == settings.structured_provider_timeout_seconds

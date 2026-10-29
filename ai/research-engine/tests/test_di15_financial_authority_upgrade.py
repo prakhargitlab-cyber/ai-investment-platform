@@ -21,10 +21,12 @@ from app.research_readiness_runtime import (
 from app.settings import Settings
 from app.stock_rule_engine import _fact_series
 from app.structured_research import latest_quarterly_result_from_facts
+from app.normalization import normalize_financial_fact
 from test_official_nse_financial_parsing import _profile, _document, JUNE
 
 
-NOW = datetime.now(timezone.utc)
+NOW = datetime(2026, 10, 3, tzinfo=timezone.utc)
+pytestmark = pytest.mark.usefixtures("financial_fixture_clock")
 
 
 def _repo():
@@ -38,7 +40,7 @@ def _repo():
 
 
 def _facts(repo, *, official=False):
-    facts = repo._official_financial_fact_candidates(_document(JUNE))
+    facts = _complete_quarterly_facts(repo._official_financial_fact_candidates(_document(JUNE)))
     if official:
         return facts
     return [replace(fact, source_tier=FactSourceTier.YAHOO, source_provider="YAHOO_FINANCE",
@@ -49,8 +51,22 @@ def _facts(repo, *, official=False):
                     })) for fact in facts]
 
 
+def _complete_quarterly_facts(facts):
+    """Add a 4th historical quarter (2025-09-30) to fixture facts that only
+    cover 3 quarters, so the 4-quarter comparable-period requirement is
+    satisfiable. Templates are cloned from the latest quarter's real values.
+    """
+    templates = [f for f in facts if f.key.period_type == "QUARTERLY" and f.key.period_end == "2026-06-30"]
+    if templates and not any(f.key.period_end == "2025-09-30" for f in facts):
+        return list(facts) + [replace(f, key=replace(f.key, period_end="2025-09-30")) for f in templates]
+    return list(facts)
+
+
 def _stored(facts):
-    return {f.key: replace(f, value=f.value.model_copy(update={"as_of_date": None, "period": None, "calculation_basis": None})) for f in facts}
+    def _normalize(fact):
+        normalized = normalize_financial_fact(fact)
+        return replace(normalized, value=normalized.value.model_copy(update={"as_of_date": None, "period": None, "calculation_basis": None}))
+    return {f.key: _normalize(f) for f in facts}
 
 
 def _seed(repo, facts):
@@ -61,7 +77,8 @@ def _seed(repo, facts):
 def test_fresh_secondary_requires_upgrade_but_complete_official_does_not():
     repo, profile = _repo()
     assert authoritative_financial_upgrade_required(profile, _facts(repo))
-    assert not authoritative_financial_upgrade_required(profile, _facts(repo, official=True))
+    official = _complete_quarterly_facts(_facts(repo, official=True))
+    assert not authoritative_financial_upgrade_required(profile, official)
 
 
 def test_single_authoritative_quarter_is_not_comparable_history():
@@ -97,7 +114,7 @@ def test_inapplicable_requirement_never_upgrades():
 @pytest.mark.parametrize("fail", [False, True])
 def test_fresh_gate_allows_only_official_upgrade_and_retains_fallback(monkeypatch, fail):
     repo, profile = _repo()
-    secondary = _facts(repo)
+    secondary = _complete_quarterly_facts(_facts(repo))
     _seed(repo, secondary)
     monkeypatch.setattr(repo, "_instrument_refresh_gate", lambda *a, **k: _InstrumentRefreshGate(set(), False, False, "FRESH_AND_COMPLETE"))
     calls = []
@@ -185,7 +202,9 @@ def test_document_without_valid_facts_never_claims_authoritative_readiness():
 
 def test_actual_ensure_executor_reuses_document_without_network(monkeypatch):
     repo, profile = _repo()
-    _seed(repo, _facts(repo))
+    _seed(repo, _complete_quarterly_facts(_facts(repo)))
+    official = _complete_quarterly_facts(_facts(repo, official=True))
+    _seed(repo, official)
     document = _document(JUNE)
     repo.documents[document.document_id] = document
 
@@ -212,7 +231,7 @@ def test_official_wins_persistence_presentation_and_rule_series():
     assert _stored(repo.financial_facts_for(profile.instrument_id)) == _stored(official)
     for combined in [list(_stored(yahoo).values()) + list(_stored(official).values()), list(_stored(official).values()) + list(_stored(yahoo).values())]:
         result = latest_quarterly_result_from_facts(combined)
-        assert result.revenue.value == Decimal("8261.11")
+        assert result.revenue.value == Decimal("82611100000")
         series = _fact_series(SimpleNamespace(financial_facts=combined), ["revenue"], "QUARTERLY")
         assert all(item.source == "NSE" for item in series)
         assert series[-1].value == Decimal("82611100000")

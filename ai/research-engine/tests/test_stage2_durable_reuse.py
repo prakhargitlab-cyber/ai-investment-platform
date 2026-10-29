@@ -26,6 +26,7 @@ from test_official_nse_financial_parsing import JUNE, _document, _profile, _trus
 
 
 NOW = datetime(2026, 8, 15, tzinfo=timezone.utc)
+pytestmark = pytest.mark.usefixtures("financial_fixture_clock")
 
 
 class Clock(datetime):
@@ -321,7 +322,7 @@ async def test_no_new_quarter_uses_parsed_period_when_title_date_regex_misses(mo
 
 @pytest.mark.asyncio
 async def test_second_targeted_financial_pass_reuses_incomplete_cycle_evidence(tmp_path, monkeypatch):
-    from test_official_nse_financial_parsing import _rolling_financial_documents
+    from test_official_nse_financial_parsing import _rolling_financial_documents, _multi_period_statement
     from app.normalization import content_hash
     monkeypatch.setattr(repository_module, "datetime", Clock)
     monkeypatch.setattr("app.research_readiness_runtime.datetime", Clock)
@@ -337,6 +338,17 @@ async def test_second_targeted_financial_pass_reuses_incomplete_cycle_evidence(t
     persistence.upsert_document(historical)
     writer.remember_persisted_document(historical)
     writer._persist_official_financial_facts(historical)
+    # CAGR needs three annual points; persist an actual third fixture statement.
+    oldest = _document(_multi_period_statement(
+        "30 June 2025", "31 March 2025", "30 June 2024", "31 March 2024",
+    )).model_copy(update={
+        "canonical_url": "https://nsearchives.nseindia.com/corporate/oldest-result.pdf",
+        "original_url": "https://nsearchives.nseindia.com/corporate/oldest-result.pdf",
+        "retrieved_at": NOW - timedelta(days=1), "content_hash": content_hash("oldest-result"),
+    })
+    persistence.upsert_document(oldest)
+    writer.remember_persisted_document(oldest)
+    writer._persist_official_financial_facts(oldest)
     # The owning run is deliberately never completed.
     assert run.refresh_run_id
     for _ in range(2):
@@ -478,21 +490,26 @@ async def test_partial_price_history_requests_only_missing_ranges_and_merges(tmp
     persistence = SqliteResearchPersistence(str(tmp_path / "prices.sqlite"))
     repository = repo(persistence)
     repository.profile(_profile().instrument_id).provider_instrument_ids["YAHOO_FINANCE"] = "EXAMPLE.NS"
-    first, last = NOW - timedelta(days=200), NOW - timedelta(days=2)
+    from app.market_sessions import completed_sessions
+    schedules = persistence.load_market_schedules({'NSE'})
+    sessions = list(completed_sessions('NSE', schedules, [], (NOW - timedelta(days=400)).date(), NOW.date(), NOW))
+    stamps = [datetime.combine(day, datetime.min.time(), timezone.utc) for day, _ in sessions]
+    first, last = stamps[140], stamps[-3]
     def observation(at, provider="YAHOO_FINANCE"):
-        return MarketPriceObservation(instrument_id=_profile().instrument_id, observed_at=at, price=Decimal("100"), provider=provider, source_url="https://finance.yahoo.com/quote/EXAMPLE.NS/history", retrieved_at=NOW)
-    for at in (first, last):
+        return MarketPriceObservation(instrument_id=_profile().instrument_id, observed_at=at, price=Decimal("100"),
+            currency='INR', provider=provider, source_url="https://finance.yahoo.com/quote/EXAMPLE.NS/history", retrieved_at=NOW)
+    for at in stamps[140:-2]:
         persistence.upsert_market_price_observation(observation(at))
     persistence.upsert_market_price_observation(observation(NOW, "NSE"))
     calls = []
     async def closes(instrument, *, start, end):
         calls.append((start, end))
-        return [] if empty_prefix and end == first else [observation(start), observation(end - timedelta(days=1))]
+        return [] if empty_prefix and end == first else [observation(at) for at in stamps if start <= at < end]
     provider = SimpleNamespace(provider_name="YAHOO_FINANCE", closes=closes)
     jobs = SimpleNamespace(settings=Settings(market_data_population_initial_lookback_days=400), population=HistoricalPricePopulationService(repository, provider))
     executor = ExistingResearchCapabilityExecutor(repository, SimpleNamespace(), jobs)
     await executor._ensure_historical_prices(_profile().instrument_id)
-    assert calls == [(NOW - timedelta(days=400), first), (last + timedelta(days=1), NOW + timedelta(days=1))]
+    assert calls == [(stamps[0], first), (stamps[-2], stamps[-1] + timedelta(days=1))]
     assert {first, last, NOW} <= {value.observed_at for value in persistence.load_market_price_observations({_profile().instrument_id})}
     reader = repo(persistence)
     reader.profile(_profile().instrument_id).provider_instrument_ids["YAHOO_FINANCE"] = "EXAMPLE.NS"
@@ -539,11 +556,11 @@ async def test_growth_uses_each_periods_existing_freshness_policy(stale, monkeyp
     repository = repo(SqliteResearchPersistence())
     prototypes = repository._official_financial_fact_candidates(_document(JUNE))
     periods = {
-        "ANNUAL": ["2026-03-31", "2025-03-31"],
+        "ANNUAL": ["2026-03-31", "2025-03-31", "2024-03-31"],
         "QUARTERLY": ["2026-06-30", "2026-03-31"],
     }
     if stale == "ANNUAL":
-        periods["ANNUAL"] = ["2025-03-31", "2024-03-31"]
+        periods["ANNUAL"] = ["2025-03-31", "2024-03-31", "2023-03-31"]
     elif stale == "QUARTERLY":
         periods["QUARTERLY"] = ["2025-12-31", "2025-09-30"]
     for period_type, dates in periods.items():

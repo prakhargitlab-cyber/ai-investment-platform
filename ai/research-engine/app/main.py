@@ -89,6 +89,8 @@ research_readiness_runtime = ResearchReadinessRuntime(
             settings.research_mcp_gateway_base_url,
             settings.research_mcp_gateway_timeout_seconds,
             settings.research_mcp_service_identity,
+            settings.research_mcp_gateway_max_concurrency,
+            repository=repository,
         ),
         enabled=settings.research_mcp_first_enabled,
     ),
@@ -195,7 +197,8 @@ def _etf_radar_worker():
             # run_global_opportunity_cycle), so portfolio-service rejected
             # it with 401. Same internal service identity, same settings.
             return await run_etf_radar_cycle_async(repository, portfolio_orchestrator, **parameters,
-                identity_headers=_internal_service_identity(portfolio_orchestrator.settings))
+                identity_headers=_internal_service_identity(portfolio_orchestrator.settings),
+                jobs=market_data_population_jobs)
         app.state.etf_radar_worker = OpportunityCycleWorker(repository, etf_runner, market='ETF')
     return app.state.etf_radar_worker
 
@@ -237,6 +240,14 @@ async def _radar_read(operation, *args, **kwargs):
     # Minimal SQLite-only test adapters are thread-affine.
     with repository._persistence_worker_lock:
         return operation(*args, **kwargs)
+
+
+@app.get('/api/v1/research/opportunities/cycles')
+async def recent_opportunity_cycles(limit: int = Query(default=20, ge=1, le=50)):
+    loader = getattr(repository.persistence, 'recent_opportunity_cycles', None)
+    if loader is None:
+        return {'cycles': [], 'active_cycle': None}
+    return await _radar_read(loader, limit=limit, market='NSE')
 
 
 @app.get('/api/v1/research/opportunities/current')
@@ -348,7 +359,18 @@ async def _controlled_etf_preflight(instrument_ids, request):
         raise HTTPException(422, 'INVALID_CANONICAL_ETF_SELECTION')
     result['recovery_paused'] = settings.research_opportunity_recovery_paused
     result['active_cycle_id'] = active['cycle_id'] if active else None
-    result['can_submit'] = result['status'] == 'READY' and not result['recovery_paused'] and active is None
+    # Mirrors Equity's LOCAL-only manual-execution override (_manual_equity_enabled
+    # gating opportunity_cycle): a paused scheduler does not block a bounded,
+    # explicit-candidate, admin-authorized diagnostics cycle when the
+    # independent bounded manual-execution gate (_manual_etf_enabled) is
+    # enabled. This never consults or widens the full-universe gate/flag
+    # (_full_universe_etf_enabled, checked only by the separate
+    # /full-universe-cycles endpoint) -- the two scopes stay independently
+    # authorizable, exactly as before this change.
+    result['manual_execution_authorized'] = bool(result['recovery_paused'] and _manual_etf_enabled())
+    result['can_submit'] = (result['status'] == 'READY'
+                             and (not result['recovery_paused'] or result['manual_execution_authorized'])
+                             and active is None)
     return result
 
 
@@ -356,6 +378,45 @@ class EtfFullUniverseRequest(BaseModel):
     max_universe: int = Field(default=2000, ge=1, le=5000)
     max_requests: int = Field(default=1500, ge=1, le=15000)
     max_seconds: int = Field(default=3600, ge=30, le=14400)
+
+
+def _manual_etf_enabled() -> bool:
+    """LOCAL-only bounded manual ETF Radar admission gate.
+
+    Mirror of :func:`_manual_equity_enabled`: authorization is restricted to
+    LOCAL environment, a paused scheduler, and an explicit operator flag.
+    The recovery-pause flag is intentionally NOT checked here: the manual
+    admission path exists precisely *during* recovery pause (the worker's
+    own gate enforces that invariant at submission time). The two ETF
+    scopes (this one and :func:`_full_universe_etf_enabled`) remain
+    independent predicates over disjoint settings fields -- this function
+    is never consulted by the full-universe endpoint, and vice versa.
+    """
+    env = getattr(settings, 'environment', None)
+    return env == 'LOCAL' and not settings.research_opportunity_scheduler_enabled and settings.research_etf_manual_execution_enabled
+
+
+def _full_universe_etf_enabled() -> bool:
+    """Full-official-universe manual ETF Radar admission gate.
+
+    Mirror of :func:`_manual_etf_enabled`, reading the independent
+    ``research_etf_full_universe_execution_enabled`` flag so the two scopes
+    are independently authorizable.
+    """
+    return not settings.research_opportunity_scheduler_enabled and settings.research_etf_full_universe_execution_enabled
+
+
+def _manual_equity_enabled() -> bool:
+    """LOCAL-only manual Equity Radar admission gate.
+
+    Authorization is restricted to LOCAL environment, a paused scheduler,
+    and an explicit operator flag. The recovery-pause flag is intentionally
+    NOT checked here: the manual path exists precisely *during* recovery
+    pause (the worker's ``submit_manual_equity_async`` enforces that
+    invariant at submission time).
+    """
+    env = getattr(settings, 'environment', None)
+    return env == 'LOCAL' and not settings.research_opportunity_scheduler_enabled and settings.research_equity_manual_execution_enabled
 
 
 def _authorize_full_etf(request):
@@ -367,11 +428,32 @@ def _authorize_full_etf(request):
 @app.post('/api/v1/etf-radar/full-universe-cycles')
 async def full_etf_cycle(body: EtfFullUniverseRequest, request: Request):
     _authorize_full_etf(request)
-    if settings.research_opportunity_recovery_paused:
-        raise HTTPException(503, 'RECOVERY_PAUSED')
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=202, content=await _etf_radar_worker().submit_async(
-        {'top_n': None, 'full_universe_limits': body.model_dump()}))
+    from app.opportunity_worker import ManualEtfAdmissionError
+    # Enforced unconditionally, BEFORE branching on recovery_paused. The
+    # production branch below used to hand off straight to the generic
+    # durable worker (submit_async), which has no knowledge of this
+    # scope-specific flag at all -- so lifting recovery_paused while this
+    # flag stayed False (or was never explicitly turned on) silently
+    # admitted a full-universe cycle anyway. Fail closed in both branches.
+    if not settings.research_etf_full_universe_execution_enabled:
+        raise HTTPException(503, 'FULL_UNIVERSE_EXECUTION_NOT_AUTHORIZED')
+    if not settings.research_opportunity_recovery_paused:
+        # Production path: automatic scheduler is running (or recovery
+        # pause is lifted). Use the generic durable worker.
+        return JSONResponse(status_code=202, content=await _etf_radar_worker().submit_async(
+            {'top_n': None, 'full_universe_limits': body.model_dump()}))
+    # Recovery-paused path: manual full-universe execution additionally
+    # requires the scheduler to be explicitly disabled (part of the
+    # independent full-universe gate predicate).
+    if not _full_universe_etf_enabled():
+        raise HTTPException(503, 'FULL_UNIVERSE_EXECUTION_NOT_AUTHORIZED')
+    try:
+        result = await _etf_radar_worker().submit_manual_etf_async(
+            {'full_universe_limits': body.model_dump()}, scope='FULL_UNIVERSE')
+    except ManualEtfAdmissionError as exc:
+        raise HTTPException(409, str(exc))
+    return JSONResponse(status_code=202, content=result)
 
 
 @app.get('/api/v1/etf-radar/full-universe-cycles/{cycle_id}/coverage')
@@ -400,13 +482,26 @@ async def controlled_etf_preflight(request: Request, instrument_ids: list[UUID] 
 @app.post('/api/v1/etf-radar/controlled-cycles')
 async def controlled_etf_cycle(body: EtfEvidenceRequest, request: Request):
     preflight = await _controlled_etf_preflight(body.instrument_ids, request)
-    if preflight['recovery_paused']:
+    if preflight['recovery_paused'] and not preflight['manual_execution_authorized']:
         raise HTTPException(503, 'RECOVERY_PAUSED')
     if not preflight['can_submit']:
         raise HTTPException(409, detail=preflight)
     from fastapi.responses import JSONResponse
-    result = await _etf_radar_worker().submit_async({'top_n': None,
-        'candidate_ids': [str(key) for key in body.instrument_ids], 'verify_canonical_candidates': True})
+    parameters = {'top_n': None, 'candidate_ids': [str(key) for key in body.instrument_ids],
+                  'verify_canonical_candidates': True}
+    if preflight['manual_execution_authorized']:
+        # Paused-recovery path: the same LOCAL/admin/scheduler-disabled manual
+        # gate Equity already uses for its own cycles endpoint, routed through
+        # the worker's BOUNDED admission check only (never FULL_UNIVERSE) --
+        # see OpportunityCycleWorker.submit_manual_etf_async /
+        # _check_manual_etf_admission.
+        from app.opportunity_worker import ManualEtfAdmissionError
+        try:
+            result = await _etf_radar_worker().submit_manual_etf_async(parameters)
+        except ManualEtfAdmissionError as exc:
+            raise HTTPException(409, str(exc))
+    else:
+        result = await _etf_radar_worker().submit_async(parameters)
     return JSONResponse(status_code=202, content=result)
 
 
@@ -586,29 +681,61 @@ class OpportunityCycleRequest(BaseModel):
 @app.post('/api/v1/research/opportunities/cycles')
 async def opportunity_cycle(body: OpportunityCycleRequest, request: Request):
     from app.global_opportunity_cycle import run_global_opportunity_cycle
+    from fastapi.responses import JSONResponse
     if not hasattr(repository.persistence, 'publish_opportunity_cycle'):
         raise HTTPException(503, 'RECOMMENDATION_PERSISTENCE_REQUIRED')
-    # Operator-controlled recovery pause: refuse new cycle submissions while paused.
-    # The cancellation REQUEST/STATUS API and the fenced /finalize-cancel endpoint
-    # remain available. Both production and controlled submissions are blocked.
-    if settings.research_opportunity_recovery_paused:
-        raise HTTPException(503, 'RECOVERY_PAUSED')
-    worker = _opportunity_worker()
-    if body.candidate_ids is None:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=202, content=await worker.submit_async(
+    from app.opportunity_worker import ManualEtfAdmissionError
+
+    async def diagnostics():
+        # Diagnostics use the same process lock and never update production state.
+        async with _opportunity_worker().run_lock:
+            try:
+                return await run_global_opportunity_cycle(repository, portfolio_orchestrator,
+                    top_n=body.top_n, shortlist_limit=body.shortlist_limit, candidate_ids=body.candidate_ids,
+                    analysis_scope=body.analysis_scope,
+                    readiness_runtime=research_readiness_runtime,
+                    identity_headers=_internal_service_identity(portfolio_orchestrator.settings))
+            except PortfolioServiceUnavailableError as exc:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                                    detail='PORTFOLIO_SERVICE_UNAVAILABLE') from exc
+
+    if not settings.research_opportunity_recovery_paused:
+        # Production path: automatic scheduler is running (or recovery pause
+        # is lifted). This mirrors the ETF full-universe endpoint's own
+        # automatic/manual branching and the pre-manual-gate contract: an
+        # ordinary, non-paused submission is never routed through the
+        # LOCAL-only manual-execution gate below, which exists only for
+        # the recovery-paused case. Without this branch every production
+        # 'Run' submission incorrectly 503s regardless of environment.
+        if body.candidate_ids is not None:
+            return await diagnostics()
+        return JSONResponse(status_code=202, content=await _opportunity_worker().submit_async(
             {'top_n': body.top_n, 'shortlist_limit': body.shortlist_limit, 'analysis_scope': body.analysis_scope}))
-    # Diagnostics use the same process lock and never update production state.
-    async with worker.run_lock:
-        try:
-            return await run_global_opportunity_cycle(repository, portfolio_orchestrator,
-                top_n=body.top_n, shortlist_limit=body.shortlist_limit, candidate_ids=body.candidate_ids,
-                analysis_scope=body.analysis_scope,
-                readiness_runtime=research_readiness_runtime,
-                identity_headers=_internal_service_identity(portfolio_orchestrator.settings))
-        except PortfolioServiceUnavailableError as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                                detail='PORTFOLIO_SERVICE_UNAVAILABLE') from exc
+    # LOCAL-only manual gate: authorized ADMIN execution despite a paused
+    # automatic scheduler. When the LOCAL gate is not satisfied, surface the
+    # same RECOVERY_PAUSED contract used by the production submission path so
+    # that callers see a consistent paused-recovery signal regardless of
+    # whether they are hitting the manual or automatic endpoint.
+    if not _manual_equity_enabled():
+        raise HTTPException(503, 'RECOVERY_PAUSED')
+    _require_market_data_admin(request.headers.get('x-aip-user-id'),
+                               request.headers.get('x-aip-user-issuer'),
+                               request.headers.get('x-aip-user-subject'),
+                               request.headers.get('x-aip-user-roles'))
+    if body.candidate_ids is not None:
+        return await diagnostics()
+    try:
+        content = await _opportunity_worker().submit_manual_equity_async(
+            {'top_n': body.top_n, 'shortlist_limit': body.shortlist_limit, 'analysis_scope': body.analysis_scope})
+    except ManualEtfAdmissionError as exc:
+        # Surface the worker's specific admission-refusal reason (e.g. an
+        # in-flight/active cycle requiring review) rather than collapsing
+        # every rejection into the same generic RECOVERY_PAUSED signal --
+        # the UI needs to tell these apart. 409 (not 503) matches the
+        # existing ETF full-universe manual-admission contract: this is a
+        # conflict with current state, not a server failure.
+        raise HTTPException(409, str(exc))
+    return JSONResponse(status_code=202, content=content)
 
 
 @app.delete('/api/v1/research/opportunities/cycles/{cycle_id}/cancel')
@@ -1385,6 +1512,95 @@ async def market_data_population_status(
     if job is None:
         raise HTTPException(status_code=404, detail="MARKET_DATA_POPULATION_JOB_NOT_FOUND")
     return job
+
+
+class InstrumentDailyBarBackfillRequest(BaseModel):
+    """Single-instrument NSE historical daily-bar backfill request.
+
+    Deliberately narrower than EtfHistoryRequest above: exactly one
+    global_instrument_id, never a batch. start/end are optional and fall
+    back to the existing worker's own bounded defaults (today, and today
+    minus market_data_population_initial_lookback_days) when omitted.
+    """
+
+    global_instrument_id: UUID
+    start: CalendarDate | None = None
+    end: CalendarDate | None = None
+    force: bool = False
+
+
+@app.post("/api/v1/research/market-data/population/instrument")
+async def backfill_instrument_daily_bars(
+    body: InstrumentDailyBarBackfillRequest,
+    x_correlation_id: str | None = Header(default=None),
+    x_aip_user_id: str | None = Header(default=None),
+    x_aip_user_issuer: str | None = Header(default=None),
+    x_aip_user_subject: str | None = Header(default=None),
+    x_aip_user_email: str | None = Header(default=None),
+    x_aip_user_display_name: str | None = Header(default=None),
+    x_aip_user_roles: str | None = Header(default=None),
+):
+    """Explicit, ADMIN-gated single-instrument NSE historical daily-bar backfill.
+
+    Wraps the existing, already-tested IndiaMarketDataPopulationJobs.backfill_daily_bars
+    worker (app.nse_daily_backfill.run_backfill) via its existing instrument_ids
+    filter, scoped to exactly this one global_instrument_id. This introduces no
+    second acquisition or persistence pipeline: the same NseHistoricalDailyProvider
+    and persist_daily_result boundary used by the whole-universe backfill and by
+    ETF history ingestion is reused unchanged.
+
+    Canonical instrument identity, NSE exchange membership and EQUITY instrument
+    type are checked here against portfolio-service's own global instrument
+    metadata before the worker is invoked at all, so a wrong instrument fails
+    with a specific, honest reason rather than a silent no-op. Bounded date-range
+    validation and acquisition backoff/cooldown are enforced inside the existing
+    worker exactly as they are for the whole-universe path, before any provider
+    call -- no new cooldown mechanism is introduced.
+
+    Never invoked by submit/ensure or any whole-universe market-data route, and
+    does not alter ETF ingestion behavior.
+    """
+    _require_market_data_admin(x_aip_user_id, x_aip_user_issuer, x_aip_user_subject, x_aip_user_roles)
+    identity_headers = _identity_headers(
+        x_aip_user_id, x_aip_user_issuer, x_aip_user_subject,
+        x_aip_user_email, x_aip_user_display_name, x_aip_user_roles,
+    )
+    try:
+        metadata = await portfolio_orchestrator.global_instrument_metadata(
+            body.global_instrument_id, correlation_id=x_correlation_id, identity_headers=identity_headers,
+        )
+    except GlobalInstrumentNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="COMPANY_NOT_RESOLVED") from exc
+    except PortfolioServiceUnavailableError as exc:
+        raise HTTPException(status_code=502, detail="PORTFOLIO_SERVICE_UNAVAILABLE") from exc
+    if metadata.get("assetType") != "EQUITY":
+        raise HTTPException(status_code=400, detail="INSTRUMENT_NOT_EQUITY")
+    if metadata.get("primaryExchange") not in {"NSE", "XNSE"} or metadata.get("country") not in {"IN", "IND", "INDIA"}:
+        raise HTTPException(status_code=400, detail="INSTRUMENT_NOT_NSE_LISTED")
+    if metadata.get("status") != "ACTIVE":
+        raise HTTPException(status_code=400, detail="INSTRUMENT_NOT_ACTIVE")
+
+    summary = await market_data_population_jobs.backfill_daily_bars(
+        identity_headers=identity_headers,
+        correlation_id=x_correlation_id,
+        instrument_ids={body.global_instrument_id},
+        start=body.start,
+        end=body.end,
+        force=body.force,
+    )
+    if summary.get("status") == "FAILED":
+        failure_reason = summary.get("failure_reason")
+        if failure_reason == "UNIVERSE_UNAVAILABLE":
+            raise HTTPException(status_code=502, detail="PORTFOLIO_SERVICE_UNAVAILABLE")
+        raise HTTPException(status_code=400, detail=failure_reason or "INVALID_DATE_RANGE")
+    instruments = summary.get("instruments") or []
+    if not instruments:
+        # Independent metadata check above passed, but the worker's own
+        # universe membership snapshot (a separate, possibly later read)
+        # excluded this instrument. Report this honestly rather than
+        # claiming a backfill ran.
+        raise HTTPException(status_code=409, detail="INSTRUMENT_NOT_ELIGIBLE_AT_BACKFILL_TIME")
+    return {"globalInstrumentId": str(body.global_instrument_id), "instrument": instruments[0], "job": summary}
 
 
 @app.get("/api/v1/research/companies/{instrument_id}")

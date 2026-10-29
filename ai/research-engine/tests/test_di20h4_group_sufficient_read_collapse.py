@@ -110,7 +110,7 @@ class _CountingRuntime:
 
     async def ensure(self, instrument_id, *, jurisdiction, requirement_ids,
                      identity_headers=None, correlation_id=None,
-                     wait_for_completion=True):
+                     wait_for_completion=True, timeout_seconds=None):
         requirement_ids = tuple(requirement_ids)
         self.ensure_calls.append(requirement_ids)
         budget = acquisition_budget(instrument_id)

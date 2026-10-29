@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from PIL import Image, ImageDraw
+from ocr_prerequisites import requires_image_ocr
 
 RELIANCE_ID = "44444444-4444-4444-4444-444444444444"
 
@@ -55,6 +56,7 @@ def _client():
 
 
 class TestCurrentNewsDraftEndpointPngJpg:
+    @requires_image_ocr
     def test_png_draft_succeeds_and_returns_ocr_text_for_review(self):
         client = _client()
         from app import manual_evidence
@@ -82,6 +84,7 @@ class TestCurrentNewsDraftEndpointPngJpg:
             or len(body["extractedText"]) > 0
         assert body["proposedFacts"] == []
 
+    @requires_image_ocr
     def test_jpg_draft_succeeds_and_returns_ocr_text_for_review(self):
         client = _client()
         from app import manual_evidence
@@ -116,6 +119,7 @@ class TestCurrentNewsDraftEndpointPngJpg:
         assert get_response.status_code == 200
         assert get_response.json()["status"] == "DRAFT"
 
+    @requires_image_ocr
     def test_full_lifecycle_draft_review_correct_accept_persist_readiness_recompute(self):
         client = _client()
         from app import manual_evidence

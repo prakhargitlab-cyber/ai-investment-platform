@@ -21,6 +21,9 @@ Invariants proven here:
 from __future__ import annotations
 
 from uuid import UUID
+import pytest
+
+pytestmark = pytest.mark.usefixtures("news_fixture_clock")
 
 RELIANCE_ID = "44444444-4444-4444-4444-444444444444"
 

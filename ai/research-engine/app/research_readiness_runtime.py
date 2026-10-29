@@ -26,7 +26,7 @@ from app.market_sessions import price_session_valid_until
 from app.normalization import content_hash
 
 from app.fact_precedence import FactSourceTier, FinancialFact
-from app.historical_market_data import HistoricalPriceIdentityConflict, HistoricalPriceProviderError, HistoricalPricePersistenceError, has_year_historical_coverage
+from app.historical_market_data import HistoricalPriceIdentityConflict, HistoricalPriceProviderError, HistoricalPricePersistenceError
 from app.structured_market import derive_and_verify_nse_yahoo_mapping, _exchange_family
 from app.structured_financial import OfficialFinancialProvider
 from app.models import (
@@ -221,7 +221,17 @@ class RepositoryResearchReadinessAdapter:
         }
         self._append_financial_evidence(evidence, facts)
         self._append_structured_evidence(evidence, structured)
-        self._append_market_observations(evidence, observations)
+        schedules, exceptions = self._sessions.get(global_instrument_id, (None, None))
+        if schedules is None:
+            store = getattr(self.repository, 'persistence', None)
+            markets = {profile.mic, profile.exchange}
+            schedules = store.load_market_schedules(markets) if callable(getattr(store, 'load_market_schedules', None)) else []
+            exceptions = store.load_market_calendar_exceptions(markets) if callable(getattr(store, 'load_market_calendar_exceptions', None)) else []
+        bars_loader = getattr(self.repository, 'daily_market_bars_for', None)
+        bars = bars_loader({global_instrument_id}).get(global_instrument_id, []) if callable(bars_loader) else []
+        self._append_market_observations(evidence, observations, profile=profile,
+            now=self._evaluation_times.get(global_instrument_id, datetime.now(timezone.utc)),
+            schedules=schedules, exceptions=exceptions, bars=bars)
         from app.valuation_evidence import materialize_valuation
         valuation_now = self._evaluation_times.get(global_instrument_id, datetime.now(timezone.utc))
         for name, value in materialize_valuation(structured, observations, now=valuation_now).items():
@@ -250,10 +260,9 @@ class RepositoryResearchReadinessAdapter:
             if not industry and industry_fact and industry_fact.value:
                 industry, classification_source = str(industry_fact.value), industry_fact.source_url
         applicability = classify_requirements(str(sector) if sector else None, str(industry) if industry else None, classification_source, asset_type=metadata.get("assetType"))
-        schedules, exceptions = self._sessions.get(global_instrument_id, ([], []))
         if schedules:
             market = profile.mic or profile.exchange
-            for requirement_id in ("LATEST_PRICE", "VALUATION_INPUTS", "HISTORICAL_PRICE_SERIES"):
+            for requirement_id in ("LATEST_PRICE", "VALUATION_INPUTS"):
                 if requirement_id not in evidence:
                     continue
                 values = []
@@ -265,8 +274,7 @@ class RepositoryResearchReadinessAdapter:
                         # fallback (fail-closed / conservative).
                         valid_until = price_session_valid_until(market, schedules, exceptions, item.as_of)
                         if valid_until and ('LATEST_USABLE_PRICE' in item.covered_input_ids
-                                            or item.evidence_id.startswith('derived-valuation:')
-                                            or requirement_id == "HISTORICAL_PRICE_SERIES"):
+                                            or item.evidence_id.startswith('derived-valuation:')):
                             item = replace(item, valid_until=valid_until)
                     values.append(item)
                 evidence[requirement_id] = values
@@ -386,15 +394,11 @@ class RepositoryResearchReadinessAdapter:
         # two internally-consistent series without requiring their units to
         # agree with each other. Reporting basis (CONSOLIDATED/STANDALONE/
         # UNKNOWN) is still the discriminator that must never be mixed.
-        # periods_by_series and annual_periods below are per-metric-own-
-        # history checks (REVENUE_HISTORY, EARNINGS_HISTORY,
-        # ANNUAL_CAGR_INPUTS all read a single metric's own period count,
-        # never a cross-metric intersection), so their existing (basis, unit)
-        # key is untouched -- it already gives each metric the same
-        # same-unit-across-time protection described above.
+        # Annual CAGR requires three comparable revenue AND earnings periods,
+        # matching the scorer. Other metrics cannot supply income history.
         quarterly_metrics: dict[str, dict[str, dict[str, set[str]]]] = {}
         all_quarterly_periods: set[str] = set()
-        annual_periods: dict[tuple, set[str]] = {}
+        annual_metrics: dict[str, dict[str, dict[str, set[str]]]] = {}
         for fact in real:
             metric = _metric(fact.key.metric)
             if not fact.key.period_end:
@@ -419,12 +423,20 @@ class RepositoryResearchReadinessAdapter:
                 )
                 quarterly_metrics.setdefault(reporting_basis, {}).setdefault(family, {}).setdefault(unit, set()).add(period)
             elif fact.key.period_type == "ANNUAL":
-                annual_periods.setdefault(basis, set()).add(period)
+                family = ("revenue" if metric in {"revenue", "total_revenue"}
+                          else "pat" if metric in {"pat", "net_income", "net_profit"} else metric)
+                annual_metrics.setdefault(reporting_basis, {}).setdefault(family, {}).setdefault(unit, set()).add(period)
         latest_quarter = max(all_quarterly_periods, default=None)
 
         def _dominant_quarterly_periods(reporting_basis: str, family: str) -> set[str]:
             by_unit = quarterly_metrics.get(reporting_basis, {}).get(family, {})
             return max(by_unit.values(), key=len, default=set())
+
+        def _comparable_annual_periods(reporting_basis: str) -> set[str]:
+            families = annual_metrics.get(reporting_basis, {})
+            revenue = max(families.get("revenue", {}).values(), key=len, default=set())
+            earnings = max((families.get("pat") or families.get("eps", {})).values(), key=len, default=set())
+            return revenue & earnings
 
         for fact in real:
             metric = _metric(fact.key.metric)
@@ -435,7 +447,7 @@ class RepositoryResearchReadinessAdapter:
                 periods_by_series.get((fact.key.period_type, (reporting_basis, unit_for(fact))), {}),
                 _dominant_quarterly_periods(reporting_basis, "revenue")
                     & _dominant_quarterly_periods(reporting_basis, "earnings"),
-                annual_periods.get((reporting_basis, unit_for(fact)), set()),
+                _comparable_annual_periods(reporting_basis),
                 latest_quarter,
             )
             for requirement_id, covered_inputs in coverage.items():
@@ -482,8 +494,15 @@ class RepositoryResearchReadinessAdapter:
 
     @staticmethod
     def _append_market_observations(
-        evidence: dict[str, list[ResearchEvidence]], observations: Sequence[Any]
+        evidence: dict[str, list[ResearchEvidence]], observations: Sequence[Any], *,
+        profile, now, schedules, exceptions, bars=()
     ) -> None:
+        from app.session_history import aware, is_daily_history
+        from app.technical_features import select_price_history
+        history, _, use_daily, _ = select_price_history(profile.instrument_id, observations,
+            as_of=now, currency=profile.currency, market=profile.mic or profile.exchange,
+            schedules=schedules, exceptions=exceptions, daily_bar_history=bars,
+            provider_symbol=profile.provider_instrument_ids.get('YAHOO_FINANCE'))
         usable = sorted(
             (
                 value
@@ -491,12 +510,36 @@ class RepositoryResearchReadinessAdapter:
                 if value.price is not None
                 and Decimal(str(value.price)).is_finite()
                 and Decimal(str(value.price)) > 0
+                and value.instrument_id == profile.instrument_id and value.currency == profile.currency
+                and aware(value.observed_at) and aware(value.retrieved_at)
+                and value.observed_at <= value.retrieved_at <= now
+                and not is_daily_history(value)
             ),
             key=lambda value: value.observed_at,
         )
-        if not usable:
+        if usable:
+            RepositoryResearchReadinessAdapter._append_latest_quote(evidence, usable[-1])
+        if not history.observations:
             return
-        latest = usable[-1]
+        latest = history.observations[-1]
+        covered = {"DURABLE_PRICE_OBSERVATIONS"}
+        if len(history.observations) >= 50:
+            covered.add("FIFTY_OBSERVATION_TECHNICAL_BASIS")
+        if len(history.observations) >= 150:
+            covered.add("ONE_HUNDRED_FIFTY_OBSERVATION_TECHNICAL_BASIS")
+        from app.market_sessions import session_bounds
+        as_of = session_bounds(profile.mic or profile.exchange, schedules, exceptions, latest.trading_date)[1] if use_daily else latest.observed_at
+        evidence["HISTORICAL_PRICE_SERIES"].append(ResearchEvidence(
+            evidence_id=f'price-series:{latest.provider}:{history.session_dates[0]}:{history.session_dates[-1]}:{len(history.observations)}',
+            requirement_id='HISTORICAL_PRICE_SERIES', source=_market_source(latest.provider),
+            source_tier=_structured_source_tier(latest.provider),
+            retrieved_at=max(row.retrieved_at for row in history.observations), as_of=as_of,
+            valid_until=history.valid_until, source_url=latest.source_url,
+            complete=not history.missing_dates and not history.conflicting_dates,
+            covered_input_ids=tuple(sorted(covered))))
+
+    @staticmethod
+    def _append_latest_quote(evidence, latest):
         source = _market_source(latest.provider)
         source_tier = _structured_source_tier(latest.provider)
         price_evidence = ResearchEvidence(
@@ -517,26 +560,6 @@ class RepositoryResearchReadinessAdapter:
                 price_evidence,
                 "VALUATION_INPUTS",
                 ("LATEST_USABLE_PRICE",),
-            )
-        )
-        covered = {"DURABLE_PRICE_OBSERVATIONS"}
-        if len(usable) >= 50:
-            covered.add("FIFTY_OBSERVATION_TECHNICAL_BASIS")
-        if len(usable) >= 150:
-            covered.add("ONE_HUNDRED_FIFTY_OBSERVATION_TECHNICAL_BASIS")
-        evidence["HISTORICAL_PRICE_SERIES"].append(
-            ResearchEvidence(
-                evidence_id=(
-                    f"price-series:{latest.provider}:{usable[0].observed_at.isoformat()}:"
-                    f"{latest.observed_at.isoformat()}:{len(usable)}"
-                ),
-                requirement_id="HISTORICAL_PRICE_SERIES",
-                source=source,
-                source_tier=source_tier,
-                retrieved_at=max(item.retrieved_at for item in usable),
-                as_of=latest.observed_at,
-                source_url=latest.source_url,
-                covered_input_ids=tuple(sorted(covered)),
             )
         )
 
@@ -770,8 +793,14 @@ class RepositoryResearchReadinessAdapter:
             # authority ordering (canonical > structured fallback > missing) is
             # enforced procedurally, not just by evidence-tier ranking.
             retrieved_at = _aware_datetime(
-                metadata.get("updatedAt") or metadata.get("retrievedAt")
-            ) or datetime.now(timezone.utc)
+                metadata.get("sectorVerifiedAt") or metadata.get("verifiedAt")
+                or metadata.get("updatedAt") or metadata.get("retrievedAt")
+            )
+            if retrieved_at is None:
+                # Canonical authority does not establish when this value was
+                # verified. Keep it authoritative without manufacturing fresh
+                # evidence or substituting a lower-authority sector below.
+                return
             evidence["SECTOR_MACRO"].append(
                 ResearchEvidence(
                     evidence_id=f"canonical-sector:{instrument_id}:{str(sector).strip().casefold()}",
@@ -936,22 +965,90 @@ class ExistingResearchCapabilityExecutor:
             return {}
         return {f'yahoo_{key}': value for key, value in contexts.retention_stats().items()}
 
-    async def acquire_official_financials(self, global_instrument_id: UUID) -> None:
+    async def acquire_official_financials(
+        self, global_instrument_id: UUID, requirement_ids=None,
+    ) -> None:
         """Structured NSE acquisition only; document fallback belongs to execute_primary."""
         if self.official_financial_provider is None:
             return
-        facts = await self.official_financial_provider.collect(self.repository.profile(global_instrument_id))
-        if any(fact.key.instrument_id != global_instrument_id
-               or fact.source_provider != "NSE" or fact.source_tier != FactSourceTier.OFFICIAL_NSE
-               or fact.source_mode != SourceMode.REAL or not fact.source_identity
-               or urlparse(fact.value.source_url).scheme != "https"
-               or not ((urlparse(fact.value.source_url).hostname or "") == "nseindia.com"
-                       or (urlparse(fact.value.source_url).hostname or "").endswith(".nseindia.com"))
-               for fact in facts):
-            raise ValueError("OFFICIAL_STRUCTURED_PROVENANCE_INVALID")
-        await self.repository.persist_international_financial_facts_async(facts)
-        if facts:
-            evidence_committed(global_instrument_id)
+        profile = self.repository.profile(global_instrument_id)
+        written = 0
+
+        async def accept(facts):
+            nonlocal written
+            if any(fact.key.instrument_id != global_instrument_id
+                   or fact.source_provider != "NSE" or fact.source_tier != FactSourceTier.OFFICIAL_NSE
+                   or fact.source_mode != SourceMode.REAL or not fact.source_identity
+                   or urlparse(fact.value.source_url).scheme != "https"
+                   or not ((urlparse(fact.value.source_url).hostname or "") == "nseindia.com"
+                           or (urlparse(fact.value.source_url).hostname or "").endswith(".nseindia.com"))
+                   for fact in facts):
+                raise ValueError("OFFICIAL_STRUCTURED_PROVENANCE_INVALID")
+            written += await self.repository.persist_international_financial_facts_async(facts)
+            if facts:
+                evidence_committed(global_instrument_id)
+            return await self.repository._run_blocking_persistence(
+                self.repository.financial_facts_for, global_instrument_id)
+
+        collect_planned = getattr(self.official_financial_provider, "collect_planned", None)
+        if not callable(collect_planned):
+            await accept(await self.official_financial_provider.collect(profile))
+            return
+
+        from app.financial_evidence_plan import build_financial_evidence_plan
+        from app.financial_gap_fill import load_financial_gap_state
+        from app.financial_authority import quarterly_income_history_gaps
+        state = await self.repository._run_blocking_persistence(
+            load_financial_gap_state, self.repository, global_instrument_id)
+        selected = _FINANCIAL_REQUIREMENTS if requirement_ids is None else set(requirement_ids)
+        missing = {key: set(inputs) for key, inputs in state.missing.items() if key in selected}
+        registry = ResearchRequirementRegistry.default()
+        for key in missing:
+            row = state.readiness.for_requirement(key)
+            if row.source != "NSE":
+                # Ready secondary evidence can still be an explicit authority
+                # upgrade. It cannot satisfy the official collector's plan.
+                missing[key].update(item.input_id for item in registry.get(key).inputs
+                                    if item.input_id not in row.not_applicable_input_reasons)
+        # Limited quarterly readiness does not certify the four TTM constituents.
+        # Explicit financial acquisition retains these historical gap targets.
+        if "QUARTERLY_FINANCIALS" in selected and quarterly_income_history_gaps(state.facts):
+            missing.setdefault("QUARTERLY_FINANCIALS", set()).update(
+                {"QUARTERLY_REVENUE", "QUARTERLY_PAT"})
+
+        def plan_factory(facts, **kwargs):
+            return build_financial_evidence_plan(
+                profile, facts, missing, as_of=state.readiness.generated_at, **kwargs)
+
+        async def document_failed(url, max_bytes):
+            return await self.repository._run_blocking_persistence(
+                self.repository.document_size_failure_known, global_instrument_id, url, max_bytes)
+
+        async def record_failure(url, max_bytes):
+            await self.repository.record_document_size_failure(global_instrument_id, url, max_bytes)
+
+        async def document_known(key):
+            return await self.repository._run_blocking_persistence(
+                self.repository._latest_acquisition_observation, global_instrument_id,
+                "FINANCIAL_XML:" + content_hash(repr(key)), "NSE")
+
+        async def record_document(key, url, count):
+            await self.repository.record_acquisition_observation(
+                global_instrument_id, "FINANCIAL_XML:" + content_hash(repr(key)), "NSE",
+                "COMPLETED", datetime.now(timezone.utc), source_url=url, evidence_count=count)
+
+        async def completed(reason):
+            await self.repository.record_acquisition_observation(
+                global_instrument_id, "FINANCIAL_PLAN", "NSE",
+                "FAILED" if reason in {"TIME_LIMIT", "CANCELLED", "PROVIDER_BACKOFF"} else
+                "COMPLETED" if reason == "SATISFIED" or written else "SUCCESS_EMPTY",
+                datetime.now(timezone.utc), failure_reason=None if reason == "SATISFIED" else reason,
+                evidence_count=written)
+
+        await collect_planned(
+            profile, existing_facts=state.facts, plan_factory=plan_factory, accept=accept,
+            document_failed=document_failed, record_failure=record_failure, completed=completed,
+            document_known=document_known, record_document=record_document)
 
     async def execute_primary(
         self,
@@ -1030,7 +1127,7 @@ class ExistingResearchCapabilityExecutor:
                 if self.official_financial_provider is not None or official_financials_attempted:
                     try:
                         if not official_financials_attempted:
-                            await self.acquire_official_financials(global_instrument_id)
+                            await self.acquire_official_financials(global_instrument_id, financial)
                         current = await memoized_assess(
                             self.repository, _assess_memo, global_instrument_id, jurisdiction=jurisdiction)
                         remaining = {key for key in financial if
@@ -1193,6 +1290,16 @@ class ExistingResearchCapabilityExecutor:
                 progress.executed("HISTORICAL_MARKET_DATA")
             try:
                 await self._ensure_historical_prices(global_instrument_id)
+                current = await self.repository._run_blocking_persistence(
+                    ResearchReadinessService(RepositoryResearchReadinessAdapter(self.repository)).assess,
+                    global_instrument_id, jurisdiction=jurisdiction, evidence_only=True,
+                )
+                if current.for_requirement("HISTORICAL_PRICE_SERIES").status in REQUIREMENT_STATUSES_NEEDING_ACQUISITION:
+                    # A completed ranged acquisition with a remaining gap is
+                    # the same evidence outcome as a completed MCP acquisition.
+                    failures["HISTORICAL_PRICE_SERIES"] = (
+                        "EXTERNAL_RESULT_INCOMPLETE:HISTORICAL_COVERAGE_INSUFFICIENT"
+                    )
             except Exception as exc:
                 # A stable, truthful technical-failure reason (identity
                 # conflict, missing verified mapping, provider/persistence
@@ -1286,19 +1393,22 @@ class ExistingResearchCapabilityExecutor:
             )
         ).get(global_instrument_id, [])
         now = datetime.now(timezone.utc)
-        usable = [value for value in observations if value.price is not None
-                  and Decimal(str(value.price)).is_finite() and Decimal(str(value.price)) > 0
-                  and value.observed_at <= now]
-        # A fresh NSE quote must not hide the missing tail of Yahoo's daily
-        # history. Its high-water mark belongs to the historical provider.
-        historical = [value for value in usable if value.provider == "YAHOO_FINANCE"]
-        observed_at = [value.observed_at for value in historical or usable]
-        has_year = bool(observed_at) and has_year_historical_coverage(
-            min(observed_at), max(observed_at), len(observed_at)
-        )
+        from app.session_history import missing_history_ranges
+        from app.technical_features import select_price_history
+        market = profile.mic or profile.exchange
+        calendars = getattr(self.repository, 'market_session_data', None)
+        if callable(calendars):
+            schedules, exceptions = await calendars({profile.mic, profile.exchange})
+        else:
+            raise HistoricalPriceProviderError('HISTORICAL_SESSION_CALENDAR_UNAVAILABLE')
+        if not schedules:
+            raise HistoricalPriceProviderError('HISTORICAL_SESSION_CALENDAR_UNAVAILABLE')
+        bars_loader = getattr(self.repository, 'daily_market_bars_for_instruments', None)
+        bars = (await bars_loader({global_instrument_id})).get(global_instrument_id, []) if callable(bars_loader) else []
+        history, _, _, _ = select_price_history(global_instrument_id, observations, as_of=now,
+            currency=profile.currency, market=market, schedules=schedules, exceptions=exceptions,
+            provider_symbol=provider_ticker, daily_bar_history=bars)
         initial_start = (now - timedelta(days=self.market_data_population_jobs.settings.market_data_population_initial_lookback_days)).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        ranges = []
         receipt_prefix = f"urn:research:price-backfill:v1:{provider_ticker}:"
         loader = getattr(self.repository, "_latest_acquisition_observation", None)
         receipt = None
@@ -1310,15 +1420,15 @@ class ExistingResearchCapabilityExecutor:
                 checked_start = datetime.fromisoformat(receipt["source_url"][len(receipt_prefix):]).date()
             except ValueError:
                 pass
-        if not observed_at:
-            ranges.append((initial_start, end, True))
-        else:
-            first = min(observed_at).replace(hour=0, minute=0, second=0, microsecond=0)
-            if not has_year and initial_start.date() < first.date() and (checked_start is None or checked_start > initial_start.date()):
-                ranges.append((initial_start, first, True))
-            tail = (max(observed_at) + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            if tail.date() < end.date():
-                ranges.append((tail, end, False))
+        start_date = initial_start.date()
+        from app.market_sessions import completed_sessions
+        first_expected = next(completed_sessions(market, schedules, exceptions, start_date, now.date(), now), None)
+        if history.session_dates and checked_start is not None and first_expected and checked_start <= first_expected[0]:
+            # A completed prefix check avoids repeated empty pre-listing reads.
+            # It is not a candle and never satisfies readiness/coverage.
+            start_date = max(start_date, history.session_dates[0])
+        ranges = missing_history_ranges(history.session_dates, market=market, schedules=schedules,
+            exceptions=exceptions, start=start_date, as_of=now, listing_date=profile.listing_date)
         if not ranges:
             return 0
         instrument = {
@@ -1336,15 +1446,36 @@ class ExistingResearchCapabilityExecutor:
             "exchange": profile.exchange,
         }
         written = 0
-        for start, stop, backfill in ranges:
-            written += await self.market_data_population_jobs.population.populate([instrument], start=start, end=stop)
+        for start, stop in ranges:
+            start_at = datetime.combine(start, time.min, timezone.utc)
+            stop_at = datetime.combine(stop, time.min, timezone.utc)
+            recorder = getattr(self.repository, "record_acquisition_observation", None)
+            source_url = (f"https://finance.yahoo.com/quote/{provider_ticker}/history"
+                          f"?interval=1d&auto_adjust=false&start={start}&end={stop}")
+            try:
+                count = await self.market_data_population_jobs.population.populate(
+                    [instrument], start=start_at, end=stop_at,
+                )
+            except Exception as exc:
+                if callable(recorder):
+                    await recorder(global_instrument_id, "HISTORICAL_PRICE_SERIES", "YAHOO_FINANCE",
+                                   "FAILED", datetime.now(timezone.utc), source_url=source_url,
+                                   failure_reason=(str(exc) if isinstance(exc, (
+                                       HistoricalPriceProviderError, HistoricalPricePersistenceError,
+                                   )) else type(exc).__name__), evidence_count=written)
+                raise
+            written += count
+            if callable(recorder):
+                await recorder(global_instrument_id, "HISTORICAL_PRICE_SERIES", "YAHOO_FINANCE",
+                               "SUCCESS" if count else "SUCCESS_EMPTY", datetime.now(timezone.utc),
+                               source_url=source_url, evidence_count=count)
             # Only a completed provider/persistence operation certifies the
             # attempted prefix (e.g. a recent listing has no earlier prices).
             # This receipt is never price evidence or a freshness extension.
-            recorder = getattr(self.repository, "record_acquisition_observation", None)
+            backfill = not history.session_dates or start < history.session_dates[0]
             if backfill and callable(recorder):
                 await recorder(global_instrument_id, "HISTORICAL_PRICE_BACKFILL", "YAHOO_FINANCE", "CHECKED", now,
-                               source_url=receipt_prefix + start.date().isoformat())
+                               source_url=receipt_prefix + start.isoformat())
         return written
 
 
@@ -1550,11 +1681,27 @@ class ResearchReadinessRuntime:
         correlation_id: str | None = None,
         identity_headers: Mapping[str, str | None] | None = None,
         wait_for_completion: bool = False,
+        timeout_seconds: float | None = None,
     ) -> TargetedEnsureResult:
         """Interactive callers cap plan execution; background owners await it.
 
         Completion mode is for the persisted cycle worker, not the API route.
         Neither mode treats transport success or elapsed time as readiness.
+
+        timeout_seconds: optional per-call override of self.ensure_timeout_seconds
+        (DEEP CD-1 fix). A caller that batches several requirements into one
+        shared acquisition plan -- see deep_investigation._acquire_group,
+        which already scales RequirementAcquisitionBudget.max_documents /
+        max_queries by len(members) -- may pass a correspondingly scaled
+        budget here so the SAME shared provider pass that was given more
+        document/query allowance for a larger batch also gets proportionally
+        more wall-clock budget to use it, instead of every batch size sharing
+        one flat single-member timeout. None (the default) preserves the
+        existing self.ensure_timeout_seconds behavior unchanged for every
+        other caller (singleton acquisition, BASELINE, the interactive API
+        route). This never changes the deadline=None contract for the
+        background-owner execution task itself -- only how long the owner
+        waits before cancelling/draining it.
         """
         selected = self._validated_requirement_ids(requirement_ids)
         _read_started = _time.monotonic()
@@ -1652,6 +1799,7 @@ class ResearchReadinessRuntime:
                 correlation_id=correlation_id,
                 identity_headers=identity_headers,
                 wait_for_completion=wait_for_completion,
+                timeout_seconds=timeout_seconds,
             )
         )
         flight = _EnsureFlight(task, target_ids)
@@ -1718,7 +1866,18 @@ class ResearchReadinessRuntime:
         correlation_id: str | None,
         identity_headers: Mapping[str, str | None] | None,
         wait_for_completion: bool = False,
+        timeout_seconds: float | None = None,
     ) -> _PlanExecutionResult:
+        # DEEP CD-1 fix: effective_timeout is the actual budget used for every
+        # wait/deadline below. It defaults to self.ensure_timeout_seconds
+        # (unchanged behavior) unless the caller passed an explicit override
+        # (see ensure()'s docstring) -- never the global instance default
+        # itself, so other callers of the SAME runtime instance (BASELINE,
+        # singleton DEEP acquisition, the interactive API route) are
+        # unaffected by a scaled override one grouped DEEP call requested.
+        effective_timeout = (
+            timeout_seconds if timeout_seconds is not None else self.ensure_timeout_seconds
+        )
         progress = CapabilityExecutionProgress()
         if wait_for_completion:
             # A persisted background opportunity job owns completion. The API
@@ -1731,7 +1890,7 @@ class ResearchReadinessRuntime:
             logger.info("acquisition_started globalInstrumentId=%s owner=BACKGROUND_CYCLE",
                         plan.global_instrument_id)
             try:
-                done, _ = await asyncio.wait({task}, timeout=self.ensure_timeout_seconds)
+                done, _ = await asyncio.wait({task}, timeout=effective_timeout)
                 if not done:
                     # OOM/stall root-cause fix: the prior code fell through to
                     # `result = await task` here, which BLOCKED INDEFINITELY on the
@@ -1762,7 +1921,7 @@ class ResearchReadinessRuntime:
                                  and capability.rsplit(':', 1)[-1] not in progress.failures
                                  and capability.rsplit(':', 1)[-1] not in progress.satisfied_requirement_ids]
                     logger.info("orchestration_wait_expired globalInstrumentId=%s budgetSeconds=%s acquisitionState=RUNNING inFlight=%s",
-                                plan.global_instrument_id, self.ensure_timeout_seconds, in_flight)
+                                plan.global_instrument_id, effective_timeout, in_flight)
                     # Hard deadline: the cancelled task must unwind its provider
                     # calls, but it MUST NOT be awaited without bound. The
                     # ensure_timeout_seconds window is the observation budget that
@@ -1772,7 +1931,7 @@ class ResearchReadinessRuntime:
                     try:
                         await asyncio.wait_for(
                             asyncio.gather(task, return_exceptions=True),
-                            timeout=max(self.ensure_timeout_seconds, 5.0),
+                            timeout=max(effective_timeout, 5.0),
                         )
                     except asyncio.TimeoutError:
                         # Even the hard-deadline drain exceeded the budget: the
@@ -1783,7 +1942,7 @@ class ResearchReadinessRuntime:
                         logger.warning(
                             "orchestration_drain_timeout globalInstrumentId=%s budgetSeconds=%s "
                             "inFlight=%s abandonedAfterHardDeadline=true",
-                            plan.global_instrument_id, self.ensure_timeout_seconds, in_flight)
+                            plan.global_instrument_id, effective_timeout, in_flight)
                     # Build a bounded failure result mirroring the interactive
                     # TimeoutError path so the caller never observes an unbounded
                     # wait -- only the durable evidence state committed before the
@@ -1829,9 +1988,9 @@ class ResearchReadinessRuntime:
         # tell how much of the SHARED budget genuinely remains, instead of
         # each target assuming its own fresh per-call timeout independent of
         # everything already attempted before it in the same plan.
-        deadline = asyncio.get_event_loop().time() + self.ensure_timeout_seconds
+        deadline = asyncio.get_event_loop().time() + effective_timeout
         try:
-            async with asyncio.timeout(self.ensure_timeout_seconds):
+            async with asyncio.timeout(effective_timeout):
                 return await self._execute_plan_until_ready(
                     plan,
                     jurisdiction=jurisdiction,
@@ -1875,7 +2034,7 @@ class ResearchReadinessRuntime:
                 "research_readiness_ensure_timeout globalInstrumentId=%s "
                 "budgetSeconds=%s requested=%s inFlight=%s requirements=%s",
                 plan.global_instrument_id,
-                self.ensure_timeout_seconds,
+                effective_timeout,
                 sorted(target.requirement_id for target in plan.targets),
                 in_flight,
                 sorted(failures),
@@ -2292,7 +2451,9 @@ def _financial_fact_coverage(
         add("GROWTH_FACTS", "EARNINGS_HISTORY")
     if fact.key.period_type == "QUARTERLY" and len(quarterly_periods) >= 2:
         add("GROWTH_FACTS", "QUARTERLY_YOY_QOQ_TRENDS")
-    if fact.key.period_type == "ANNUAL" and len(annual_periods) >= 2:
+    from app.financial_authority import ANNUAL_CAGR_MIN_PERIODS
+    if (fact.key.period_type == "ANNUAL" and len(annual_periods) >= ANNUAL_CAGR_MIN_PERIODS
+            and metric in {"revenue", "total_revenue", "pat", "net_income", "net_profit", "eps"}):
         add("GROWTH_FACTS", "ANNUAL_CAGR_INPUTS")
     if metric in {"total_debt", "debt", "debt_or_borrowings", "borrowings"}:
         add("BALANCE_SHEET_FACTS", "DEBT")

@@ -42,10 +42,19 @@ def setup():
     repo, profile = _repo()
     profile = profile.model_copy(update={'isin': 'INE539A01019', 'provider_instrument_ids': {'NSE': 'GHCL'}})
     repo.profiles = [profile]
-    client = SimpleNamespace(get=AsyncMock(return_value=httpx.Response(200, json={'data': ROWS},
-                             request=httpx.Request('GET', NseOfficialFinancialProvider.RESULTS_URL))))
     xml = {ROWS[0]['xbrl']: (FIXTURES / 'ghcl_20260630.xml').read_bytes(),
            ROWS[1]['xbrl']: (FIXTURES / 'ghcl_20260331.xml').read_bytes()}
+    rows = list(ROWS)
+    # The success scenario needs the four-quarter history used by the scorer.
+    # These explicit synthetic offline filings exercise real XML acquisition;
+    # no production fact is invented and the original assertions stay intact.
+    for start, end, reported in [('2025-10-01', '2025-12-31', '31-Dec-2025'),
+                                 ('2025-07-01', '2025-09-30', '30-Sep-2025')]:
+        filing = {**ROWS[0], 'qe_Date': reported, 'xbrl': ROWS[0]['xbrl'].replace('.xml', f'_{end}.xml')}
+        rows.append(filing)
+        xml[filing['xbrl']] = xml[ROWS[0]['xbrl']].replace(b'2026-04-01', start.encode()).replace(b'2026-06-30', end.encode())
+    client = SimpleNamespace(get=AsyncMock(return_value=httpx.Response(200, json={'data': rows},
+                             request=httpx.Request('GET', NseOfficialFinancialProvider.RESULTS_URL))))
     async def fetch(url, **kwargs):
         return SimpleNamespace(final_url=url, status_code=200, content_type='application/xml', content=xml[url])
     fetcher = SimpleNamespace(settings=repo.settings, fetch_network=AsyncMock(side_effect=fetch))
@@ -74,6 +83,23 @@ async def test_verified_structured_quarters_persist_and_satisfy_readiness_withou
     assert any(f.key.metric == 'total_equity' and f.key.period_type == 'AS_AT' for f in facts)
     # This small verified feed does not manufacture the remaining balance/quality inputs.
     assert actual.for_requirement('BALANCE_SHEET_FACTS').status != 'READY_FRESH'
+    # Seed two additional durable historical quarters (2025-12-31, 2025-09-30)
+    # and two additional annual periods (2025-03-31, 2024-03-31) from prior
+    # cycles so the 4-quarter comparable-period and 3-annual-period
+    # requirements are met and the warm path does not trigger a redundant
+    # authority upgrade/fetch.
+    current_quarterly = [f for f in facts if f.key.period_type == 'QUARTERLY']
+    templates = [f for f in current_quarterly if f.key.period_end == '2026-06-30']
+    historical = [replace(f, key=replace(f.key, period_end=period),
+                           source_identity=f.source_identity + f':DURABLE_{period}')
+                  for period in ('2025-12-31', '2025-09-30') for f in templates]
+    current_annual = [f for f in facts if f.key.period_type == 'ANNUAL' and f.key.metric in ('revenue', 'pat')]
+    annual_templates = [f for f in current_annual if f.key.period_end == '2026-03-31']
+    historical_annual = [replace(f, key=replace(f.key, period_end=period),
+                                  source_identity=f.source_identity + f':DURABLE_{period}')
+                         for period in ('2025-03-31', '2024-03-31') for f in annual_templates]
+    await repo.persist_international_financial_facts_async(historical + historical_annual)
+    await repo.persist_international_financial_facts_async(historical)
     provider.client.get.reset_mock()
     provider.fetcher.fetch_network.reset_mock()
     runtime = ResearchReadinessRuntime(repo, RepositoryResearchReadinessAdapter(repo), executor)
@@ -124,6 +150,23 @@ async def test_structured_growth_uses_durable_prior_year_comparison_without_pdf(
                       source_identity=fact.source_identity + ':DURABLE_PRIOR_FY')
              for fact in current_annual]
     await repo.persist_international_financial_facts_async(prior)
+    # Seed two additional durable historical quarters and one additional
+    # annual period so the 4-quarter comparable-period and 3-annual-period
+    # requirements are met and the subsequent execute_primary does not
+    # trigger a redundant authority upgrade/fetch.
+    current_quarterly = [f for f in repo.financial_facts_for(profile.instrument_id)
+                         if f.key.period_type == 'QUARTERLY' and f.key.period_end == '2026-06-30']
+    templates = [f for f in current_quarterly if f.key.metric in {'revenue', 'pat', 'eps', 'finance_costs'}]
+    historical = [replace(f, key=replace(f.key, period_end=period),
+                           source_identity=f.source_identity + f':DURABLE_HIST_{period}')
+                  for period in ('2025-12-31', '2025-09-30') for f in templates]
+    annual_templates = [f for f in repo.financial_facts_for(profile.instrument_id)
+                        if f.key.period_type == 'ANNUAL' and f.key.period_end == '2026-03-31'
+                        and f.key.metric in {'revenue', 'pat'}]
+    historical_annual = [replace(f, key=replace(f.key, period_end='2024-03-31'),
+                                  source_identity=f.source_identity + ':DURABLE_2024')
+                         for f in annual_templates]
+    await repo.persist_international_financial_facts_async(historical + historical_annual)
 
     # Retrieving current results again (e.g. a later cycle) must reuse the
     # already-durable current+prior evidence, not fabricate a second annual
@@ -320,8 +363,11 @@ async def test_xml_collection_is_bounded_and_uses_verified_query_contract(monkey
     monkeypatch.setattr('app.structured_financial.parse_nse_financial_xbrl', lambda *a, **k: [])
     assert not await provider.collect(profile)
     assert provider.fetcher.fetch_network.await_count == 4
+    # Discovery can inspect a second page independently of the four downloads.
+    # The mock repeats page 1, so duplicate-page detection ends discovery here.
+    assert [call.kwargs['params']['page'] for call in provider.client.get.call_args_list] == [1, 2]
     assert provider.client.get.call_args.kwargs['params'] == {
-        'symbol': 'GHCL', 'type': 'Integrated Filing- Financials', 'page': 1, 'size': 20}
+        'symbol': 'GHCL', 'type': 'Integrated Filing- Financials', 'page': 2, 'size': 20}
 
 
 def test_dtd_and_duplicate_contexts_fail_closed():

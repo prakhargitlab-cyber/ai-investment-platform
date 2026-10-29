@@ -47,11 +47,15 @@ class BaselineTicker:
         raise AssertionError(f"Baseline must not acquire {name}")
 
 
-def history(store, *, end=NOW, count=150):
-    for index in range(count):
+def history(store, *, end=NOW, count=150, provider="YAHOO_FINANCE"):
+    from app.market_sessions import completed_sessions
+    sessions = list(completed_sessions('NSE', store.load_market_schedules({'NSE'}),
+        store.load_market_calendar_exceptions({'NSE'}),
+        (end - timedelta(days=count * 2)).date(), end.date(), end))[-count:]
+    for _day, close in sessions:
         store.upsert_market_price_observation(MarketPriceObservation(
-            instrument_id=INSTRUMENT_ID, observed_at=end - timedelta(days=count - index - 1),
-            price=Decimal(250), currency="INR", provider="YAHOO_FINANCE",
+            instrument_id=INSTRUMENT_ID, observed_at=close,
+            price=Decimal(250), currency="INR", provider=provider,
             source_url="https://finance.yahoo.com/quote/READY.NS/history", retrieved_at=end,
         ))
 
@@ -86,6 +90,47 @@ async def ensure(h, requirements=BASELINE_REQUIREMENT_IDS):
     return await asyncio.wait_for(h.runtime.ensure(
         INSTRUMENT_ID, jurisdiction="INDIA", requirement_ids=requirements,
     ), 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["YAHOO_FINANCE", "YAHOO_FINANCE_MCP"])
+@pytest.mark.parametrize("prior_failure", [False, True])
+async def test_275_completed_sessions_from_either_yahoo_provider_are_reused(harness, provider, prior_failure, monkeypatch):
+    h = harness
+    as_of = datetime(2026, 10, 17, 16, tzinfo=timezone.utc)
+
+    class HistoryClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return as_of
+
+    for module in (research_readiness, research_readiness_runtime):
+        monkeypatch.setattr(module, "datetime", HistoryClock)
+    # Explicit fixture closure: history generation and the durable reader must
+    # both respect the same calendar, with Friday's close fresh on Saturday.
+    h.store._connection.execute("INSERT INTO market_trading_calendar_exceptions "
+        "(market_code,trading_date,exception_type) VALUES ('NSE','2026-10-02','CLOSED')")
+    h.store._connection.commit()
+    history(h.store, end=as_of, count=275, provider=provider)
+    if prior_failure:
+        await h.repo.record_acquisition_observation(INSTRUMENT_ID, "HISTORICAL_PRICE_SERIES",
+            provider, "FAILED", as_of, failure_reason="HISTORICAL_PRICE_PROVIDER_UNAVAILABLE")
+    # A new worker/execution reads the same durable source evidence, not old READY states.
+    repository = ResearchRepository(persistence=h.store, settings=h.repo.settings)
+    repository.profiles.append(_profile())
+    h.runtime = ResearchReadinessRuntime(repository, RepositoryResearchReadinessAdapter(repository), h.executor)
+    h.executor._ensure_historical_prices = AsyncMock(side_effect=AssertionError("Stored history is sufficient"))
+    result = await ensure(h, ["HISTORICAL_PRICE_SERIES"])
+    readiness = result.readiness.for_requirement("HISTORICAL_PRICE_SERIES")
+    assert readiness.status == ResearchRequirementStatus.READY_FRESH, readiness
+    assert readiness.coverage_pct == 100
+    assert any(evidence_id.endswith(":275") for evidence_id in readiness.evidence_ids)
+    assert readiness.as_of == datetime(2026, 10, 16, 10, tzinfo=timezone.utc)
+    assert result.planned_requirement_ids == ()
+    assert result.executed_capabilities == ()
+    h.executor._ensure_historical_prices.assert_not_awaited()
+    h.factory.assert_not_called()
+    h.network.assert_not_called()
 
 
 @pytest.mark.asyncio

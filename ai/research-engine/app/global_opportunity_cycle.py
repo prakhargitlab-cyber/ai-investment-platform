@@ -26,8 +26,13 @@ class UniverseUnavailableError(RuntimeError):
     The cycle is rejected BEFORE publish_opportunity_cycle so an empty result
     can never overwrite the persisted Global Opportunity Radar. The owning
     OpportunityCycleWorker maps this to error_code='UNIVERSE_UNAVAILABLE'
-    (matching the existing UNIVERSE_UNAVAILABLE convention).
+    (matching the existing UNIVERSE_UNAVAILABLE convention), unless the
+    exception carries an explicit ``error_code`` attribute set by the
+    domain layer (e.g. ETF-specific codes).
     """
+    def __init__(self, message, error_code=None):
+        super().__init__(message)
+        self.error_code = error_code or 'UNIVERSE_UNAVAILABLE'
 
 
 # Internal lifecycle actions that map to the four public radar actions.

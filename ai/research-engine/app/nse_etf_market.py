@@ -4,12 +4,15 @@ Market Watch has a session timestamp, not per-instrument last-trade timestamps.
 getYearwiseData contains periodic percentage returns and is NOT a candle source.
 No cookies, credentials, provider URL overrides, or automatic provider fallback.
 """
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import httpx
 
 from app.etf_evidence import EtfAuthority, EtfFact, EtfMetric, EtfNavObservation, EtfProvenance
+
+logger = logging.getLogger(__name__)
 
 MARKET_URL = "https://www.nseindia.com/api/NextApi/apiClient/marketWatchApi?functionName=getETFData&parent=all&child=all"
 META_URL = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
@@ -58,7 +61,24 @@ async def get_json(client, url, *, params=None):
     return response.json()
 
 
-def market_snapshot(payload, listings, now):
+def market_snapshot(payload, listings, now, *, requested_symbols=None):
+    """``requested_symbols``, when given, is the set of normalized official
+    symbols for the specific bounded instruments being ingested (the only
+    real caller, app.etf_ingestion.ingest_quotes, is always limited to 1-5
+    instrument_ids -- see MAX_ETF_INGESTION_CANDIDATES). getETFData's
+    parent=all&child=all live feed and the official ETF security list both
+    cover the ENTIRE NSE ETF universe; prior to this scoping, one unrelated
+    symbol's listing/duplicate/format problem anywhere in that shared
+    universe aborted this call for every bounded request regardless of
+    which instrument it was actually about (confirmed: GOLDBEES's own
+    discovery/identity checks succeeded independently, yet MARKET_PRICE/
+    TRADING_VOLUME/NAV all failed identically via this one shared call).
+    Rows/listings outside ``requested_symbols`` are skipped, never fatal;
+    every requested instrument still gets the exact same strict, fail-closed
+    uniqueness and format checks as before -- no ambiguous match is ever
+    chosen. When ``requested_symbols`` is None (omitted), behavior is
+    unchanged from before this parameter existed: every row is validated.
+    """
     envelope = payload["data"]
     rows = envelope["data"]
     if not isinstance(rows, list) or not rows:
@@ -69,15 +89,33 @@ def market_snapshot(payload, listings, now):
         raise NseContractError("FUTURE_NSE_SESSION")
     by_symbol = {}
     for listing in listings:
+        if requested_symbols is not None and listing.symbol not in requested_symbols:
+            continue
         if listing.symbol in by_symbol:
+            logger.warning("etf_market_snapshot_rejected symbol=%s category=%s", listing.symbol, "AMBIGUOUS_OFFICIAL_SYMBOL")
             raise NseContractError("AMBIGUOUS_OFFICIAL_SYMBOL")
         by_symbol[listing.symbol] = listing
     selected = {}
     for row in rows:
-        symbol = row["symbol"]
+        # The official ETF security-list CSV (parse_nse_etf_list, above) is
+        # normalized to .strip().upper() before becoming a by_symbol key.
+        # The live market-watch feed's own "symbol" field was compared to
+        # that normalized key WITHOUT equivalent normalization -- any
+        # incidental case or whitespace difference between NSE's two
+        # separately-maintained feeds for the same instrument would
+        # therefore raise UNVERIFIED_OR_DUPLICATE_MARKET_SYMBOL even though
+        # the instrument is genuinely verified and unambiguous. Normalizing
+        # both sides the same way closes that gap without weakening the
+        # check itself: an actually-unknown or actually-duplicate symbol
+        # is still rejected exactly as before.
+        symbol = str(row["symbol"]).strip().upper()
+        if requested_symbols is not None and symbol not in requested_symbols:
+            continue
         if symbol in selected or symbol not in by_symbol:
+            logger.warning("etf_market_snapshot_rejected symbol=%s category=%s", symbol, "UNVERIFIED_OR_DUPLICATE_MARKET_SYMBOL")
             raise NseContractError("UNVERIFIED_OR_DUPLICATE_MARKET_SYMBOL")
         if row["series"] != "EQ" or row["identifier"] != symbol + "EQN":
+            logger.warning("etf_market_snapshot_rejected symbol=%s category=%s", symbol, "UNSUPPORTED_NSE_LISTING")
             raise NseContractError("UNSUPPORTED_NSE_LISTING")
         selected[symbol] = row
     # A missing watch row is an explicit per-instrument failure, never a fake quote.

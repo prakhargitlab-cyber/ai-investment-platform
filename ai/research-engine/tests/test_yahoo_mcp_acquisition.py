@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+import respx
 from pydantic import ValidationError
 
 from app.fact_precedence import FactSourceTier, FinancialFact, FinancialFactKey, merge_fact
@@ -141,6 +144,95 @@ class FakeGateway:
         if isinstance(self.outcome, Exception):
             raise self.outcome
         return self.outcome
+
+
+@pytest.fixture
+def nse_session_repository():
+    from pathlib import Path
+
+    store = SqliteResearchPersistence()
+    migration = (Path(__file__).resolve().parents[3] / "services/research-service/src/main/resources/db/migration"
+                 / "V25__nse_cash_equity_calendar_2025_2026.sql")
+    store._connection.executescript(migration.read_text(encoding="utf-8"))
+
+    async def load(markets):
+        return store.load_market_schedules(markets), store.load_market_calendar_exceptions(markets)
+
+    yield SimpleNamespace(market_session_data=load, store=store)
+    store._connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("now,close,until", [
+    ("2026-10-18T12:00:00Z", "2026-10-16T10:00:00Z", "2026-10-19T03:45:00Z"),
+    # V25 official NSE holiday and special-session exceptions, loaded from persistence.
+    ("2026-10-02T12:00:00Z", "2026-10-01T10:00:00Z", "2026-10-05T03:45:00Z"),
+    ("2026-01-31T12:00:00Z", "2026-01-30T10:00:00Z", "2026-02-01T03:45:00Z"),
+    ("2026-02-01T12:00:00Z", "2026-02-01T10:00:00Z", "2026-02-02T03:45:00Z"),
+    ("2026-02-01T04:00:00Z", None, None),
+    ("2026-10-19T03:45:00Z", None, None),
+    ("2026-10-19T08:00:00Z", None, None),
+])
+async def test_latest_price_context_uses_persisted_nse_calendar(nse_session_repository, now, close, until):
+    gateway = HttpExternalResearchToolGateway("http://mcp-gateway", 1, "research-engine",
+                                              repository=nse_session_repository)
+    context = await gateway._latest_price_session(profile(), datetime.fromisoformat(now))
+    if close is None:
+        assert context is None
+    else:
+        assert datetime.fromisoformat(context["sessionClose"]) == datetime.fromisoformat(close)
+        assert datetime.fromisoformat(context["validUntil"]) == datetime.fromisoformat(until)
+
+
+@pytest.mark.asyncio
+async def test_unknown_calendar_and_unverified_special_hours_do_not_extend_price_validity(nse_session_repository):
+    gateway = HttpExternalResearchToolGateway("http://mcp-gateway", 1, "research-engine",
+                                              repository=nse_session_repository)
+    store = nse_session_repository.store
+    store._connection.execute("UPDATE market_trading_calendar_exceptions SET open_time=NULL, close_time=NULL "
+                              "WHERE market_code='NSE' AND trading_date='2026-02-01'")
+    assert await gateway._latest_price_session(profile(), datetime(2026, 2, 1, 12, tzinfo=timezone.utc)) is None
+    store._connection.execute("DELETE FROM market_trading_schedules")
+    assert await gateway._latest_price_session(profile(), datetime(2026, 10, 18, 12, tzinfo=timezone.utc)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requirement", ["LATEST_PRICE", "HISTORICAL_PRICE_SERIES"])
+async def test_http_gateway_transmits_calendar_only_for_latest_price(monkeypatch, nse_session_repository, requirement):
+    import app.yahoo_mcp_acquisition as module
+
+    sunday = datetime(2026, 10, 18, 12, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return sunday.astimezone(tz)
+
+    monkeypatch.setattr(module, "datetime", FrozenDateTime)
+    gateway = HttpExternalResearchToolGateway("http://mcp-gateway", 1, "research-engine",
+                                              repository=nse_session_repository)
+    grant = target(requirement).authority_policy.fallback_policy.authorize_external_tool(
+        global_instrument_id=INSTRUMENT_ID, requirement_id=requirement,
+        status=ResearchRequirementStatus.MISSING, confidence=None,
+        permitted_provider_ids=("YAHOO_FINANCE_MCP",), now=sunday,
+    )
+    with respx.mock:
+        route = respx.post("http://mcp-gateway/internal/v1/external-research/acquire").mock(
+            return_value=httpx.Response(200, json={"ok": True, "data": result(requirement).model_dump(mode="json", by_alias=True)}))
+        try:
+            await gateway.acquire_requirement(profile(), region="INDIA", requirement_id=requirement,
+                                              authorization=grant, request_id="calendar-boundary")
+        finally:
+            await gateway._client.aclose()
+        import json
+        body = json.loads(route.calls.last.request.content)
+    if requirement == "LATEST_PRICE":
+        assert body["latestPriceSession"] == {
+            "market": "XNSE", "sessionClose": "2026-10-16T10:00:00+00:00",
+            "validUntil": "2026-10-19T03:45:00+00:00",
+        }
+    else:
+        assert "latestPriceSession" not in body
 
 
 class FakeLegacy:
@@ -565,3 +657,200 @@ async def test_persisted_news_event_independence_key_is_deterministic_sha256_hex
     impostor_source, impostor_tier = _event_source(impostor, "CURRENT_NEWS")
     assert impostor_source != "APPROVED_EXTERNAL_TOOL"
     assert impostor_tier != ResearchSourceTier.APPROVED_EXTERNAL_TOOL
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_gateway_reuses_one_http_client_across_sequential_calls():
+    """Root-cause fix (YAHOO_FINANCE_MCP sequential-call latency): a BASELINE
+    candidate makes several sequential acquire_requirement() calls against
+    this same gateway singleton inside one shared ensure_timeout_seconds
+    window. Previously each call opened (`async with httpx.AsyncClient(...)`)
+    and immediately tore down a brand-new client/connection, paying a fresh
+    connection-establishment cost on every one of those sequential round
+    trips. The gateway must now lazily create exactly one httpx.AsyncClient
+    and reuse it (pooled/keep-alive) across every subsequent call, never
+    opening a second one."""
+    route = respx.post("http://mcp-gateway/internal/v1/external-research/acquire").mock(
+        return_value=httpx.Response(404, json={"ok": False, "error": {"code": "EXTERNAL_PROVIDER_UNAVAILABLE"}})
+    )
+    gateway = HttpExternalResearchToolGateway("http://mcp-gateway", 1.0, "research-engine")
+    grant = target().authority_policy.fallback_policy.authorize_external_tool(
+        global_instrument_id=INSTRUMENT_ID,
+        requirement_id="LATEST_PRICE",
+        status=ResearchRequirementStatus.MISSING,
+        confidence=None,
+        permitted_provider_ids=("YAHOO_FINANCE_MCP",),
+        now=NOW,
+    )
+    assert gateway._client is None
+    for _ in range(3):
+        with pytest.raises(ExternalMcpAcquisitionError):
+            await gateway.acquire_requirement(
+                profile(), region="INDIA", requirement_id="LATEST_PRICE",
+                authorization=grant, request_id="reuse-check",
+            )
+    assert route.call_count == 3
+    assert gateway._client is not None
+    first_client = gateway._client
+    with pytest.raises(ExternalMcpAcquisitionError):
+        await gateway.acquire_requirement(
+            profile(), region="INDIA", requirement_id="LATEST_PRICE",
+            authorization=grant, request_id="reuse-check-2",
+        )
+    # Same client instance reused on every call -- never recreated.
+    assert gateway._client is first_client
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_queue_wait_for_the_semaphore_is_bounded_by_the_effective_timeout():
+    """Regression for the semaphore queue-wait budget defect: live BASELINE
+    telemetry showed mcp_requirement_timing durations clustering at 20-25s
+    -- far above the 10s per-call gateway timeout -- while the Yahoo MCP
+    pod itself answered in 0.1-6.3s. The semaphore acquisition previously
+    had no timeout of its own, so a caller queued behind a busy slot could
+    wait indefinitely (bounded only by whatever outer deadline eventually
+    cancelled it), silently burning the caller's own effective_timeout
+    budget on pure scheduling delay before a request was even dispatched.
+    This proves a caller with a short effective_timeout fails fast (close
+    to that timeout, not after some much longer unbounded wait) when every
+    slot is occupied, and that no HTTP request is even attempted."""
+    route = respx.post("http://mcp-gateway/internal/v1/external-research/acquire").mock(
+        return_value=httpx.Response(200, json={
+            "ok": True, "data": result("LATEST_PRICE").model_dump(mode="json", by_alias=True),
+        })
+    )
+    gateway = HttpExternalResearchToolGateway(
+        "http://mcp-gateway", 5.0, "research-engine", max_concurrent_requests=1,
+    )
+    grant = target().authority_policy.fallback_policy.authorize_external_tool(
+        global_instrument_id=INSTRUMENT_ID,
+        requirement_id="LATEST_PRICE",
+        status=ResearchRequirementStatus.MISSING,
+        confidence=None,
+        permitted_provider_ids=("YAHOO_FINANCE_MCP",),
+        now=NOW,
+    )
+    # Occupy the one available slot for far longer than the second call's
+    # own effective_timeout, so the second call is purely queue-blocked.
+    await gateway._request_semaphore.acquire()
+    asyncio.get_event_loop().call_later(2.0, gateway._request_semaphore.release)
+
+    timings = []
+    started = asyncio.get_event_loop().time()
+    with pytest.raises(ExternalMcpAcquisitionError, match="DOWNSTREAM_TIMEOUT"):
+        await gateway.acquire_requirement(
+            profile(), region="INDIA", requirement_id="LATEST_PRICE",
+            authorization=grant, request_id="queue-timeout-check",
+            timeout_seconds=0.2,
+            timing_hook=lambda queue_wait, http_duration: timings.append((queue_wait, http_duration)),
+        )
+    elapsed = asyncio.get_event_loop().time() - started
+
+    # Failed close to the 0.2s budget, not after the full 2.0s the slot
+    # was actually held -- the queue-wait is bounded by effective_timeout.
+    assert elapsed < 1.0, elapsed
+    # No HTTP request was ever dispatched -- the call never got a slot.
+    assert route.call_count == 0
+    # The timing hook reports the queue-wait timeout itself, with zero
+    # HTTP duration (the request was never attempted).
+    assert len(timings) == 1
+    queue_wait, http_duration = timings[0]
+    assert queue_wait >= 0.15, queue_wait
+    assert http_duration == 0.0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_http_portion_gets_only_the_remaining_budget_after_queue_wait():
+    """Once a slot frees up, the HTTP request must be capped by whatever
+    of the caller's effective_timeout the queue-wait has NOT already
+    consumed -- not a fresh full-length timeout window. Otherwise total
+    wall time (queue-wait + HTTP) could exceed the budget the caller
+    computed from its own remaining ensure() window, which is exactly how
+    live BASELINE calls were silently overrunning their allotted share of
+    the shared 25s orchestration budget. respx's mocked transport does not
+    itself enforce httpx-level request timeouts against a slow side_effect,
+    so this asserts directly on the `timeout` value handed to the real
+    httpx.AsyncClient.post call -- the actual mechanism being fixed --
+    rather than on respx reproducing socket-level timeout behavior."""
+    respx.post("http://mcp-gateway/internal/v1/external-research/acquire").mock(
+        return_value=httpx.Response(200, json={
+            "ok": True, "data": result("LATEST_PRICE").model_dump(mode="json", by_alias=True),
+        })
+    )
+    gateway = HttpExternalResearchToolGateway(
+        "http://mcp-gateway", 5.0, "research-engine", max_concurrent_requests=1,
+    )
+    grant = target().authority_policy.fallback_policy.authorize_external_tool(
+        global_instrument_id=INSTRUMENT_ID,
+        requirement_id="LATEST_PRICE",
+        status=ResearchRequirementStatus.MISSING,
+        confidence=None,
+        permitted_provider_ids=("YAHOO_FINANCE_MCP",),
+        now=NOW,
+    )
+    captured_timeouts = []
+    real_post = httpx.AsyncClient.post
+
+    async def _spying_post(self, *args, **kwargs):
+        captured_timeouts.append(kwargs.get("timeout"))
+        return await real_post(self, *args, **kwargs)
+
+    # Occupy the slot for 0.3s -- the caller below has a 0.4s total budget,
+    # so only ~0.1s of it should remain earmarked for the HTTP call once
+    # the slot frees -- never the full 0.4s again.
+    await gateway._request_semaphore.acquire()
+    asyncio.get_event_loop().call_later(0.3, gateway._request_semaphore.release)
+
+    timings = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(httpx.AsyncClient, "post", _spying_post)
+        await gateway.acquire_requirement(
+            profile(), region="INDIA", requirement_id="LATEST_PRICE",
+            authorization=grant, request_id="http-budget-check",
+            timeout_seconds=0.4,
+            timing_hook=lambda queue_wait, http_duration: timings.append((queue_wait, http_duration)),
+        )
+    assert len(captured_timeouts) == 1
+    # NOT the full 0.4s budget again -- only what the ~0.3s queue-wait left.
+    assert 0.0 < captured_timeouts[0] < 0.2, captured_timeouts[0]
+    assert len(timings) == 1
+    queue_wait, _http_duration = timings[0]
+    assert queue_wait >= 0.25, queue_wait
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_timing_hook_reports_queue_wait_and_http_duration_separately_on_success():
+    """A successful call with no contention reports near-zero queue-wait
+    and the actual HTTP duration as two distinct numbers -- the fix this
+    review asked for (item 2: measure/enforce HTTP timeout separately from
+    queue-wait time) applies to the success path too, not just failures."""
+    async def _responder(request):
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={
+            "ok": True, "data": result("LATEST_PRICE").model_dump(mode="json", by_alias=True),
+        })
+
+    respx.post("http://mcp-gateway/internal/v1/external-research/acquire").mock(side_effect=_responder)
+    gateway = HttpExternalResearchToolGateway("http://mcp-gateway", 5.0, "research-engine")
+    grant = target().authority_policy.fallback_policy.authorize_external_tool(
+        global_instrument_id=INSTRUMENT_ID,
+        requirement_id="LATEST_PRICE",
+        status=ResearchRequirementStatus.MISSING,
+        confidence=None,
+        permitted_provider_ids=("YAHOO_FINANCE_MCP",),
+        now=NOW,
+    )
+    timings = []
+    await gateway.acquire_requirement(
+        profile(), region="INDIA", requirement_id="LATEST_PRICE",
+        authorization=grant, request_id="timing-split-check",
+        timing_hook=lambda queue_wait, http_duration: timings.append((queue_wait, http_duration)),
+    )
+    assert len(timings) == 1
+    queue_wait, http_duration = timings[0]
+    assert queue_wait < 0.02, queue_wait
+    assert http_duration >= 0.04, http_duration

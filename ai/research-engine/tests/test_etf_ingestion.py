@@ -204,6 +204,29 @@ async def test_optional_nav_is_not_mandatory_but_failure_is_reported(repo, missi
     result, _ = await ingest(repo, data)
     assert result["instruments"][0]["summary"]["mandatory_ready"] == 3
     assert result["status"] == ("COMPLETED" if missing else "PARTIAL_FAILURE")
+    # MARKET_PRICE/TRADING_VOLUME must never be affected by a NAV-only parse
+    # failure -- each metric is acquired and recorded independently.
+    attempts = {a["metric"]: a["outcome"] for a in result["instruments"][0]["attempts"]}
+    assert attempts["MARKET_PRICE"] == "SUCCESS_WITH_DATA"
+    assert attempts["TRADING_VOLUME"] == "SUCCESS_WITH_DATA"
+
+
+@pytest.mark.asyncio
+async def test_nav_parse_rejection_logs_only_symbol_and_capped_raw_value(repo, monkeypatch, caplog):
+    # Diagnostic logging added for the "NSE_ACQUISITION_FAILED:INVALID_NSE_NUMBER"
+    # NAV incident: confirms the log fires with just the public symbol and a
+    # short, length-capped repr of the "nav" field alone -- never the full
+    # quote/row (price, volume, session totals) and never credentials.
+    import app.etf_ingestion as etf_ingestion
+    captured = []
+    monkeypatch.setattr(etf_ingestion.logger, "warning",
+                        lambda msg, *args: captured.append(msg % args))
+    data = snapshot()
+    data["data"]["data"][0]["nav"] = "NaN"
+    await ingest(repo, data)
+    assert len(captured) == 1
+    assert captured[0] == "etf_nav_parse_rejected symbol=TESTETF raw_nav='NaN'"
+    assert "lastPrice" not in captured[0] and "totalTradedVolume" not in captured[0]
 
 
 @pytest.mark.asyncio

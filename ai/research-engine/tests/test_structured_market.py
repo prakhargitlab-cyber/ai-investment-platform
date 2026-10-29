@@ -67,8 +67,8 @@ async def test_yahoo_statement_adapter_requires_explicit_period_and_marks_unknow
     snapshot = await yfinance_provider({"currency": "INR", "quoteType": "EQUITY", "regularMarketPrice": 10},
                                        quarterly_income_stmt=quarterly).collect(instrument(structuredProviderTicker="ZENTEC.NS", structuredProviderStatus="VERIFIED"))
     values = {(item["metric"], item["periodType"], item["periodEnd"], item["reportingBasis"]): item["value"] for item in snapshot.statement_facts}
-    assert values[("revenue", "QUARTERLY", "2026-06-30T00:00:00", "UNKNOWN")] == Decimal("1000")
-    assert values[("pat", "QUARTERLY", "2026-06-30T00:00:00", "UNKNOWN")] == Decimal("120")
+    assert values[("revenue", "QUARTERLY", "2026-06-30", "UNKNOWN")] == Decimal("1000")
+    assert values[("pat", "QUARTERLY", "2026-06-30", "UNKNOWN")] == Decimal("120")
     assert next(item for item in snapshot.statement_facts if item["metric"] == "revenue")["rawFieldOrigin"] == "Total Revenue"
     assert "totalDebt" not in {item["metric"] for item in snapshot.statement_facts}
 

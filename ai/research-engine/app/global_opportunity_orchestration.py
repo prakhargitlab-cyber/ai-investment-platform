@@ -32,7 +32,7 @@ import json
 import logging
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Mapping
 from uuid import UUID
@@ -71,18 +71,53 @@ class _BaselineOutcome:
     attempted: bool = False
     timed_out: bool = False
     failed: bool = False
+    # Per-requirement safe-codes from TargetedEnsureResult.failures, preserved
+    # verbatim so the checkpoint persistence layer can serialize them into
+    # global_opportunity_cycle_progress.failure_reason (DI-20H: the
+    # BASELINE_INCOMPLETE path previously dropped them, producing NULL).
+    failure_reasons: dict[str, str] = field(default_factory=dict)
+    # Distinct from failure_reasons: a requirement here had NO acquisition
+    # failure at all (the provider call itself succeeded) but durable
+    # readiness still does not consider it satisfied -- e.g.
+    # HISTORICAL_PRICE_SERIES returned some prices but not the
+    # FIFTY_OBSERVATION_TECHNICAL_BASIS minimum. This is what the task
+    # document's Section 7 calls "Correct remaining BASELINE failure-reason
+    # defect": the 47-instrument ready=False/failures={}/failure_reason=NULL
+    # scenario, confirmed by tracing -- TargetedEnsureResult.failures only
+    # ever records genuine ACQUISITION failures, never a readiness-shortfall
+    # that the acquisition itself completed without error. Populated from
+    # each unsatisfied BASELINE_REQUIREMENT_IDS row's own
+    # ResearchRequirementRow.missing_reason (already a structured code such
+    # as INSUFFICIENT_COMPLETE_EVIDENCE / MISSING_REQUIRED_INPUTS:.../
+    # FRESHNESS_POLICY_EXPIRED -- see research_readiness.py's _result()), so
+    # this never fabricates a reason the readiness graph did not itself
+    # record. Acquisition success is never converted into failure here --
+    # ready=False is already decided by `ready` above; this field only
+    # explains WHY a not-ready outcome has no acquisition failure to blame.
+    readiness_shortfall_reasons: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_result(cls, result):
         failures = getattr(result, "failures", {}) or {}
         readiness = getattr(result, "readiness", None)
-        ready = callable(getattr(readiness, "for_requirement", None)) and all(
+        has_readiness = callable(getattr(readiness, "for_requirement", None))
+        ready = has_readiness and all(
             (row := readiness.for_requirement(key)) is not None
             and row.status in {"READY_FRESH", "NOT_APPLICABLE"}
             for key in BASELINE_REQUIREMENT_IDS)
+        shortfalls: dict[str, str] = {}
+        if not ready and has_readiness:
+            for key in BASELINE_REQUIREMENT_IDS:
+                if key in failures:
+                    continue  # genuine acquisition failure already explains this one.
+                row = readiness.for_requirement(key)
+                if row is None or row.status in {"READY_FRESH", "NOT_APPLICABLE"}:
+                    continue  # this specific requirement IS satisfied; some sibling isn't.
+                shortfalls[key] = str(getattr(row, "missing_reason", None) or "READINESS_NOT_SATISFIED")
         return cls(tuple(result.planned_requirement_ids), bool(ready and not failures),
                    bool(getattr(result, "executed_capabilities", ())),
-                   any("TIMEOUT" in str(reason).upper() for reason in failures.values()), bool(failures))
+                   any("TIMEOUT" in str(reason).upper() for reason in failures.values()), bool(failures),
+                   dict(failures), shortfalls)
 
 
 def _baseline_jurisdiction(profile) -> str:
@@ -107,6 +142,27 @@ def _baseline_jurisdiction(profile) -> str:
     }:
         return "EUROPE"
     return "GLOBAL"
+
+
+def _aggregate_baseline_failure_reason(failure_reasons: dict[str, str] | None) -> str | None:
+    """Aggregate per-requirement safe-codes into a durable failure_reason string.
+
+    Format: ``REQUIREMENT:DOWNSTREAM_TIMEOUT|EXTERNAL_PROVIDER_UNAVAILABLE;...``
+    Uses only the current acquisition's own ``TargetedEnsureResult.failures``
+    mapping (requirement_id -> composite safe-code), never historical
+    observations, so the persisted reason always traces back to this cycle's
+    acquisition attempt (DI-20H: observations table lacks cycle_id).
+    """
+    if not failure_reasons:
+        return None
+    parts: list[str] = []
+    for requirement_id in sorted(failure_reasons):
+        codes = [c.strip() for c in str(failure_reasons[requirement_id]).split("|") if c.strip()]
+        if codes:
+            parts.append(f"{requirement_id}:{'|'.join(codes)}")
+    if not parts:
+        return None
+    return ";".join(parts)
 
 
 class OpportunityEntry(ResearchBaseModel):
@@ -333,7 +389,9 @@ class GlobalOpportunityOrchestrator:
                         return key, _BaselineOutcome(
                             tuple(stored.get("planned_requirement_ids") or ()),
                             stored.get("ready", False), stored.get("attempted", False),
-                            stored.get("timed_out", False), stored.get("failed", False)), None
+                            stored.get("timed_out", False), stored.get("failed", False),
+                            dict(stored.get("failure_reasons") or {}),
+                            dict(stored.get("readiness_shortfall_reasons") or {})), None
                     return key, None, restored.get("failure_reason") or "BASELINE_ACQUISITION_FAILED"
                 # Legacy COMPLETED meant only that ensure returned. Reassess
                 # admitted candidates instead of restoring fabricated readiness.
@@ -341,12 +399,32 @@ class GlobalOpportunityOrchestrator:
             outcome = await _acquire_one_body(candidate)
             _, result, reason = outcome
             if result is not None:
+                # DI-20H: carry the per-requirement safe-codes from the current
+                # acquisition's TargetedEnsureResult.failures into the checkpoint.
+                # Previously this path called checkpoint.finish with no
+                # failure_reason, producing NULL on every BASELINE_INCOMPLETE row.
+                # Section 7 fix: when acquisition genuinely failed on some
+                # requirement, that failure code still takes priority (merged
+                # dict below never overwrites an existing failure_reasons
+                # entry). Only requirements with NO acquisition failure but
+                # whose readiness is still not satisfied fall back to
+                # readiness_shortfall_reasons -- this is exactly the
+                # ready=False/failures={}/failure_reason=NULL gap: previously
+                # _aggregate_baseline_failure_reason({}) returned None
+                # whenever acquisition itself raised no failure, even though
+                # the instrument was genuinely not BASELINE_READY.
+                combined_reasons = {**result.readiness_shortfall_reasons, **result.failure_reasons}
+                checkpoint_failure_reason = _aggregate_baseline_failure_reason(
+                    combined_reasons if not result.ready else None)
                 await checkpoint.finish(PHASE_BASELINE, key,
                     CandidateState.COMPLETED if result.ready else CandidateState.RETRYABLE_FAILURE,
                     disposition="BASELINE_READY" if result.ready else "BASELINE_INCOMPLETE",
+                    failure_reason=checkpoint_failure_reason,
                     payload={"has_outcome": True, "planned_requirement_ids": list(result.planned_requirement_ids),
                              "ready": result.ready, "attempted": result.attempted,
-                             "timed_out": result.timed_out, "failed": result.failed})
+                             "timed_out": result.timed_out, "failed": result.failed,
+                             "failure_reasons": dict(result.failure_reasons),
+                             "readiness_shortfall_reasons": dict(result.readiness_shortfall_reasons)})
             else:
                 await checkpoint.finish(PHASE_BASELINE, key, state_for_disposition(reason),
                                         disposition=reason, failure_reason=reason)
@@ -391,11 +469,33 @@ class GlobalOpportunityOrchestrator:
                 if profile.instrument_id != key:
                     return key, None, "PROFILE_IDENTITY_MISMATCH"
                 self.readiness_adapter.remember_canonical_metadata(key, payload)
+                # Root cause (Equity Radar BASELINE readiness-timeout
+                # investigation): this call used to omit
+                # wait_for_completion, so it defaulted to False and ran on
+                # ResearchReadinessRuntime.ensure's INTERACTIVE/API budget
+                # path (asyncio.timeout(ensure_timeout_seconds) wrapping the
+                # execution directly, logging research_readiness_ensure_timeout
+                # on expiry) instead of the background-cycle-owner path that
+                # DEEP stage already uses everywhere else in this module and
+                # in deep_investigation.py (asyncio.wait + explicit cancel
+                # plus a bounded drain window, logging orchestration_wait_expired
+                # / orchestration_drain_timeout instead). BASELINE acquisition
+                # is itself a persisted background cycle worker -- there is no
+                # interactive caller whose latency budget it should inherit --
+                # so it must identify itself the same way DEEP does. Passing
+                # wait_for_completion=True does not change TargetedEnsureResult's
+                # shape (_BaselineOutcome.from_result only reads .failures and
+                # .readiness, present on both paths); it only gives a cancelled,
+                # slow HISTORICAL_MARKET_DATA/STRUCTURED_MARKET acquisition the
+                # same bounded grace period to unwind/persist partial progress
+                # that DEEP's acquisitions already get, instead of an abrupt
+                # same-task cancellation with no drain.
                 result = await self.readiness.ensure(
                     key,
                     jurisdiction=_baseline_jurisdiction(profile),
                     requirement_ids=BASELINE_REQUIREMENT_IDS,
                     identity_headers=identity_headers,
+                    wait_for_completion=True,
                 )
                 return key, (_BaselineOutcome.from_result(result)
                              if result is not None else None), None
@@ -443,6 +543,16 @@ class GlobalOpportunityOrchestrator:
                         failures[key] = reason
                         failed += 1
                         logger.warning("baseline_acquisition_failed instrument_id=%s reason=%s", key, reason)
+                    elif result is not None and not result.ready:
+                        # DI-20H: BASELINE_INCOMPLETE outcomes (acquisition completed
+                        # with unmet requirements) were previously invisible to the
+                        # in-memory failed counter -- only pre-ensure reason strings
+                        # incremented it. Now count the durable checkpoint failure
+                        # so operators see the real failure rate in progress logs.
+                        failed += 1
+                        if result.failure_reasons:
+                            logger.warning("baseline_acquisition_incomplete instrument_id=%s failure_reasons=%s",
+                                           key, result.failure_reasons)
                 # Refill only the slots that just freed, never exceeding max_workers.
                 for _ in range(min(len(done), max_workers - len(pending))):
                     try:
@@ -785,7 +895,7 @@ class GlobalOpportunityOrchestrator:
         deep_pool_eligible_count = 0
         deep_candidate_count = 0
         deep_attempted_count = 0
-        deep_durable_completed_count = 0
+        deep_durable_completed_keys: set = set()
         deep_ready_count = 0
         deep_readiness_failed_count = 0
         deep_acquisition_timeout_count = 0
@@ -1172,12 +1282,12 @@ class GlobalOpportunityOrchestrator:
                 # K/N recovery invariant -- it must never be re-derived from
                 # iteration order alone, or a restart would appear to regress
                 # progress even though no completed work is re-executed.
-                deep_durable_completed_count = sum(
-                    1 for c in deep_candidates
-                    if checkpoint.restorable(PHASE_DEEP, c.global_instrument_id) is not None)
-                if deep_durable_completed_count:
+                deep_durable_completed_keys = {
+                    c.global_instrument_id for c in deep_candidates
+                    if checkpoint.restorable(PHASE_DEEP, c.global_instrument_id) is not None}
+                if deep_durable_completed_keys:
                     logger.info("stage2_deep_resume_state cycleId=%s correlationId=%s durableCompleted=%d/%d",
-                                checkpoint.cycle_id, correlation_id, deep_durable_completed_count, len(deep_candidates))
+                                checkpoint.cycle_id, correlation_id, len(deep_durable_completed_keys), len(deep_candidates))
             _cycle_timing_recorder = cycle_timing.CycleTimingRecorder(
                 cycle_id=str(correlation_id) if correlation_id else None)
             _cycle_timing_token = cycle_timing.bind_recorder(_cycle_timing_recorder)
@@ -1257,12 +1367,24 @@ class GlobalOpportunityOrchestrator:
                             # The candidate stays NON-RANKABLE -- it is never forced
                             # through rule_engine.analyze() with nothing to evaluate.
                             deep_source_unavailable_count += 1
+                            # If BASELINE acquisition for this exact candidate already
+                            # failed outright (_acquire_baseline_requirements), DEEP's
+                            # re-acquisition is hitting the identical unavailable
+                            # source, not a new/different failure. Carry forward the
+                            # original, more specific baseline failure_reason (e.g.
+                            # BASELINE_ACQUISITION_FAILED) instead of masking it with
+                            # the generic DEEP_SOURCE_UNAVAILABLE label -- the
+                            # deep_diagnosed_keys guard below (added to stop a
+                            # candidate recovered in DEEP from being double-suppressed)
+                            # would otherwise skip appending the real reason entirely,
+                            # since this DEEP diagnostic already covers the candidate.
+                            reason = baseline_failures.get(key, "DEEP_SOURCE_UNAVAILABLE")
                             diagnostics.append(CandidateDiagnostic(
                                 global_instrument_id=key,
                                 status="SUPPRESSED",
-                                failure_reason="DEEP_SOURCE_UNAVAILABLE",
+                                failure_reason=reason,
                                 rank_eligible=False,
-                                suppression_reasons=["DEEP_SOURCE_UNAVAILABLE"],
+                                suppression_reasons=[reason],
                                 disposition="DEEP_SOURCE_UNAVAILABLE"
                             ))
                         else:
@@ -1439,7 +1561,7 @@ class GlobalOpportunityOrchestrator:
                         if checkpoint is not None and body_completed:
                             await self._checkpoint_deep_outcome(checkpoint, key, diagnostics, rules, by_id,
                                                                 investigation_matrix)
-                            deep_durable_completed_count += 1
+                            deep_durable_completed_keys.add(key)
                         if key in repairing and body_completed:
                             repairing.discard(key)
                             if key in rules:
@@ -1448,7 +1570,7 @@ class GlobalOpportunityOrchestrator:
                         ensure_result = readiness_result = None
                         enriched = refreshed = plan = matrix = None
                         if deep_attempted_count % 10 == 0 or deep_attempted_count == len(deep_candidates):
-                            _deep_progress_completed = (deep_durable_completed_count if checkpoint is not None
+                            _deep_progress_completed = (len(deep_durable_completed_keys) if checkpoint is not None
                                                         else deep_attempted_count)
                             logger.info("stage2_deep_progress: completed=%d/%d active=%d/%d",
                                         _deep_progress_completed, len(deep_candidates), _running(), stage2_concurrency)
@@ -1526,14 +1648,45 @@ class GlobalOpportunityOrchestrator:
                 )
 
 
+            # Only candidates that were NEVER reached by the DEEP stage (e.g.
+            # cycle cancelled mid-pass) have no deep diagnostic. A candidate
+            # that failed BASELINE but was already processed in DEEP gets its
+            # own deep disposition above -- adding a second SUPPRESSED entry
+            # here would falsely suppress candidates recovered in DEEP and
+            # corrupt the evaluated/suppressed accounting.
+            #
+            # But when that existing DEEP disposition is itself just a
+            # generic catch-all for the IDENTICAL underlying acquisition
+            # failure -- STAGE2_INTERNAL_ERROR from the raw exception
+            # propagating out of _acquire_deep's un-guarded ensure() call
+            # (the non-discovery_v2 path), or DEEP_SOURCE_UNAVAILABLE from a
+            # missing readiness snapshot -- that generic label is strictly
+            # less informative than the already-known, more specific
+            # baseline failure_reason. Upgrade it in place rather than
+            # silently lose the real root cause (e.g. BASELINE_ACQUISITION_
+            # FAILED, PROFILE_IDENTITY_MISMATCH) behind a vague label. A
+            # candidate DEEP genuinely recovered or substantively classified
+            # (RANK_ELIGIBLE/ANALYZED/RANK_FILTERED/DEEP_READINESS_NOT_MET/
+            # DEEP_ACQUISITION_TIMEOUT/...) is left untouched.
+            _GENERIC_DEEP_CATCHALLS = {"STAGE2_INTERNAL_ERROR", "DEEP_SOURCE_UNAVAILABLE"}
+            deep_diagnosed_keys = {d.global_instrument_id for d in diagnostics}
             for candidate_id in baseline_eligible_ids:
-                if ensure_results.get(candidate_id) is None:
+                if candidate_id not in deep_diagnosed_keys:
                     reason = baseline_failures.get(candidate_id, "BASELINE_ACQUISITION_FAILED")
                     diagnostics.append(CandidateDiagnostic(
                         global_instrument_id=candidate_id,
                         status="SUPPRESSED",
                         failure_reason=reason,
                         suppression_reasons=[reason]))
+                elif candidate_id in baseline_failures:
+                    index = next((i for i in range(len(diagnostics) - 1, -1, -1)
+                                  if diagnostics[i].global_instrument_id == candidate_id), None)
+                    existing = diagnostics[index] if index is not None else None
+                    if (existing is not None and existing.status == "SUPPRESSED"
+                            and existing.failure_reason in _GENERIC_DEEP_CATCHALLS):
+                        reason = baseline_failures[candidate_id]
+                        diagnostics[index] = existing.model_copy(
+                            update={"failure_reason": reason, "suppression_reasons": [reason]})
 
         else:
             stage_b = await self._run_blocking(scanner.enrich_candidates, scan, sector_contexts=dict(sector_contexts or {}))

@@ -149,7 +149,7 @@ async def test_19b_current_news_falls_back_to_inline_when_registry_at_capacity()
             return self.readiness
 
         async def ensure(self, instrument_id, *, jurisdiction, requirement_ids, identity_headers=None,
-                          correlation_id=None, wait_for_completion=True):
+                          correlation_id=None, wait_for_completion=True, timeout_seconds=None):
             from app.research_readiness_runtime import TargetedEnsureResult
             requirement_id = requirement_ids[0]
             self.readiness = replace(self.readiness, requirements=tuple(

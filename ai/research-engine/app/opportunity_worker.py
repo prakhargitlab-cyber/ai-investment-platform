@@ -19,10 +19,20 @@ from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
-from app.cycle_checkpoint import (DEFAULT_LEASE_SECONDS, CycleCheckpoint, CycleOwnershipLost, new_owner_id)
+from app.cycle_checkpoint import (DEFAULT_LEASE_SECONDS, CycleCheckpoint, CycleOwnershipLost, EXTERNAL_RESPONSE_PHASES, new_owner_id)
 from app.global_opportunity_cycle import UniverseUnavailableError
 
 logger = logging.getLogger(__name__)
+
+
+class ManualEtfAdmissionError(RuntimeError):
+    """Raised when a manual/paused ETF or Equity Radar submission is rejected.
+
+    The error code string (e.g. 'ETF_MANUAL_EXECUTION_DISABLED',
+    'ETF_FULL_UNIVERSE_EXECUTION_DISABLED', 'ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+    is carried in ``str(e)`` so the HTTP layer can map it to the appropriate
+    status code without exposing internal gate details to the caller.
+    """
 
 
 class OpportunityCycleWorker:
@@ -46,6 +56,7 @@ class OpportunityCycleWorker:
         self._closing = False
         self._submission_lock = asyncio.Lock()
         self._in_flight_cycle_id = None
+        self._manual_etf_active = False  # set True when an ETF manual run is admitted
 
     # -- persistence helpers ---------------------------------------------------
     @property
@@ -229,6 +240,120 @@ class OpportunityCycleWorker:
             if self.active is None and not self.queue.full():
                 self.active = value
                 self.queue.put_nowait(value)
+            return dict(value)
+
+    def _check_manual_etf_admission(self, scope='BOUNDED'):
+        """Evaluate the paused/manual ETF admission gate.
+
+        Returns the scope-specific error code if admission is denied. The
+        manual submission path is ONLY available when:
+          - the worker's market is 'ETF' (equity workers cannot submit ETF),
+          - recovery is paused (this is a diagnostics-only path),
+          - the scheduler is explicitly disabled (exactly False),
+          - the scope-specific execution flag is enabled.
+        Any single precondition failure yields the scope-specific error code
+        so the HTTP layer can surface a precise message.
+        """
+        settings = getattr(self.repository, 'settings', None)
+        scope_error = 'ETF_FULL_UNIVERSE_EXECUTION_DISABLED' if scope == 'FULL_UNIVERSE' else 'ETF_MANUAL_EXECUTION_DISABLED'
+        if self.market != 'ETF':
+            return 'ETF_MANUAL_EXECUTION_DISABLED'
+        if scope not in ('BOUNDED', 'FULL_UNIVERSE'):
+            raise ValueError(f"invalid ETF execution scope: {scope}")
+        recovery_paused = bool(getattr(settings, 'research_opportunity_recovery_paused', False))
+        scheduler_enabled = getattr(settings, 'research_opportunity_scheduler_enabled', True)
+        flag = getattr(settings, 'research_etf_full_universe_execution_enabled' if scope == 'FULL_UNIVERSE'
+                       else 'research_etf_manual_execution_enabled', False)
+        if not (recovery_paused and scheduler_enabled is False and flag):
+            return scope_error
+        return None
+
+    async def submit_manual_etf_async(self, parameters, *, scope='BOUNDED', allow_active=False):
+        """Admit a single manual ETF Radar cycle under the paused-diagnostics gate.
+
+        Unlike ``submit_async``, this bypasses the recovery-pause early-return so
+        that a controlled (LOCAL, ADMIN) cycle can run while the production
+        scheduler is paused. It uses the market-specific ('ETF') active-cycle
+        slot for coalescing and lease fencing, never touching the Equity ('NSE')
+        slot.
+        """
+        deny = self._check_manual_etf_admission(scope)
+        if deny is not None:
+            raise ManualEtfAdmissionError(deny)
+        async with self._submission_lock:
+            # Parallel submissions to the same worker coalesce onto the
+            # in-flight accepted job BEFORE consulting the durable active-cycle
+            # slot: the worker task may already have transitioned the durable
+            # run to RUNNING while the in-memory active is still ACCEPTED.
+            if self.active is not None and not allow_active:
+                if self.active.get('status') == 'ACCEPTED':
+                    return {**self.active, 'coalesced': True}
+                raise ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+            if self._resumable_supported():
+                run = await self._blocking(self._store.active_cycle_run, self.market)
+                if run is not None and not allow_active:
+                    # A durable cycle exists in an active (non-terminal) state.
+                    # If it is queued (ACCEPTED) and this worker has not yet
+                    # taken ownership, coalesce onto it. If it is RUNNING, the
+                    # cycle is in-flight and cannot be coalesced -- it requires
+                    # explicit review/cancellation first.
+                    if run.get('status') == 'ACCEPTED' and run.get('owner_id') == self.owner_id:
+                        return {**self._job_for_run(run), 'coalesced': True, 'status': 'ACCEPTED'}
+                    raise ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+            parameters = {**(parameters or {}), 'correlation_id': str(uuid4()), 'manual_etf_scope': scope}
+            if scope == 'FULL_UNIVERSE' and 'full_universe_limits' in (parameters or {}):
+                parameters = {**parameters, 'full_universe_limits': parameters['full_universe_limits']}
+            cycle_id = str(uuid4())
+            if self._resumable_supported():
+                run, created = await self._blocking(self._store.create_cycle_run, cycle_id, parameters, market=self.market)
+                if not created:
+                    raise ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+            value = dict(cycle_id=cycle_id, status='ACCEPTED',
+                         updated_at=datetime.now(timezone.utc).isoformat(), parameters=parameters)
+            await self._blocking(self.record, value)
+            self.active = value
+            self._manual_etf_active = True
+            self.queue.put_nowait(value)
+            self.task = asyncio.create_task(self._work(), name='manual-etf-opportunity-worker')
+            return dict(value)
+
+    async def submit_manual_equity_async(self, parameters):
+        """Admit a single manual Equity Radar cycle under the LOCAL gate.
+
+        Only available when environment is LOCAL, recovery is paused, the
+        scheduler is disabled, and the equity manual flag is enabled.
+        Uses the default ('NSE') market slot for coalescing.
+        """
+        settings = getattr(self.repository, 'settings', None)
+        environment = getattr(settings, 'environment', None)
+        recovery_paused = bool(getattr(settings, 'research_opportunity_recovery_paused', False))
+        scheduler_enabled = getattr(settings, 'research_opportunity_scheduler_enabled', True)
+        equity_enabled = bool(getattr(settings, 'research_equity_manual_execution_enabled', False))
+        if not (environment == 'LOCAL' and recovery_paused and scheduler_enabled is False and equity_enabled):
+            raise ManualEtfAdmissionError('ETF_MANUAL_EXECUTION_DISABLED')
+        async with self._submission_lock:
+            # Parallel submissions coalesce onto the in-flight accepted job
+            # BEFORE consulting the durable active-cycle slot: the worker task
+            # may already have transitioned the durable run to RUNNING while
+            # the in-memory active is still ACCEPTED.
+            if self.active is not None:
+                raise ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+            if self._resumable_supported():
+                run = await self._blocking(self._store.active_cycle_run, self.market)
+                if run is not None:
+                    raise ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+            parameters = {**(parameters or {}), 'correlation_id': str(uuid4())}
+            cycle_id = str(uuid4())
+            if self._resumable_supported():
+                run, created = await self._blocking(self._store.create_cycle_run, cycle_id, parameters, market=self.market)
+                if not created:
+                    raise ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
+            value = dict(cycle_id=cycle_id, status='ACCEPTED',
+                         updated_at=datetime.now(timezone.utc).isoformat(), parameters=parameters)
+            await self._blocking(self.record, value)
+            self.active = value
+            self.queue.put_nowait(value)
+            self.task = asyncio.create_task(self._work(), name='manual-equity-opportunity-worker')
             return dict(value)
 
     def _enqueue_resume(self, run):
@@ -432,7 +557,8 @@ class OpportunityCycleWorker:
                      'universe_count': result.get('universe_count')}
             if resumable:
                 await self._blocking(self._store.update_cycle_run, cycle_id, self.owner_id, status='COMPLETED')
-                value.update(resumed_candidates=dict(checkpoint.restored), executed_candidates=dict(checkpoint.executed))
+                value.update(resumed_candidates={k: v for k, v in checkpoint.restored.items() if k in EXTERNAL_RESPONSE_PHASES},
+                             executed_candidates={k: v for k, v in checkpoint.executed.items() if k in EXTERNAL_RESPONSE_PHASES})
             logger.info(
                 "opportunity_cycle_complete cycleId=%s correlationId=%s resultCycleId=%s "
                 "universeCount=%s status=COMPLETED",
@@ -445,11 +571,24 @@ class OpportunityCycleWorker:
                     value = {**value, 'status': 'CANCELLED', 'error_code': 'CYCLE_CANCELLED'}
                     await self._blocking(self.record, value)
             elif resumable and self._closing:
-                # Graceful shutdown without cancellation keeps the SAME cycle
-                # resumable by the next worker.
-                value = {**value, 'status': 'RUNNING', 'error_code': 'WORKER_STOPPED_RESUMABLE'}
-                with suppress(Exception):
-                    await self._blocking(self._store.release_cycle_run, cycle_id, self.owner_id)
+                if getattr(self, '_manual_etf_active', False):
+                    # An ETF manual run was interrupted by shutdown. The cycle
+                    # requires human review before it can be re-run; tag it
+                    # with an explicit error code but leave it in its current
+                    # (non-terminal) state so the next worker sees an active
+                    # cycle and blocks with ETF_ACTIVE_CYCLE_REQUIRES_REVIEW
+                    # rather than silently resuming.
+                    with suppress(Exception):
+                        await self._blocking(self._store.update_cycle_run, cycle_id, self.owner_id,
+                                             error_code='ETF_MANUAL_RUN_INTERRUPTED_REVIEW_REQUIRED')
+                    value = {**value, 'status': 'RUNNING',
+                             'error_code': 'ETF_MANUAL_RUN_INTERRUPTED_REVIEW_REQUIRED'}
+                else:
+                    # Graceful shutdown without cancellation keeps the SAME cycle
+                    # resumable by the next worker.
+                    value = {**value, 'status': 'RUNNING', 'error_code': 'WORKER_STOPPED_RESUMABLE'}
+                    with suppress(Exception):
+                        await self._blocking(self._store.release_cycle_run, cycle_id, self.owner_id)
             else:
                 value = {**value, 'status': 'FAILED', 'error_code': 'WORKER_STOPPED'}
                 if resumable:
@@ -462,7 +601,7 @@ class OpportunityCycleWorker:
             if await self._blocking(self._is_cycle_cancelled, cycle_id):
                 await self._blocking(self._store.cancel_cycle_run, cycle_id, self.owner_id)
             value = {**value, 'status': 'RUNNING', 'error_code': 'OWNERSHIP_LOST'}
-        except UniverseUnavailableError:
+        except UniverseUnavailableError as exc:
             # Empty/missing universe -- fail fast without overwriting the
             # persisted radar. Distinct error_code so ops/monitoring can
             # separate a universe/data failure from generic cycle failures.
@@ -471,9 +610,10 @@ class OpportunityCycleWorker:
                 value.get('cycle_id'), value.get('parameters', {}).get('correlation_id'),
                 "UniverseUnavailableError",
             )
-            value = {**value, 'status': 'FAILED', 'error_code': 'UNIVERSE_UNAVAILABLE'}
+            error_code = getattr(exc, 'error_code', None) or 'UNIVERSE_UNAVAILABLE'
+            value = {**value, 'status': 'FAILED', 'error_code': error_code}
             if resumable:
-                await self._blocking(self._fail_run, cycle_id, 'UNIVERSE_UNAVAILABLE')
+                await self._blocking(self._fail_run, cycle_id, error_code)
         except Exception as exc:
             # The cycle entry point signals persisted cancellation this way.
             # Require both the exact internal signal and durable intent; an
@@ -537,5 +677,6 @@ class OpportunityCycleWorker:
                                  'updated_at': datetime.now(timezone.utc).isoformat()})
             self.active = None
             self._in_flight_cycle_id = None
+            self._manual_etf_active = False
         finally:
             self._closing = False

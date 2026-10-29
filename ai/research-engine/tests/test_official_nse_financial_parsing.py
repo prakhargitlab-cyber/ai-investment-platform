@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 import threading
@@ -1087,7 +1088,7 @@ def test_ncc_march_valid_parse_supersedes_persisted_malformed_ncc_facts() -> Non
     assert written > 0
     facts = {
         fact.key: fact.value.value
-        for fact in repository.financial_facts_for(document.instrument_id)
+        for fact in repository.persistence.load_financial_facts({document.instrument_id})
         if fact.source_identity == str(document.document_id)
     }
     # Validated EPS replaces colliding keys. The unresolved investing row is
@@ -1110,7 +1111,7 @@ def test_ncc_june_zero_parse_does_not_delete_source_owned_malformed_facts() -> N
     # June is structurally rejected (zero valid facts) -> zero-trust parse must
     # not trigger destructive cleanup of source-owned facts.
     assert repository._reconcile_persisted_official_financial_document(document) == (False, 0)
-    assert repository.financial_facts_for(document.instrument_id) == [stale]
+    assert repository.persistence.load_financial_facts({document.instrument_id}) == [stale]
 
 
 class _FactRecorder:
@@ -1168,7 +1169,7 @@ def test_document_scoped_reconciliation_replaces_deepak_values_without_touching_
 
     parsed, _written = repository._reconcile_persisted_official_financial_document(document)
     assert parsed
-    facts = {fact.key: fact for fact in repository.financial_facts_for(document.instrument_id)}
+    facts = {fact.key: fact for fact in repository.persistence.load_financial_facts({document.instrument_id})}
     assert facts[FinancialFactKey(document.instrument_id, "pat", "2025-12-31", "QUARTERLY", "CONSOLIDATED")].value.value == Decimal("99.82")
     assert facts[FinancialFactKey(document.instrument_id, "pat", "2024-12-31", "QUARTERLY", "CONSOLIDATED")].value.value == Decimal("98.13")
     assert facts[FinancialFactKey(document.instrument_id, "pat", "2025-12-31", "QUARTERLY", "STANDALONE")].value.value == Decimal("8.14")
@@ -1176,9 +1177,9 @@ def test_document_scoped_reconciliation_replaces_deepak_values_without_touching_
     assert facts[FinancialFactKey(document.instrument_id, "revenue", "2024-12-31", "QUARTERLY", "STANDALONE")].value.value == Decimal("551.59")
     assert facts[unrelated.key].source_identity == "other-official-document"
     assert all(fact.source_identity == str(document.document_id) for key, fact in facts.items() if key != unrelated.key)
-    before = list(repository.financial_facts_for(document.instrument_id))
+    before = list(repository.persistence.load_financial_facts({document.instrument_id}))
     assert repository._reconcile_persisted_official_financial_document(document)[0]
-    assert repository.financial_facts_for(document.instrument_id) == before
+    assert repository.persistence.load_financial_facts({document.instrument_id}) == before
 
 
 def test_conflicting_period_evidence_preserves_electronics_mart_source_facts() -> None:
@@ -1198,7 +1199,7 @@ def test_conflicting_period_evidence_preserves_electronics_mart_source_facts() -
     # The title says nine months but the table says year. DI-20E cannot
     # authorize durable facts or deletion from this unresolved contradiction.
     assert repository._reconcile_persisted_official_financial_document(document) == (False, 0)
-    facts = {fact.key: fact for fact in repository.financial_facts_for(document.instrument_id)}
+    facts = {fact.key: fact for fact in repository.persistence.load_financial_facts({document.instrument_id})}
     assert facts[FinancialFactKey(document.instrument_id, "pat", "2025-12-31", "ANNUAL", "CONSOLIDATED")].value.value == Decimal("335.04")
     assert facts[FinancialFactKey(document.instrument_id, "pat", "2024-12-31", "ANNUAL", "CONSOLIDATED")].value.value == Decimal("674.04")
     assert len(facts) == 3
@@ -1212,7 +1213,7 @@ def test_document_scoped_reconciliation_does_not_delete_when_parser_emits_no_val
     repository._persistence.upsert_financial_fact(stale)
 
     assert repository._reconcile_persisted_official_financial_document(document) == (False, 0)
-    assert repository.financial_facts_for(document.instrument_id) == [stale]
+    assert repository.persistence.load_financial_facts({document.instrument_id}) == [stale]
 
 
 def test_document_scoped_reconciliation_preserves_another_document_owning_the_same_semantic_key() -> None:
@@ -1226,7 +1227,7 @@ def test_document_scoped_reconciliation_preserves_another_document_owning_the_sa
     repository._persistence.upsert_financial_fact(existing)
 
     assert repository._reconcile_persisted_official_financial_document(document)[0]
-    fact = next(item for item in repository.financial_facts_for(document.instrument_id) if item.key == existing.key)
+    fact = next(item for item in repository.persistence.load_financial_facts({document.instrument_id}) if item.key == existing.key)
     assert fact.source_identity == "other-official-document"
     assert fact.value.value == Decimal("8261.11")
 
@@ -1249,7 +1250,7 @@ def test_document_scoped_reconciliation_rolls_back_on_persistence_failure(monkey
     monkeypatch.setattr(repository._persistence, "_write_financial_fact", fail_second_write)
     with pytest.raises(RuntimeError, match="simulated persistence failure"):
         repository._reconcile_persisted_official_financial_document(document)
-    assert repository.financial_facts_for(document.instrument_id) == [stale]
+    assert repository.persistence.load_financial_facts({document.instrument_id}) == [stale]
 
 
 def test_repository_retains_financial_history_while_newest_windows_remain_available_with_document_provenance() -> None:
@@ -1271,7 +1272,7 @@ def test_repository_retains_financial_history_while_newest_windows_remain_availa
     for document in documents:
         repository._persist_official_financial_facts(document)
 
-    facts = [fact for fact in repository.financial_facts_for(documents[0].instrument_id) if fact.key.metric == "revenue"]
+    facts = [fact for fact in repository.persistence.load_financial_facts({documents[0].instrument_id}) if fact.key.metric == "revenue"]
     quarterly = {fact.key.period_end for fact in facts if fact.key.period_type == "QUARTERLY"}
     annual = {fact.key.period_end for fact in facts if fact.key.period_type == "ANNUAL"}
     assert {"2026-06-30", "2026-03-31", "2025-06-30", "2022-03-31"} <= quarterly
@@ -1282,11 +1283,11 @@ def test_repository_retains_financial_history_while_newest_windows_remain_availa
     latest_revenue = next(fact for fact in facts if fact.key.period_end == "2026-06-30" and fact.key.period_type == "QUARTERLY")
     assert latest_revenue.source_identity == str(documents[0].document_id)
     assert latest_revenue.value.source_url == documents[0].canonical_url
-    total_before = len(repository.financial_facts_for(documents[0].instrument_id))
+    total_before = len(repository.persistence.load_financial_facts({documents[0].instrument_id}))
     before = len(facts)
     repository._persist_official_financial_facts(documents[0])
-    assert len(repository.financial_facts_for(documents[0].instrument_id)) == total_before
-    assert len([fact for fact in repository.financial_facts_for(documents[0].instrument_id) if fact.key.metric == "revenue"]) == before
+    assert len(repository.persistence.load_financial_facts({documents[0].instrument_id})) == total_before
+    assert len([fact for fact in repository.persistence.load_financial_facts({documents[0].instrument_id}) if fact.key.metric == "revenue"]) == before
 
 
 def test_duplicate_official_period_does_not_overwrite_existing_document_provenance() -> None:
@@ -1297,7 +1298,7 @@ def test_duplicate_official_period_does_not_overwrite_existing_document_provenan
     repository._persist_official_financial_facts(first)
     repository._persist_official_financial_facts(second)
     facts = [
-        fact for fact in repository.financial_facts_for(first.instrument_id)
+        fact for fact in repository.persistence.load_financial_facts({first.instrument_id})
         if fact.key.metric == "revenue" and fact.key.period_end == "2026-06-30" and fact.key.period_type == "QUARTERLY"
     ]
     assert len(facts) == 1
@@ -1316,12 +1317,12 @@ def test_balance_sheet_persistence_retains_history_idempotently_and_keeps_docume
     ]
     for document in documents:
         repository._persist_official_financial_facts(document)
-    facts = [fact for fact in repository.financial_facts_for(documents[0].instrument_id) if fact.key.metric == "total_assets"]
+    facts = [fact for fact in repository.persistence.load_financial_facts({documents[0].instrument_id}) if fact.key.metric == "total_assets"]
     assert {fact.key.period_end for fact in facts} == {"2026-03-31", "2025-03-31", "2024-03-31", "2023-03-31", "2022-03-31", "2021-03-31"}
     assert all(fact.key.period_type == "AS_AT" and fact.source_identity in {str(item.document_id) for item in documents} for fact in facts)
-    before = len(repository.financial_facts_for(documents[0].instrument_id))
+    before = len(repository.persistence.load_financial_facts({documents[0].instrument_id}))
     repository._persist_official_financial_facts(documents[0])
-    assert len(repository.financial_facts_for(documents[0].instrument_id)) == before
+    assert len(repository.persistence.load_financial_facts({documents[0].instrument_id})) == before
 
 
 def test_duplicate_balance_sheet_period_does_not_overwrite_other_official_document() -> None:
@@ -1332,7 +1333,7 @@ def test_duplicate_balance_sheet_period_does_not_overwrite_other_official_docume
     repository._persist_official_financial_facts(first)
     repository._persist_official_financial_facts(second)
     fact = next(
-        item for item in repository.financial_facts_for(first.instrument_id)
+        item for item in repository.persistence.load_financial_facts({first.instrument_id})
         if item.key.metric == "total_assets" and item.key.period_end == "2026-03-31"
     )
     assert fact.value.value == Decimal("500")
@@ -1350,7 +1351,7 @@ def test_cash_flow_persistence_retains_history_and_preserves_official_provenance
     ]
     for document in documents:
         repository._persist_official_financial_facts(document)
-    facts = [fact for fact in repository.financial_facts_for(documents[0].instrument_id)
+    facts = [fact for fact in repository.persistence.load_financial_facts({documents[0].instrument_id})
              if fact.key.metric == "cash_flow_from_operating_activities"]
     assert {fact.key.period_end for fact in facts} == {"2026-03-31", "2025-03-31", "2024-03-31", "2023-03-31", "2022-03-31", "2021-03-31"}
     assert all(fact.key.period_type == "ANNUAL" and fact.source_identity in {str(item.document_id) for item in documents} for fact in facts)
@@ -1358,7 +1359,7 @@ def test_cash_flow_persistence_retains_history_and_preserves_official_provenance
     second = _document(_cash_flow().replace("100.00", "999.00", 1))
     repository._persist_official_financial_facts(first)
     repository._persist_official_financial_facts(second)
-    fact = next(item for item in repository.financial_facts_for(first.instrument_id)
+    fact = next(item for item in repository.persistence.load_financial_facts({first.instrument_id})
                 if item.key.metric == "cash_flow_from_operating_activities" and item.key.period_end == "2026-03-31")
     assert fact.value.value == Decimal("100")
 
@@ -1378,12 +1379,17 @@ def _trusted_source(profile: CompanyResearchProfile) -> RegisteredResearchSource
 
 
 def test_reused_trusted_nse_document_reconciles_same_document_facts_without_fetch_or_events() -> None:
+    # Text-source reuse needs no PDF geometry. PDF byte recovery is covered by
+    # test_radar_financial_retry_fixes and must retain its layout requirement.
     profile = _profile()
-    source = _trusted_source(profile)
-    repository = ResearchRepository()
+    source = replace(_trusted_source(profile), url="https://nsearchives.nseindia.com/corporate/result.txt")
+    repository = ResearchRepository(persistence=SqliteResearchPersistence())
     repository._persistence = SqliteResearchPersistence()
     document = _document(JUNE).model_copy(update={"canonical_url": source.url, "original_url": source.url})
-    repository.documents[document.document_id] = document
+    document = document.model_copy(update={"canonical_url": source.url, "original_url": source.url,
+        "content_type": "text/plain", "document_type": DocumentType.TEXT})
+    repository.persistence.upsert_document(document)
+    repository.remember_persisted_document(document)
     bad = FinancialFact(FinancialFactKey(profile.instrument_id, "eps", "2026-06-30", "QUARTERLY", None),
         ProvenancedValue(value=Decimal("10"), unit="INR crore", source_url=source.url, source_name="NSE", source_type="EXCHANGE", retrieved_at=document.retrieved_at),
         FactSourceTier.OFFICIAL_NSE, "NSE", str(document.document_id), SourceMode.REAL)
@@ -1392,7 +1398,7 @@ def test_reused_trusted_nse_document_reconciles_same_document_facts_without_fetc
     documents_before = len(repository.documents)
 
     asyncio.run(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
-    facts = repository.financial_facts_for(profile.instrument_id)
+    facts = repository.persistence.load_financial_facts({profile.instrument_id})
     # Filtered SQL may use a different index; assert the reconciled period,
     # independently of database row order and comparative-period facts.
     current = {fact.key.metric: fact for fact in facts
@@ -1406,18 +1412,24 @@ def test_reused_trusted_nse_document_reconciles_same_document_facts_without_fetc
     assert len(repository.documents) == documents_before
 
     asyncio.run(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
-    assert len(repository.financial_facts_for(profile.instrument_id)) == len(facts)
+    assert len(repository.persistence.load_financial_facts({profile.instrument_id})) == len(facts)
     yahoo = FinancialFact(eps.key, ProvenancedValue(value=Decimal("9"), source_url="https://yahoo.test", source_name="Yahoo", source_type="YAHOO", retrieved_at=document.retrieved_at), FactSourceTier.YAHOO, "YAHOO_FINANCE", "yahoo", SourceMode.REAL)
     assert not repository._persistence.upsert_financial_fact(yahoo)
-    assert next(fact for fact in repository.financial_facts_for(profile.instrument_id) if fact.key == eps.key).value.value == Decimal("1.47")
+    assert next(fact for fact in repository.persistence.load_financial_facts({profile.instrument_id}) if fact.key == eps.key).value.value == Decimal("1.47")
+
 
 
 def test_already_persisted_official_document_recovers_zero_facts_without_redownload() -> None:
+    # Text-source reuse needs no PDF geometry. PDF byte recovery is covered by
+    # test_radar_financial_retry_fixes and must retain its layout requirement.
     profile = _profile()
-    source = _trusted_source(profile)
+    source = replace(_trusted_source(profile), url="https://nsearchives.nseindia.com/corporate/result.txt")
     repository = ResearchRepository(persistence=SqliteResearchPersistence())
     document = _document(JUNE).model_copy(update={"canonical_url": source.url, "original_url": source.url})
-    repository.documents[document.document_id] = document
+    document = document.model_copy(update={"canonical_url": source.url, "original_url": source.url,
+        "content_type": "text/plain", "document_type": DocumentType.TEXT})
+    repository.persistence.upsert_document(document)
+    repository.remember_persisted_document(document)
     documents_before = len(repository.documents)
     parser_calls = 0
     network_calls = 0
@@ -1438,7 +1450,7 @@ def test_already_persisted_official_document_recovers_zero_facts_without_redownl
 
     asyncio.run(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
 
-    facts_after_recovery = repository.financial_facts_for(profile.instrument_id)
+    facts_after_recovery = repository.persistence.load_financial_facts({profile.instrument_id})
     assert parser_calls == 1
     assert network_calls == 0
     assert len(repository.documents) == documents_before
@@ -1447,15 +1459,21 @@ def test_already_persisted_official_document_recovers_zero_facts_without_redownl
     asyncio.run(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
     assert network_calls == 0
     assert len(repository.documents) == documents_before
-    assert len(repository.financial_facts_for(profile.instrument_id)) == len(facts_after_recovery)
+    assert len(repository.persistence.load_financial_facts({profile.instrument_id})) == len(facts_after_recovery)
+
 
 
 def test_reused_official_document_repairs_missing_facts_without_degrading_existing_official_revenue() -> None:
+    # Text-source reuse needs no PDF geometry. PDF byte recovery is covered by
+    # test_radar_financial_retry_fixes and must retain its layout requirement.
     profile = _profile()
-    source = _trusted_source(profile)
+    source = replace(_trusted_source(profile), url="https://nsearchives.nseindia.com/corporate/result.txt")
     repository = ResearchRepository(persistence=SqliteResearchPersistence())
     document = _document(JUNE).model_copy(update={"canonical_url": source.url, "original_url": source.url})
-    repository.documents[document.document_id] = document
+    document = document.model_copy(update={"canonical_url": source.url, "original_url": source.url,
+        "content_type": "text/plain", "document_type": DocumentType.TEXT})
+    repository.persistence.upsert_document(document)
+    repository.remember_persisted_document(document)
     revenue = next(
         value for period in parsed_nse_income_statement_periods([document])
         if period.period_end == "2026-06-30" and period.period_type == "QUARTERLY"
@@ -1480,13 +1498,14 @@ def test_reused_official_document_repairs_missing_facts_without_degrading_existi
     repository._single_flight_official_filing = no_network  # type: ignore[method-assign]
     asyncio.run(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
 
-    facts = {fact.key.metric: fact for fact in repository.financial_facts_for(profile.instrument_id)
+    facts = {fact.key.metric: fact for fact in repository.persistence.load_financial_facts({profile.instrument_id})
              if fact.key.period_end == "2026-06-30" and fact.key.period_type == "QUARTERLY"}
     assert network_calls == 0
     assert facts["revenue"].source_identity == "older-official-document"
     assert facts["revenue"].value.value == Decimal("8261.11")
     assert facts["pat"].value.value == Decimal("1927.21")
     assert facts["eps"].value.value == Decimal("1.47")
+
 
 
 def test_persisted_official_document_with_no_parseable_financial_result_creates_no_facts() -> None:
@@ -1506,15 +1525,19 @@ def test_persisted_official_document_with_no_parseable_financial_result_creates_
 
     assert asyncio.run(repository._reconcile_incomplete_persisted_official_financial_facts(profile)) is False
     assert parser_calls == 0
-    assert repository.financial_facts_for(profile.instrument_id) == []
+    assert repository.persistence.load_financial_facts({profile.instrument_id}) == []
 
 
 def test_reused_official_reconciliation_does_not_block_the_event_loop() -> None:
+    # Text-source reuse needs no PDF geometry. PDF byte recovery is covered by
+    # test_radar_financial_retry_fixes and must retain its layout requirement.
     profile = _profile()
-    source = _trusted_source(profile)
-    repository = ResearchRepository()
+    source = replace(_trusted_source(profile), url="https://nsearchives.nseindia.com/corporate/result.txt")
+    repository = ResearchRepository(persistence=SqliteResearchPersistence())
     document = _document(JUNE).model_copy(update={"canonical_url": source.url, "original_url": source.url})
-    repository.documents[document.document_id] = document
+    document = document.model_copy(update={"content_type": "text/plain", "document_type": DocumentType.TEXT})
+    repository.persistence.upsert_document(document)
+    repository.remember_persisted_document(document)
     started = threading.Event()
 
     def slow_reconcile(*_args) -> None:
@@ -1525,8 +1548,12 @@ def test_reused_official_reconciliation_does_not_block_the_event_loop() -> None:
 
     async def run() -> int:
         task = asyncio.create_task(repository._fetch_official_filings(profile, [DiscoveryResult("FINANCIAL_RESULTS", source)], set()))
-        while not started.is_set():
-            await asyncio.sleep(0)
+        async with asyncio.timeout(2):
+            while not started.is_set():
+                if task.done():
+                    await task
+                    pytest.fail("Durable document was not reconciled")
+                await asyncio.sleep(0)
         ticks = 0
         while not task.done():
             await asyncio.sleep(0.005)
@@ -1535,6 +1562,7 @@ def test_reused_official_reconciliation_does_not_block_the_event_loop() -> None:
         return ticks
 
     assert asyncio.run(run()) > 0
+
 
 
 def test_async_yahoo_fact_persistence_preserves_fact_precedence_payload() -> None:
@@ -1574,7 +1602,7 @@ def test_reused_untrusted_or_textless_document_cannot_create_facts() -> None:
     untrusted = source.__class__(**{**source.__dict__, "official_nse_profile_symbol": None})
     repository._reconcile_reused_official_financial_facts(profile, untrusted, _document(JUNE).model_copy(update={"canonical_url": source.url}))
     repository._reconcile_reused_official_financial_facts(profile, source, _document(JUNE).model_copy(update={"normalized_text": ""}))
-    assert repository.financial_facts_for(profile.instrument_id) == []
+    assert repository.persistence.load_financial_facts({profile.instrument_id}) == []
 
 
 def test_persisted_trusted_financial_document_repairs_zero_normalized_facts_idempotently() -> None:
@@ -1586,7 +1614,7 @@ def test_persisted_trusted_financial_document_repairs_zero_normalized_facts_idem
     first = asyncio.run(repository._incomplete_persisted_official_financial_documents(profile))
     assert first == [document]
     asyncio.run(repository._run_blocking_persistence(repository._persist_official_financial_facts, document))
-    assert {fact.key.metric for fact in repository.financial_facts_for(profile.instrument_id)} >= {"revenue", "pat"}
+    assert {fact.key.metric for fact in repository.persistence.load_financial_facts({profile.instrument_id})} >= {"revenue", "pat"}
     assert asyncio.run(repository._incomplete_persisted_official_financial_documents(profile)) == []
 
 
@@ -1621,7 +1649,7 @@ def test_no_due_refresh_repairs_persisted_official_facts_without_discovery() -> 
 
     asyncio.run(repository.refresh(profile.instrument_id, allow_demo=False))
 
-    assert {fact.key.metric for fact in repository.financial_facts_for(profile.instrument_id)} >= {"revenue", "pat"}
+    assert {fact.key.metric for fact in repository.persistence.load_financial_facts({profile.instrument_id})} >= {"revenue", "pat"}
     assert calls == {"official": 0, "search": 0, "registered": 0}
     writes = 0
     original_persist = repository._persist_official_financial_facts
@@ -1667,7 +1695,7 @@ def test_persisted_trusted_financial_document_with_revenue_and_pat_is_complete_w
     document = _document(JUNE)
     repository.documents[document.document_id] = document
     repository._persist_official_financial_facts(document)
-    for fact in list(repository.financial_facts_for(profile.instrument_id)):
+    for fact in list(repository.persistence.load_financial_facts({profile.instrument_id})):
         if fact.key.metric == "eps":
             repository._persistence._connection.execute("DELETE FROM global_financial_facts WHERE metric = 'eps'")
             repository._persistence._connection.commit()
@@ -1731,7 +1759,7 @@ def test_non_nse_profile_does_not_activate_fresh_financial_repair() -> None:
     repository._persist_official_financial_facts = count_persist  # type: ignore[method-assign]
     asyncio.run(repository.refresh(profile.instrument_id, allow_demo=False))
     assert writes == 0
-    assert repository.financial_facts_for(profile.instrument_id) == []
+    assert repository.persistence.load_financial_facts({profile.instrument_id}) == []
 
 
 def test_rolling_window_recovers_newer_quarters_after_one_year_absence_and_retains_history() -> None:
@@ -1751,14 +1779,14 @@ def test_rolling_window_recovers_newer_quarters_after_one_year_absence_and_retai
     assert asyncio.run(repository._incomplete_persisted_official_financial_documents(profile)) == current_documents
     assert asyncio.run(repository._reconcile_incomplete_persisted_official_financial_facts(profile)) is True
     quarterly = {
-        fact.key.period_end for fact in repository.financial_facts_for(profile.instrument_id)
+        fact.key.period_end for fact in repository.persistence.load_financial_facts({profile.instrument_id})
         if fact.key.metric == "revenue" and fact.key.period_type == "QUARTERLY"
     }
     assert {"2026-06-30", "2026-03-31", "2025-12-31", "2025-09-30"} <= quarterly
     assert {"2025-06-30", "2024-09-30"} <= quarterly
-    before = len(repository.financial_facts_for(profile.instrument_id))
+    before = len(repository.persistence.load_financial_facts({profile.instrument_id}))
     assert asyncio.run(repository._reconcile_incomplete_persisted_official_financial_facts(profile)) is False
-    assert len(repository.financial_facts_for(profile.instrument_id)) == before
+    assert len(repository.persistence.load_financial_facts({profile.instrument_id})) == before
 
 
 def test_rolling_window_repairs_historical_gap_and_fresh_path_never_calls_provider() -> None:
@@ -1779,7 +1807,7 @@ def test_rolling_window_repairs_historical_gap_and_fresh_path_never_calls_provid
     repository._discovery.discover = forbidden  # type: ignore[method-assign]
 
     asyncio.run(repository._refresh_live(profile.instrument_id, set()))
-    recovered = {(fact.key.period_end, fact.key.metric) for fact in repository.financial_facts_for(profile.instrument_id)}
+    recovered = {(fact.key.period_end, fact.key.metric) for fact in repository.persistence.load_financial_facts({profile.instrument_id})}
     assert {("2026-03-31", "revenue"), ("2026-03-31", "pat")} <= recovered
 
 
@@ -1795,5 +1823,5 @@ def test_rolling_window_is_basis_isolated_and_malformed_document_does_not_block_
     selected = asyncio.run(repository._incomplete_persisted_official_financial_documents(profile))
     assert selected == [standalone, consolidated]
     asyncio.run(repository._reconcile_incomplete_persisted_official_financial_facts(profile))
-    facts = repository.financial_facts_for(profile.instrument_id)
+    facts = repository.persistence.load_financial_facts({profile.instrument_id})
     assert {fact.key.reporting_basis for fact in facts if fact.key.period_type == "QUARTERLY"} == {"STANDALONE", "CONSOLIDATED"}

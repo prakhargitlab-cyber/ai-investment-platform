@@ -81,7 +81,7 @@ research:
   # LOCAL/DEV: independent full-NSE-universe permission, also kept
   # explicitly false unless expressly approved for a controlled run; see
   # research_etf_full_universe_execution_enabled in app/settings.py.
-  etfFullUniverseExecutionEnabled: false
+  etfFullUniverseExecutionEnabled: true
   # LOCAL/DEV: one explicit, independently-verified NSE trading-series
   # override, confirmed against the official NSE Security-wise Archives
   # page for this single instrument only (Triveni Power Transmission

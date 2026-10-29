@@ -1,24 +1,23 @@
 ﻿{
     "schemaVersion":  1,
-    "baselineVersion":  9,
-    "approvedAtUtc":  "2026-10-21T18:58:21.3178588Z",
+    "baselineVersion":  11,
+    "approvedAtUtc":  "2026-10-29T13:46:18.3150932Z",
     "approvedBy":  "Prakhar",
     "components":  {
                        "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
-                       "research-engine":  "sha256:2f6e3c379207ad3c23834bc58be4bda8d29ff4daa572618dce98d770f6105dcf",
+                       "research-engine":  "sha256:aabaf120a11af77cd96f0003bb8f98392d48bc468316bd1f89141f563fc86f76",
                        "portfolio-service":  "sha256:8b001ae437122c66ffb8fc5543b9b9d64fa9c1b3e29212b56dcc44a87fc27703",
-                       "frontend":  "sha256:e1361b84c6823802900bdc99d986da88fe956de9c06be346d56648460388ab71"
+                       "frontend":  "sha256:5c21757f54eba0b040259dee5be2fd58398171d2634d0afb6943cf5ce8d41505"
                    },
     "initContainers":  {
-                           "wait-for-research-migrations":  "sha256:2f6e3c379207ad3c23834bc58be4bda8d29ff4daa572618dce98d770f6105dcf"
+                           "wait-for-research-migrations":  "sha256:8703f9cbb23b7cdf8c9f1f835f4733e000e85716fbfcf2bdef4d68ab57cedad3"
                        },
     "advancedFrom":  {
-                         "reason":  "Align approved Research Engine rollback baseline with verified healthy live deployment after NSE trading-series override recovery",
-                         "baselineVersion":  8,
-                         "approvedAtUtcPreviewed":  "2026-10-21T18:58:21.3138877Z",
+                         "reason":  "Reviewed current frontend deployment and image provenance; registry digest and running pod verified; approved for controlled rollout baseline",
+                         "baselineVersion":  10,
+                         "approvedAtUtcPreviewed":  "2026-10-29T13:46:18.3101042Z",
                          "componentTags":  {
-                                               "research-engine":  "review-20261021-185439-36c3e90c28fc46d1b56a12dc8407a65f",
-                                               "research-engine/wait-for-research-migrations":  "review-20261021-185439-36c3e90c28fc46d1b56a12dc8407a65f"
+                                               "frontend":  "radar-20261028-etf-universe-ui"
                                            },
                          "kind":  "reconciliation"
                      }

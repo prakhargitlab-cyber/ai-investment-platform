@@ -25,11 +25,15 @@ import {
   Eye,
   EyeOff,
   WalletCards,
-  X
+  X,
+  Radar,
+  PieChart
 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { RadarTabs } from "./radar-tabs";
+import { OpportunityRadar } from "./opportunity-radar";
+import { EtfRadar } from "./etf-radar";
 import { PortfolioRadarCompanyName, EtfRadarCompanyName } from "./portfolio-radar-signal";
 import { Backtesting } from "./backtesting";
 import { frontendConfig } from "../config";
@@ -93,7 +97,7 @@ import { Badge, Button, Card, EmptyState, ErrorState, Field, MetricCard, Skeleto
 
 import { AdminUsers } from "./admin-users";
 
-type View = "dashboard" | "portfolio" | "research" | "backtesting" | "brokers" | "settings" | "admin";
+type View = "dashboard" | "portfolio" | "equity-radar" | "etf-radar" | "watchlist" | "research" | "backtesting" | "brokers" | "settings" | "admin";
 type Theme = "system" | "light" | "dark";
 type SortKey = "company" | "ticker" | "marketValue" | "profitLoss" | "allocation";
 type ResearchSectionId = "overview" | "growth" | "orders" | "capex" | "customers" | "guidance" | "news" | "sources";
@@ -109,6 +113,9 @@ const brokerAuthenticationTimeoutMs = 5 * 60 * 1000;
 const navItems: Array<{ id: View; label: string; icon: typeof Gauge }> = [
   { id: "dashboard", label: "Dashboard", icon: Gauge },
   { id: "portfolio", label: "Portfolio", icon: BriefcaseBusiness },
+  { id: "equity-radar", label: "Equity Radar", icon: Radar },
+  { id: "etf-radar", label: "ETF Radar", icon: PieChart },
+  { id: "watchlist", label: "Watchlist", icon: Eye },
   { id: "research", label: "Research", icon: Search },
   { id: "backtesting", label: "Backtesting", icon: LineChart },
   { id: "brokers", label: "Brokers", icon: WalletCards },
@@ -270,6 +277,7 @@ export function InvestmentWorkspace() {
   const [view, setView] = useState<View>("dashboard");
   const [theme, setTheme] = useState<Theme>("system");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [portfolioNavExpanded, setPortfolioNavExpanded] = useState(true);
   const [portfolios, setPortfolios] = useState<PortfolioListItem[]>([]);
   const [portfolioDashboard, setPortfolioDashboard] = useState<PortfolioDashboard | null>(null);
   const [sectorPerformance, setSectorPerformance] = useState<SectorPerformance | null>(null);
@@ -1568,6 +1576,46 @@ export function InvestmentWorkspace() {
     return <SignInView error={error} onLogin={login} onEmailLogin={loginEmail} />;
   }
 
+  const researchViewElement = (
+                  <ResearchView
+                    positions={positions}
+                    portfolioResearchSummary={portfolioResearchSummary}
+                    portfolioResearchLoading={portfolioResearchLoading}
+                    portfolioResearchError={portfolioResearchError}
+                    researchContext={researchContext}
+                    watchlistResearch={watchlistResearch}
+                    watchlistResearchLoading={watchlistResearchLoading}
+                    watchlistResearchError={watchlistResearchError}
+                    selectedResearchInstrumentId={selectedResearchInstrumentId}
+                    onSelectInstrument={setSelectedResearchInstrumentId}
+                    searchPresentation={searchPresentation}
+                    onSearchSelect={handleSearchSelect}
+                    searchSelectedMatch={searchSelectedMatch}
+                    searchWatchlistSaved={searchWatchlistSaved}
+                    searchWatchlistBusy={searchWatchlistBusy}
+                    searchWatchlistError={searchWatchlistError}
+                    onToggleSearchWatchlist={toggleSearchWatchlist}
+                    summary={researchSummary}
+                    loading={researchLoading}
+                    eventType={researchEventType}
+                    impact={researchImpact}
+                    onEventType={setResearchEventType}
+                    onImpact={setResearchImpact}
+                    onRefresh={async () => {
+                      if (!selectedResearchInstrumentId) {
+                        return;
+                      }
+                      const selectedCompany = portfolioResearchSummary?.companies.find(
+                        (company) => company.instrumentId === selectedResearchInstrumentId
+                      );
+                      await openResearchReadiness(
+                        selectedResearchInstrumentId,
+                        selectedCompany?.companyName ?? researchSummary?.profile.companyName ?? "Company research"
+                      );
+                    }}
+                  />
+  );
+
   return (
     <main className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -1599,6 +1647,40 @@ export function InvestmentWorkspace() {
             );
           })}
         </nav>
+
+        {portfolios.length > 0 ? (
+          <div className="sidebar-portfolio-nav">
+            <button
+              type="button"
+              className="sidebar-portfolio-nav-toggle"
+              onClick={() => setPortfolioNavExpanded((value) => !value)}
+              aria-expanded={portfolioNavExpanded}
+            >
+              <span>My Portfolios</span>
+              <ChevronDown size={14} style={{ transform: portfolioNavExpanded ? "rotate(0deg)" : "rotate(-90deg)" }} aria-hidden="true" />
+            </button>
+            {portfolioNavExpanded ? (
+              <ul className="sidebar-portfolio-list">
+                {portfolios.map((item) => (
+                  <li key={item.portfolioId}>
+                    <button
+                      type="button"
+                      className={view === "portfolio" && selectedPortfolioId === item.portfolioId ? "sidebar-portfolio-item sidebar-portfolio-item-active" : "sidebar-portfolio-item"}
+                      onClick={() => {
+                        setSelectedPortfolioId(item.portfolioId);
+                        clearMarketIntelligenceContext();
+                        setView("portfolio");
+                        setSidebarOpen(false);
+                      }}
+                    >
+                      {item.name}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="sidebar-panel">
           <Badge tone={hasRealBrokerPositions(positions) ? "positive" : "info"}>
@@ -1658,13 +1740,19 @@ export function InvestmentWorkspace() {
         <div className="content">
           <section className="page-header">
             <div>
-              <p className="eyebrow">{view === "admin" ? "Administration" : view === "research" ? "Research intelligence" : "Brokers & Portfolios"}</p>
+              <p className="eyebrow">{view === "admin" ? "Administration" : view === "research" ? "Research intelligence"
+                : view === "watchlist" ? "Saved instruments, research freshness and signals"
+                : view === "equity-radar" ? "AI-powered research across the NSE equity universe"
+                : view === "etf-radar" ? "AI-powered research across the NSE ETF universe"
+                : "Brokers & Portfolios"}</p>
               <h1>{view === "dashboard" ? "Portfolio command center" : navItems.find((item) => item.id === view)?.label}</h1>
-              <p>
-                Backend: <code>{frontendConfig.apiBaseUrl || "same-origin gateway"}</code>
-              </p>
+              {view === "settings" || view === "admin" ? (
+                <p className="eyebrow">
+                  Backend: <code>{frontendConfig.apiBaseUrl || "same-origin gateway"}</code>
+                </p>
+              ) : null}
             </div>
-            {view === "research" || view === "admin" ? (
+            {view === "research" || view === "watchlist" || view === "admin" || view === "equity-radar" || view === "etf-radar" ? (
               null
             ) : (
               <PortfolioSelector
@@ -1699,9 +1787,20 @@ export function InvestmentWorkspace() {
           {view === "backtesting" ? <Backtesting /> : null}
           {view === "admin" ? <AdminUsers operatorId={authenticatedUser.userId} roles={authenticatedUser.roles ?? []} /> : null}
           {loading ? <LoadingView /> : null}
-          {view === "dashboard" && (loading || error) ? <RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} /> : null}
+          {/* Only while the main portfolio-detail load is still in flight --
+              once it settles (success OR failure) the normal DashboardView
+              below renders its own embedded radar, so this fallback must
+              not also render then or the radar would appear twice. */}
+          {view === "dashboard" && loading ? <RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} onOpenEquityRadar={() => setView("equity-radar")} onOpenEtfRadar={() => setView("etf-radar")} /> : null}
 
-          {!loading && !error ? (
+          {/* `error` is a single shared flag set by many independent actions
+              (sync, broker auth, stock search, portfolio-detail load, ...).
+              Gating the whole view on it used to blank every dashboard
+              section whenever any one of them failed, even though the
+              other sections' own state was untouched and still valid --
+              the ErrorState banner above already surfaces the failure, so
+              content continues to render underneath/alongside it. */}
+          {!loading ? (
             <>
               {view === "dashboard" ? (
                 <>
@@ -1719,7 +1818,7 @@ export function InvestmentWorkspace() {
                       onAddWatchlist={(selection) => { void addRankedStockToWatchlist(selection); }}
                       savedInstrumentIds={watchlists.filter((list) => list.region === sectorPerformanceRegion && list.systemDefault).flatMap((list) => savedWatchlistIds[list.watchlistId] ?? [])}
                       watchlistBusy={watchlistMutation !== null}
-                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
+                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} onOpenEquityRadar={() => setView("equity-radar")} onOpenEtfRadar={() => setView("etf-radar")} />}
                       performance={sectorPerformance}
                       performanceRegion={sectorPerformanceRegion}
                       performanceSector={sectorPerformanceSector}
@@ -1744,7 +1843,9 @@ export function InvestmentWorkspace() {
                       portfolio={selectedPortfolio}
                       summary={summary}
                       positions={positions}
-                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} />}
+                      radar={<RadarTabs roles={authenticatedUser?.roles} heldIds={positions.flatMap(p => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])} watchlistedIds={Object.values(savedWatchlistIds).flat()} onOpenEquityRadar={() => setView("equity-radar")} onOpenEtfRadar={() => setView("etf-radar")} />}
+                      marketPerformance={sectorPerformance}
+                      research={portfolioResearchSummary}
                       onCreate={createPortfolio}
                       onSync={selectedPortfolio?.brokerConnectionId ? syncSelectedPortfolio : undefined}
                       onRefreshPrices={selectedPortfolio?.acquisitionSource === "MANUAL_CSV_IMPORT" ? refreshSelectedPrices : undefined}
@@ -1787,6 +1888,14 @@ export function InvestmentWorkspace() {
                   etfRadarSignals={etfPortfolioRadarSignals}
                 />
               ) : null}
+              {view === "equity-radar" ? (
+                <OpportunityRadar
+                  roles={authenticatedUser?.roles}
+                  heldIds={positions.flatMap((p) => p.instrument.globalInstrumentId ? [p.instrument.globalInstrumentId] : [])}
+                  watchlistedIds={Object.values(savedWatchlistIds).flat()}
+                />
+              ) : null}
+              {view === "etf-radar" ? <EtfRadar roles={authenticatedUser?.roles} /> : null}
               {view === "brokers" ? (
                 <BrokerView
                   providers={brokerProviders}
@@ -1881,6 +1990,22 @@ export function InvestmentWorkspace() {
                   }}
                 />
               ) : null}
+              {view === "watchlist" ? (
+                <WatchlistWorkspace
+                  watchlists={watchlists}
+                  researchContext={researchContext}
+                  watchlistResearch={watchlistResearch}
+                  watchlistResearchLoading={watchlistResearchLoading}
+                  watchlistResearchError={watchlistResearchError}
+                  watchlistActionError={watchlistActionError}
+                  selectedResearchInstrumentId={selectedResearchInstrumentId}
+                  onSelectInstrument={setSelectedResearchInstrumentId}
+                  onSelectWatchlist={(watchlistId) => selectResearchContext(`watchlist:${watchlistId}`)}
+                  onOpenRegional={(region) => { void openRegionalWatchlist(region); }}
+                  onRemoveInstrument={(globalInstrumentId) => { void removeWatchlistStock(globalInstrumentId); }}
+                  watchlistMutation={watchlistMutation}
+                />
+              ) : null}
               {view === "research" ? (
                 <>
                 <Card className="wide-panel research-discovery">
@@ -1901,43 +2026,7 @@ export function InvestmentWorkspace() {
                   {watchlistActionError ? <p role="alert">{watchlistActionError}</p> : null}
                   {researchContext.kind === "WATCHLIST" && selectedResearchInstrumentId ? <Button variant="secondary" disabled={watchlistMutation !== null} onClick={() => { void removeWatchlistStock(selectedResearchInstrumentId); }}>Remove selected company from {researchContext.name}</Button> : null}
                 </Card>
-                <ResearchView
-                  positions={positions}
-                  portfolioResearchSummary={portfolioResearchSummary}
-                  portfolioResearchLoading={portfolioResearchLoading}
-                  portfolioResearchError={portfolioResearchError}
-                  researchContext={researchContext}
-                  watchlistResearch={watchlistResearch}
-                  watchlistResearchLoading={watchlistResearchLoading}
-                  watchlistResearchError={watchlistResearchError}
-                  selectedResearchInstrumentId={selectedResearchInstrumentId}
-                  onSelectInstrument={setSelectedResearchInstrumentId}
-                  searchPresentation={searchPresentation}
-                  onSearchSelect={handleSearchSelect}
-                  searchSelectedMatch={searchSelectedMatch}
-                  searchWatchlistSaved={searchWatchlistSaved}
-                  searchWatchlistBusy={searchWatchlistBusy}
-                  searchWatchlistError={searchWatchlistError}
-                  onToggleSearchWatchlist={toggleSearchWatchlist}
-                  summary={researchSummary}
-                  loading={researchLoading}
-                  eventType={researchEventType}
-                  impact={researchImpact}
-                  onEventType={setResearchEventType}
-                  onImpact={setResearchImpact}
-                  onRefresh={async () => {
-                    if (!selectedResearchInstrumentId) {
-                      return;
-                    }
-                    const selectedCompany = portfolioResearchSummary?.companies.find(
-                      (company) => company.instrumentId === selectedResearchInstrumentId
-                    );
-                    await openResearchReadiness(
-                      selectedResearchInstrumentId,
-                      selectedCompany?.companyName ?? researchSummary?.profile.companyName ?? "Company research"
-                    );
-                  }}
-                />
+                {researchViewElement}
                 </>
               ) : null}
               {view === "settings" ? <SettingsView /> : null}
@@ -2641,6 +2730,8 @@ function DashboardView({
   summary,
   positions,
   radar,
+  marketPerformance,
+  research,
   onCreate,
   onSync,
   onRefreshPrices,
@@ -2655,6 +2746,8 @@ function DashboardView({
   summary: PortfolioSummary | null;
   positions: PortfolioPosition[];
   radar: ReactNode;
+  marketPerformance?: SectorPerformance | null;
+  research?: PortfolioResearchSummary | null;
   onCreate: () => void;
   onSync?: () => void;
   onRefreshPrices?: () => void;
@@ -2714,25 +2807,101 @@ function DashboardView({
         <MetricCard label={sourceLabels.returnLabel} value={formatPercent(liveTotals && liveTotals.cost ? liveTotals.pnl / liveTotals.cost * 100 : summary?.unrealizedProfitLossPercent)} tone={valueTone(liveTotals?.pnl ?? summary?.unrealizedProfitLossPercent)} />
         <MetricCard label="Cash" value={formatBackendMoney(summary?.cash)} />
         <MetricCard label="Holdings" value={String(summary?.positions ?? 0)} />
-        <MetricCard label="Portfolio risk" value="Pending" meta="Risk service not implemented" tone="warning" />
       </section>
 
-      <Card className="wide-panel">
-        <div className="panel-header">
-          <div>
-            <h2>{portfolio.name}</h2>
-            <p>Last updated: {summary ? sourceLabels.lastUpdated : "not synced"} - Source: {sourceLabels.source}</p>
+      <div className="dashboard-main-row wide-panel">
+        <Card className="dashboard-main-col">
+          <div className="panel-header">
+            <div>
+              <h2>{portfolio.name}</h2>
+              <p>Last updated: {summary ? sourceLabels.lastUpdated : "not synced"} - Source: {sourceLabels.source}</p>
+            </div>
+            {syncAction}{refreshAction}
           </div>
-          {syncAction}{refreshAction}
-        </div>
-        {summary && !onRefreshPrices ? <AllocationCharts summary={summary} /> : positions.length ? <p>Allocation uses refreshed holding values in the Portfolio view.</p> : <EmptyState title="No positions" message="This portfolio currently has no positions." />}
-      </Card>
-
-      <div className="dashboard-radar wide-panel">{radar}</div>
+          {summary ? <AllocationDonutPanel summary={summary} positions={positions} /> : positions.length ? <p>Allocation uses refreshed holding values in the Portfolio view.</p> : <EmptyState title="No positions" message="This portfolio currently has no positions." />}
+        </Card>
+        <div className="dashboard-radar dashboard-side-col">{radar}</div>
+      </div>
       <h2 className="dashboard-section-title wide-panel">Attention</h2>
       <MovementPanel title="Top gainers" icon={TrendingUp} positions={topGainers} sourceLabels={sourceLabels} />
       <MovementPanel title="Top losers" icon={TrendingDown} positions={topLosers} sourceLabels={sourceLabels} />
+
+      <h2 className="dashboard-section-title wide-panel">Market &amp; research</h2>
+      <div className="dashboard-main-row wide-panel">
+        <MarketOverviewCard performance={marketPerformance} />
+        <RecentResearchActivityCard research={research} />
+      </div>
     </div>
+  );
+}
+
+/** Compact market snapshot reusing the same sector-performance data already
+ * fetched for the "All portfolios" dashboard (see sectorPerformance in
+ * InvestmentWorkspace) -- no new request, no invented figures. Shows only
+ * the single best/worst mover already present in that durable dataset. */
+function MarketOverviewCard({ performance }: { performance?: SectorPerformance | null }) {
+  const best = performance?.bestPerformers[0];
+  const worst = performance?.worstPerformers[0];
+  return (
+    <Card className="dashboard-main-col">
+      <div className="panel-header compact">
+        <h2>Market overview</h2>
+        {performance ? <span className="eyebrow">{performance.region} &middot; {performance.period}</span> : null}
+      </div>
+      {!performance ? <p className="broker-note">Market overview is not available yet.</p> : !best && !worst
+        ? <p className="broker-note">Insufficient historical data for this region/period.</p>
+        : (
+          <div className="market-overview-grid">
+            {best ? (
+              <div className="market-overview-row">
+                <span>Top mover</span>
+                <strong>{best.companyName}</strong>
+                <span className={`${performanceRowTone(best.performancePct)}-text`}>{formatSignedPerformancePct(best.performancePct)}</span>
+              </div>
+            ) : null}
+            {worst ? (
+              <div className="market-overview-row">
+                <span>Bottom mover</span>
+                <strong>{worst.companyName}</strong>
+                <span className={`${performanceRowTone(worst.performancePct)}-text`}>{formatSignedPerformancePct(worst.performancePct)}</span>
+              </div>
+            ) : null}
+          </div>
+        )}
+    </Card>
+  );
+}
+
+/** Compact "recently refreshed" list reusing the same portfolioResearchSummary
+ * already loaded for the Portfolio/Research views -- no new fetch, no
+ * fabricated event text; only real backend fields (lastRefresh, latestEvent). */
+function RecentResearchActivityCard({ research }: { research?: PortfolioResearchSummary | null }) {
+  const companies = research?.companies ?? [];
+  const recent = [...companies]
+    .filter((company) => company.lastRefresh)
+    .sort((a, b) => new Date(b.lastRefresh as string).getTime() - new Date(a.lastRefresh as string).getTime())
+    .slice(0, 5);
+  return (
+    <Card className="dashboard-side-col">
+      <div className="panel-header compact">
+        <h2>Recent research activity</h2>
+      </div>
+      {!research ? <p className="broker-note">Research activity is not available yet.</p> : !recent.length
+        ? <p className="broker-note">No refreshed research yet for this portfolio.</p>
+        : (
+          <ul className="recent-research-list">
+            {recent.map((company) => (
+              <li key={company.instrumentId ?? company.companyName}>
+                <strong>{company.companyName}</strong>
+                <span>{company.latestEvent ? company.latestEvent.title : "No recent event reported"}</span>
+                <span className="recent-research-meta">
+                  Refreshed {new Date(company.lastRefresh as string).toLocaleDateString()} &middot; {company.freshness.replaceAll("_", " ")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+    </Card>
   );
 }
 
@@ -2873,12 +3042,34 @@ function PortfolioView({
         <MetricCard label="Position count" value={String(summary?.positions ?? 0)} />
       </section>
 
-      <PortfolioHistoryPanel
-        history={history}
-        range={historyRange}
-        loading={historyLoading}
-        onRange={onHistoryRange}
-      />
+      <div className="two-col-row wide-panel">
+        {summary ? (
+          <Card className="panel-col-main">
+            <div className="panel-header compact">
+              <h2>Allocation</h2>
+              <LineChart size={18} aria-hidden="true" />
+            </div>
+            {/* Previously hidden entirely for manually-priced (CSV-import)
+                portfolios, leaving this whole column blank -- the
+                PortfolioSelector's own summary already promises
+                "Allocation uses refreshed holding values in the Portfolio
+                view", so render it here too rather than leave a gap. */}
+            <AllocationDonutPanel summary={summary} positions={rawPositions} />
+            <details className="allocation-more-breakdowns">
+              <summary>More breakdowns (country, currency, broker)</summary>
+              <AllocationCharts summary={summary} />
+            </details>
+          </Card>
+        ) : <div className="panel-col-main" />}
+        <div className="panel-col-side">
+          <PortfolioHistoryPanel
+            history={history}
+            range={historyRange}
+            loading={historyLoading}
+            onRange={onHistoryRange}
+          />
+        </div>
+      </div>
 
       <Card className="wide-panel">
           <div className="panel-header">
@@ -2932,18 +3123,6 @@ function PortfolioView({
         )}
       </Card>
 
-      {summary && !onRefreshPrices ? (
-        <Card className="wide-panel">
-          <div className="panel-header">
-            <div>
-              <h2>Allocation</h2>
-              <p>Normalized into {summary.baseCurrency}; charts include textual values for accessibility.</p>
-            </div>
-            <LineChart size={20} aria-hidden="true" />
-          </div>
-          <AllocationCharts summary={summary} />
-        </Card>
-      ) : null}
     </div>
   );
 }
@@ -2966,8 +3145,8 @@ function PortfolioHistoryPanel({
   const hasInvestedCapital = points.some((point) => point.investedCapital);
 
   return (
-    <Card className="wide-panel">
-      <div className="panel-header">
+    <Card>
+      <div className="panel-header compact">
         <div>
           <h2>Portfolio value history</h2>
           <p>{history?.investedCapitalStatus === "AVAILABLE" ? "Market value and invested capital." : "Portfolio value change; investment return needs cash-flow history."}</p>
@@ -3139,9 +3318,71 @@ function HoldingsTable({ positions, summary, portfolioResearch, radarSignals, et
     );
   }
 
+  // Group by the instrument's real backend assetType (e.g. EQUITY, ETF),
+  // preserving the caller's chosen sort order *within* each group -- this
+  // only adds a grouping layer on top of the existing sort, it never
+  // changes which order positions appear in relative to one another.
+  const assetTypeGroups = new Map<string, PortfolioPosition[]>();
+  for (const position of positions) {
+    const key = position.instrument.assetType || "OTHER";
+    const existing = assetTypeGroups.get(key);
+    if (existing) existing.push(position); else assetTypeGroups.set(key, [position]);
+  }
+  const groupedPositions = Array.from(assetTypeGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+  function renderPositionRow(position: PortfolioPosition) {
+            const allocation = manualMarketTotal !== null
+              ? (manualMarketTotal === 0 || !position.marketValue ? null : position.marketValue.amount / manualMarketTotal * 100)
+              : getAllocationValue(summary, position);
+            const research = researchFor(position);
+            const ownershipClass = research?.ownershipIncreases?.length
+              ? `ownership-${research.ownershipIncreases.map((value) => value.toLowerCase().replace("_fpi", "")).join("-")}`
+              : "";
+            const valuationClass = `valuation-${(research?.valuation.state ?? "UNKNOWN").toLowerCase()}`;
+            const radarSignal = position.instrument.globalInstrumentId
+              ? radarSignalsByInstrumentId.get(position.instrument.globalInstrumentId)
+              : undefined;
+            const etfRadarSignal = position.instrument.assetType === "ETF" && position.instrument.globalInstrumentId
+              ? etfRadarSignalsByInstrumentId.get(position.instrument.globalInstrumentId)
+              : undefined;
+    return (
+      <tr className={`${valuationClass} ${ownershipClass}`.trim()} key={position.positionId} onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
+        <td>
+          <button className="security-button" type="button" onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
+            {position.instrument.assetType === "ETF"
+              ? <EtfRadarCompanyName companyName={position.displayName} signal={etfRadarSignal} />
+              : <PortfolioRadarCompanyName companyName={position.displayName} signal={radarSignal} />}
+            <span>{position.instrument.isin ?? "No ISIN"}</span>
+          </button>
+        </td>
+        <td>{position.instrument.ticker}</td>
+        <td>{position.quantity.toLocaleString("en")}</td>
+        <td>{formatMoney(position.averageCost.amount, position.averageCost.currency)}</td>
+        <td>{formatBackendMoney(position.currentPrice)}</td>
+        <td>{formatBackendMoney(position.marketValue)}</td>
+        <td className={position.unrealizedProfitLoss == null ? undefined : position.unrealizedProfitLoss.amount >= 0 ? "positive-text" : "negative-text"}>
+          {formatBackendMoney(position.unrealizedProfitLoss)}
+        </td>
+        <td className={position.unrealizedProfitLossPercent == null ? undefined : position.unrealizedProfitLossPercent >= 0 ? "positive-text" : "negative-text"}>
+          {formatPercent(position.unrealizedProfitLossPercent)}
+        </td>
+        <td>{formatPercent(allocation)}</td>
+        <td>{position.instrument.tradingCurrency}</td>
+        <td className="holding-status-cell">
+          <ResearchStatusBadge status={research?.status} />
+          <span>Position price: {position.dataFreshness === "IMPORTED_SNAPSHOT" ? "Imported snapshot" : position.dataFreshness.replaceAll("_", " ")}</span>
+          <span>Live quote: <FreshnessBadge freshness={position.quote?.freshness ?? "UNAVAILABLE"} /></span>
+          <span>Research price: <FreshnessBadge freshness={research?.priceFreshness ?? "UNKNOWN"} /></span>
+          <span>Valuation: {(research?.valuation.state ?? "UNKNOWN").replaceAll("_", " ")}</span>
+          {research?.ownershipIncreases?.length ? <span>Ownership increase: {research.ownershipIncreases.map((value) => value.replaceAll("_", "/")).join(", ")}</span> : <span>Ownership increase: None reported</span>}
+        </td>
+      </tr>
+    );
+  }
+
   return (
     <div className="table-frame">
-      <table>
+      <table className="holdings-financial-table">
         <thead>
           <tr>
             <th>Company</th>
@@ -3157,57 +3398,16 @@ function HoldingsTable({ positions, summary, portfolioResearch, radarSignals, et
             <th>Research & price status</th>
           </tr>
         </thead>
-        <tbody>
-          {positions.map((position) => {
-            const allocation = manualMarketTotal !== null
-              ? (manualMarketTotal === 0 || !position.marketValue ? null : position.marketValue.amount / manualMarketTotal * 100)
-              : getAllocationValue(summary, position);
-            const research = researchFor(position);
-            const ownershipClass = research?.ownershipIncreases?.length
-              ? `ownership-${research.ownershipIncreases.map((value) => value.toLowerCase().replace("_fpi", "")).join("-")}`
-              : "";
-            const valuationClass = `valuation-${(research?.valuation.state ?? "UNKNOWN").toLowerCase()}`;
-            const radarSignal = position.instrument.globalInstrumentId
-              ? radarSignalsByInstrumentId.get(position.instrument.globalInstrumentId)
-              : undefined;
-            const etfRadarSignal = position.instrument.assetType === "ETF" && position.instrument.globalInstrumentId
-              ? etfRadarSignalsByInstrumentId.get(position.instrument.globalInstrumentId)
-              : undefined;
-            return (
-              <tr className={`${valuationClass} ${ownershipClass}`.trim()} key={position.positionId} onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
-                <td>
-                  <button className="security-button" type="button" onClick={() => setDetail({ position, researchInstrumentId: research?.instrumentId ?? position.instrument.globalInstrumentId })}>
-                    {position.instrument.assetType === "ETF"
-                      ? <EtfRadarCompanyName companyName={position.displayName} signal={etfRadarSignal} />
-                      : <PortfolioRadarCompanyName companyName={position.displayName} signal={radarSignal} />}
-                    <span>{position.instrument.isin ?? "No ISIN"}</span>
-                  </button>
-                </td>
-                <td>{position.instrument.ticker}</td>
-                <td>{position.quantity.toLocaleString("en")}</td>
-                <td>{formatMoney(position.averageCost.amount, position.averageCost.currency)}</td>
-                <td>{formatBackendMoney(position.currentPrice)}</td>
-                <td>{formatBackendMoney(position.marketValue)}</td>
-                <td className={position.unrealizedProfitLoss == null ? undefined : position.unrealizedProfitLoss.amount >= 0 ? "positive-text" : "negative-text"}>
-                  {formatBackendMoney(position.unrealizedProfitLoss)}
-                </td>
-                <td className={position.unrealizedProfitLossPercent == null ? undefined : position.unrealizedProfitLossPercent >= 0 ? "positive-text" : "negative-text"}>
-                  {formatPercent(position.unrealizedProfitLossPercent)}
-                </td>
-                <td>{formatPercent(allocation)}</td>
-                <td>{position.instrument.tradingCurrency}</td>
-                <td className="holding-status-cell">
-                  <ResearchStatusBadge status={research?.status} />
-                  <span>Position price: {position.dataFreshness === "IMPORTED_SNAPSHOT" ? "Imported snapshot" : position.dataFreshness.replaceAll("_", " ")}</span>
-                  <span>Live quote: <FreshnessBadge freshness={position.quote?.freshness ?? "UNAVAILABLE"} /></span>
-                  <span>Research price: <FreshnessBadge freshness={research?.priceFreshness ?? "UNKNOWN"} /></span>
-                  <span>Valuation: {(research?.valuation.state ?? "UNKNOWN").replaceAll("_", " ")}</span>
-                  {research?.ownershipIncreases?.length ? <span>Ownership increase: {research.ownershipIncreases.map((value) => value.replaceAll("_", "/")).join(", ")}</span> : <span>Ownership increase: None reported</span>}
-                </td>
+        {groupedPositions.map(([assetType, group]) => (
+          <tbody key={assetType}>
+            {groupedPositions.length > 1 ? (
+              <tr className="holdings-group-header">
+                <td colSpan={11}>{assetType.replaceAll("_", " ")} ({group.length})</td>
               </tr>
-            );
-          })}
-        </tbody>
+            ) : null}
+            {group.map((position) => renderPositionRow(position))}
+          </tbody>
+        ))}
       </table>
       {detail ? <StockResearchDrawer position={detail.position} research={detail.researchInstrumentId ? portfolioResearch?.companies.find((company) => company.instrumentId === detail.researchInstrumentId) : researchFor(detail.position)} onUpdateDisplayName={onUpdateDisplayName} onClose={() => setDetail(null)} /> : null}
     </div>
@@ -3446,6 +3646,161 @@ function StockResearchDrawer({ position, watchlistItem, research, onUpdateDispla
         <section><h3>News</h3>{market?.news?.length ? market.news.map((article) => <article key={article.url}><strong>{article.headline}</strong><p>{article.publisher} · {article.publishedAt ? new Date(article.publishedAt).toLocaleString() : "Date unavailable"}</p><a href={article.url} target="_blank" rel="noreferrer">Open source</a></article>) : <p>No public provider news available.</p>}</section>
         <section><h3>Research & Evidence</h3><p>Status: {research?.status?.replaceAll("_", " ") ?? "Awaiting research"}; {research?.sourceDiversity?.domainsFound ?? 0} unique domains, {research?.sourceDiversity?.exchangeSources ?? 0} exchange sources, {research?.sourceDiversity?.companySources ?? 0} company sources, {research?.sourceDiversity?.secondarySources ?? 0} secondary sources.</p>{research?.latestEvent ? <a href={research.latestEvent.sourceUrl} target="_blank" rel="noreferrer">Latest evidence source</a> : null}</section>
       </aside>
+    </div>
+  );
+}
+
+type DonutSegment = { label: string; value: number; amount?: number; color: string };
+
+const ALLOCATION_CATEGORICAL_PALETTE = [
+  "var(--primary)", "var(--info)", "var(--positive)", "var(--warning)",
+  "var(--negative)", "var(--primary-strong)", "var(--text-soft)", "var(--line-strong)"
+];
+
+function Donut({ segments, size = 176, thickness = 26 }: { segments: DonutSegment[]; size?: number; thickness?: number }) {
+  const total = segments.reduce((sum, segment) => sum + segment.value, 0);
+  const radius = (size - thickness) / 2;
+  const circumference = 2 * Math.PI * radius;
+  let offsetAcc = 0;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" aria-label="Allocation donut chart">
+      <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="var(--line)" strokeWidth={thickness} />
+      <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
+        {total > 0 ? segments.filter((segment) => segment.value > 0).map((segment, index) => {
+          const fraction = segment.value / total;
+          const dash = fraction * circumference;
+          const node = (
+            <circle
+              key={`${segment.label}-${index}`}
+              cx={size / 2} cy={size / 2} r={radius}
+              fill="none" stroke={segment.color} strokeWidth={thickness}
+              strokeDasharray={`${dash} ${Math.max(circumference - dash, 0)}`}
+              strokeDashoffset={-offsetAcc}
+              strokeLinecap={segments.length > 1 ? "butt" : "round"}
+            >
+              <title>{`${segment.label}: ${segment.value.toFixed(1)}%`}</title>
+            </circle>
+          );
+          offsetAcc += dash;
+          return node;
+        }) : null}
+      </g>
+      <text x="50%" y="50%" textAnchor="middle" dominantBaseline="central" className="donut-center-label">
+        {total > 0 ? `${total.toFixed(0)}%` : "N/A"}
+      </text>
+    </svg>
+  );
+}
+
+type AllocationDonutMode = "ASSET_CLASS" | "SECTOR" | "PNL";
+
+/**
+ * Three mandatory donut modes (asset class / sector / P&L) over a shared
+ * Donut renderer. Asset-class and sector slices come straight from
+ * PortfolioSummary.allocation, which the backend derives from verified
+ * instrument metadata (never guessed from a company's name). The P&L mode
+ * cannot reuse that shape: a signed gain/loss cannot be an ordinary positive
+ * allocation slice, so it instead measures each bucket's share of invested
+ * capital (market value where priced, cost basis where not) held in
+ * winning vs. losing vs. flat vs. unpriced positions, and always shows the
+ * exact amounts and counts next to the chart, never just percentages.
+ */
+function AllocationDonutPanel({ summary, positions }: { summary: PortfolioSummary | null; positions: PortfolioPosition[] }) {
+  const [mode, setMode] = useState<AllocationDonutMode>("ASSET_CLASS");
+  const [pnlBasis, setPnlBasis] = useState<"MARKET_VALUE" | "COST_BASIS">("MARKET_VALUE");
+  const currency = summary?.baseCurrency ?? "";
+
+  const unvaluedPositionCount = positions.filter((position) => position.marketValue == null).length;
+  const coverageNote = unvaluedPositionCount > 0 && mode !== "PNL"
+    ? `${unvaluedPositionCount} of ${positions.length} position${positions.length === 1 ? "" : "s"} have no current market price; market-value percentages below reflect the remaining priced positions only.`
+    : null;
+
+  let segments: DonutSegment[];
+  let methodology: string;
+
+  if (mode === "PNL") {
+    let gainAmount = 0, lossAmount = 0, flatAmount = 0, unvaluedAmount = 0;
+    let gainCount = 0, lossCount = 0, flatCount = 0, unvaluedCount = 0;
+    for (const position of positions) {
+      const basisAmount = pnlBasis === "MARKET_VALUE" ? position.marketValue?.amount : position.costBasis.amount;
+      if (basisAmount == null || position.unrealizedProfitLoss == null) {
+        unvaluedAmount += position.costBasis.amount;
+        unvaluedCount += 1;
+        continue;
+      }
+      const pnl = position.unrealizedProfitLoss.amount;
+      if (pnl > 0) { gainAmount += basisAmount; gainCount += 1; }
+      else if (pnl < 0) { lossAmount += basisAmount; lossCount += 1; }
+      else { flatAmount += basisAmount; flatCount += 1; }
+    }
+    const denominator = gainAmount + lossAmount + flatAmount + unvaluedAmount;
+    const pct = (amount: number) => denominator > 0 ? (amount / denominator) * 100 : 0;
+    segments = [
+      { label: `Gaining (${gainCount})`, value: pct(gainAmount), amount: gainAmount, color: "var(--positive)" },
+      { label: `Losing (${lossCount})`, value: pct(lossAmount), amount: lossAmount, color: "var(--negative)" },
+      { label: `Flat (${flatCount})`, value: pct(flatAmount), amount: flatAmount, color: "var(--text-soft)" },
+      { label: `Unvalued (${unvaluedCount})`, value: pct(unvaluedAmount), amount: unvaluedAmount, color: "var(--line-strong)" }
+    ];
+    methodology = `Share of invested capital (${pnlBasis === "MARKET_VALUE" ? "market value where priced, cost basis where not yet priced" : "acquisition cost"}) held in winning vs. losing positions -- a measure chosen because signed gains and losses cannot be shown as ordinary positive allocation slices.`;
+  } else {
+    const source = mode === "ASSET_CLASS" ? summary?.allocation.assetType : summary?.allocation.sector;
+    const entries = Object.entries(source ?? {}).sort(([, a], [, b]) => b - a);
+    segments = entries.map(([label, value], index) => ({
+      label: mode === "ASSET_CLASS" ? label.replaceAll("_", " ") : label,
+      value,
+      color: ALLOCATION_CATEGORICAL_PALETTE[index % ALLOCATION_CATEGORICAL_PALETTE.length]
+    }));
+    methodology = mode === "ASSET_CLASS"
+      ? "Share of market value by verified instrument asset type."
+      : "Share of market value by verified instrument sector metadata; never inferred from a company's name.";
+  }
+
+  return (
+    <div className="allocation-donut-panel">
+      <div className="allocation-mode-tabs" role="tablist" aria-label="Allocation breakdown mode">
+        {([["ASSET_CLASS", "Asset class"], ["SECTOR", "Sector"], ["PNL", "Profit / Loss"]] as const).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            role="tab"
+            aria-selected={mode === value}
+            className={mode === value ? "allocation-mode-tab allocation-mode-tab-active" : "allocation-mode-tab"}
+            onClick={() => setMode(value)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {mode === "PNL" ? (
+        <label className="sort-control allocation-basis-control">
+          <span>Basis</span>
+          <select value={pnlBasis} onChange={(event) => setPnlBasis(event.target.value as "MARKET_VALUE" | "COST_BASIS")}>
+            <option value="MARKET_VALUE">Market value</option>
+            <option value="COST_BASIS">Acquisition cost</option>
+          </select>
+        </label>
+      ) : null}
+      {segments.length === 0 || segments.every((segment) => segment.value === 0 && (segment.amount ?? 0) === 0) ? (
+        <p className="broker-note">No allocation data available for this breakdown.</p>
+      ) : (
+        <div className="allocation-donut-body">
+          <Donut segments={segments} />
+          <ul className="allocation-legend">
+            {segments.filter((segment) => segment.value > 0 || (segment.amount ?? 0) > 0).map((segment) => (
+              <li key={segment.label}>
+                <span className="allocation-legend-swatch" style={{ background: segment.color }} aria-hidden="true" />
+                <span className="allocation-legend-label">{segment.label}</span>
+                <span className="allocation-legend-value">
+                  {segment.value.toFixed(1)}%
+                  {segment.amount != null ? ` · ${formatMoney(segment.amount, currency)}` : ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <p className="allocation-methodology">{methodology}</p>
+      {coverageNote ? <p className="broker-note">{coverageNote}</p> : null}
     </div>
   );
 }
@@ -3732,6 +4087,186 @@ function researchCompanyName(position: PortfolioPosition, resolved?: PortfolioRe
     if (parsed) return parsed;
   }
   return ticker || instrument.brokerSymbol?.trim() || "Unknown company";
+}
+
+/**
+ * A genuinely dedicated Watchlist page -- unlike the generic ResearchView
+ * (built for Portfolio holdings / ad-hoc Search research and shared across
+ * those two contexts), this component's only job is presenting ONE
+ * watchlist's own membership: a selector, an overview header, and a
+ * compact instrument table. It never shows portfolio holdings as
+ * watchlist membership (it only ever reads watchlistResearch.instruments,
+ * never positions), and it renders the watchlist's name exactly once (in
+ * the overview header) rather than repeating it per row or in a second
+ * nav element.
+ */
+function WatchlistWorkspace({
+  watchlists,
+  researchContext,
+  watchlistResearch,
+  watchlistResearchLoading,
+  watchlistResearchError,
+  watchlistActionError,
+  selectedResearchInstrumentId,
+  onSelectInstrument,
+  onSelectWatchlist,
+  onOpenRegional,
+  onRemoveInstrument,
+  watchlistMutation
+}: {
+  watchlists: ResearchWatchlist[];
+  researchContext: ResearchContext;
+  watchlistResearch: WatchlistResearchPresentation | null;
+  watchlistResearchLoading: boolean;
+  watchlistResearchError: string | null;
+  watchlistActionError: string | null;
+  selectedResearchInstrumentId: string;
+  onSelectInstrument: (value: string) => void;
+  onSelectWatchlist: (watchlistId: string) => void;
+  onOpenRegional: (region: SectorPerformance["region"]) => void;
+  onRemoveInstrument: (globalInstrumentId: string) => void;
+  watchlistMutation: string | null;
+}) {
+  const [detailInstrumentId, setDetailInstrumentId] = useState<string | null>(null);
+  const hasSelection = researchContext.kind === "WATCHLIST" || researchContext.kind === "WATCHLIST_PENDING";
+  const instruments = watchlistResearch?.instruments ?? [];
+  const detailItem = detailInstrumentId
+    ? instruments.find((item) => item.globalInstrumentId === detailInstrumentId) ?? null
+    : null;
+
+  function openDetail(item: WatchlistResearchInstrument) {
+    onSelectInstrument(item.globalInstrumentId);
+    setDetailInstrumentId(item.globalInstrumentId);
+  }
+
+  return (
+    <div className="watchlist-workspace">
+      <aside className="watchlist-sidebar" aria-label="My watchlists">
+        <div className="panel-header compact"><h2>My Watchlists</h2></div>
+        {watchlists.length === 0 ? (
+          <p className="broker-note">No watchlists yet. Use a regional shortcut below to create one.</p>
+        ) : (
+          <ul className="watchlist-select-list">
+            {watchlists.map((list) => (
+              <li key={list.watchlistId}>
+                <button
+                  type="button"
+                  className={researchContext.kind === "WATCHLIST" && researchContext.watchlistId === list.watchlistId ? "sidebar-portfolio-item sidebar-portfolio-item-active" : "sidebar-portfolio-item"}
+                  onClick={() => onSelectWatchlist(list.watchlistId)}
+                >
+                  <span>{list.name}</span>
+                  <span className="watchlist-count-badge">{list.instrumentCount}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="button-row" role="group" aria-label="Regional watchlists">
+          {(["INDIA", "USA", "EUROPE"] as const).map((region) => (
+            <Button key={region} variant="secondary" onClick={() => onOpenRegional(region)}>{regionalWatchlistName(region)}</Button>
+          ))}
+        </div>
+        {watchlistActionError ? <p role="alert">{watchlistActionError}</p> : null}
+      </aside>
+
+      <div className="watchlist-main">
+        {!hasSelection ? (
+          <Card className="wide-panel">
+            <EmptyState
+              title="No watchlist selected"
+              message="Pick a watchlist on the left, or use a regional shortcut, to see its instruments here."
+            />
+          </Card>
+        ) : (
+          <>
+            <Card className="wide-panel watchlist-overview">
+              <div className="panel-header compact">
+                <div>
+                  <p className="eyebrow">{researchContext.region} watchlist</p>
+                  <h2>{researchContext.name}</h2>
+                </div>
+                <Badge tone="info">
+                  {watchlistResearchLoading ? "Loading…" : `${instruments.length} instrument${instruments.length === 1 ? "" : "s"}`}
+                </Badge>
+              </div>
+              {watchlistResearchError ? <p className="research-refresh-notice" role="alert">{watchlistResearchError}</p> : null}
+            </Card>
+
+            <Card className="wide-panel">
+              {researchContext.kind === "WATCHLIST_PENDING" || watchlistResearchLoading ? (
+                <Skeleton rows={4} />
+              ) : instruments.length === 0 ? (
+                <EmptyState
+                  title="This watchlist is empty"
+                  message="Search for a company in Research and add it to this watchlist, or use a regional shortcut to populate one automatically."
+                />
+              ) : (
+                <div className="table-frame">
+                  <table className="watchlist-instrument-table">
+                    <thead>
+                      <tr>
+                        <th>Company</th>
+                        <th>Price</th>
+                        <th>Market return</th>
+                        <th>Signal</th>
+                        <th>Research status</th>
+                        <th aria-label="Actions" />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {instruments.map((item) => {
+                        const company = item.company;
+                        const price = item.marketData?.quote?.last?.amount ?? item.marketData?.snapshot?.price ?? null;
+                        const currency = item.marketData?.quote?.currency ?? item.marketData?.snapshot?.currency ?? item.currency ?? undefined;
+                        const tone = performanceRowTone(item.sourcePerformancePct);
+                        return (
+                          <tr
+                            key={item.globalInstrumentId}
+                            className={selectedResearchInstrumentId === item.globalInstrumentId ? "watchlist-row-active" : undefined}
+                            onClick={() => openDetail(item)}
+                            aria-current={selectedResearchInstrumentId === item.globalInstrumentId ? "true" : undefined}
+                          >
+                            <td>
+                              <button className="security-button" type="button" onClick={(event) => { event.stopPropagation(); openDetail(item); }}>
+                                <strong>{company.companyName}</strong>
+                                <span>{[company.ticker, company.exchange].filter(Boolean).join(" / ") || "No ticker"}</span>
+                              </button>
+                            </td>
+                            <td>{price == null ? "N/A" : formatMoney(Number(price), currency)}</td>
+                            <td className={`${tone}-text`}>
+                              {item.sourcePeriod ? `${formatSignedPerformancePct(item.sourcePerformancePct)} (${item.sourcePeriod})` : "N/A"}
+                            </td>
+                            <td><Badge tone={valuationTone(company.valuation?.state)}>{(company.valuation?.state ?? "UNKNOWN").replaceAll("_", " ")}</Badge></td>
+                            <td><Badge tone={researchStatusTone(company.status ?? "")}>{(company.status ?? "UNAVAILABLE").replaceAll("_", " ")}</Badge></td>
+                            <td>
+                              <Button
+                                variant="secondary"
+                                disabled={watchlistMutation !== null}
+                                onClick={(event) => { event.stopPropagation(); onRemoveInstrument(item.globalInstrumentId); }}
+                              >
+                                Remove
+                              </Button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </Card>
+          </>
+        )}
+      </div>
+      {detailItem ? (
+        <StockResearchDrawer
+          watchlistItem={detailItem}
+          research={detailItem.company}
+          onClose={() => setDetailInstrumentId(null)}
+        />
+      ) : null}
+    </div>
+  );
 }
 
 function ResearchView({
@@ -4042,7 +4577,7 @@ function ResearchView({
                   <span role="cell">
                     <strong>{company.companyName} <span className={`research-status-dot research-status-${researchStatusTone(companyStatus)}`} role="img" aria-label={researchStatusDescription(companyStatus)} title={researchStatusDescription(companyStatus)} /></strong>
                     <small>{[company.ticker, company.exchange, company.isin].filter(Boolean).join(" / ")}</small>
-                    <small>{researchContext.name} · Public company research · Not held</small>
+                    <small>Public company research · Not held</small>
                   </span>
                   <span role="cell">
                     {watchlistPrice == null

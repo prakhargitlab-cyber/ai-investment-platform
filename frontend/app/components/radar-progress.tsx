@@ -44,9 +44,48 @@ function statusLabel(status: string): string {
 
 export type RadarProgressCounter = { label: string; value: number | null };
 
+/**
+ * Presentational-only pipeline breadcrumb for the Equity radar
+ * (BASELINE -> CANDIDATE_SELECTION -> DEEP -> Ranking & publication).
+ * Never shown for ETF (which has no `phase` concept -- see etf-radar.tsx,
+ * where this is intentionally never passed). The final "Ranking &
+ * publication" step is only ever marked reached once the cycle's real
+ * lifecycle status is COMPLETED -- it is a label for a state the backend
+ * already confirmed, never a fabricated phase value.
+ */
+const EQUITY_PIPELINE_STAGES: { id: string; label: string }[] = [
+  { id: "BASELINE", label: "Baseline" },
+  { id: "CANDIDATE_SELECTION", label: "Candidate selection" },
+  { id: "DEEP", label: "Deep analysis" },
+  { id: "RANKING", label: "Ranking & publication" },
+];
+
+function EquityPipelineSteps({ phase, status }: { phase: string; status: string }) {
+  const reachedRanking = status === "COMPLETED";
+  const currentIndex = reachedRanking ? EQUITY_PIPELINE_STAGES.length - 1
+    : EQUITY_PIPELINE_STAGES.findIndex((stage) => stage.id === phase);
+  return (
+    <div className="radar-pipeline-steps" aria-label="Equity radar pipeline stage">
+      {EQUITY_PIPELINE_STAGES.map((stage, index) => {
+        const state = currentIndex < 0 ? "" : index < currentIndex ? "radar-pipeline-step-done"
+          : index === currentIndex ? "radar-pipeline-step-active" : "";
+        return (
+          <span key={stage.id}>
+            <span className={`radar-pipeline-step ${state}`} aria-current={index === currentIndex ? "step" : undefined}>
+              {stage.label}
+            </span>
+            {index < EQUITY_PIPELINE_STAGES.length - 1 ? <span className="radar-pipeline-sep" aria-hidden="true">-&gt;</span> : null}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 export function RadarProgressPanel({
   radarType,
   cycleId,
+  showCycleId = true,
   status,
   startedAt,
   updatedAt,
@@ -59,6 +98,7 @@ export function RadarProgressPanel({
 }: {
   radarType: "Equity" | "ETF";
   cycleId: string;
+  showCycleId?: boolean;
   status: string;
   startedAt: string | null;
   updatedAt: string | null;
@@ -82,8 +122,11 @@ export function RadarProgressPanel({
     <div className={`radar-progress-panel radar-progress-${tone}`} role="status" aria-live="polite">
       <div className="radar-progress-heading">
         <strong>{radarType} radar · {statusLabel(status)}</strong>
-        <small>Cycle {cycleId}</small>
+        {showCycleId ? <small>Cycle {cycleId}</small> : null}
       </div>
+      {radarType === "Equity" && phase ? (
+        <EquityPipelineSteps phase={phase} status={status} />
+      ) : null}
       {!terminal && radarType === "Equity" && status !== "CANCEL_REQUESTED" ? <p>{phase === "DEEP"
         ? "Deep investigation ? progress covers admitted candidates only."
         : phase === "CANDIDATE_SELECTION" ? "Candidate selection ? selecting instruments for deep investigation."

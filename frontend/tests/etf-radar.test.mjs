@@ -128,57 +128,77 @@ test('ETF radar content renders one card per ranked candidate', () => {
       ranked: [candidate(), candidate({ global_instrument_id: 'id-2', symbol: 'GOLDBEES', rank: 2 })],
       excluded_by_reason: {},
     },
+    initialTab: 'screener',
   }));
   assert.equal((html.match(/class="opportunity-card etf-radar-card"/g) ?? []).length, 2);
   assert.match(html, /GOLDBEES/);
 });
 
-test('Dashboard tabs: RadarTabs is used in place of OpportunityRadar at every Equity Radar call site', () => {
+test('Dashboard embeds still use RadarTabs; the dedicated Equity/ETF Radar workspaces use their own components directly, never duplicated', () => {
+  // Dashboard-level embeds (the loading/error fallback and the compact
+  // shortcut inside DashboardView / MultiPortfolioDashboard) are unchanged --
+  // still RadarTabs, so the Equity/ETF tab switch inside the Dashboard embed
+  // behaves exactly as it always did.
   assert.match(workspaceSource, /import \{ RadarTabs \} from "\.\/radar-tabs";/);
-  assert.doesNotMatch(workspaceSource, /import \{ OpportunityRadar \} from "\.\/opportunity-radar";/);
-  // Every former <OpportunityRadar ... /> render call site is now a RadarTabs call.
-  assert.doesNotMatch(workspaceSource, /<OpportunityRadar\b/);
   const radarTabsCallSites = workspaceSource.match(/<RadarTabs\b/g) ?? [];
   assert.ok(radarTabsCallSites.length >= 3, `expected >=3 RadarTabs call sites, found ${radarTabsCallSites.length}`);
+
+  // The dedicated "Equity Radar" / "ETF Radar" sidebar workspaces (added so
+  // each radar is a first-class, directly navigable page rather than only
+  // reachable through the Dashboard embed) render OpportunityRadar/EtfRadar
+  // directly -- exactly once each, never re-wrapped in another RadarTabs
+  // switcher (that would nest a redundant Equity/ETF toggle inside a
+  // sidebar entry that already made the choice).
+  assert.match(workspaceSource, /import \{ OpportunityRadar \} from "\.\/opportunity-radar";/);
+  assert.match(workspaceSource, /import \{ EtfRadar \} from "\.\/etf-radar";/);
+  const opportunityRadarCallSites = workspaceSource.match(/<OpportunityRadar\b/g) ?? [];
+  assert.equal(opportunityRadarCallSites.length, 1, `expected exactly 1 direct <OpportunityRadar> call site, found ${opportunityRadarCallSites.length}`);
+  const etfRadarCallSites = workspaceSource.match(/<EtfRadar\b/g) ?? [];
+  assert.equal(etfRadarCallSites.length, 1, `expected exactly 1 direct <EtfRadar> call site, found ${etfRadarCallSites.length}`);
+  assert.match(workspaceSource, /view === "equity-radar" \?/);
+  assert.match(workspaceSource, /view === "etf-radar" \?/);
 });
 
-test('RadarTabs renders both tab buttons and defaults to the Equity Radar tab', () => {
+test('RadarTabs is a lightweight Dashboard summary: one-shot reads, no full radar terminal mounted', () => {
+  // Dashboard cards must stay useful without pulling in OpportunityRadar's/
+  // EtfRadar's full tabbed research terminals (search, filters, run/cancel
+  // controls, continuous 2.5s polling) -- that belongs only to the
+  // dedicated, directly-navigable Equity/ETF Radar pages.
+  assert.doesNotMatch(radarTabsSource, /import \{ OpportunityRadar \} from "\.\/opportunity-radar";/);
+  assert.doesNotMatch(radarTabsSource, /import \{ EtfRadar \} from "\.\/etf-radar";/);
   assert.match(radarTabsSource, /Equity Radar/);
   assert.match(radarTabsSource, /ETF Radar/);
-  assert.match(radarTabsSource, /useState<"equity" \| "etf">\("equity"\)/);
-  // Equity Radar's own component is imported unmodified, never re-implemented here.
-  assert.match(radarTabsSource, /import \{ OpportunityRadar \} from "\.\/opportunity-radar";/);
-  assert.match(radarTabsSource, /import \{ EtfRadar \} from "\.\/etf-radar";/);
+  assert.match(radarTabsSource, /Open Equity Radar/);
+  assert.match(radarTabsSource, /Open ETF Radar/);
 });
 
-// -- Dashboard tab isolation closure -----------------------------------------
-//
-// This repo's frontend test harness (ts.transpileModule + renderToStaticMarkup)
-// never runs React effects or state updates -- renderToStaticMarkup is a pure,
-// one-shot synchronous render, so it cannot drive a live loading -> ready/error
-// transition or a real tab switch. These tests instead prove the STRUCTURAL
-// guarantee that makes cross-tab leakage impossible in the first place:
-// RadarTabs mounts exactly one radar component at a time via a plain ternary
-// (never both, never a CSS-hidden second copy), so each tab's loading/error/
-// result state is that component's own useState -- destroyed on unmount and
-// freshly re-initialized on remount, with nothing shared in between.
-
-test('RadarTabs mounts exactly one radar at a time via a ternary, never a CSS-hide pattern', () => {
-  const ternaries = radarTabsSource.match(/\{tab === "equity" \? <OpportunityRadar[\s\S]*?: <EtfRadar \/>\}/g) ?? [];
-  assert.equal(ternaries.length, 1, 'expected exactly one equity/etf render ternary');
-  // Never both rendered simultaneously with visibility toggled by CSS/style
-  // (that would leak state across tabs even while visually hidden).
-  assert.doesNotMatch(radarTabsSource, /display:\s*none/);
-  assert.doesNotMatch(radarTabsSource, /hidden=\{tab/);
+test('RadarTabs polls boundedly only while a cycle is running, stops at terminal, and cleans up its timer on unmount', () => {
+  // Bounded self-scheduling poll (setTimeout re-armed from inside its own
+  // .then, exactly like the dedicated Radar pages' own pattern), never a
+  // raw setInterval that would keep firing after unmount or after terminal.
+  assert.match(radarTabsSource, /pollTimer = useRef<ReturnType<typeof setTimeout> \| null>\(null\);/);
+  assert.doesNotMatch(radarTabsSource, /setInterval/);
+  // Polling stops once the cycle reaches a terminal status.
+  assert.match(radarTabsSource, /if \(isTerminalRadarStatus\(value\.status\)\) \{/);
+  // Timer is cleared on unmount via the effect cleanup.
+  assert.match(radarTabsSource, /return \(\) => \{ active = false; if \(pollTimer\.current\) clearTimeout\(pollTimer\.current\); \};/);
+  // Slower than the dedicated page's own 2.5s poll, to reduce (not fully
+  // eliminate) the chance both race on the exact same tick when open together.
+  assert.match(radarTabsSource, /DASHBOARD_RADAR_SUMMARY_POLL_MS = 6000/);
 });
 
-test('RadarTabs holds no loading/error/result state of its own that could leak between tabs', () => {
-  // The only state RadarTabs itself owns is which tab is selected; all
-  // loading/error/result state lives inside OpportunityRadar/EtfRadar,
-  // which RadarTabs never reads or threads between each other.
-  const stateDeclarations = radarTabsSource.match(/useState(<[^>]*>)?\(/g) ?? [];
-  assert.equal(stateDeclarations.length, 1, `expected exactly one useState in RadarTabs, found ${stateDeclarations.length}`);
-  assert.match(radarTabsSource, /useState<"equity" \| "etf">\("equity"\)/);
+test('RadarTabs reuses the Radar type/normalizer and the existing lightweight status endpoints, never a bespoke heavy fetch', () => {
+  assert.match(radarTabsSource, /import \{ normalizeRadar, type Radar \} from "\.\/opportunity-radar";/);
+  assert.match(radarTabsSource, /import type \{ EtfCycleResult \} from "\.\/etf-radar";/);
+  assert.match(radarTabsSource, /\/api\/v1\/research\/opportunities\/current/);
+  assert.match(radarTabsSource, /\/api\/v1\/etf-radar\/current/);
+  assert.match(radarTabsSource, /\/api\/v1\/research\/opportunities\/cycles\/\$\{cycleId\}\/status/);
+  assert.match(radarTabsSource, /\/api\/v1\/etf-radar\/cycles\/\$\{cycleId\}\/status/);
+});
+
+test('RadarTabs navigates to the dedicated pages via callbacks rather than mounting them inline', () => {
+  assert.match(radarTabsSource, /onOpenEquityRadar/);
+  assert.match(radarTabsSource, /onOpenEtfRadar/);
 });
 
 test('switching tabs cannot target the wrong radar\'s refresh action: "Run full NSE ETF Radar" is scoped to etf-radar.tsx only', () => {
@@ -223,16 +243,18 @@ for (const [disposition, reason, message] of [
   ['INELIGIBLE', 'FAILED_NSE_ETF_ACTIVE_PREFILTER', /Review the evaluation and exclusion counts/],
 ]) {
   test(`empty ETF rankings distinguish ${disposition} and expose reasons`, () => {
-    const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: {
+    const dataShape = {
       cycle_id: 'legacy', as_of: '2026-10-11T12:00:00Z',
       candidates: [candidate({ disposition, reason, recommendation: null })], ranked: [],
       excluded_by_reason: { [reason]: 1 },
-    } }));
-    assert.match(html, message);
-    assert.match(html, new RegExp(reason));
-    assert.match(html, /Universe size<\/dt><dd>1/);
-    assert.match(html, /Evaluated ETFs<\/dt><dd>0/);
-    assert.doesNotMatch(html, /No ETF currently ranks as a qualifying opportunity/);
+    };
+    const overviewHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: dataShape }));
+    assert.match(overviewHtml, message);
+    assert.match(overviewHtml, /Universe size<\/dt><dd>1/);
+    assert.match(overviewHtml, /Evaluated ETFs<\/dt><dd>0/);
+    assert.doesNotMatch(overviewHtml, /No ETF currently ranks as a qualifying opportunity/);
+    const qualityHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: dataShape, initialTab: 'quality' }));
+    assert.match(qualityHtml, new RegExp(reason));
   });
 }
 
@@ -250,21 +272,32 @@ test('ETF ranks are not represented as qualifying opportunities', () => {
 
 test('Full universe coverage and peer ranks remain distinct from shortlist size', () => {
   const item = candidate({ peer_group: 'GOLD' });
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: {
+  const dataShape = {
     cycle_id: 'full', as_of: '2026-10-11T12:00:00Z', scope: 'FULL_OFFICIAL_NSE_ETF',
     universe_count: 352, candidates: [item], ranked: [item], excluded_by_reason: {},
     coverage: { official: 352, attempted: 352, acquired: 351, ranked: 1, shortlisted: 1 },
-  } }));
-  assert.match(html, /official<\/dt><dd>352/);
-  assert.match(html, /GOLD: peer rank 1/);
-  assert.match(html, /Rankings compare verified peers only/);
+  };
+  const overviewHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: dataShape }));
+  assert.match(overviewHtml, /Rankings compare verified peers only/);
+  const qualityHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: dataShape, initialTab: 'quality' }));
+  assert.match(qualityHtml, /official<\/dt><dd>352/);
+  const screenerHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: dataShape, initialTab: 'screener' }));
+  assert.match(screenerHtml, /GOLD: peer rank 1/);
 });
 
-test('Regular ETF action targets full universe, not the five-ID smoke endpoint', () => {
+test('Regular (full-universe) ETF action and the bounded admin action each target only their own endpoint', () => {
   const source = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
-  assert.match(source, /etf-radar\/full-universe-cycles/);
-  assert.doesNotMatch(source, /controlled-cycles/);
+  // The full-universe runCycle() action still only ever posts to its own endpoint.
+  const runCycleBody = source.slice(source.indexOf('const runCycle = ()'), source.indexOf('const running ='));
+  assert.match(runCycleBody, /etf-radar\/full-universe-cycles/);
+  assert.doesNotMatch(runCycleBody, /controlled-cycles/);
   assert.doesNotMatch(source, /top_n: 10/);
+  // The separate bounded admin action (checkBoundedPreflight/submitBoundedCycle)
+  // only ever uses /preflight and /controlled-cycles, never full-universe-cycles.
+  const boundedBody = source.slice(source.indexOf('const checkBoundedPreflight ='), source.indexOf('const terminalData ='));
+  assert.match(boundedBody, /etf-radar\/preflight/);
+  assert.match(boundedBody, /etf-radar\/controlled-cycles/);
+  assert.doesNotMatch(boundedBody, /full-universe-cycles/);
 });
 
 
@@ -277,4 +310,20 @@ test('ETF opportunity cards disclose gaps, valuation dates and actual source ref
   assert.match(html, /Corporate-action adjustments unavailable/);
   assert.match(html, /2026-10-09/);
   assert.match(html, /https:\/\/www.nseindia.com/);
+});
+
+test('ETF Radar result tabs mount only the active panel -- true conditional unmount, never a CSS-hide pattern', () => {
+  const etfRadarSource = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
+  assert.doesNotMatch(etfRadarSource, /hidden=\{tab/);
+  const ternaries = etfRadarSource.match(/\{tab === "[a-z]+" \? \(<div className="radar-tab-panel">/g) ?? [];
+  assert.equal(ternaries.length, 7, `expected 7 tab ternaries (overview/top/leaders/universe/screener/compare/quality), found ${ternaries.length}`);
+  const item = candidate();
+  const data = {
+    cycle_id: 'c1', as_of: '2026-10-11T12:00:00Z', candidates: [item], ranked: [item],
+    top_opportunities: [item], excluded_by_reason: {},
+  };
+  const overviewHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'overview' }));
+  assert.doesNotMatch(overviewHtml, /class="opportunity-card etf-radar-card"/);
+  const topHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'top' }));
+  assert.match(topHtml, /class="opportunity-card etf-radar-card"/);
 });

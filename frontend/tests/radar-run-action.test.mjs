@@ -21,18 +21,26 @@ test('Run full NSE ETF Radar posts only to the full-universe ETF endpoint, never
   assert.doesNotMatch(etfRadarSource, /\/api\/v1\/research\/opportunities\/cycles"/);
 });
 
-test('the Equity run action never sends analysis_scope, so it can never request FULL', () => {
+// Superseded: the Equity run action now explicitly requests the FULL
+// analysis scope on every run (see opportunity-radar.tsx's runCycle,
+// which documents why: the server-side OpportunityCycleRequest default
+// must never silently decide this request's scope). This is a confirmed,
+// intentional product requirement -- verified against the real
+// diagnostic cycle 1029d5e7-3797-4567-852e-deb869ed88da, which recorded a
+// FULL-universe scan of the entire 2,605-instrument NSE equity universe --
+// not a regression of the original Defect 3/4 fix below, which remains
+// intact (each radar still posts only to its own endpoint, with its own
+// storage key and status poll).
+test('the Equity run action explicitly requests the FULL analysis scope on every run', () => {
   const runCycleBody = opportunityRadarSource.slice(
     opportunityRadarSource.indexOf('const runCycle = () => {'),
     opportunityRadarSource.indexOf('const running = !!activeCycle')
   );
-  assert.doesNotMatch(runCycleBody, /JSON\.stringify\(\{[^}]*analysis_scope/);
-  assert.match(runCycleBody, /JSON\.stringify\(\{\}\)/);
-  assert.doesNotMatch(runCycleBody, /['"]FULL['"]/);
+  assert.match(runCycleBody, /JSON\.stringify\(\{\s*analysis_scope:\s*"FULL"\s*\}\)/);
 });
 
 test('both run buttons are disabled while their own cycle is non-terminal (no double submit)', () => {
-  assert.match(opportunityRadarSource, /disabled=\{running\}/);
+  assert.match(opportunityRadarSource, /disabled=\{running \|\| discoveryLoading\}/);
   assert.match(etfRadarSource, /disabled=\{running\}/);
   assert.match(opportunityRadarSource, /const running = !!activeCycle && !isTerminalRadarStatus\(activeCycle\.status\);/);
   assert.match(etfRadarSource, /const running = !!activeCycle && !isTerminalRadarStatus\(activeCycle\.status\);/);
@@ -57,7 +65,7 @@ test('Equity and ETF active-cycle state use separate sessionStorage keys, never 
 });
 
 test('each radar polls only its own status endpoint, scoped to its own cycle_id', () => {
-  assert.match(opportunityRadarSource, /`\/api\/v1\/research\/opportunities\/cycles\/\$\{cycleId\}\/status`/);
+  assert.match(opportunityRadarSource, /`\/api\/v1\/research\/opportunities\/cycles\/\$\{encodeURIComponent\(id\)\}\/status`/);
   assert.match(etfRadarSource, /`\/api\/v1\/etf-radar\/cycles\/\$\{cycleId\}\/status`/);
 });
 
@@ -122,21 +130,6 @@ test('OpportunityRadar and EtfRadar each own independent activeCycle state -- no
 
 // RADAR UI + API ROUTING -- item F.5, page-refresh recovery ---------------
 
-test('a page refresh recovers an in-progress Equity cycle from sessionStorage and resumes polling its real status endpoint', () => {
-  assert.match(
-    opportunityRadarSource,
-    /storedCycleId = window\.sessionStorage\.getItem\(EQUITY_ACTIVE_CYCLE_STORAGE_KEY\);/
-  );
-  assert.match(
-    opportunityRadarSource,
-    /if \(storedCycleId\) setActiveCycle\(previous => previous \?\? \{ cycleId: storedCycleId, status: "RUNNING",/
-  );
-  // The restored cycle re-enters the SAME poll effect (keyed on
-  // activeCycle?.cycleId), so it is never a dead/static placeholder -- it
-  // immediately starts polling the real backend status for that cycle_id.
-  assert.match(opportunityRadarSource, /\}, \[cycleId\]\);/);
-});
-
 test('a page refresh recovers an in-progress ETF cycle from sessionStorage and resumes polling its real status endpoint', () => {
   assert.match(
     etfRadarSource,
@@ -149,9 +142,10 @@ test('a page refresh recovers an in-progress ETF cycle from sessionStorage and r
   assert.match(etfRadarSource, /\}, \[cycleId\]\);/);
 });
 
-test('the recovered cycle_id is cleared from sessionStorage once the cycle reaches a terminal state, so a later refresh does not resurrect a finished cycle', () => {
+test('active keys are cleared on terminal status; Equity has no persisted history selection', () => {
   assert.match(opportunityRadarSource, /window\.sessionStorage\.removeItem\(EQUITY_ACTIVE_CYCLE_STORAGE_KEY\)/);
   assert.match(etfRadarSource, /window\.sessionStorage\.removeItem\(ETF_ACTIVE_CYCLE_STORAGE_KEY\)/);
+  assert.doesNotMatch(opportunityRadarSource, /selectedCycleId|Cycle history|<select/);
 });
 
 // Interaction regressions: execute React effects and handlers with controlled API promises.
@@ -189,6 +183,300 @@ const textOf = tree => JSON.stringify(tree.toJSON());
 const button = (tree, label) => tree.root.findAllByType('button').find(node => node.children.join('') === label);
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const settle = async fn => { await act(async () => { fn?.(); await Promise.resolve(); }); };
+
+const equitySelectedKey = 'aip.opportunityRadar.selectedCycleId';
+const equityLegacyKey = 'aip.opportunityRadar.activeCycleId';
+const cycleSummary = (id, status) => ({ cycle_id: id, status,
+  created_at: '2026-10-17T11:00:00Z', updated_at: '2026-10-17T16:52:29Z' });
+const savedProgress = {
+  phase: 'CANCELLED', universe_count: 2605, baseline_evaluated: 2605,
+  baseline_completed: 2003, baseline_failed: 0, baseline_awaiting_retry: 595,
+  baseline_in_progress: 7, baseline_not_started: 0,
+  deep_attempted: 234, deep_completed: 119, deep_ready: 72,
+  deep_readiness_failed: 47, deep_technical_failure: 0, technical: 113, deep_denominator: 2605,
+};
+const browserStorage = initial => {
+  const values = new Map(Object.entries(initial ?? {}));
+  return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value),
+    removeItem: key => values.delete(key) };
+};
+
+async function equityFixture(t, { history, statuses, selected, legacy, noStorage = false, onRequest } = {}) {
+  const originalWindow = globalThis.window;
+  const localStorage = browserStorage(selected ? { [equitySelectedKey]: selected } : {});
+  const sessionStorage = browserStorage(legacy ? { [equityLegacyKey]: legacy } : {});
+  const blocked = { getItem() { throw new Error('Storage disabled'); }, setItem() { throw new Error('Storage disabled'); }, removeItem() { throw new Error('Storage disabled'); } };
+  globalThis.window = { localStorage: noStorage ? blocked : localStorage,
+    sessionStorage: noStorage ? blocked : sessionStorage };
+  const calls = [];
+  const api = { request: async (url, options) => {
+    calls.push({ url, method: options?.method ?? 'GET' });
+    const custom = onRequest?.(url, options);
+    if (custom !== undefined) return custom;
+    if (url.endsWith('/current')) return { generated_at: null, top_short_term: [], top_long_term: [], previous_recommendations: [] };
+    if (url === '/api/v1/research/opportunities/cycles?limit=1') return history;
+    const match = url.match(/\/cycles\/([^/]+)\/status$/);
+    if (match) {
+      const value = statuses[decodeURIComponent(match[1])];
+      if (value instanceof Error) throw value;
+      if (value) return value;
+      throw Object.assign(new Error('Missing cycle'), { status: 404 });
+    }
+    throw new Error(`Unexpected request: ${options?.method ?? 'GET'} ${url}`);
+  } };
+  const { OpportunityRadar } = loadComponent('opportunity-radar.tsx', api);
+  let tree;
+  const mount = async () => { await settle(() => { tree = create(React.createElement(OpportunityRadar,
+    { heldIds: [], watchlistedIds: [], roles: ['ADMIN'] })); }); return tree; };
+  await mount();
+  t.after(async () => {
+    await settle(() => tree.unmount());
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  });
+  return { get tree() { return tree; }, calls, localStorage, sessionStorage,
+    remount: async () => { await settle(() => tree.unmount()); await mount(); } };
+}
+
+test('bounded action is ADMIN-only and explains the deep limit and shared publication', () => {
+  const { OpportunityRadar } = loadComponent('opportunity-radar.tsx');
+  for (const roles of [[], ['USER'], ['ADMIN']]) {
+    const html = renderToString(React.createElement(OpportunityRadar, { heldIds: [], watchlistedIds: [], roles }));
+    assert.equal(html.includes('Run Bounded Test'), roles.includes('ADMIN'));
+    assert.match(html, /Run Equity Radar/);
+    if (roles.includes('ADMIN')) {
+      assert.match(html, /limited to 1 candidate/);
+      assert.match(html, /Baseline screening still covers the NSE universe/);
+      assert.match(html, /Completed results update the shared Equity Radar/);
+    }
+  }
+});
+
+for (const terminalStatus of ['COMPLETED', 'FAILED']) {
+  test(`bounded submission tracks ${terminalStatus} and refreshes only completed persisted results`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const pending = deferred();
+    const submissions = [];
+    const statuses = { bounded: { status: 'RUNNING' } };
+    const result = { generated_at: '2026-10-21T00:00:00Z', top_short_term: [], top_long_term: [] };
+    const previousResult = { ...result, generated_at: '2026-10-20T00:00:00Z' };
+    let currentReads = 0;
+    const fixture = await equityFixture(t, {
+      history: { cycles: [], active_cycle: null }, statuses,
+      onRequest: (url, options) => {
+        if (options?.method === 'POST') {
+          submissions.push({ url, ...options });
+          return pending.promise;
+        }
+        if (url.endsWith('/current')) { currentReads++; return currentReads === 1 ? previousResult : result; }
+      },
+    });
+    const start = button(fixture.tree, 'Run Bounded Test').props.onClick;
+    await settle(start);
+    assert.equal(button(fixture.tree, 'Submitting bounded test…').props.disabled, true);
+    await settle(start);
+    assert.equal(submissions.length, 1);
+    assert.equal(submissions[0].url, '/api/v1/research/opportunities/cycles');
+    assert.deepEqual(JSON.parse(submissions[0].body), { analysis_scope: 'BOUNDED', shortlist_limit: 1 });
+    assert.equal(submissions[0].headers, undefined);
+    await settle(() => pending.resolve({ cycle_id: 'bounded', status: 'ACCEPTED' }));
+    assert.equal(fixture.sessionStorage.getItem(equityLegacyKey), 'bounded');
+    assert.equal(button(fixture.tree, 'Run Bounded Test').props.disabled, true);
+    assert.equal(button(fixture.tree, 'Running…').props.disabled, true);
+    assert.ok(fixture.calls.some(call => call.url.endsWith('/cycles/bounded/status')));
+
+    statuses.bounded = { status: terminalStatus, error_code: terminalStatus === 'FAILED' ? 'BOUNDED_FIXTURE_FAILURE' : null };
+    await settle(() => t.mock.timers.tick(2500));
+    assert.equal(button(fixture.tree, 'Run Bounded Test').props.disabled, false);
+    assert.equal(fixture.sessionStorage.getItem(equityLegacyKey), null);
+    assert.equal(currentReads, terminalStatus === 'COMPLETED' ? 2 : 1);
+    const content = fixture.tree.root.find(node => typeof node.type === 'function' && node.type.name === 'RadarContent');
+    assert.equal(content.props.data.generated_at, terminalStatus === 'COMPLETED' ? result.generated_at : previousResult.generated_at);
+    if (terminalStatus === 'FAILED') assert.match(textOf(fixture.tree), /BOUNDED FIXTURE FAILURE/);
+    const callsAtCompletion = fixture.calls.length;
+    await settle(() => t.mock.timers.tick(10000));
+    assert.equal(fixture.calls.length, callsAtCompletion);
+  });
+}
+
+for (const [status, message, explanation] of [
+  [403, 'Forbidden', /Administrator access is required/],
+  [409, 'ETF_ACTIVE_CYCLE_REQUIRES_REVIEW', /already in flight/],
+  [503, 'RECOVERY_PAUSED', /manual execution is not authorized/],
+]) {
+  test(`bounded admission preserves the server's ${status} refusal`, async t => {
+    const fixture = await equityFixture(t, {
+      history: { cycles: [], active_cycle: null }, statuses: {},
+      onRequest: (_url, options) => options?.method === 'POST' ? Promise.reject({ status, message }) : undefined,
+    });
+    await settle(button(fixture.tree, 'Run Bounded Test').props.onClick);
+    assert.match(textOf(fixture.tree), explanation);
+    assert.equal(button(fixture.tree, 'Run Bounded Test').props.disabled, false);
+    assert.equal(fixture.sessionStorage.getItem(equityLegacyKey), null);
+    assert.equal(fixture.calls.filter(call => call.method === 'POST').length, 1);
+  });
+}
+
+test('bounded action stays disabled while discovery is pending or fails', async t => {
+  const pending = deferred();
+  const fixture = await equityFixture(t, {
+    onRequest: url => url.endsWith('/cycles?limit=1') ? pending.promise : undefined,
+  });
+  assert.equal(button(fixture.tree, 'Run Bounded Test').props.disabled, true);
+  await settle(button(fixture.tree, 'Run Bounded Test').props.onClick);
+  await settle(() => pending.reject({ status: 503 }));
+  assert.equal(button(fixture.tree, 'Run Bounded Test').props.disabled, true);
+  await settle(button(fixture.tree, 'Run Bounded Test').props.onClick);
+  assert.equal(fixture.calls.filter(call => call.method === 'POST').length, 0);
+});
+
+test('the existing FULL button retains its exact request after adding the bounded action', async t => {
+  let submission;
+  const fixture = await equityFixture(t, {
+    history: { cycles: [], active_cycle: null }, statuses: {},
+    onRequest: (url, options) => {
+      if (options?.method === 'POST') {
+        submission = { url, ...options };
+        return Promise.reject({ status: 503, message: 'RECOVERY_PAUSED' });
+      }
+    },
+  });
+  await settle(button(fixture.tree, 'Run Equity Radar').props.onClick);
+  assert.equal(submission.url, '/api/v1/research/opportunities/cycles');
+  assert.deepEqual(JSON.parse(submission.body), { analysis_scope: 'FULL' });
+});
+
+test('cancelled Equity progress survives reload and terminal cycles stop polling', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const id = 'retained-execution-id-must-stay-internal';
+  const cancelled = cycleSummary(id, 'CANCELLED');
+  const fixture = await equityFixture(t, { history: { cycles: [cancelled], active_cycle: null },
+    statuses: { [id]: { status: 'CANCELLED', authoritative_progress: savedProgress } } });
+  assert.equal(button(fixture.tree, 'Run Equity Radar').props.disabled, false);
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+  assert.match(textOf(fixture.tree), /Retained historical research/);
+  assert.doesNotMatch(textOf(fixture.tree), /Cycle cancelled|Historical cycle|Cycle history/);
+  assert.ok(!textOf(fixture.tree).includes(id));
+  assert.match(textOf(fixture.tree), /2003/);
+  assert.match(textOf(fixture.tree), /119/);
+  assert.equal(button(fixture.tree, 'Cancel Equity Radar'), undefined);
+  const before = fixture.calls.length;
+  await settle(() => t.mock.timers.tick(30000));
+  assert.equal(fixture.calls.length, before);
+  await fixture.remount();
+  assert.match(textOf(fixture.tree), /2003/);
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+  assert.ok(fixture.calls.every(call => call.method === 'GET'));
+});
+
+test('server discovery restores terminal progress with empty or disabled storage', async t => {
+  const failed = cycleSummary('failed', 'FAILED');
+  const fixture = await equityFixture(t, { noStorage: true,
+    history: { cycles: [failed], active_cycle: null },
+    statuses: { failed: { status: 'FAILED', authoritative_progress: { ...savedProgress, phase: 'FAILED' } } } });
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+  assert.equal(button(fixture.tree, 'Run Equity Radar').props.disabled, false);
+  assert.match(textOf(fixture.tree), /2003/);
+});
+
+test('obsolete saved selection is ignored in favor of the latest retained work', async t => {
+  const fixture = await equityFixture(t, { selected: 'older',
+    history: { cycles: [cycleSummary('newest', 'COMPLETED')], active_cycle: null },
+    statuses: { newest: { status: 'COMPLETED', authoritative_progress: savedProgress } } });
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+  assert.match(textOf(fixture.tree), /2003/);
+  assert.ok(!fixture.calls.some(call => call.url.includes('/older/')));
+  assert.doesNotMatch(textOf(fixture.tree), /newest|older/);
+});
+
+test('server active execution takes priority over retained work and obsolete selection', async t => {
+  const active = cycleSummary('active-old', 'RUNNING');
+  const fixture = await equityFixture(t, { selected: 'deleted',
+    history: { cycles: [cycleSummary('newest', 'COMPLETED')], active_cycle: active },
+    statuses: { 'active-old': { status: 'RUNNING', authoritative_progress: { ...savedProgress, phase: 'DEEP' } } } });
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+  assert.ok(fixture.tree.root.findAllByType('button').some(node => node.props.disabled && node.children.join('').startsWith('Running')));
+  assert.ok(!fixture.calls.some(call => /\/(newest|deleted)\/status$/.test(call.url)));
+  assert.doesNotMatch(textOf(fixture.tree), /Retained historical|active-old|newest|deleted/);
+});
+
+test('progress and Cancel target only the active execution despite an old saved selection', async t => {
+  const active = cycleSummary('active', 'RUNNING');
+  const fixture = await equityFixture(t, { selected: 'cancelled',
+    history: { cycles: [active, cycleSummary('cancelled', 'CANCELLED')], active_cycle: active },
+    statuses: { active: { status: 'RUNNING', authoritative_progress: { ...savedProgress, baseline_completed: 42 } }, cancelled: { status: 'CANCELLED', authoritative_progress: savedProgress } },
+    onRequest: (url, options) => options?.method === 'DELETE' ? { status: 'CANCEL_REQUESTED' } : undefined });
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+  assert.match(textOf(fixture.tree), /42/);
+  assert.doesNotMatch(textOf(fixture.tree), /2003|Retained historical/);
+  assert.ok(fixture.tree.root.findAllByType('button').some(node => node.props.disabled && node.children.join('').startsWith('Running')));
+  await settle(() => button(fixture.tree, 'Cancel Equity Radar').props.onClick());
+  assert.deepEqual(fixture.calls.filter(call => call.method === 'DELETE'),
+    [{ url: '/api/v1/research/opportunities/cycles/active/cancel', method: 'DELETE' }]);
+  assert.ok(!fixture.calls.some(call => call.url.endsWith('/cancelled/status')));
+});
+
+test('cancellation retains final progress and server discovery restores it on reload', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const active = cycleSummary('legacy', 'RUNNING');
+  const statuses = { legacy: { status: 'RUNNING', authoritative_progress: { ...savedProgress, phase: 'DEEP' } } };
+  const history = { cycles: [active], active_cycle: active };
+  const fixture = await equityFixture(t, { legacy: 'legacy', history, statuses,
+    onRequest: (url, options) => {
+      if (options?.method !== 'DELETE') return undefined;
+      statuses.legacy = { status: 'CANCELLED', authoritative_progress: savedProgress };
+      history.active_cycle = null;
+      history.cycles = [cycleSummary('legacy', 'CANCELLED')];
+      return { status: 'CANCEL_REQUESTED' };
+    } });
+  await settle(() => button(fixture.tree, 'Cancel Equity Radar').props.onClick());
+  await settle(() => t.mock.timers.tick(2500));
+  assert.equal(fixture.sessionStorage.getItem(equityLegacyKey), null);
+  assert.equal(button(fixture.tree, 'Run Equity Radar').props.disabled, false);
+  await fixture.remount();
+  assert.match(textOf(fixture.tree), /2003/);
+  assert.match(textOf(fixture.tree), /Retained historical research/);
+  assert.doesNotMatch(textOf(fixture.tree), /Cycle legacy|Cycle history/);
+});
+
+test('late retained status responses cannot replace a newly started execution', async t => {
+  const slow = deferred();
+  const fixture = await equityFixture(t, { selected: 'first',
+    history: { cycles: [cycleSummary('first', 'CANCELLED')], active_cycle: null },
+    statuses: { second: { status: 'RUNNING', authoritative_progress: { ...savedProgress, baseline_completed: 42 } } },
+    onRequest: (url, options) => options?.method === 'POST' ? { cycle_id: 'second', status: 'ACCEPTED' }
+      : url.endsWith('/first/status') ? slow.promise : undefined });
+  await settle(() => button(fixture.tree, 'Run Equity Radar').props.onClick());
+  await settle(() => slow.resolve({ status: 'RUNNING', authoritative_progress: savedProgress }));
+  assert.ok(fixture.tree.root.findAllByType('button').some(node => node.props.disabled && node.children.join('').startsWith('Running')));
+  assert.match(textOf(fixture.tree), /42/);
+  assert.doesNotMatch(textOf(fixture.tree), /2003|Retained historical/);
+  assert.equal(fixture.sessionStorage.getItem(equityLegacyKey), 'second');
+});
+
+test('a transient active status failure retains the last known counters', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const active = cycleSummary('active', 'RUNNING');
+  const statuses = { active: { status: 'RUNNING', authoritative_progress: { ...savedProgress, phase: 'DEEP' } } };
+  const fixture = await equityFixture(t, { history: { cycles: [active], active_cycle: active }, statuses });
+  statuses.active = Object.assign(new Error('Temporarily unavailable'), { status: 503 });
+  await settle(() => t.mock.timers.tick(2500));
+  assert.match(textOf(fixture.tree), /Could not refresh status just now/);
+  assert.match(textOf(fixture.tree), /2003/);
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+});
+
+test('failed discovery restores the known active execution without a history selection', async t => {
+  const fixture = await equityFixture(t, { legacy: 'known-active',
+    statuses: { 'known-active': { status: 'RUNNING', authoritative_progress: { ...savedProgress, phase: 'DEEP' } } },
+    onRequest: url => url.endsWith('/cycles?limit=1')
+      ? Promise.reject(Object.assign(new Error('Unavailable'), { status: 503 })) : undefined });
+  assert.ok(fixture.tree.root.findAllByType('button').some(node => node.props.disabled && node.children.join('').startsWith('Running')));
+  assert.ok(button(fixture.tree, 'Cancel Equity Radar'));
+  assert.match(textOf(fixture.tree), /2003/);
+  assert.doesNotMatch(textOf(fixture.tree), /known-active|Retained historical/);
+  assert.equal(fixture.tree.root.findAllByType('select').length, 0);
+});
 
 test('recommendation page 2 survives rerenders and resets on changed list membership', async () => {
   const { PreviousRecommendationsList } = loadComponent('opportunity-radar.tsx');
@@ -252,6 +540,8 @@ for (const [name, filename, key, endpoint] of [
       try {
         globalThis.window = { sessionStorage: { getItem: k => store.get(k), removeItem: k => store.delete(k) } };
         const Component = loadComponent(filename, { request: url => {
+          if (url.endsWith('/cycles?limit=1')) return Promise.resolve({
+            cycles: [cycleSummary('terminal-cycle', terminalStatus)], active_cycle: null });
           const pending = deferred(); calls.push({ url, ...pending }); return pending.promise;
         } })[name];
         await settle(() => { tree = create(React.createElement(Component, { heldIds: [], watchlistedIds: [] })); });
@@ -271,6 +561,8 @@ for (const [name, filename, key, endpoint] of [
     const calls = [], timers = new Map(); let sequence = 0;
     const data = name === 'EtfRadar' ? { cycle_id: 'older', as_of: '2026-01-01', candidates: [], ranked: [] } : { generated_at: null, best_buy_today: null, top_short_term: [], top_long_term: [] };
     const Component = loadComponent(filename, { request: url => {
+      if (url.endsWith('/cycles?limit=1')) return Promise.resolve({
+        cycles: [cycleSummary('restored', 'RUNNING')], active_cycle: cycleSummary('restored', 'RUNNING') });
       const pending = deferred(); calls.push({ url, ...pending }); return pending.promise;
     } })[name];
     const props = { heldIds: [], watchlistedIds: [] };
@@ -340,6 +632,8 @@ test('ADMIN cancellation uses DELETE request helper and exposes permission failu
   try {
     globalThis.window = { sessionStorage: { getItem: () => 'c', removeItem() {} } };
     const { OpportunityRadar } = loadComponent('opportunity-radar.tsx', { request: (url, init) => {
+      if (url.endsWith('/cycles?limit=1')) return Promise.resolve({
+        cycles: [cycleSummary('c', 'RUNNING')], active_cycle: cycleSummary('c', 'RUNNING') });
       const pending = deferred(); calls.push({ url, init, ...pending }); return pending.promise;
     } });
     await settle(() => { tree = create(React.createElement(OpportunityRadar, { heldIds: [], watchlistedIds: [], roles: ['ADMIN'] })); });
@@ -378,10 +672,17 @@ for (const scenario of [
   { name: 'readiness without completion cannot manufacture work progress', progress: { phase: 'DEEP', deep_ready: 25, deep_denominator: 25 } },
   { name: 'missing legacy fields remain indeterminate', progress: {} },
   ...['COMPLETED', 'CANCELLED', 'FAILED'].map(status => ({ name: `${status} preserves counters and hides active bars`, status, progress: deepProgress(4, 25), terminal: true })),
-  { name: 'acquisition phase with authoritative scan counters', progress: { phase: 'BASELINE', baseline_evaluated: 700, universe_count: 2621, deep_denominator: 25 }, acquisitionPercent: 700 / 2621 * 100 },
+  // baseline_evaluated is deliberately decoyed to a DIFFERENT value than
+  // baseline_completed in every scenario below that has a defined
+  // acquisitionPercent -- the displayed/percentaged "scanned" count must
+  // come from baseline_completed (live progress), never baseline_evaluated
+  // (a static admission-time snapshot, see app/cycle_checkpoint.py's
+  // cycle_status_snapshot); a regression back to reading baseline_evaluated
+  // would compute a visibly wrong percentage/count against these fixtures.
+  { name: 'acquisition phase with authoritative scan counters', progress: { phase: 'BASELINE', baseline_evaluated: 2621, baseline_completed: 700, universe_count: 2621, deep_denominator: 25 }, acquisitionPercent: 700 / 2621 * 100 },
   { name: 'acquisition phase without counters never uses the shortlist', progress: { phase: 'BASELINE', deep_denominator: 25 } },
-  { name: 'acquisition phase with missing total is indeterminate', progress: { phase: 'BASELINE', baseline_evaluated: 700, deep_denominator: 25 } },
-  { name: 'durable full-market scan and deep work have independent percentages', progress: { ...deepProgress(4), baseline_evaluated: 2621, universe_count: 2621 }, percent: 16, acquisitionPercent: 100 },
+  { name: 'acquisition phase with missing total is indeterminate', progress: { phase: 'BASELINE', baseline_evaluated: 2621, baseline_completed: 700, deep_denominator: 25 } },
+  { name: 'durable full-market scan and deep work have independent percentages', progress: { ...deepProgress(4), baseline_evaluated: 1, baseline_completed: 2621, universe_count: 2621 }, percent: 16, acquisitionPercent: 100 },
 ]) {
   test(`Equity progress: ${scenario.name}`, async () => {
     const originalWindow = globalThis.window, originalTimeout = globalThis.setTimeout, originalClear = globalThis.clearTimeout;
@@ -392,15 +693,22 @@ for (const scenario of [
       globalThis.setTimeout = () => 1;
       globalThis.clearTimeout = () => {};
       const { OpportunityRadar } = loadComponent('opportunity-radar.tsx', { request: async url =>
-        url.endsWith('/status') ? { status, authoritative_progress: scenario.progress }
+        url.endsWith('/cycles?limit=1') ? { cycles: [cycleSummary('progress-cycle', status)],
+          active_cycle: scenario.terminal ? null : cycleSummary('progress-cycle', status) }
+          : url.endsWith('/status') ? { status, authoritative_progress: scenario.progress }
           : { generated_at: null, best_buy_today: null, top_short_term: [], top_long_term: [] }
       });
       await settle(() => { tree = create(React.createElement(OpportunityRadar, { heldIds: [], watchlistedIds: [] })); });
       const bars = tree.root.findAll(node => node.props.role === 'progressbar');
       const counter = label => tree.root.findAllByType('dt').find(node => node.children.join('') === label).parent.findByType('dd').children.join('');
-      assert.equal(counter('Deep completed'), String(scenario.progress.deep_completed ?? 'Unavailable'));
+      // "Deep completed"/"Deep attempted" counters were removed from the shared
+      // progress-counters dl (duplicate-counters cleanup); the same deep_completed/
+      // deep_attempted/deep_ready values are still rendered, now only inside
+      // EquityAnalysisPanels under the shorter "Completed"/"Attempted"/"Ready for
+      // ranking" labels -- assert there instead of in the counters dl.
+      assert.equal(counter('Completed'), String(scenario.progress.deep_completed ?? 'Unavailable'));
       assert.equal(counter('Ready for ranking'), String(scenario.progress.deep_ready ?? 'Unavailable'));
-      assert.equal(counter('Deep attempted'), String(scenario.progress.deep_attempted ?? 'Unavailable'));
+      assert.equal(counter('Attempted'), String(scenario.progress.deep_attempted ?? 'Unavailable'));
       assert.equal(button(tree, scenario.terminal ? 'Run Equity Radar' : 'Running\u2026').props.disabled, !scenario.terminal);
       if (scenario.terminal) {
         assert.equal(bars.length, 0);
@@ -408,6 +716,11 @@ for (const scenario of [
       } else {
         const market = bars.find(node => node.props['aria-label'] === 'Full-market baseline scan');
         assert.equal(market.props['aria-valuenow'], scenario.acquisitionPercent);
+        // Explicit check that the rendered scanned/total text itself comes from
+        // baseline_completed, not baseline_evaluated (see decoy values above).
+        const scanSection = tree.root.findAll(node => node.type === 'section' && node.props['aria-label'] === 'Full-market baseline scan')[0];
+        assert.equal(scanSection.findByType('p').children.join(''),
+          `Full-market baseline scan: ${scenario.progress.baseline_completed ?? 'Unavailable'} of ${scenario.progress.universe_count ?? 'Unavailable'} instruments scanned.`);
         const deep = bars.find(node => node.props['aria-label'] === 'Deep processing');
         if (scenario.progress.phase === 'DEEP') assert.equal(deep.props['aria-valuenow'], scenario.percent);
         else assert.equal(deep, undefined);
@@ -426,3 +739,130 @@ for (const scenario of [
     }
   });
 }
+
+// Bounded/controlled ETF Radar admin action -----------------------------
+
+const boundedPreflightResponse = (overrides = {}) => ({
+  status: 'READY', scope: 'BOUNDED_CANONICAL_ETF', candidate_count: 1, ready_count: 1,
+  instruments: [{ instrument_id: '11111111-1111-1111-1111-111111111111', symbol: 'NIFTYBEES', isin: 'INF1', canonical_identity_matches: true, mandatory_evidence_ready: true, blocking_reasons: [] }],
+  recovery_paused: true, active_cycle_id: null, manual_execution_authorized: true, can_submit: true,
+  ...overrides,
+});
+
+test('Bounded ETF Radar section is hidden without the ADMIN role', async () => {
+  const calls = [];
+  const Component = loadComponent('etf-radar.tsx', { request: url => { calls.push(url); return Promise.reject({ status: 404 }); } }).EtfRadar;
+  let tree;
+  await settle(() => { tree = create(React.createElement(Component, {})); });
+  assert.doesNotMatch(textOf(tree), /Run Bounded ETF Radar/);
+  await settle(() => tree.unmount());
+});
+
+test('Bounded ETF Radar: happy path checks preflight, requires confirmation, and submits only to /controlled-cycles', async () => {
+  const calls = [];
+  const originalWindow = globalThis.window;
+  const store = new Map();
+  try {
+    globalThis.window = { sessionStorage: { getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: k => store.delete(k) } };
+    const Component = loadComponent('etf-radar.tsx', { request: (url, init) => {
+      calls.push({ url, init });
+      if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
+      if (url.startsWith('/api/v1/etf-radar/full-universe-cycles')) return Promise.reject(new Error('bounded action must never call full-universe-cycles'));
+      if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse());
+      if (url === '/api/v1/etf-radar/controlled-cycles') return Promise.resolve({ cycle_id: 'bounded-1', status: 'ACCEPTED' });
+      return Promise.reject(new Error('unexpected url ' + url));
+    } }).EtfRadar;
+    let tree;
+    await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
+    assert.match(textOf(tree), /Run Bounded ETF Radar/);
+    await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
+    await settle(() => button(tree, 'Check preflight').props.onClick());
+    const preflightCall = calls.find(c => c.url.startsWith('/api/v1/etf-radar/preflight'));
+    assert.match(preflightCall.url, /instrument_ids=11111111-1111-1111-1111-111111111111/);
+    assert.match(textOf(tree), /status=/);
+    assert.match(textOf(tree), /READY/);
+    // Submit stays disabled until the explicit confirmation checkbox is checked.
+    assert.equal(button(tree, 'Run Bounded ETF Radar').props.disabled, true);
+    await settle(() => tree.root.findByType('input').props.onChange({ target: { checked: true } }));
+    assert.equal(button(tree, 'Run Bounded ETF Radar').props.disabled, false);
+    await settle(() => button(tree, 'Run Bounded ETF Radar').props.onClick());
+    const submitCall = calls.find(c => c.url === '/api/v1/etf-radar/controlled-cycles');
+    assert.ok(submitCall, 'controlled-cycles was called');
+    assert.deepEqual(JSON.parse(submitCall.init.body), { instrument_ids: ['11111111-1111-1111-1111-111111111111'] });
+    assert.equal(calls.some(c => c.url.startsWith('/api/v1/etf-radar/full-universe-cycles')), false);
+    assert.equal(store.get('aip.etfRadar.activeCycleId'), 'bounded-1');
+    await settle(() => tree.unmount());
+  } finally { globalThis.window = originalWindow; }
+});
+
+test('Bounded ETF Radar: invalid instrument ID input is rejected client-side without any network call', async () => {
+  const calls = [];
+  const Component = loadComponent('etf-radar.tsx', { request: url => { calls.push(url); return Promise.reject({ status: 404 }); } }).EtfRadar;
+  let tree;
+  await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
+  await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: 'not-a-uuid' } }));
+  await settle(() => button(tree, 'Check preflight').props.onClick());
+  assert.match(textOf(tree), /Not a valid instrument ID/);
+  assert.equal(calls.filter(u => u.includes('preflight')).length, 0);
+  await settle(() => tree.unmount());
+});
+
+test('Bounded ETF Radar: a BLOCKED preflight explains why and never offers a confirm/submit control', async () => {
+  const Component = loadComponent('etf-radar.tsx', { request: url => {
+    if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
+    if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse({
+      status: 'BLOCKED', can_submit: false, ready_count: 0,
+      instruments: [{ instrument_id: '11111111-1111-1111-1111-111111111111', symbol: 'NIFTYBEES', isin: 'INF1', canonical_identity_matches: true, mandatory_evidence_ready: false, blocking_reasons: ['EVIDENCE_INSUFFICIENT_WITHIN_PLAN'] }],
+    }));
+    return Promise.reject(new Error('unexpected url ' + url));
+  } }).EtfRadar;
+  let tree;
+  await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
+  await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
+  await settle(() => button(tree, 'Check preflight').props.onClick());
+  assert.match(textOf(tree), /mandatory evidence ready/);
+  assert.match(textOf(tree), /EVIDENCE_INSUFFICIENT_WITHIN_PLAN/);
+  assert.equal(tree.root.findAllByType('input').length, 0);
+  assert.equal(button(tree, 'Run Bounded ETF Radar'), undefined);
+  await settle(() => tree.unmount());
+});
+
+test('Bounded ETF Radar: recovery-paused-without-authorization preflight is explained, not silently blocked', async () => {
+  const Component = loadComponent('etf-radar.tsx', { request: url => {
+    if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
+    if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse({
+      recovery_paused: true, manual_execution_authorized: false, can_submit: false,
+    }));
+    return Promise.reject(new Error('unexpected url ' + url));
+  } }).EtfRadar;
+  let tree;
+  await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
+  await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
+  await settle(() => button(tree, 'Check preflight').props.onClick());
+  assert.match(textOf(tree), /not authorized in this environment/);
+  await settle(() => tree.unmount());
+});
+
+test('Bounded ETF Radar: submission is disabled while another ETF cycle is active, even if preflight says READY', async () => {
+  const originalWindow = globalThis.window;
+  const store = new Map([['aip.etfRadar.activeCycleId', 'already-running']]);
+  try {
+    globalThis.window = { sessionStorage: { getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: k => store.delete(k) } };
+    const calls = [];
+    const Component = loadComponent('etf-radar.tsx', { request: url => {
+      calls.push(url);
+      if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
+      if (url.endsWith('/cycles/already-running/status')) return Promise.resolve({ status: 'RUNNING' });
+      if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse());
+      if (url === '/api/v1/etf-radar/controlled-cycles') return Promise.reject(new Error('must never submit while a cycle is active'));
+      return Promise.reject(new Error('unexpected url ' + url));
+    } }).EtfRadar;
+    let tree;
+    await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
+    await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
+    await settle(() => button(tree, 'Check preflight').props.onClick());
+    await settle(() => tree.root.findByType('input').props.onChange({ target: { checked: true } }));
+    assert.equal(button(tree, 'Another ETF cycle is running…').props.disabled, true);
+    await settle(() => tree.unmount());
+  } finally { globalThis.window = originalWindow; }
+});

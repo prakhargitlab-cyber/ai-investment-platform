@@ -150,10 +150,10 @@ test("autocomplete result rows have explicit theme-safe colors in all states", (
 test("research option colors have theme-safe dark-mode overrides", () => {
   const styles = readFileSync(new URL("../app/styles.css", import.meta.url), "utf8");
   assert.match(styles, /--research-option-bg: #f8fafc;/);
-  assert.equal((styles.match(/--research-option-bg: #1e2b3a;/g) ?? []).length, 2);
-  assert.equal((styles.match(/--research-option-hover: #334457;/g) ?? []).length, 2);
-  assert.equal((styles.match(/--research-option-text: #f1f5f9;/g) ?? []).length, 2);
-  assert.equal((styles.match(/--research-option-muted: #94a3b8;/g) ?? []).length, 2);
+  assert.equal((styles.match(/--research-option-bg: #1b1e24;/g) ?? []).length, 2);
+  assert.equal((styles.match(/--research-option-hover: #272a30;/g) ?? []).length, 2);
+  assert.equal((styles.match(/--research-option-text: #eef0f2;/g) ?? []).length, 2);
+  assert.equal((styles.match(/--research-option-muted: #9ba1a9;/g) ?? []).length, 2);
 });
 
   test("readiness acquisition observation is null-safe for the news-run shape (no replaceAll on undefined outcome/provider)", () => {

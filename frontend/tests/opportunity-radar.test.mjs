@@ -65,7 +65,7 @@ test('radar renders persisted 0–4 cards per horizon and missing ranges', () =>
   // 0 cards: empty state messages, zero opportunity-card elements.
   for (const count of [0, 1, 2, 3, 4]) {
     const picks = Array.from({ length: count }, (_, i) => item(i));
-    const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, top_short_term: picks, top_long_term: picks }, heldIds: ['0'], watchlistedIds: ['1'] }));
+    const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, top_short_term: picks, top_long_term: picks }, heldIds: ['0'], watchlistedIds: ['1'], initialTab: 'top' }));
     assert.equal((html.match(/class="opportunity-card"/g) ?? []).length, count * 2);
     if (count > 0) {
       assert.match(html, /Insufficient evidence/);
@@ -86,7 +86,7 @@ test('radar shows More button only when more than 4 cards per horizon', () => {
   // 5+ cards: first 4 render initially, "More" button appears.
   for (const count of [5, 9, 20]) {
     const picks = Array.from({ length: count }, (_, i) => item(i));
-    const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, top_short_term: picks, top_long_term: picks }, heldIds: [], watchlistedIds: [] }));
+    const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, top_short_term: picks, top_long_term: picks }, heldIds: [], watchlistedIds: [], initialTab: 'top' }));
     // Only INITIAL_DISPLAY cards per horizon render (4 short + 4 long = 8).
     assert.equal((html.match(/class="opportunity-card"/g) ?? []).length, INITIAL_DISPLAY * 2);
     // "More" buttons: one for short-term, one for long-term.
@@ -100,7 +100,7 @@ test('radar shows More button only when more than 4 cards per horizon', () => {
 
 test('radar does not show Show-less initially (only after More click)', () => {
   const picks = Array.from({ length: 9 }, (_, i) => item(i));
-  const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, top_short_term: picks, top_long_term: picks }, heldIds: [], watchlistedIds: [] }));
+  const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, top_short_term: picks, top_long_term: picks }, heldIds: [], watchlistedIds: [], initialTab: 'top' }));
   // Initially only first 4 shown; no Show-less button (only appears after expansion).
   assert.doesNotMatch(html, /opportunity-show-less/);
   // But More buttons are present.
@@ -110,7 +110,7 @@ test('radar does not show Show-less initially (only after More click)', () => {
 
 test('radar empty and lifecycle render', () => {
   assert.match(renderToStaticMarkup(React.createElement(RadarContent, { data: empty })), /No persisted opportunity cycle/);
-  const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, previous_recommendations: [{ ...item(1), current_short_action: 'PARTIAL_PROFIT', short_term_state: 'PARTIAL_PROFIT', current_long_action: 'HOLD', long_term_state: 'HOLDING' }] } }));
+  const html = renderToStaticMarkup(React.createElement(RadarContent, { data: { ...empty, previous_recommendations: [{ ...item(1), current_short_action: 'PARTIAL_PROFIT', short_term_state: 'PARTIAL_PROFIT', current_long_action: 'HOLD', long_term_state: 'HOLDING' }] }, initialTab: 'screener' }));
   assert.match(html, /Partial profit/); assert.match(html, /Long: Hold/);
 });
 
@@ -419,7 +419,7 @@ test('backtest status mapping renders friendly labels for every known status, ne
 test('previous recommendations paginate: first page shows 10, More shows next', () => {
   const picks = Array.from({ length: 25 }, (_, i) => ({ ...item(i), current_short_action: 'BUY', short_term_state: 'BUY' }));
   const html = renderToStaticMarkup(React.createElement(RadarContent, {
-    data: { ...empty, previous_recommendations: picks }
+    data: { ...empty, previous_recommendations: picks }, initialTab: 'screener'
   }));
   // Page 1 of 3, first 10 shown.
   assert.match(html, /Page 1 of 3/);
@@ -437,7 +437,7 @@ test('previous recommendations paginate: first page shows 10, More shows next', 
 
 test('previous recommendations empty shows no pagination', () => {
   const html = renderToStaticMarkup(React.createElement(RadarContent, {
-    data: { ...empty, previous_recommendations: [] }
+    data: { ...empty, previous_recommendations: [] }, initialTab: 'screener'
   }));
   assert.match(html, /No previous recommendations/);
   assert.doesNotMatch(html, /pagination-controls/);
@@ -446,7 +446,7 @@ test('previous recommendations empty shows no pagination', () => {
 test('previous recommendations single page: no next, previous disabled', () => {
   const picks = Array.from({ length: 5 }, (_, i) => ({ ...item(i), current_short_action: 'BUY', short_term_state: 'BUY' }));
   const html = renderToStaticMarkup(React.createElement(RadarContent, {
-    data: { ...empty, previous_recommendations: picks }
+    data: { ...empty, previous_recommendations: picks }, initialTab: 'screener'
   }));
   assert.match(html, /Page 1 of 1/);
   // Both buttons disabled on single page (no more, no prev).
@@ -457,11 +457,48 @@ test('previous recommendations single page: no next, previous disabled', () => {
 test('previous recommendations render all when under page size', () => {
   const picks = Array.from({ length: 10 }, (_, i) => ({ ...item(i), current_short_action: 'BUY', short_term_state: 'BUY' }));
   const html = renderToStaticMarkup(React.createElement(RadarContent, {
-    data: { ...empty, previous_recommendations: picks }
+    data: { ...empty, previous_recommendations: picks }, initialTab: 'screener'
   }));
   // All 10 visible, page 1 of 1
   assert.match(html, /Page 1 of 1/);
   for (let i = 0; i < 10; i++) {
     assert.match(html, new RegExp(`Company ${i}`));
   }
+});
+
+test('Equity Radar run action explicitly submits analysis_scope FULL, never relying on the server default', () => {
+  // runCycle() is only invoked from a button click handler and makes a real
+  // fetch call, which this render-to-static-markup harness does not execute
+  // (see loadLocalModule's portfolio-api stub above). Assert directly against
+  // the component source for the exact request body, the same pattern already
+  // used above for investment-workspace.tsx via workspaceSource.
+  const radarSource = fs.readFileSync(new URL('../app/components/opportunity-radar.tsx', import.meta.url), 'utf8');
+  const runCycleBody = radarSource.slice(
+    radarSource.indexOf('const runCycle = ()'),
+    radarSource.indexOf('const cancelCycle = ')
+  );
+  assert.match(runCycleBody, /\/api\/v1\/research\/opportunities\/cycles/);
+  assert.match(runCycleBody, /analysis_scope:\s*"FULL"/);
+  assert.doesNotMatch(runCycleBody, /must never request FULL/);
+});
+
+test('Equity Radar result tabs mount only the active panel -- true conditional unmount, never a CSS-hide pattern', () => {
+  const opportunityRadarSource = fs.readFileSync(new URL('../app/components/opportunity-radar.tsx', import.meta.url), 'utf8');
+  assert.doesNotMatch(opportunityRadarSource, /hidden=\{tab/);
+  const ternaries = opportunityRadarSource.match(/\{tab === "[a-z]+" \? \(<div className="radar-tab-panel">/g) ?? [];
+  assert.equal(ternaries.length, 6, `expected 6 tab ternaries (overview/top/screener/sector/compare/quality), found ${ternaries.length}`);
+  // Rendering with a given initialTab produces exactly that tab's content and
+  // not another tab's (e.g. "top" never leaks "screener"-only markup).
+  const picks = Array.from({ length: 1 }, (_, i) => ({
+    global_instrument_id: `${i}`, company_name: `Company ${i}`, symbol: `C${i}`, current_price: 100,
+    opportunity_score: 80, opportunity_confidence: 85, score_coverage: 90, new_investor_action: 'BUY_CANDIDATE',
+    existing_holder_action: 'HOLD', current_short_action: 'BUY', current_long_action: 'ACCUMULATE',
+    short_entry_low: null, short_entry_high: null, top_positive_reasons: [], top_negative_reasons: [],
+    data_state: 'PARTIAL', missing_areas: [], stale_areas: [], short_horizon: '1-3 months', long_horizon: '6-12 months'
+  }));
+  const data = { generated_at: null, best_buy_today: null, top_short_term: picks, top_long_term: picks, previous_recommendations: [] };
+  const overviewHtml = renderToStaticMarkup(React.createElement(RadarContent, { data, initialTab: 'overview' }));
+  assert.doesNotMatch(overviewHtml, /class="opportunity-card"/);
+  const topHtml = renderToStaticMarkup(React.createElement(RadarContent, { data, initialTab: 'top' }));
+  assert.match(topHtml, /class="opportunity-card"/);
 });

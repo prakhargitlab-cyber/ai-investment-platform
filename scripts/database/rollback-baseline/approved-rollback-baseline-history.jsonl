@@ -1,0 +1,190 @@
+﻿{
+  "schemaVersion": 1,
+  "baselineVersion": 1,
+  "approvedAtUtc": "2026-10-11T20:28:20Z",
+  "approvedBy": "migrated-from-platform.ps1-hardcoded-map (frontend entry already reconciled to etf-radar-ui-20261013-01 baseline prior to externalization)",
+  "components": {
+    "api-gateway": "sha256:69895f18d6360cdc087d51b3f54c29a822d283f709a1b50ae77bb2e18239d5b5",
+    "research-engine": "sha256:c9ccb210e81c45a3152079baca8ca939e521340ed23dcace4522748eb98edff3",
+    "portfolio-service": "sha256:6d5e111a118a659bf84bdee03e2b0561feed003f7feb6b41fa9ddebef80ddd9f",
+    "frontend": "sha256:135ac1b5a5f9c0df853faa5e808265318c88973ec4f20018572ab09c2a5fb9a5"
+  }
+}
+
+{
+    "schemaVersion":  1,
+    "baselineVersion":  2,
+    "approvedAtUtc":  "2026-10-13T20:46:09.8040250Z",
+    "approvedBy":  "Prakhar",
+    "components":  {
+                       "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
+                       "research-engine":  "sha256:c281eed803bdf087d64d698b88e8e37693529f16e7ed9e0c192e093c7f339a60",
+                       "portfolio-service":  "sha256:814cfbc908dc8eccbbd1277260372d833a2b9cb34f23aa303f276c302788b3aa",
+                       "frontend":  "sha256:135ac1b5a5f9c0df853faa5e808265318c88973ec4f20018572ab09c2a5fb9a5"
+                   },
+    "advancedFrom":  {
+                         "reason":  "Explicitly approved reconciliation of three existing ready deployments verified against registry and pod image digests on 2026-10-13.",
+                         "baselineVersion":  1,
+                         "approvedAtUtcPreviewed":  "2026-10-13T20:46:09.7984896Z",
+                         "componentTags":  {
+                                               "research-engine":  "etf-nse-safe-20261013-02",
+                                               "api-gateway":  "etf-universe-route-20261013-01",
+                                               "portfolio-service":  "etf-single-20261013-01"
+                                           },
+                         "kind":  "reconciliation"
+                     }
+}
+
+{
+    "schemaVersion":  1,
+    "baselineVersion":  3,
+    "approvedAtUtc":  "2026-10-13T21:12:16.5261021Z",
+    "approvedBy":  "Prakhar",
+    "components":  {
+                       "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
+                       "research-engine":  "sha256:c281eed803bdf087d64d698b88e8e37693529f16e7ed9e0c192e093c7f339a60",
+                       "portfolio-service":  "sha256:814cfbc908dc8eccbbd1277260372d833a2b9cb34f23aa303f276c302788b3aa",
+                       "frontend":  "sha256:135ac1b5a5f9c0df853faa5e808265318c88973ec4f20018572ab09c2a5fb9a5"
+                   },
+    "initContainers":  {
+                           "wait-for-research-migrations":  "sha256:c9ccb210e81c45a3152079baca8ca939e521340ed23dcace4522748eb98edff3"
+                       },
+    "advancedFrom":  {
+                         "reason":  "Explicit approval of existing migration init-container image, independently verified against registry and running pod.",
+                         "baselineVersion":  2,
+                         "approvedAtUtcPreviewed":  "2026-10-13T21:12:16.5225886Z",
+                         "componentTags":  {
+                                               "research-engine/wait-for-research-migrations":  "dev-20261011-202820"
+                                           },
+                         "kind":  "reconciliation"
+                     }
+}
+
+{
+    "schemaVersion":  1,
+    "baselineVersion":  4,
+    "approvedAtUtc":  "2026-10-15T18:20:57.3961469Z",
+    "approvedBy":  "Prakhar",
+    "components":  {
+                       "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
+                       "research-engine":  "sha256:c4802237c29d91ae5b75fcb34f0f73cb4fe270c4a97cc76eb113c963297e3d12",
+                       "portfolio-service":  "sha256:814cfbc908dc8eccbbd1277260372d833a2b9cb34f23aa303f276c302788b3aa",
+                       "frontend":  "sha256:e1361b84c6823802900bdc99d986da88fe956de9c06be346d56648460388ab71"
+                   },
+    "initContainers":  {
+                           "wait-for-research-migrations":  "sha256:c9ccb210e81c45a3152079baca8ca939e521340ed23dcace4522748eb98edff3"
+                       },
+    "advancedFrom":  {
+                         "reason":  "Align approved rollback baseline with independently verified running images after local registry artifact recovery on 2026-10-15",
+                         "baselineVersion":  3,
+                         "approvedAtUtcPreviewed":  "2026-10-15T18:20:57.3519997Z",
+                         "componentTags":  {
+                                               "frontend":  "dev-20261015-184731",
+                                               "research-engine":  "dev-20261015-184731"
+                                           },
+                         "kind":  "reconciliation"
+                     }
+}
+
+{
+    "schemaVersion":  1,
+    "baselineVersion":  5,
+    "approvedAtUtc":  "2026-10-15T21:06:24.0803499Z",
+    "approvedBy":  "Prakhar",
+    "components":  {
+                       "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
+                       "research-engine":  "sha256:ef35dcaecd3e18426c193af69bc41a7b83d28d1ecb48332484d1d65d11e4aa29",
+                       "portfolio-service":  "sha256:814cfbc908dc8eccbbd1277260372d833a2b9cb34f23aa303f276c302788b3aa",
+                       "frontend":  "sha256:e1361b84c6823802900bdc99d986da88fe956de9c06be346d56648460388ab71"
+                   },
+    "initContainers":  {
+                           "wait-for-research-migrations":  "sha256:c9ccb210e81c45a3152079baca8ca939e521340ed23dcace4522748eb98edff3"
+                       },
+    "advancedFrom":  {
+                         "reason":  "Align approved rollback baseline with previously verified research-engine deployment before ETF ingestion header fix.",
+                         "baselineVersion":  4,
+                         "approvedAtUtcPreviewed":  "2026-10-15T21:06:24.0763511Z",
+                         "componentTags":  {
+                                               "research-engine":  "review-20261015-203550-c3b076e7d18646d29e9cb3864ed4bcc9"
+                                           },
+                         "kind":  "reconciliation"
+                     }
+}
+
+{
+    "schemaVersion":  1,
+    "baselineVersion":  6,
+    "approvedAtUtc":  "2026-10-17T02:58:16.0079896Z",
+    "approvedBy":  "Prakhar",
+    "components":  {
+                       "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
+                       "research-engine":  "sha256:ef35dcaecd3e18426c193af69bc41a7b83d28d1ecb48332484d1d65d11e4aa29",
+                       "portfolio-service":  "sha256:8b001ae437122c66ffb8fc5543b9b9d64fa9c1b3e29212b56dcc44a87fc27703",
+                       "frontend":  "sha256:e1361b84c6823802900bdc99d986da88fe956de9c06be346d56648460388ab71"
+                   },
+    "initContainers":  {
+                           "wait-for-research-migrations":  "sha256:c9ccb210e81c45a3152079baca8ca939e521340ed23dcace4522748eb98edff3"
+                       },
+    "advancedFrom":  {
+                         "reason":  "Reconcile existing healthy Portfolio deployment with verified registry image before deploying tested valuation fix",
+                         "baselineVersion":  5,
+                         "approvedAtUtcPreviewed":  "2026-10-17T02:58:15.9958409Z",
+                         "componentTags":  {
+                                               "portfolio-service":  "dev-20261015-184731"
+                                           },
+                         "kind":  "reconciliation"
+                     }
+}
+
+{
+    "schemaVersion":  1,
+    "baselineVersion":  7,
+    "approvedAtUtc":  "2026-10-17T23:35:35.1572477Z",
+    "approvedBy":  "Prakhar",
+    "components":  {
+                       "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
+                       "research-engine":  "sha256:c53b0c70475e197aa148e8ae74ccf0a62bdbe1a555322685e072e42ecf457cef",
+                       "portfolio-service":  "sha256:8b001ae437122c66ffb8fc5543b9b9d64fa9c1b3e29212b56dcc44a87fc27703",
+                       "frontend":  "sha256:e1361b84c6823802900bdc99d986da88fe956de9c06be346d56648460388ab71"
+                   },
+    "initContainers":  {
+                           "wait-for-research-migrations":  "sha256:9efc75766128b2a4dd5532dec3b44217ac9aa175b7a365a3b9bf73bc97604c69"
+                       },
+    "advancedFrom":  {
+                         "reason":  "Reconcile verified running Research Engine and migration-wait images before deploying NSE calendar readiness correction",
+                         "baselineVersion":  6,
+                         "approvedAtUtcPreviewed":  "2026-10-17T23:35:35.1305560Z",
+                         "componentTags":  {
+                                               "research-engine":  "equity-fixes-20261017-184500",
+                                               "research-engine/wait-for-research-migrations":  "fresh-20261017-044525-9c7e10e37599"
+                                           },
+                         "kind":  "reconciliation"
+                     }
+}
+
+{
+    "schemaVersion":  1,
+    "baselineVersion":  8,
+    "approvedAtUtc":  "2026-10-21T16:18:06.3571184Z",
+    "approvedBy":  "Prakhar",
+    "components":  {
+                       "api-gateway":  "sha256:60d2d784bc39309d58da7d606603cc757821f5817f719ad29b864b69c0eebfe8",
+                       "research-engine":  "sha256:2977b255481dc901e89e057d7b5eacc99fc308154897fe9bf2571f68110c7c4a",
+                       "portfolio-service":  "sha256:8b001ae437122c66ffb8fc5543b9b9d64fa9c1b3e29212b56dcc44a87fc27703",
+                       "frontend":  "sha256:e1361b84c6823802900bdc99d986da88fe956de9c06be346d56648460388ab71"
+                   },
+    "initContainers":  {
+                           "wait-for-research-migrations":  "sha256:2977b255481dc901e89e057d7b5eacc99fc308154897fe9bf2571f68110c7c4a"
+                       },
+    "advancedFrom":  {
+                         "reason":  "Reconcile research-engine fresh-deploy image before the NSE Triveni BE verified deployment",
+                         "baselineVersion":  7,
+                         "approvedAtUtcPreviewed":  "2026-10-21T16:18:06.3106439Z",
+                         "componentTags":  {
+                                               "research-engine":  "fresh-20261021-144950-58fa7485e3df",
+                                               "research-engine/wait-for-research-migrations":  "fresh-20261021-144950-58fa7485e3df"
+                                           },
+                         "kind":  "reconciliation"
+                     }
+}
+

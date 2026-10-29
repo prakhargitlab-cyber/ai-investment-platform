@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 from unittest.mock import AsyncMock
@@ -14,6 +15,7 @@ import httpx
 import pytest
 import uvicorn
 
+from app.deep_investigation import RequirementAcquisitionBudget, _scope
 from app.models import CompanyResearchProfile
 from app.persistence import SqliteResearchPersistence
 from app.research_readiness import ResearchRequirementStatus
@@ -386,42 +388,61 @@ async def test_first_party_incomplete_result_crosses_mcp_and_invokes_fallback_on
         ]
 
 
+def _hal_financial_runtime(gateway_port):
+    repository = ResearchRepository(
+        settings=Settings(research_live_enabled=False, research_demo_enabled=False),
+        persistence=SqliteResearchPersistence(),
+    )
+    repository.profiles.append(
+        CompanyResearchProfile(
+            instrument_id=INSTRUMENT_ID,
+            company_id=uuid4(),
+            company_name="Hindustan Aeronautics Limited",
+            ticker="HAL",
+            exchange="NSE",
+            mic="XNSE",
+            country="IN",
+            currency="INR",
+            provider_instrument_ids={"YAHOO_FINANCE": "HAL.NS"},
+        )
+    )
+    fallback = RecordingFallback()
+    runtime = ResearchReadinessRuntime(
+        repository,
+        RepositoryResearchReadinessAdapter(repository),
+        McpFirstResearchCapabilityExecutor(
+            fallback,
+            repository,
+            HttpExternalResearchToolGateway(
+                f"http://127.0.0.1:{gateway_port}", 3, "research-engine"
+            ),
+            enabled=True,
+        ),
+    )
+    return repository, fallback, runtime
+
+
+def _assert_partial_hal_financial_facts(repository, result):
+    facts = repository.financial_facts_for(INSTRUMENT_ID)
+    assert facts and all(fact.value.unit == "INR" for fact in facts)
+    assert all(fact.key.period_end in {"2025-03-31", "2024-03-31"} for fact in facts)
+    # The Yahoo write is genuinely partial: readiness must stay truthful.
+    assert result.readiness.for_requirement("BUSINESS_QUALITY_FACTS").status != "READY_FRESH"
+
+
 @pytest.mark.asyncio
-async def test_first_party_partial_financial_success_persists_and_falls_back():
+async def test_first_party_partial_financial_success_persists_and_skips_routine_fallback():
+    """Routine (non-repair) ensure: the established contract
+    (research-engine test_di_mcp_optimistic_completion_fix.py, FIX E --
+    test_mcp_success_missing_targeted_input_still_completes_without_active_budget)
+    trusts the Yahoo MCP SUCCESS outcome and does NOT add a regional fallback
+    call, even when the write leaves BUSINESS_QUALITY_FACTS partial. Readiness
+    still reports the gap truthfully for a later targeted repair."""
     capability = _capability(
         "BUSINESS_QUALITY_FACTS", "ANNUAL_FINANCIALS", "get_financials"
     )
     async with _actual_stack("SUCCESS", capability) as (gateway_port, audit):
-        repository = ResearchRepository(
-            settings=Settings(research_live_enabled=False, research_demo_enabled=False),
-            persistence=SqliteResearchPersistence(),
-        )
-        repository.profiles.append(
-            CompanyResearchProfile(
-                instrument_id=INSTRUMENT_ID,
-                company_id=uuid4(),
-                company_name="Hindustan Aeronautics Limited",
-                ticker="HAL",
-                exchange="NSE",
-                mic="XNSE",
-                country="IN",
-                currency="INR",
-                provider_instrument_ids={"YAHOO_FINANCE": "HAL.NS"},
-            )
-        )
-        fallback = RecordingFallback()
-        runtime = ResearchReadinessRuntime(
-            repository,
-            RepositoryResearchReadinessAdapter(repository),
-            McpFirstResearchCapabilityExecutor(
-                fallback,
-                repository,
-                HttpExternalResearchToolGateway(
-                    f"http://127.0.0.1:{gateway_port}", 3, "research-engine"
-                ),
-                enabled=True,
-            ),
-        )
+        repository, fallback, runtime = _hal_financial_runtime(gateway_port)
         result = await runtime.ensure(
             INSTRUMENT_ID,
             jurisdiction="INDIA",
@@ -430,13 +451,46 @@ async def test_first_party_partial_financial_success_persists_and_falls_back():
         )
         assert result.executed_capabilities == (
             "YAHOO_FINANCE_MCP:BUSINESS_QUALITY_FACTS",
+        )
+        assert fallback.primary_calls == [] and fallback.secondary_calls == []
+        _assert_partial_hal_financial_facts(repository, result)
+        assert [item["event"] for item in audit.events] == [
+            "YAHOO_MCP_REQUEST",
+            "YAHOO_MCP_SUCCESS",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_first_party_partial_financial_success_falls_back_under_active_repair_budget():
+    """Targeted deep-investigation repair (FIX D contract): the same partial
+    Yahoo MCP SUCCESS is re-verified against durable readiness and, because
+    the gap is still open, the regional fallback runs exactly once."""
+    capability = _capability(
+        "BUSINESS_QUALITY_FACTS", "ANNUAL_FINANCIALS", "get_financials"
+    )
+    async with _actual_stack("SUCCESS", capability) as (gateway_port, audit):
+        repository, fallback, runtime = _hal_financial_runtime(gateway_port)
+        budget = RequirementAcquisitionBudget(
+            INSTRUMENT_ID, "BUSINESS_QUALITY_FACTS", datetime.now(timezone.utc),
+            AsyncMock(return_value=False),
+        )
+        token = _scope.set(budget)
+        try:
+            result = await runtime.ensure(
+                INSTRUMENT_ID,
+                jurisdiction="INDIA",
+                requirement_ids=("BUSINESS_QUALITY_FACTS",),
+                correlation_id="offline-financial-repair-5c",
+            )
+        finally:
+            _scope.reset(token)
+        assert result.executed_capabilities == (
+            "YAHOO_FINANCE_MCP:BUSINESS_QUALITY_FACTS",
             "REGIONAL_FALLBACK",
         )
         assert len(fallback.primary_calls) == 1
-        facts = repository.financial_facts_for(INSTRUMENT_ID)
-        assert facts and all(fact.value.unit == "INR" for fact in facts)
-        assert all(fact.key.period_end in {"2025-03-31", "2024-03-31"} for fact in facts)
-        assert result.readiness.for_requirement("BUSINESS_QUALITY_FACTS").status != "READY_FRESH"
+        assert fallback.secondary_calls == []
+        _assert_partial_hal_financial_facts(repository, result)
         assert [item["event"] for item in audit.events] == [
             "YAHOO_MCP_REQUEST",
             "YAHOO_MCP_SUCCESS",

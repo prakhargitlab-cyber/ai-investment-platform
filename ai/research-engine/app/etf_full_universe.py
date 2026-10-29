@@ -233,6 +233,16 @@ def _classify_historical_acquisition(onboard_row):
         status = 'ACQUIRED'
     elif disposition == 'SUCCESS_EMPTY':
         status = 'INSUFFICIENT_TRADING_HISTORY'
+    elif disposition == 'TECHNICAL_FAILURE' and str(reason or '').startswith(
+            'VERIFIED_HISTORICAL_IDENTITY_MISMATCH:PROVIDER_IDENTITY_UNAVAILABLE'):
+        # Yahoo metadata unavailable / Equity Radar retries root cause: this
+        # specific reason means the provider returned NO identity evidence
+        # at all (a stale/invalid session, not a comparison that actually
+        # disagreed) -- the same kind of technical, retryable gap as any
+        # other PROVIDER_UNAVAILABLE case, not a proven wrong-company
+        # correctness rejection. See verify_identity_by_isin_or_name's
+        # docstring in app/structured_market.py.
+        status = 'PROVIDER_UNAVAILABLE'
     elif disposition == 'TECHNICAL_FAILURE' and str(reason or '').startswith('VERIFIED_HISTORICAL_IDENTITY_MISMATCH'):
         status = 'IDENTITY_MISMATCH'
     elif disposition == 'TECHNICAL_FAILURE':

@@ -346,6 +346,22 @@ class YahooHistoricalPriceProvider:
             returned_symbol=info.get("symbol"),
             returned_quote_type=info.get("quoteType"),
         )
+        if reason == "PROVIDER_IDENTITY_UNAVAILABLE":
+            # Yahoo returned literally no identity evidence for a resolved
+            # ticker (every one of name/isin/exchange/currency absent) --
+            # the production signature of a stale/invalid crumb on the
+            # shared Yahoo session (concurrent HTTP 401 Invalid Crumb
+            # observed in production logs), not a genuine wrong-company
+            # mapping. A brand-new yfinance Ticker per acquisition context
+            # (see YahooTickerContexts.acquire) does not help on its own,
+            # since every Ticker still shares the same underlying session.
+            # Report the signal so the session can be rebuilt, bounded by
+            # its own cooldown -- never on every single occurrence, and
+            # never for a persistent/permanent provider rejection that a
+            # rebuilt session also fails. This never weakens the
+            # fail-closed rejection below: the current acquisition still
+            # raises and nothing is persisted either way.
+            self.ticker_contexts.note_identity_metadata_unavailable()
         if reason is not None:
             # Include the two compared (public, non-sensitive) fund-name
             # strings -- previously only the stable reason code was logged,

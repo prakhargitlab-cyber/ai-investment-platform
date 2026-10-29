@@ -107,6 +107,20 @@ def _components(reason: str | None) -> list[str]:
 
 
 def classify_reason(reason: str | None) -> str | None:
+    # Yahoo metadata unavailable / Equity Radar retries root cause: neither
+    # "VERIFIED_HISTORICAL_IDENTITY_MISMATCH:COMPANY_NAME_MISMATCH" (a
+    # provider response that was actually compared and disagreed) nor
+    # "VERIFIED_HISTORICAL_IDENTITY_MISMATCH:PROVIDER_IDENTITY_UNAVAILABLE"
+    # (a provider response with no identity evidence to compare at all --
+    # see verify_identity_by_isin_or_name in app/structured_market.py) is a
+    # literal member of PERMANENT_REASONS below, so both already classify
+    # as TECHNICAL_RETRYABLE by this module's existing unknown-reason-is-
+    # technical default -- distinct STRINGS (an operator or a future rule
+    # change can tell them apart), but deliberately the SAME, unchanged
+    # retry classification: this module's whole design is that a failure
+    # it cannot positively prove is "the evidence does not exist" must
+    # never become terminal, and an absent-metadata response proves even
+    # less than a proven name mismatch does.
     parts = _components(reason)
     if not parts:
         return None

@@ -136,7 +136,20 @@ class YahooFinanceProvider:
         self._bounded_session = _build_bounded_yahoo_session(settings.structured_provider_timeout_seconds)
         self.ticker_factory = ticker_factory or (
             lambda symbol: yf.Ticker(symbol, session=self._bounded_session))
-        self.ticker_contexts = YahooTickerContexts(self.ticker_factory)
+        # Only wire the bounded session-refresh hook (see
+        # YahooTickerContexts.note_identity_metadata_unavailable) for the
+        # default, yfinance-backed factory this provider builds for itself
+        # -- `self.ticker_factory`'s closure reads `self._bounded_session`
+        # at CALL time, not at lambda-construction time, so rebuilding it
+        # in `_rebuild_bounded_session` below takes effect for every
+        # ticker created afterward, including through an already-shared
+        # YahooTickerContexts. A caller-supplied `ticker_factory` (tests,
+        # or any other explicit wiring) owns its own session lifecycle, so
+        # there is nothing of ours to refresh.
+        self.ticker_contexts = YahooTickerContexts(
+            self.ticker_factory,
+            session_refresh=None if ticker_factory is not None else self._rebuild_bounded_session,
+        )
         self.use_yfinance = client is None or ticker_factory is not None
         # The shared pool serializes access to each mutable ticker and bounds
         # retention. No context means no reuse; new contexts always retry.
@@ -155,6 +168,21 @@ class YahooFinanceProvider:
         # owners are cancelled faster than their threads actually drain.
         self._thread_dispatch_semaphore = asyncio.Semaphore(
             max(1, settings.structured_provider_max_concurrent_threads))
+
+    def _rebuild_bounded_session(self) -> None:
+        """Replace the shared Yahoo session with a brand-new one.
+
+        Called (bounded, see YahooTickerContexts.note_identity_metadata_
+        unavailable) when a resolved instrument's provider identity
+        metadata came back completely empty -- the production signature
+        of a stale/invalid crumb on this shared session, not a per-
+        instrument data problem. `self.ticker_factory`'s closure reads
+        `self._bounded_session` fresh on every call, so reassigning it
+        here is picked up by every ticker created afterward without any
+        further plumbing.
+        """
+        self._bounded_session = _build_bounded_yahoo_session(
+            self.settings.structured_provider_timeout_seconds)
 
     async def collect(self, instrument: dict[str, Any], *, acquisition_context: object | None = None) -> StructuredMarketSnapshot:
         return await self._collect(instrument, acquisition_context=acquisition_context)
@@ -669,6 +697,24 @@ def verify_identity_by_isin_or_name(
     is never overridden by a low name-similarity score. A mismatched ISIN is
     rejected outright; when an exact comparison cannot be made at all
     (either side missing an ISIN), this falls back to name similarity.
+
+    Root cause (Yahoo metadata unavailable / Equity Radar retries): a
+    provider that returned NO name at all (an empty/invalid-session
+    response -- e.g. Yahoo's ``.info`` coming back empty after an HTTP 401
+    Invalid Crumb / session failure) was previously indistinguishable from
+    one that returned a genuinely different, populated company name --
+    both fell into the same ``if not returned_name_s or similarity < 0.55``
+    branch and were reported as ``COMPANY_NAME_MISMATCH``. That label is
+    wrong for the first case: nothing was ever actually compared, so
+    nothing was ever actually found to mismatch. Both cases still fail
+    closed (never silently verified), but this now reports a distinct,
+    truthful reason for "we have no identity evidence to compare" versus
+    "we compared it and it does not match" -- the first callers need to be
+    able to tell apart from a genuine wrong-company mapping, including an
+    operator reading structured retry/alerting dashboards and anything
+    upstream (see failure_taxonomy.classify_reason) that could someday
+    decide to treat a *proven* mismatch differently from an *unprovable*
+    one.
     """
     expected_isin_u = str(expected_isin or "").upper()
     returned_isin_u = str(returned_isin or "").upper()
@@ -676,8 +722,10 @@ def verify_identity_by_isin_or_name(
         if expected_isin_u != returned_isin_u:
             return "ISIN_MISMATCH"
         return None
-    returned_name_s = str(returned_name or "")
-    if not returned_name_s or _name_similarity(expected_name, returned_name_s) < 0.55:
+    returned_name_s = str(returned_name or "").strip()
+    if not returned_name_s:
+        return "PROVIDER_IDENTITY_UNAVAILABLE"
+    if _name_similarity(expected_name, returned_name_s) < 0.55:
         return "COMPANY_NAME_MISMATCH"
     return None
 

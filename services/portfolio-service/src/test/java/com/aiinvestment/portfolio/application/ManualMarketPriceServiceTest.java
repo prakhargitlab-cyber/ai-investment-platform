@@ -92,6 +92,68 @@ class ManualMarketPriceServiceTest {
     }
 
     @Test
+    void manualImportWithNoLiveQuoteDerivesValuationFromItsOwnImportedBrokerPrice() {
+        // No market-data refresh has ever been attempted for this position
+        // (PortfolioPositionResponse.from(position) -- the single-arg list
+        // path, which calls unpricedManualPosition(position, null)). The
+        // broker's own imported snapshot price must stand in for valuation
+        // instead of leaving marketValue/P&L at N/A, while currentPrice and
+        // dataFreshness still correctly reflect that this is a snapshot, not
+        // a verified live quote.
+        var position = manualPosition("ICICI_DIRECT", "ZENTEC", "1700", "1200", "100");
+
+        var response = PortfolioPositionResponse.from(position);
+
+        assertThat(response.importedPrice().amount()).isEqualByComparingTo("1700");
+        assertThat(response.currentPrice()).isNull();
+        assertThat(response.marketValue().amount()).isEqualByComparingTo("170000");
+        assertThat(response.costBasis().amount()).isEqualByComparingTo("120000");
+        assertThat(response.unrealizedProfitLoss().amount()).isEqualByComparingTo("50000");
+        assertThat(response.unrealizedProfitLossPercent()).isEqualByComparingTo("41.6667");
+        assertThat(response.dataFreshness()).isEqualTo("IMPORTED_SNAPSHOT");
+        assertThat(response.quote()).isNull();
+    }
+
+    @Test
+    void manualImportWithoutAnyImportedPriceStaysUnvaluedRatherThanFabricatingOne() {
+        // Genuinely no imported price on file (e.g. the broker CSV column was
+        // blank/zero at import time) -- valuation must stay null exactly as
+        // before this fix, never fabricated from quantity/averageCost alone.
+        var instrument = instrument("NOPRICE", AssetType.EQUITY, "IN", "INR");
+        var position = new PortfolioPosition(UUID.randomUUID(), portfolioId, instrument, new BigDecimal("50"),
+                money("1200", "INR"), null, null, money("60000", "INR"), null, null,
+                "manual", "ICICI_DIRECT", "MANUAL_CSV_IMPORT", true, "IMPORTED_SNAPSHOT", Instant.now(), null, null);
+
+        var response = PortfolioPositionResponse.from(position);
+
+        assertThat(response.importedPrice()).isNull();
+        assertThat(response.currentPrice()).isNull();
+        assertThat(response.marketValue()).isNull();
+        assertThat(response.unrealizedProfitLoss()).isNull();
+        assertThat(response.unrealizedProfitLossPercent()).isNull();
+    }
+
+    @Test
+    void manualImportWithCurrencyMismatchedImportedPriceStaysUnvalued() {
+        // The imported price's currency disagreeing with averageCost's own
+        // currency is a genuine data problem (e.g. a provider/parsing
+        // mismatch) -- it must never be silently used to derive a
+        // cross-currency market value.
+        var instrument = instrument("XCCY", AssetType.EQUITY, "IN", "INR");
+        var position = new PortfolioPosition(UUID.randomUUID(), portfolioId, instrument, new BigDecimal("10"),
+                money("1200", "INR"), null, null, money("12000", "INR"), null, null,
+                "manual", "ICICI_DIRECT", "MANUAL_CSV_IMPORT", true, "IMPORTED_SNAPSHOT", Instant.now(), null,
+                money("15", "USD"));
+
+        var response = PortfolioPositionResponse.from(position);
+
+        assertThat(response.importedPrice().amount()).isEqualByComparingTo("15");
+        assertThat(response.marketValue()).isNull();
+        assertThat(response.unrealizedProfitLoss()).isNull();
+        assertThat(response.unrealizedProfitLossPercent()).isNull();
+    }
+
+    @Test
     void ibkrIsSkippedAndValidatedEtfUsesManualPublicPriceAuthority() {
         var ibkr = new PortfolioPosition(UUID.randomUUID(), portfolioId,
                 instrument("BESI", AssetType.EQUITY, "NL", "EUR"), new BigDecimal("4"), money("80", "EUR"), money("100", "EUR"),

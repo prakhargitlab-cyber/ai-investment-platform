@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * Bounded, idempotent, explicit bootstrap of GENUINELY MISSING NSE ETF {@code instrument_master}
@@ -155,6 +156,107 @@ public class NseEtfUniverseBootstrapService {
         log.info("nse_etf_universe_bootstrap_complete {}", summary);
         return summary;
     }
+
+    /**
+     * Bounded single-ISIN counterpart to {@link #bootstrapMissingEtfs()}, used only by
+     * {@link NseEtfUniverseApplyService#applySingle}. Fetches both official sources fresh (never
+     * reuses a prior pass's snapshot), applies the SAME prevalidation ({@link NseEtfListingValidation})
+     * and the SAME IV-series conflict definition as the bulk path, plus a symbol-collision check
+     * across the fetched ETF list that only matters once a single ISIN is pinned down. Never reads
+     * or writes {@code instrument_master} directly -- existence, identity and mapping completeness
+     * are entirely {@link InstrumentMasterService#canonicalizeSelectedOfficialEtf}'s job, exactly as
+     * {@link InstrumentMasterService#canonicalizeOfficialEtf} is the bulk path's.
+     */
+    public SingleEtfOutcome provisionSingleEtf(String isin) {
+        List<NseOfficialEtfSecurityList.Listing> listings;
+        try {
+            listings = etfSecurityList.listAll();
+        } catch (RuntimeException unavailable) {
+            log.warn("nse_etf_single_provisioning event=OFFICIAL_SOURCE_UNAVAILABLE isin={} source=ETF_LIST exception={}",
+                    isin, unavailable.getClass().getSimpleName());
+            return new SingleEtfOutcome("OFFICIAL_SOURCE_UNAVAILABLE", null);
+        }
+
+        List<NseOfficialSecurityMaster.Listing> equityListings;
+        try {
+            equityListings = securityMaster.listedEquities();
+        } catch (RuntimeException unavailable) {
+            log.warn("nse_etf_single_provisioning event=OFFICIAL_SOURCE_UNAVAILABLE isin={} source=IV_SERIES exception={}",
+                    isin, unavailable.getClass().getSimpleName());
+            return new SingleEtfOutcome("OFFICIAL_SOURCE_UNAVAILABLE", null);
+        }
+        if (equityListings.isEmpty()) {
+            // Mirrors bootstrapMissingEtfs()'s ivSeriesSourceAvailable: an empty IV-series source is
+            // never treated as "no conflict", only as unavailable.
+            log.warn("nse_etf_single_provisioning event=OFFICIAL_SOURCE_UNAVAILABLE isin={} source=IV_SERIES reason=EMPTY", isin);
+            return new SingleEtfOutcome("OFFICIAL_SOURCE_UNAVAILABLE", null);
+        }
+
+        int rawOccurrences = 0;
+        for (NseOfficialEtfSecurityList.Listing listing : listings) {
+            if (isin.equals(InstrumentMasterEntity.normalizeIsin(listing.isin()))) {
+                rawOccurrences++;
+            }
+        }
+        if (rawOccurrences == 0) {
+            return new SingleEtfOutcome("ISIN_NOT_IN_OFFICIAL_ETF_UNIVERSE", null);
+        }
+
+        // Same whole-list prevalidation bootstrapMissingEtfs() uses: a listing with a missing ISIN
+        // is malformed, and a duplicated ISIN anywhere in the source disqualifies every occurrence --
+        // including the one that otherwise looks fine. A raw ISIN appearing more than once in the
+        // source is itself a conflicting-identity condition even when only one of those occurrences
+        // is well-formed (a "malformed duplicate"): NseEtfListingValidation only groups WELL-FORMED
+        // candidates by ISIN, so when one of two same-ISIN entries is malformed, the other is left as
+        // the sole accepted candidate and would otherwise look like a clean, unique identity. Checking
+        // rawOccurrences alongside acceptedMatches catches that case too: the selector must map to
+        // exactly one accepted, well-formed candidate AND appear exactly once in the raw source.
+        NseEtfListingValidation.Result validation = NseEtfListingValidation.validate(listings);
+        NseEtfListingValidation.Candidate selected = null;
+        int acceptedMatches = 0;
+        for (NseEtfListingValidation.Candidate candidate : validation.accepted()) {
+            if (isin.equals(candidate.isin())) {
+                selected = candidate;
+                acceptedMatches++;
+            }
+        }
+        if (rawOccurrences != 1 || acceptedMatches != 1) {
+            return new SingleEtfOutcome("OFFICIAL_ETF_IDENTITY_INVALID_OR_DUPLICATE", null);
+        }
+
+        // A different ISIN in the same fetched list claiming the same trading symbol is an
+        // authoritative-source inconsistency NseEtfListingValidation does not check (it only groups
+        // by ISIN), so it is checked here before this ISIN is ever handed to the canonicalizer.
+        for (NseEtfListingValidation.Candidate other : validation.accepted()) {
+            if (!other.isin().equals(selected.isin()) && other.symbol().equalsIgnoreCase(selected.symbol())) {
+                return new SingleEtfOutcome("OFFICIAL_ETF_SYMBOL_CONFLICT", null);
+            }
+        }
+
+        for (NseOfficialSecurityMaster.Listing listing : equityListings) {
+            if ("IV".equalsIgnoreCase(listing.series()) && isin.equals(InstrumentMasterEntity.normalizeIsin(listing.isin()))) {
+                return new SingleEtfOutcome("ISIN_IN_BOTH_ETF_LIST_AND_IV_SERIES", null);
+            }
+        }
+
+        try {
+            InstrumentMasterEntity master = instruments.canonicalizeSelectedOfficialEtf(selected.isin(), selected.symbol(), selected.securityName());
+            log.info("nse_etf_single_provisioning event=ETF_PROVISIONED isin={} symbol={}", selected.isin(), selected.symbol());
+            return new SingleEtfOutcome("VERIFIED", master.getInstrumentId());
+        } catch (IllegalStateException conflict) {
+            log.warn("nse_etf_single_provisioning event=CANONICAL_IDENTITY_OR_MAPPING_CONFLICT isin={} symbol={}",
+                    selected.isin(), selected.symbol());
+            return new SingleEtfOutcome("CANONICAL_IDENTITY_OR_MAPPING_CONFLICT", null);
+        } catch (RuntimeException failure) {
+            log.warn("nse_etf_single_provisioning event=PROVISIONING_FAILED isin={} symbol={} reason={}",
+                    selected.isin(), selected.symbol(), failure.getClass().getSimpleName());
+            return new SingleEtfOutcome("SINGLE_ETF_PROVISIONING_FAILED", null);
+        }
+    }
+
+    /** Outcome of one {@link #provisionSingleEtf} call; {@code instrumentId} is null unless
+     * {@code "VERIFIED".equals(outcome)}. */
+    public record SingleEtfOutcome(String outcome, UUID instrumentId) {}
 
     /** Bounded observability counts for one pass; never per-row logging beyond created/rejected/failed above. */
     public static final class Summary {

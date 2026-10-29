@@ -170,6 +170,43 @@ public class InstrumentMasterService {
                 com.aiinvestment.shared.domain.AssetType.ETF);
     }
 
+    /**
+     * Canonicalize an official NSE ETF identity that a caller has already SELECTED for an
+     * explicit, single-ISIN provisioning request (see NseEtfUniverseApplyService#applySingle) --
+     * distinct from {@link #canonicalizeOfficialEtf}, whose bulk-bootstrap contract only has to
+     * confirm that *some* pre-existing row at this ISIN looks plausible before leaving it alone.
+     * Here the caller named this exact (isin, symbol, companyName) triple, so the result must be
+     * verified to hold EXACTLY that identity as a durable, VERIFIED provider mapping -- not merely
+     * an existing row whose master fields happen to match. An existing row with no mapping, an
+     * INVALID mapping, or a mapping whose symbol/ISIN/currency differs even slightly is rejected
+     * rather than silently left as-is or repaired (see NseEtfSinglePersistenceTest).
+     *
+     * <p>Delegates the actual creation/matching to {@link #canonicalizeOfficialEtf} via a plain
+     * same-class method call, so it runs in the SAME transaction this method's own
+     * {@code @Transactional} already started (self-invocation never re-enters the Spring proxy).
+     * A postcondition failure below therefore rolls back a freshly created master row and its
+     * mapping together, exactly as if neither had ever been written.
+     *
+     * <p>The identity comparison is deliberately exact (case-sensitive {@code equals}, not the
+     * case-insensitive {@code same} helper used elsewhere in this class): {@code canonicalizeOfficialEtf}
+     * tolerates and normalizes ISIN case for its own (bulk) callers, but a caller that selected one
+     * exact ISIN must get back confirmation of that exact ISIN, not a normalized stand-in.
+     */
+    @Transactional
+    public InstrumentMasterEntity canonicalizeSelectedOfficialEtf(String isin, String symbol, String companyName) {
+        InstrumentMasterEntity master = canonicalizeOfficialEtf(isin, symbol, companyName);
+        Optional<InstrumentProviderMappingEntity> mapping = reusableMapping(master.getInstrumentId(), "NSE");
+        boolean verifiedExactIdentity = isin.equals(master.getIsin())
+                && symbol.equals(master.getPrimarySymbol())
+                && master.getAssetType() == com.aiinvestment.shared.domain.AssetType.ETF
+                && mapping.isPresent()
+                && isin.equals(mapping.get().getProviderInstrumentId())
+                && symbol.equals(mapping.get().getProviderSymbol())
+                && "INR".equals(mapping.get().getCurrency());
+        if (!verifiedExactIdentity) throw new IllegalStateException("NSE_ETF_SELECTED_IDENTITY_NOT_VERIFIED");
+        return master;
+    }
+
     private InstrumentMasterEntity canonicalizeOfficialSecurity(String isin, String symbol, String companyName, String source,
             com.aiinvestment.shared.domain.AssetType assetType) {
         String normalized = InstrumentMasterEntity.normalizeIsin(isin);

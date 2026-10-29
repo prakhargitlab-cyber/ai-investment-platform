@@ -32,17 +32,25 @@ function Reset {
  $script:Jobs=@{items=@()};$script:Pods=@{items=@(@{metadata=@{namespace='ai-investment'};spec=@{}})}
  $script:Pod=@{metadata=@{uid='uid'};status=@{containerStatuses=@(@{name='research-engine';restartCount=0;containerID='one';ready=$true})}}
  $script:Pod=$script:Pod | ConvertTo-Json -Depth 20 | ConvertFrom-Json
- $script:Gate=@{ResearchPod='research-1';ResearchUID='uid';PodIdentity=($script:Pod.status.containerStatuses|Select-Object name,restartCount,containerID|ConvertTo-Json -Compress);Selector=@{matchLabels=@{component='research-engine'}};Callers=@('gateway','portfolio','mcp');ServiceIP='10.43.0.1';PodIP='10.42.0.1';Baseline=@{fingerprint=('a'*64)};AuditPath='mock';Started='2026-10-12T00:00:00Z';Workloads=@{items=@(@{kind='Deployment';metadata=@{name='other'};spec=@{replicas=1}})}}
+ $script:Gate=@{ResearchPod='research-1';ResearchUID='uid';PodIdentity=($script:Pod.status.containerStatuses|Select-Object name,restartCount,containerID|ConvertTo-Json -Compress);Selector=@{matchLabels=@{component='research-engine'}};Callers=@('gateway','portfolio','mcp');ServiceIP='10.43.0.1';PodIP='10.42.0.1';Baseline=@{fingerprint=('a'*64)};AuditPath='mock';Started='2026-10-12T00:00:00Z';Migrations=$null;Workloads=@{items=@(@{kind='Deployment';metadata=@{name='other'};spec=@{replicas=1}})}}
  $script:Policies=@{items=@(@{metadata=@{name='research-bootstrap-isolation'};spec=@{podSelector=$script:Gate.Selector;policyTypes=@('Ingress');ingress=@()}})}
  $script:Workloads=$script:Gate.Workloads
  $script:Fingerprint='a'*64
 }
 Test 'PowerShell parser' {Assert ($errors.Count -eq 0) 'Parser failed';Write-Output "PowerShell $($PSVersionTable.PSVersion)"}
 Test 'baseline/control health probe' {Reset;Invoke-IsolationProbe caller research-service 80;Assert ($script:Calls.Count -eq 1) 'Probe absent'}
-Test 'denial requires timeout, not HTTP/refused/missing binary' {
- Reset;Throws {Invoke-IsolationProbe caller 10.42.0.1 8000 -Denied} '*isolation failed*'
- $script:ProbeOutput='ISOLATED';Invoke-IsolationProbe caller 10.42.0.1 8000 -Denied
- $script:ProbeError=$true;Throws {Invoke-IsolationProbe caller 10.42.0.1 8000 -Denied} '*binary unavailable*'
+Test 'denial requires explicit refusal and increasing REJECT counter, never timeout' {
+ Reset;$script:ActiveIsolationGate=$script:Gate
+ $script:Pod.status | Add-Member phase 'Running'
+ $script:Pod.status | Add-Member podIP $script:Gate.PodIP
+ $script:ProbeCounter=0
+ function Get-VerifiedResearchRejectCounter {param($Gate);$script:ProbeCounter++;return $script:ProbeCounter}
+ function Invoke-DeploymentNativeCommand {param($Program,$Arguments);if($script:ProbeError){throw 'binary unavailable'};return $script:NativeProbe}
+ $script:NativeProbe=@{ExitCode=124;StdOut='';StdErr=''}
+ Throws {Invoke-IsolationProbe gateway 10.42.0.1 8000 -Denied} '*REJECT proof failed*exit=124*'
+ $script:NativeProbe=@{ExitCode=1;StdOut='';StdErr='bash: /dev/tcp/10.42.0.1/8000: Connection refused'}
+ Invoke-IsolationProbe gateway 10.42.0.1 8000 -Denied
+ $script:ProbeError=$true;Throws {Invoke-IsolationProbe gateway 10.42.0.1 8000 -Denied} '*binary unavailable*'
 }
 Test 'control timeout rejected' {Reset;$script:ProbeOutput='ISOLATED';Throws {Invoke-IsolationProbe caller research-service 80} '*unavailable*'}
 Test 'invalid probe address rejected before command' {Reset;Throws {Invoke-IsolationProbe caller 'host;bad' 80} '*Invalid*';Assert ($script:Calls.Count -eq 0) 'Command escaped'}

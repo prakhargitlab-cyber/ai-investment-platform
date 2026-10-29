@@ -34,7 +34,10 @@ class OfficialFinancialProvider(Protocol):
 _XBRLI = "http://www.xbrl.org/2003/instance"
 _TAXONOMY = "http://www.sebi.gov.in/xbrl/2026-01-31/in-capmkt"
 _SUPPORTED_TAXONOMIES = {_TAXONOMY, "http://www.sebi.gov.in/xbrl/2025-01-31/in-capmkt"}
-_PARSER_VERSION = "nse-integrated-2025-2026-v2"
+# v3: contexts identified by the NSE trading Symbol (not only ScripCode) are
+# supported. Receipts key on this value, so filings previously parsed to zero
+# facts under v2 are eligible for exactly one bounded re-download.
+_PARSER_VERSION = "nse-integrated-2025-2026-v3"
 _MAX_DISCOVERY_PAGES = 5
 _MAX_XML_DOCUMENTS = 4
 _EXTRA_PERIOD_DOCUMENTS = 2
@@ -53,6 +56,14 @@ _INSTANT = {"Assets": "total_assets", "Equity": "total_equity", "Liabilities": "
             "BorrowingsCurrent": "current_borrowings", "BorrowingsNoncurrent": "noncurrent_borrowings"}
 _EPS = ("DilutedEarningsLossPerShareFromContinuingAndDiscontinuedOperations",
         "BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations")
+_SCRIP_CODE_SCHEMES = {"http://www.sebi.gov.in/in-capmkt/ScripCode",
+                       "http://www.nseindia.com/in-capmkt/ScripCode",
+                       "http://www.bseindia.com/in-capmkt/ScripCode"}
+# Some integrated filings identify every context by the NSE trading symbol
+# instead (observed: sebi.gov.in for the 2026 taxonomy, bseindia.com for 2025).
+_SYMBOL_SCHEMES = {"http://www.sebi.gov.in/in-capmkt/Symbol",
+                   "http://www.nseindia.com/in-capmkt/Symbol",
+                   "http://www.bseindia.com/in-capmkt/Symbol"}
 
 
 def _financial_log_url(value):
@@ -160,11 +171,13 @@ def parse_nse_financial_xbrl(content: bytes, profile, row, *, retrieved_at) -> l
         if any(n.tag.rsplit("}", 1)[-1] in {"scenario", "segment"} for n in context.iter()):
             continue
         identifier = context.find(f"{{{_XBRLI}}}entity/{{{_XBRLI}}}identifier")
+        # The context entity must name this filing's already-verified identity:
+        # its single ScripCode, or the NSE symbol checked against the profile,
+        # the filing row and the document's own Symbol element above.
         if identifier is None or not (
-                identifier.get("scheme") in {"http://www.sebi.gov.in/in-capmkt/ScripCode",
-                                              "http://www.nseindia.com/in-capmkt/ScripCode",
-                                              "http://www.bseindia.com/in-capmkt/ScripCode"}
-                and scrips == {identifier.text}):
+                (identifier.get("scheme") in _SCRIP_CODE_SCHEMES and scrips == {identifier.text})
+                or (identifier.get("scheme") in _SYMBOL_SCHEMES
+                    and str(identifier.text or "").strip().upper() == symbol)):
             continue
         period = context.find(f"{{{_XBRLI}}}period")
         if period is None:

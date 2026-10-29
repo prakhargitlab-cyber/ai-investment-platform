@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Any, AsyncContextManager, Callable, Protocol
+from typing import Any, AsyncContextManager, Callable, Literal, Protocol
 from urllib.parse import quote
 
 import httpx2
@@ -277,6 +277,31 @@ class OfficialYahooMcpClientFactory:
                 transport, read_timeout_seconds=self.config.timeout_seconds, cache=None
             ) as client:
                 yield client
+
+
+class LatestPriceSession(StrictContract):
+    """Trusted research-engine calendar bounds; never sent to the Yahoo tool."""
+
+    market: Literal["NSE", "XNSE"]
+    session_close: datetime = Field(alias="sessionClose")
+    valid_until: datetime = Field(alias="validUntil")
+
+    @field_validator("session_close", "valid_until")
+    @classmethod
+    def aware_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("calendar timestamps require a timezone")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def ordered_bounds(self):
+        if self.valid_until <= self.session_close:
+            raise ValueError("next opening must follow the session close")
+        return self
+
+    def covers(self, observed: datetime, now: datetime, max_age_seconds: int) -> bool:
+        return (self.session_close <= now < self.valid_until
+                and abs(observed - self.session_close) <= timedelta(seconds=max_age_seconds))
 
 
 class YahooMcpRawFact(StrictContract):
@@ -547,11 +572,21 @@ class YahooFinanceMcpProvider:
             "expectedExchange",
             "expectedCurrency",
             "financialGapFill",
+            "latestPriceSession",
         }
         if set(arguments) - allowed:
             raise McpGatewayError(McpErrorCode.INVALID_ARGUMENT)
         region = str(arguments.get("region") or "").upper()
         requirement = str(arguments.get("requirementId") or "").upper()
+        session = None
+        if arguments.get("latestPriceSession") is not None:
+            try:
+                session = LatestPriceSession.model_validate(arguments["latestPriceSession"])
+            except ValidationError as exc:
+                raise McpGatewayError(McpErrorCode.INVALID_ARGUMENT) from exc
+            if (requirement != "LATEST_PRICE" or region != "INDIA"
+                    or _exchange_family(str(arguments.get("expectedExchange") or "")) != "NSE"):
+                raise McpGatewayError(McpErrorCode.INVALID_ARGUMENT)
         financial_gap_fill = arguments.get("financialGapFill", False)
         if not isinstance(financial_gap_fill, bool) or (financial_gap_fill and (
                 region != "INDIA" or requirement not in {
@@ -590,6 +625,8 @@ class YahooFinanceMcpProvider:
             expected_exchange=arguments.get("expectedExchange"),
             expected_currency=arguments.get("expectedCurrency"),
         )
+        if session is not None and _exchange_family(raw.exchange or "") != "NSE":
+            raise McpGatewayError(McpErrorCode.EXTERNAL_IDENTITY_CONFLICT)
         normalized = self._normalize(
             raw,
             capability=capability,
@@ -597,6 +634,7 @@ class YahooFinanceMcpProvider:
             region=region,
             requirement=requirement,
             tool=tool,
+            latest_price_session=session,
         )
         self._validate_completeness(normalized, capability, financial_gap_fill=financial_gap_fill)
         return normalized
@@ -636,7 +674,7 @@ class YahooFinanceMcpProvider:
                 if self.circuit_breaker:
                     await self.circuit_breaker.record_failure(dependency=PROVIDER_ID)
                 raise
-            except TimeoutError:
+            except (TimeoutError, httpx2.TimeoutException):
                 last_code = McpErrorCode.DOWNSTREAM_TIMEOUT
             except _RetryableProviderFailure as exc:
                 last_code = exc.code
@@ -711,16 +749,20 @@ class YahooFinanceMcpProvider:
         region: str,
         requirement: str,
         tool: str,
+        latest_price_session: LatestPriceSession | None = None,
     ) -> dict[str, Any]:
         now = _aware(self.clock())
         observed = _aware(raw.as_of) if raw.as_of else None
         if capability.max_age_seconds:
-            if observed is None:
+            if observed is None or (requirement == "LATEST_PRICE" and raw.as_of.tzinfo is None):
                 raise McpGatewayError(McpErrorCode.EXTERNAL_RESULT_INCOMPLETE)
-            if observed > now + timedelta(minutes=5) or now - observed > timedelta(
-                seconds=capability.max_age_seconds
-            ):
+            future_limit = now if requirement == "LATEST_PRICE" else now + timedelta(minutes=5)
+            if observed > future_limit:
                 raise McpGatewayError(McpErrorCode.EXTERNAL_RESULT_STALE)
+            if now - observed > timedelta(seconds=capability.max_age_seconds):
+                if not (requirement == "LATEST_PRICE" and latest_price_session is not None
+                        and latest_price_session.covers(observed, now, capability.max_age_seconds)):
+                    raise McpGatewayError(McpErrorCode.EXTERNAL_RESULT_STALE)
 
         source_url = raw.source_url or (
             f"https://finance.yahoo.com/quote/{quote(raw.symbol, safe='')}"

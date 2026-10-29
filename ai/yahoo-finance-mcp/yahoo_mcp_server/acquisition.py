@@ -4,11 +4,12 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Any, Callable
 
-import yfinance as yf
-
-from app.historical_market_data import YahooHistoricalPriceProvider
+from app.historical_market_data import (
+    HistoricalPriceIdentityConflict, HistoricalPriceProviderError, YahooHistoricalPriceProvider,
+)
 from app.models import StructuredInstrumentResolution, StructuredMarketSnapshot
 from app.settings import Settings as ResearchSettings
 from app.structured_market import StructuredProviderError, YahooFinanceProvider
@@ -35,14 +36,14 @@ class YahooAcquisitionService:
     ) -> None:
         self.settings = settings
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self.ticker_factory = ticker_factory or yf.Ticker
         shared_settings = ResearchSettings(
             structured_provider_timeout_seconds=settings.upstream_timeout_seconds,
             research_user_agent=settings.user_agent,
         )
         self.structured = YahooFinanceProvider(
-            shared_settings, ticker_factory=self.ticker_factory
+            shared_settings, ticker_factory=ticker_factory
         )
+        self.ticker_factory = self.structured.ticker_factory
         self.history = YahooHistoricalPriceProvider(self.ticker_factory)
         self._concurrency = asyncio.Semaphore(settings.max_concurrency)
         self._workers = ThreadPoolExecutor(
@@ -84,7 +85,10 @@ class YahooAcquisitionService:
             # Observe late failures even when their request has timed out.
             future.exception()
 
-    async def snapshot(self, identity: IdentityInput) -> StructuredMarketSnapshot:
+    async def snapshot(self, identity: IdentityInput, *, capability: str = 'all') -> StructuredMarketSnapshot:
+        classes = {'all': None, 'quote': frozenset(), 'profile': frozenset(),
+                   'annual': frozenset({'ANNUAL'}), 'quarterly': frozenset({'QUARTERLY'}),
+                   'news': frozenset({'NEWS'}), 'analyst': frozenset()}[capability]
         resolution = StructuredInstrumentResolution(
             instrument_id=identity.global_instrument_id,
             provider="YAHOO_FINANCE",
@@ -101,7 +105,7 @@ class YahooAcquisitionService:
             # Reuse the same synchronous acquisition/normalization underneath
             # collect_verified, with this service owning worker lifetime.
             result = await self._run_blocking(
-                self.structured._collect_resolved_yfinance, resolution
+                partial(self.structured._collect_resolved_yfinance, data_classes=classes), resolution
             )
         except TimeoutError as exc:
             raise YahooMcpServiceError("YAHOO_MCP_UPSTREAM_TIMEOUT") from exc
@@ -130,6 +134,14 @@ class YahooAcquisitionService:
             )
         except TimeoutError as exc:
             raise YahooMcpServiceError("YAHOO_MCP_UPSTREAM_TIMEOUT") from exc
+        except HistoricalPriceIdentityConflict as exc:
+            raise YahooMcpServiceError("YAHOO_MCP_IDENTITY_MISMATCH") from exc
+        except HistoricalPriceProviderError as exc:
+            code = {
+                "DOWNSTREAM_TIMEOUT": "YAHOO_MCP_UPSTREAM_TIMEOUT",
+                "EXTERNAL_PROVIDER_RATE_LIMITED": "YAHOO_MCP_RATE_LIMITED",
+            }.get(str(exc), "YAHOO_MCP_UPSTREAM_UNAVAILABLE")
+            raise YahooMcpServiceError(code) from exc
         except asyncio.CancelledError:
             raise
         except Exception as exc:

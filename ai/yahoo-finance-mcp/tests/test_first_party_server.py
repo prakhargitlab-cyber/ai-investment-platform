@@ -113,6 +113,47 @@ async def test_quote_contract_preserves_canonical_identity_and_normalized_price(
 
 
 @pytest.mark.asyncio
+async def test_quote_without_market_timestamp_does_not_substitute_retrieval_time():
+    from fake_yahoo import FakeYahooTicker
+
+    class MissingMarketTime(FakeYahooTicker):
+        @property
+        def info(self):
+            values = super().info
+            values.pop("regularMarketTime")
+            return values
+
+    config = settings()
+    acquisition = YahooAcquisitionService(config, ticker_factory=lambda symbol: MissingMarketTime(symbol, "SUCCESS"))
+    result = await call_tool(create_yahoo_mcp_server(config, acquisition=acquisition), "get_quote")
+    assert result.is_error is False
+    payload = ToolPayload.model_validate(result.structured_content)
+    assert payload.as_of is None
+    assert payload.retrieved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_quote_preserves_regular_market_time_independently_of_retrieval():
+    from datetime import datetime, timezone
+    from fake_yahoo import FakeYahooTicker
+
+    close = datetime(2026, 10, 16, 10, tzinfo=timezone.utc)
+
+    class FridayClose(FakeYahooTicker):
+        @property
+        def info(self):
+            return {**super().info, "regularMarketTime": int(close.timestamp())}
+
+    config = settings()
+    acquisition = YahooAcquisitionService(config, ticker_factory=lambda symbol: FridayClose(symbol, "SUCCESS"))
+    result = await call_tool(create_yahoo_mcp_server(config, acquisition=acquisition), "get_quote")
+    assert result.is_error is False
+    payload = ToolPayload.model_validate(result.structured_content)
+    assert payload.as_of == close
+    assert payload.retrieved_at != payload.as_of
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("symbol", ["HAL.NS", "RBLBANK.NS", "AAPL", "MSFT", "BESI.AS"])
 async def test_representative_verified_provider_symbols_are_forwarded_exactly(symbol):
     result = await call_tool(server(), "get_quote", arguments(symbol))

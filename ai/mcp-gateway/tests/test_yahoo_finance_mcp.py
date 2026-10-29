@@ -351,6 +351,126 @@ async def test_stale_and_incomplete_results_are_distinct() -> None:
 
 
 @pytest.mark.asyncio
+async def test_nse_latest_close_is_valid_during_weekend_with_internal_calendar_context():
+    close = datetime(2026, 10, 16, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 18, 12, tzinfo=timezone.utc)
+    adapter, client = provider(
+        mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=900),
+        payload(asOf=close.isoformat()), clock=lambda: now,
+    )
+    result = await adapter.invoke(tool="get_quote", arguments=arguments(latestPriceSession={
+        "market": "XNSE", "sessionClose": close.isoformat(),
+        "validUntil": "2026-10-19T03:45:00+00:00",
+    }), request_id="weekend-close")
+    assert result["observedAt"] == close.isoformat()
+    assert result["structuredFacts"][0]["asOf"] == close.isoformat()
+    assert "latestPriceSession" not in client.calls[0][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed,now,close,until,accepted", [
+    # Official Oct 2 closure: Thursday close survives the holiday and weekend.
+    ("2026-10-01T10:00:00Z", "2026-10-02T12:00:00Z", "2026-10-01T10:00:00Z", "2026-10-05T03:45:00Z", True),
+    # The Budget Sunday is a real session, not an ordinary weekend.
+    ("2026-02-01T10:00:00Z", "2026-02-01T12:00:00Z", "2026-02-01T10:00:00Z", "2026-02-02T03:45:00Z", True),
+    ("2026-01-30T10:00:00Z", "2026-02-01T12:00:00Z", "2026-02-01T10:00:00Z", "2026-02-02T03:45:00Z", False),
+    # An old session or intraday observation cannot masquerade as the latest close.
+    ("2026-10-15T10:00:00Z", "2026-10-18T12:00:00Z", "2026-10-16T10:00:00Z", "2026-10-19T03:45:00Z", False),
+    ("2026-10-16T07:00:00Z", "2026-10-18T12:00:00Z", "2026-10-16T10:00:00Z", "2026-10-19T03:45:00Z", False),
+    # Closed-market validity ends exactly at the next opening.
+    ("2026-10-16T10:00:00Z", "2026-10-19T03:44:59Z", "2026-10-16T10:00:00Z", "2026-10-19T03:45:00Z", True),
+    ("2026-10-16T10:00:00Z", "2026-10-19T03:45:00Z", "2026-10-16T10:00:00Z", "2026-10-19T03:45:00Z", False),
+    # Replaying a closed-market context cannot extend a live intraday quote.
+    ("2026-10-19T07:44:59Z", "2026-10-19T08:00:00Z", "2026-10-16T10:00:00Z", "2026-10-19T03:45:00Z", False),
+])
+async def test_latest_price_session_bounds(observed, now, close, until, accepted):
+    adapter, _ = provider(
+        mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=900),
+        payload(asOf=observed), clock=lambda: datetime.fromisoformat(now),
+    )
+    call = adapter.invoke(tool="get_quote", arguments=arguments(latestPriceSession={
+        "market": "NSE", "sessionClose": close, "validUntil": until,
+    }), request_id="session-bounds")
+    if accepted:
+        result = await call
+        assert datetime.fromisoformat(result["observedAt"]) == datetime.fromisoformat(observed)
+    else:
+        with pytest.raises(McpGatewayError) as error:
+            await call
+        assert error.value.code is McpErrorCode.EXTERNAL_RESULT_STALE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age,expected", [(900, None), (901, McpErrorCode.EXTERNAL_RESULT_STALE),
+                                           (-1, McpErrorCode.EXTERNAL_RESULT_STALE)])
+async def test_latest_price_retains_strict_live_ttl_and_rejects_future(age, expected):
+    adapter, _ = provider(
+        mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=900),
+        payload(asOf=(NOW - timedelta(seconds=age)).isoformat()),
+    )
+    if expected is None:
+        assert (await adapter.invoke(tool="get_quote", arguments=arguments(), request_id="live"))["freshness"] == "FRESH"
+    else:
+        with pytest.raises(McpGatewayError) as error:
+            await adapter.invoke(tool="get_quote", arguments=arguments(), request_id="live")
+        assert error.value.code is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stamp", [None, "2026-10-16T10:00:00"])
+async def test_latest_price_requires_a_genuine_aware_observation_timestamp(stamp):
+    adapter, _ = provider(mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=900), payload(asOf=stamp))
+    with pytest.raises(McpGatewayError) as error:
+        await adapter.invoke(tool="get_quote", arguments=arguments(), request_id="missing-time")
+    assert error.value.code is McpErrorCode.EXTERNAL_RESULT_INCOMPLETE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", [
+    None,
+    {"market": "UNKNOWN", "sessionClose": "2026-10-16T10:00:00Z", "validUntil": "2026-10-19T03:45:00Z"},
+    {"market": "NSE", "sessionClose": "2026-10-16T10:00:00", "validUntil": "2026-10-19T03:45:00Z"},
+    {"market": "NSE", "sessionClose": "2026-10-19T10:00:00Z", "validUntil": "2026-10-16T03:45:00Z"},
+])
+async def test_missing_or_invalid_calendar_cannot_extend_freshness(context):
+    adapter, client = provider(
+        mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=900),
+        payload(asOf="2026-10-16T10:00:00Z"),
+        clock=lambda: datetime(2026, 10, 18, 12, tzinfo=timezone.utc),
+    )
+    with pytest.raises(McpGatewayError) as error:
+        await adapter.invoke(tool="get_quote", arguments=arguments(latestPriceSession=context), request_id="unknown-calendar")
+    assert error.value.code is (McpErrorCode.EXTERNAL_RESULT_STALE if context is None else McpErrorCode.INVALID_ARGUMENT)
+    if context is not None:
+        assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [{"region": "USA"}, {"region": "EUROPE"},
+                                      {"expectedExchange": "UNKNOWN"}, {"requirementId": "VALUATION_INPUTS"}])
+async def test_nse_session_context_is_scoped_to_latest_nse_price(overrides):
+    adapter, client = provider(mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=900))
+    with pytest.raises(McpGatewayError) as error:
+        await adapter.invoke(tool="get_quote", arguments=arguments(latestPriceSession={
+            "market": "XNSE", "sessionClose": NOW.isoformat(), "validUntil": (NOW + timedelta(days=3)).isoformat(),
+        }, **overrides), request_id="scope")
+    assert error.value.code is McpErrorCode.INVALID_ARGUMENT
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_cannot_supply_its_own_calendar_freshness_exemption():
+    adapter, _ = provider(
+        mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=900),
+        payload(latestPriceSession={"market": "NSE", "sessionClose": NOW.isoformat(),
+                                    "validUntil": (NOW + timedelta(days=3)).isoformat()}),
+    )
+    with pytest.raises(McpGatewayError) as error:
+        await adapter.invoke(tool="get_quote", arguments=arguments(), request_id="provider-calendar")
+    assert error.value.code is McpErrorCode.EXTERNAL_SCHEMA_INVALID
+
+
+@pytest.mark.asyncio
 async def test_annual_and_quarterly_periods_remain_distinct() -> None:
     facts = [
         {"metric": metric, "value": value, "periodEnd": period, "periodType": kind, "reportingBasis": "CONSOLIDATED"}
@@ -491,7 +611,8 @@ async def test_health_does_not_return_endpoint_or_credentials() -> None:
     assert (await adapter.health())["status"] == "DEGRADED"
 
 
-def test_internal_acquisition_route_requires_caller_and_emits_argument_free_audit() -> None:
+@pytest.mark.parametrize("with_session", [False, True])
+def test_internal_acquisition_route_requires_caller_and_emits_argument_free_audit(with_session) -> None:
     capabilities = json.dumps(
         [mapping("LATEST_PRICE", "LATEST_PRICE", "get_quote", maxAgeSeconds=600)]
     )
@@ -533,6 +654,12 @@ def test_internal_acquisition_route_requires_caller_and_emits_argument_free_audi
         "expectedCurrency": "INR",
         "authorization": authorization,
     }
+    if with_session:
+        adapter.clock = lambda: NOW + timedelta(days=2)
+        body["latestPriceSession"] = {
+            "market": "XNSE", "sessionClose": NOW.isoformat(),
+            "validUntil": "2026-09-14T03:45:00+00:00",
+        }
     with TestClient(app) as client:
         assert client.post("/internal/v1/external-research/acquire", json=body).status_code == 401
         response = client.post(
@@ -542,6 +669,8 @@ def test_internal_acquisition_route_requires_caller_and_emits_argument_free_audi
         )
     assert response.status_code == 200
     assert response.json()["data"]["providerId"] == PROVIDER_ID
+    assert response.json()["data"]["observedAt"] == NOW.isoformat()
+    assert "latestPriceSession" not in fake_client.calls[0][1]
     assert [event["event"] for event in audit.events] == [
         "MCP_TOOL_INVOKED",
         "MCP_TOOL_SUCCEEDED",

@@ -8,6 +8,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -289,7 +290,7 @@ async def test_targeted_ensure_uses_complete_offline_mcp_chain_and_rereads_readi
 
 
 @pytest.mark.asyncio
-async def test_unsupported_shareholding_skips_yahoo_and_invokes_regional_fallback_once():
+async def test_unsupported_shareholding_uses_each_authorized_nse_phase_once():
     repository = ResearchRepository(
         settings=Settings(research_live_enabled=False, research_demo_enabled=False),
         persistence=SqliteResearchPersistence(),
@@ -318,6 +319,7 @@ async def test_unsupported_shareholding_skips_yahoo_and_invokes_regional_fallbac
             raise ExternalMcpAcquisitionError("EXTERNAL_CAPABILITY_UNSUPPORTED")
 
     fallback, gateway = RecordingFallback(), UnsupportedGateway()
+    repository.refresh_targeted_categories = AsyncMock()
     executor = McpFirstResearchCapabilityExecutor(
         fallback, repository, gateway, enabled=True
     )
@@ -329,10 +331,13 @@ async def test_unsupported_shareholding_skips_yahoo_and_invokes_regional_fallbac
         requirement_ids=("SHAREHOLDING",),
         correlation_id="shareholding-fallback-5c",
     )
-    assert gateway.calls == 1
-    assert len(fallback.primary_calls) == 1
-    assert len(fallback.secondary_calls) == 0
-    assert readiness.executed_capabilities == ("REGIONAL_FALLBACK",)
+    assert gateway.calls == 0
+    assert len(fallback.primary_calls) == 0
+    assert len(fallback.secondary_calls) == 1
+    assert [call.kwargs["shareholding_phase"] for call in
+            repository.refresh_targeted_categories.await_args_list] == ["STRUCTURED_ONLY", "DOCUMENT_ONLY"]
+    assert readiness.executed_capabilities == (
+        "NSE:SHAREHOLDING_STRUCTURED", "NSE:SHAREHOLDING_DOCUMENT", "REGIONAL_SECONDARY")
 
 
 @pytest.mark.asyncio
@@ -374,7 +379,7 @@ async def test_first_party_incomplete_result_crosses_mcp_and_invokes_fallback_on
         )
         assert len(fallback.primary_calls) == 1
         assert fallback.secondary_calls == []
-        assert result.executed_capabilities == ("REGIONAL_FALLBACK",)
+        assert result.executed_capabilities == ("YAHOO_FINANCE_MCP:LATEST_PRICE", "REGIONAL_FALLBACK")
         assert [item["event"] for item in audit.events] == [
             "YAHOO_MCP_REQUEST",
             "YAHOO_MCP_FAILED",
@@ -382,7 +387,7 @@ async def test_first_party_incomplete_result_crosses_mcp_and_invokes_fallback_on
 
 
 @pytest.mark.asyncio
-async def test_first_party_financial_success_persists_and_skips_fallback():
+async def test_first_party_partial_financial_success_persists_and_falls_back():
     capability = _capability(
         "BUSINESS_QUALITY_FACTS", "ANNUAL_FINANCIALS", "get_financials"
     )
@@ -425,9 +430,13 @@ async def test_first_party_financial_success_persists_and_skips_fallback():
         )
         assert result.executed_capabilities == (
             "YAHOO_FINANCE_MCP:BUSINESS_QUALITY_FACTS",
+            "REGIONAL_FALLBACK",
         )
-        assert fallback.primary_calls == [] and fallback.secondary_calls == []
-        assert len(repository.financial_facts_for(INSTRUMENT_ID)) >= 6
+        assert len(fallback.primary_calls) == 1
+        facts = repository.financial_facts_for(INSTRUMENT_ID)
+        assert facts and all(fact.value.unit == "INR" for fact in facts)
+        assert all(fact.key.period_end in {"2025-03-31", "2024-03-31"} for fact in facts)
+        assert result.readiness.for_requirement("BUSINESS_QUALITY_FACTS").status != "READY_FRESH"
         assert [item["event"] for item in audit.events] == [
             "YAHOO_MCP_REQUEST",
             "YAHOO_MCP_SUCCESS",

@@ -34,6 +34,7 @@ from app.registry import McpToolRegistry
 from app.settings import McpGatewaySettings
 from app.tools import build_internal_tool_registry
 from app.yahoo_finance_mcp import (
+    LatestPriceSession,
     YahooFinanceCapabilityRegistry,
     YahooFinanceMcpConfig,
     YahooFinanceMcpProvider,
@@ -49,6 +50,7 @@ class ExternalResearchAcquisitionRequest(StrictContract):
     expected_exchange: str | None = Field(default=None, alias="expectedExchange", max_length=100)
     expected_currency: str | None = Field(default=None, alias="expectedCurrency", max_length=20)
     financial_gap_fill: bool = Field(default=False, alias="financialGapFill")
+    latest_price_session: LatestPriceSession | None = Field(default=None, alias="latestPriceSession")
     authorization: ProviderFallbackAuthorization
 
 
@@ -287,6 +289,8 @@ def create_mcp_server(container: McpGatewayContainer) -> MCPServer:
                     "expectedExchange": command.expected_exchange,
                     "expectedCurrency": command.expected_currency,
                     **({"financialGapFill": True} if command.financial_gap_fill else {}),
+                    **({"latestPriceSession": command.latest_price_session.model_dump(mode="json", by_alias=True)}
+                       if command.latest_price_session is not None else {}),
                 },
                 request_id=request_id,
                 authorization=command.authorization,

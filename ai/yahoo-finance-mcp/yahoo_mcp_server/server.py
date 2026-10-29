@@ -164,7 +164,7 @@ def create_yahoo_mcp_server(
         identity = _identity(globalInstrumentId, verifiedYahooSymbol, region, exchange, currency)
 
         async def work() -> dict[str, Any]:
-            snapshot = await source.snapshot(identity)
+            snapshot = await source.snapshot(identity, capability='quote')
             fact = snapshot.facts.get("latestPrice")
             if fact is None:
                 raise YahooMcpServiceError("YAHOO_MCP_INCOMPLETE")
@@ -227,7 +227,7 @@ def create_yahoo_mcp_server(
         identity = _identity(globalInstrumentId, verifiedYahooSymbol, region, exchange, currency)
 
         async def work() -> dict[str, Any]:
-            snapshot = await source.snapshot(identity)
+            snapshot = await source.snapshot(identity, capability='profile')
             profile = _profile(snapshot)
             if not any((profile.company_name, profile.sector, profile.industry)):
                 raise YahooMcpServiceError("YAHOO_MCP_INCOMPLETE")
@@ -248,7 +248,7 @@ def create_yahoo_mcp_server(
         identity = _identity(globalInstrumentId, verifiedYahooSymbol, region, exchange, currency)
 
         async def work() -> dict[str, Any]:
-            snapshot = await source.snapshot(identity)
+            snapshot = await source.snapshot(identity, capability='annual')
             facts = _statement_facts(snapshot, "ANNUAL") + _selected_facts(
                 snapshot, _STRUCTURED_FINANCIAL_METRICS
             )
@@ -278,7 +278,7 @@ def create_yahoo_mcp_server(
         identity = _identity(globalInstrumentId, verifiedYahooSymbol, region, exchange, currency)
 
         async def work() -> dict[str, Any]:
-            snapshot = await source.snapshot(identity)
+            snapshot = await source.snapshot(identity, capability='quarterly')
             facts = _statement_facts(snapshot, "QUARTERLY")
             facts = facts[: config.max_response_items]
             if not facts:
@@ -308,7 +308,7 @@ def create_yahoo_mcp_server(
         )
 
         async def work() -> dict[str, Any]:
-            snapshot = await source.snapshot(command)
+            snapshot = await source.snapshot(command, capability='news')
             cutoff = datetime.now(timezone.utc) - timedelta(days=command.days)
             articles = []
             seen = set()
@@ -349,7 +349,7 @@ def create_yahoo_mcp_server(
         identity = _identity(globalInstrumentId, verifiedYahooSymbol, region, exchange, currency)
 
         async def work() -> dict[str, Any]:
-            snapshot = await source.snapshot(identity)
+            snapshot = await source.snapshot(identity, capability='profile')
             profile = _profile(snapshot)
             if not profile.sector and not profile.industry:
                 raise YahooMcpServiceError("YAHOO_MCP_INCOMPLETE")
@@ -370,7 +370,7 @@ def create_yahoo_mcp_server(
         identity = _identity(globalInstrumentId, verifiedYahooSymbol, region, exchange, currency)
 
         async def work() -> dict[str, Any]:
-            snapshot = await source.snapshot(identity)
+            snapshot = await source.snapshot(identity, capability='analyst')
             facts = _selected_facts(snapshot, _ANALYST_METRICS)
             if not facts:
                 raise YahooMcpServiceError("YAHOO_MCP_INCOMPLETE")
@@ -479,7 +479,7 @@ def _payload(identity: IdentityInput, snapshot, **updates: Any) -> ToolPayload:
         symbol=identity.verified_yahoo_symbol,
         exchange=snapshot.resolution.exchange or identity.exchange,
         currency=snapshot.resolution.currency or identity.currency,
-        asOf=snapshot.market_as_of or snapshot.retrieved_at,
+        asOf=snapshot.market_as_of,
         retrievedAt=snapshot.retrieved_at,
         sourceUrl=snapshot.source_url,
         **updates,
@@ -527,6 +527,10 @@ def _statement_facts(snapshot, period_type: str) -> list[RawFact]:
             RawFact(
                 metric=item.get("metric"),
                 value=item.get("value"),
+                unit=item.get("unit") or (
+                    f"{snapshot.resolution.currency} per share" if item.get("metric") == "eps"
+                    else snapshot.resolution.currency
+                ),
                 periodEnd=item.get("periodEnd"),
                 periodType=period_type,
                 reportingBasis=item.get("reportingBasis") or "UNKNOWN",

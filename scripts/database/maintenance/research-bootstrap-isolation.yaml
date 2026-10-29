@@ -1,0 +1,14 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: research-bootstrap-isolation
+  namespace: ai-investment
+  labels:
+    aip.maintenance/intent: research-isolation
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: research-engine
+  policyTypes:
+  - Ingress
+  ingress: []

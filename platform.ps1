@@ -1932,16 +1932,20 @@ function Assert-RecoveryWorkerExited {
     if (-not $Gate.Recovery -or -not $Gate.RecoveryOwner) { throw 'Recovery evidence unavailable' }
     $id=[regex]::Escape($Gate.Recovery.cycle_id)
     $owner=[regex]::Escape($Gate.RecoveryOwner)
-    $logs=@(Invoke-DeploymentKubectl @('logs',$Gate.ResearchPod,'-c','research-engine','--timestamps'))
+    # kubectl may return one multiline string or an array of lines; normalize to lines.
+    $logs=@(@(Invoke-DeploymentKubectl @('logs',$Gate.ResearchPod,'-c','research-engine','--timestamps')) | ForEach-Object { ([string]$_) -split '\r?\n' } | Where-Object { $_ -ne '' })
+    # Exact cycle and owner; the owner must end at whitespace, the JSON closing quote, or end of line.
+    $lostPattern='opportunity_cycle_ownership_lost cycleId=' + $id + ' owner=' + $owner + '(?=["\s]|$)'
+    $suppressedPattern='opportunity_cycle_status_suppressed cycleId=' + $id + ' '
     $lost=-1
     for ($i=0; $i -lt $logs.Count; $i++) {
-        if ([string]$logs[$i] -cmatch "opportunity_cycle_ownership_lost cycleId=$id owner=$owner(\s|$)") { $lost=$i; break }
+        if ([string]$logs[$i] -cmatch $lostPattern) { $lost=$i; break }
     }
     if ($lost -lt 0) { throw 'Old worker exit not evidenced: no ownership-lost record for the interrupted cycle owner' }
     for ($i=$lost+1; $i -lt $logs.Count; $i++) {
         $line=[string]$logs[$i]
         if ($line -match 'opportunity_cycle_(claimed|claim_skipped|resume_enqueued|operator_resume_admitted|cancel_drain_takeover|owned_elsewhere|lease_renew)|takeover|acquisition|Traceback' -or
-            ($line -match $id -and $line -cnotmatch "opportunity_cycle_status_suppressed cycleId=$id ")) { throw 'Interrupted cycle activity after ownership loss' }
+            ($line -match $id -and $line -cnotmatch $suppressedPattern)) { throw 'Interrupted cycle activity after ownership loss' }
     }
 }
 
@@ -1950,7 +1954,8 @@ function Assert-RecoveryNotResumed {
     # claimed, resumed or referenced the interrupted cycle.
     param($Gate)
     $id=[regex]::Escape($Gate.Recovery.cycle_id)
-    foreach ($line in @(Invoke-DeploymentKubectl @('logs',$Gate.ResearchPod,'-c','research-engine','--timestamps'))) {
+    $logs=@(@(Invoke-DeploymentKubectl @('logs',$Gate.ResearchPod,'-c','research-engine','--timestamps')) | ForEach-Object { ([string]$_) -split '\r?\n' } | Where-Object { $_ -ne '' })
+    foreach ($line in $logs) {
         if ([string]$line -match $id -or [string]$line -match 'opportunity_cycle_(claimed|resume_enqueued|operator_resume_admitted|cancel_drain_takeover)|takeover') { throw 'Replacement worker touched the interrupted cycle' }
     }
 }

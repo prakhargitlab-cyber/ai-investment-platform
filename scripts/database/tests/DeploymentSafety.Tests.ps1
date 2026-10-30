@@ -188,6 +188,47 @@ Test 'recovery requires old-worker ownership-loss evidence and no later activity
  }
  $gate.RecoveryOwner=$null;Throws {Assert-RecoveryWorkerExited $gate} '*evidence unavailable*'
 }
+Test 'recovery worker exit parses timestamp-prefixed JSON logs, array or combined multiline stdout' {
+ Reset;$gate=RecoveryGate
+ $owner='research-engine:865e05b3-dfb7-4c2a-9dca-6ee9c825a013';$gate.RecoveryOwner=$owner
+ $boot='2026-10-29T22:00:00Z {"message":"startup complete"}'
+ $lost='2026-10-29T22:28:49Z {"message":"opportunity_cycle_ownership_lost cycleId=' + $script:CycleId + ' owner=' + $owner + '"}'
+ $suppressed='2026-10-29T22:28:50Z {"message":"opportunity_cycle_status_suppressed cycleId=' + $script:CycleId + ' owner=' + $owner + ' reason=SUPERSEDED"}'
+ $health='2026-10-29T22:29:00Z {"message":"GET /health HTTP/1.1 200"}'
+ $script:FullLogs=@($boot,$lost,$suppressed,$health);Assert-RecoveryWorkerExited $gate
+ # Real kubectl stdout: one combined string, LF or CRLF separated.
+ $script:FullLogs=(@($boot,$lost,$suppressed,$health) -join "`n") + "`n";Assert-RecoveryWorkerExited $gate
+ $script:FullLogs=(@($boot,$lost,$suppressed,$health) -join "`r`n");Assert-RecoveryWorkerExited $gate
+ # Incorrect owner, owner-prefix collisions and a different cycle are not evidence.
+ foreach($wrong in @('research-engine:00000000-dfb7-4c2a-9dca-6ee9c825a013',($owner + '0'),($owner + ':other'),'research-engine:865e05b3')){
+  $script:FullLogs=(@($boot,('2026-10-29T22:28:49Z {"message":"opportunity_cycle_ownership_lost cycleId=' + $script:CycleId + ' owner=' + $wrong + '"}')) -join "`n")
+  Throws {Assert-RecoveryWorkerExited $gate} '*exit not evidenced*'
+ }
+ $script:FullLogs=@('2026-10-29T22:28:49Z {"message":"opportunity_cycle_ownership_lost cycleId=11111111-2222-4333-8444-555555555555 owner=' + $owner + '"}')
+ Throws {Assert-RecoveryWorkerExited $gate} '*exit not evidenced*'
+ # Any later claim, resume, acquisition or unexpected cycle activity rejects, in either input shape.
+ foreach($after in @(
+  ('2026-10-29T22:30:00Z {"message":"opportunity_cycle_claimed cycleId=' + $script:CycleId + ' owner=research-engine:aaaaaaaa-0000-4000-8000-000000000000 resumeCount=1"}'),
+  ('2026-10-29T22:30:00Z {"message":"opportunity_cycle_resume_enqueued cycleId=' + $script:CycleId + ' status=RUNNING resumeCount=0"}'),
+  ('2026-10-29T22:30:00Z {"message":"opportunity_cycle_operator_resume_admitted cycleId=' + $script:CycleId + ' owner=x previousOwner=' + $owner + '"}'),
+  '2026-10-29T22:30:00Z {"message":"etf_acquisition_started attempt=1"}',
+  ('2026-10-29T22:30:00Z {"message":"opportunity_cycle_analysis_scope cycleId=' + $script:CycleId + ' analysisScope=FULL"}'))){
+  $script:FullLogs=@($lost,$after);Throws {Assert-RecoveryWorkerExited $gate} '*activity after ownership loss*'
+  $script:FullLogs=(@($lost,$after) -join "`n");Throws {Assert-RecoveryWorkerExited $gate} '*activity after ownership loss*'
+ }
+}
+Test 'replacement worker log check parses combined JSON stdout' {
+ Reset;$gate=RecoveryGate
+ $script:FullLogs=(@('2026-10-30T09:00:00Z {"message":"startup complete"}','2026-10-30T09:00:05Z {"message":"scheduler operation=OPPORTUNITY_CYCLE_SKIP phase=RECOVERY_PAUSED reason=pause_active"}') -join "`n")
+ Assert-RecoveryNotResumed $gate
+ foreach($line in @(
+  ('2026-10-30T09:01:00Z {"message":"opportunity_cycle_claimed cycleId=' + $script:CycleId + ' owner=research-engine:new resumeCount=1"}'),
+  '2026-10-30T09:01:00Z {"message":"opportunity_cycle_resume_enqueued cycleId=11111111-2222-4333-8444-555555555555 status=RUNNING resumeCount=0"}',
+  ('2026-10-30T09:01:00Z {"message":"opportunity_cycle_owned_elsewhere cycleId=' + $script:CycleId + ' owner=x"}'))){
+  $script:FullLogs=(@('2026-10-30T09:00:00Z {"message":"startup complete"}',$line) -join "`r`n")
+  Throws {Assert-RecoveryNotResumed $gate} '*touched the interrupted cycle*'
+ }
+}
 Test 'replacement worker must not touch the interrupted cycle' {
  Reset;$gate=RecoveryGate
  $script:FullLogs=@('INFO startup','INFO scheduler operation=OPPORTUNITY_CYCLE_SKIP phase=RECOVERY_PAUSED reason=pause_active');Assert-RecoveryNotResumed $gate

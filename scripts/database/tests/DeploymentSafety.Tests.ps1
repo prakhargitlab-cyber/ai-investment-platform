@@ -19,7 +19,7 @@ function Invoke-DeploymentKubectl {
  param($Arguments)
  $script:Calls+=,($Arguments -join ' ')
  if($Arguments[0] -eq 'exec'){if($script:ProbeError){throw 'binary unavailable'}; if($Arguments -contains 'python'){return ($script:Observation | ConvertTo-Json -Depth 10)}; return $script:ProbeOutput}
- if($Arguments[0] -eq 'logs'){return $script:Logs}
+ if($Arguments[0] -eq 'logs'){if(@($Arguments|Where-Object {$_ -like '--since-time=*'}).Count){return $script:Logs};return $script:FullLogs}
  if($Arguments[1] -eq 'networkpolicies'){return ($script:Policies | ConvertTo-Json -Depth 20)}
  if($Arguments[1] -eq 'jobs,cronjobs'){return ($script:Jobs | ConvertTo-Json -Depth 20)}
  if($Arguments[1] -eq 'pods'){return ($script:Pods | ConvertTo-Json -Depth 20)}
@@ -28,7 +28,7 @@ function Invoke-DeploymentKubectl {
  throw 'Unexpected mock boundary'
 }
 function Reset {
- $script:Calls=@();$script:Tunnels=@();$script:ProbeError=$false;$script:ProbeOutput='HTTP/1.0 200 OK';$script:Logs=@()
+ $script:Calls=@();$script:Tunnels=@();$script:ProbeError=$false;$script:ProbeOutput='HTTP/1.0 200 OK';$script:Logs=@();$script:FullLogs=@()
  $script:Jobs=@{items=@()};$script:Pods=@{items=@(@{metadata=@{namespace='ai-investment'};spec=@{}})}
  $script:Pod=@{metadata=@{uid='uid'};status=@{containerStatuses=@(@{name='research-engine';restartCount=0;containerID='one';ready=$true})}}
  $script:Pod=$script:Pod | ConvertTo-Json -Depth 20 | ConvertFrom-Json
@@ -96,11 +96,119 @@ Test 'unknown status and invalid fingerprint rejected' {
  $script:Observation=@{status='QUIET_SNAPSHOT';fingerprint='invalid'}
  Throws {Invoke-DeploymentObservation $script:Gate} '*missing fingerprint*'
 }
+$script:CycleId='86f0567d-978e-4fcc-a9c5-337ed729db69'
+function RecoveryObservation {
+ param([hashtable]$Override=@{})
+ $r=[ordered]@{cycle_id=$script:CycleId;market='NSE';status='RUNNING';owner_id='worker-old';lease_expires_at='2026-10-29T10:00:00.000000+00:00';resume_count=0;updated_at='2026-10-29T09:59:00.000000+00:00';error_code=$null;lease_expired=$true;lease_expired_seconds=900.5;slot=@(,@('NSE',$script:CycleId));checkpoint_rows=3;checkpoint_fingerprint=('c'*64)}
+ foreach($k in $Override.Keys){$r[$k]=$Override[$k]}
+ return @{status='RECOVERY_SNAPSHOT';reasons=@();fingerprint=$script:Fingerprint;recovery=$r}
+}
+function RecoveryGate {$g=$script:Gate.Clone();$g.Recovery=@{cycle_id=$script:CycleId;market='NSE'};return $g}
+Test 'recovery request requires explicit paired authorization and strict scope' {
+ $Profile=$null;$DryRun=$false;$ResumeAuditTag=$null;$AcceptBootstrapRisk=$true;$ConfirmCallerFreeze=$true
+ $RecoverInterruptedCycleId=$null;$AuthorizeInterruptedCycleRecovery=$false
+ Assert ($null -eq (Get-InterruptedCycleRecoveryRequest -Names @('research-engine'))) 'Ordinary deployment acquired recovery'
+ $RecoverInterruptedCycleId=$script:CycleId
+ Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine')} '*requires both*'
+ $RecoverInterruptedCycleId=$null;$AuthorizeInterruptedCycleRecovery=$true
+ Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine')} '*requires both*'
+ foreach($bad in @($script:CycleId.ToUpper(),($script:CycleId+"'"),'86f0567d978e4fcca9c5337ed729db69','x')){
+  $RecoverInterruptedCycleId=$bad;Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine')} '*Invalid interrupted-cycle id*'
+ }
+ $RecoverInterruptedCycleId=$script:CycleId
+ Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine','api-gateway')} '*research-engine alone*'
+ Throws {Get-InterruptedCycleRecoveryRequest -Names @('frontend')} '*research-engine alone*'
+ $DryRun=$true;Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine')} '*incompatible*';$DryRun=$false
+ $ResumeAuditTag='review-20261029-000000-'+('a'*32);Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine')} '*incompatible*';$ResumeAuditTag=$null
+ $ConfirmCallerFreeze=$false;Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine')} '*caller freeze*';$ConfirmCallerFreeze=$true
+ $AcceptBootstrapRisk=$false;Throws {Get-InterruptedCycleRecoveryRequest -Names @('research-engine')} '*caller freeze*';$AcceptBootstrapRisk=$true
+ $request=Get-InterruptedCycleRecoveryRequest -Names @('research-engine')
+ Assert ($request.cycle_id -eq $script:CycleId -and $request.market -eq 'NSE' -and $request.Count -eq 2) 'Recovery request malformed'
+}
+Test 'ordinary gate still rejects recovery snapshots and blocked durable work' {
+ Reset;$ProjectRoot=(Get-Location).Path
+ $script:Observation=RecoveryObservation
+ Throws {Invoke-DeploymentObservation $script:Gate} '*UNKNOWN/BLOCKED*'
+ $script:Observation=@{status='BLOCKED';reasons=@('ACTIVE_SLOT','DURABLE_WORK');fingerprint=$script:Fingerprint}
+ Throws {Invoke-DeploymentObservation $script:Gate} '*UNKNOWN/BLOCKED*'
+ $source=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(([regex]::Match($script:Calls[-1],"b64decode\('([^']+)'\)")).Groups[1].Value))
+ Assert ($source.TrimEnd().EndsWith("raise SystemExit(main(json.loads('null')))")) 'Ordinary observer invocation changed'
+}
+Test 'recovery gate passes the authorized cycle to the observer and accepts a stable recovery snapshot' {
+ Reset;$ProjectRoot=(Get-Location).Path;$gate=RecoveryGate
+ $script:Observation=RecoveryObservation
+ $result=Invoke-DeploymentObservation $gate
+ Assert ($result.status -eq 'RECOVERY_SNAPSHOT' -and $gate.RecoveryOwner -eq 'worker-old' -and $gate.RecoveryPin) 'Recovery snapshot not pinned'
+ $source=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(([regex]::Match($script:Calls[-1],"b64decode\('([^']+)'\)")).Groups[1].Value))
+ Assert ($source.TrimEnd().EndsWith("raise SystemExit(main(json.loads('null'), json.loads('{`"cycle_id`":`"$($script:CycleId)`",`"market`":`"NSE`"}')))")) 'Recovery request not passed to observer'
+ $script:Observation=RecoveryObservation @{lease_expired_seconds=1200.0}
+ $null=Invoke-DeploymentObservation $gate
+ $gate.Recovery.cycle_id='11111111-2222-4333-8444-555555555555'
+ Throws {Invoke-DeploymentObservation $gate} '*Recovery invariants*'
+ $gate.Recovery.cycle_id="$($script:CycleId)')),__import__('os').system('x"
+ Throws {Invoke-DeploymentObservation $gate} '*Invalid interrupted-cycle recovery request*'
+ $gate.Recovery.cycle_id=$script:CycleId;$gate.Recovery.market='ETF'
+ Throws {Invoke-DeploymentObservation $gate} '*Invalid interrupted-cycle recovery request*'
+}
+Test 'recovery gate fails closed on blocked, quiet or non-matching observations' {
+ Reset;$ProjectRoot=(Get-Location).Path
+ foreach($obs in @(
+  @{status='QUIET_SNAPSHOT';reasons=@();fingerprint=$script:Fingerprint},
+  @{status='BLOCKED';reasons=@('DURABLE_WORK');fingerprint=$script:Fingerprint},
+  @{status='BLOCKED';reasons=@('BACKGROUND_REFRESH');fingerprint=$script:Fingerprint},
+  @{status='BLOCKED';reasons=@('RECOVERY_LEASE_LIVE');fingerprint=$script:Fingerprint})){
+  $gate=RecoveryGate;$script:Observation=$obs;Throws {Invoke-DeploymentObservation $gate} '*UNKNOWN/BLOCKED*'
+ }
+ $o=RecoveryObservation;$o.reasons=@('LEGACY_WORK');$gate=RecoveryGate;$script:Observation=$o;Throws {Invoke-DeploymentObservation $gate} '*UNKNOWN/BLOCKED*'
+ foreach($override in @(@{cycle_id='11111111-2222-4333-8444-555555555555'},@{market='ETF'},@{status='ACCEPTED'},@{owner_id=$null},@{lease_expired=$false},@{lease_expired='true'},@{lease_expires_at=$null},@{checkpoint_fingerprint='bad'})){
+  $gate=RecoveryGate;$script:Observation=RecoveryObservation $override;Throws {Invoke-DeploymentObservation $gate} '*Recovery invariants*'
+ }
+ $gate=RecoveryGate;$script:Observation=@{status='RECOVERY_SNAPSHOT';reasons=@();fingerprint=$script:Fingerprint};Throws {Invoke-DeploymentObservation $gate} '*Recovery invariants*'
+}
+Test 'recovery pin rejects any change of owner, lease, resume count, update, error, slot or checkpoint' {
+ Reset;$ProjectRoot=(Get-Location).Path
+ foreach($override in @(@{owner_id='worker-new'},@{lease_expires_at='2026-10-29T10:05:00.000000+00:00'},@{resume_count=1},@{updated_at='2026-10-29T10:01:00.000000+00:00'},@{error_code='OWNERSHIP_LOST'},@{slot=@(,@('NSE','11111111-2222-4333-8444-555555555555'))},@{checkpoint_rows=4},@{checkpoint_fingerprint=('d'*64)})){
+  $gate=RecoveryGate;$script:Observation=RecoveryObservation;$null=Invoke-DeploymentObservation $gate
+  $script:Observation=RecoveryObservation $override
+  Throws {Invoke-DeploymentObservation $gate} '*ownership/lease/checkpoint/slot changed*'
+ }
+}
+Test 'recovery requires old-worker ownership-loss evidence and no later activity' {
+ Reset;$gate=RecoveryGate;$gate.RecoveryOwner='worker-old'
+ $lost="2026-10-29T10:00:01Z WARNING opportunity_cycle_ownership_lost cycleId=$($script:CycleId) owner=worker-old"
+ Throws {Assert-RecoveryWorkerExited $gate} '*exit not evidenced*'
+ $script:FullLogs=@("2026-10-29T10:00:01Z WARNING opportunity_cycle_ownership_lost cycleId=$($script:CycleId) owner=worker-other")
+ Throws {Assert-RecoveryWorkerExited $gate} '*exit not evidenced*'
+ $script:FullLogs=@("2026-10-29T10:00:01Z WARNING opportunity_cycle_ownership_lost cycleId=$($script:CycleId) owner=worker-old-2")
+ Throws {Assert-RecoveryWorkerExited $gate} '*exit not evidenced*'
+ $script:FullLogs=@('INFO boot',$lost,"2026-10-29T10:00:02Z WARNING opportunity_cycle_status_suppressed cycleId=$($script:CycleId) owner=worker-old reason=SUPERSEDED",'INFO "GET /health HTTP/1.1" 200 OK')
+ Assert-RecoveryWorkerExited $gate
+ foreach($after in @("INFO opportunity_cycle_claimed cycleId=$($script:CycleId) owner=worker-new resumeCount=1","INFO opportunity_cycle_claimed cycleId=11111111-2222-4333-8444-555555555555 owner=x resumeCount=0","INFO opportunity_cycle_resume_enqueued cycleId=$($script:CycleId) status=RUNNING resumeCount=1","INFO stage2 instrument progress cycleId=$($script:CycleId)",'ERROR Traceback (most recent call last)','INFO opportunity_cycle_takeover_check_failed')){
+  $script:FullLogs=@($lost,$after);Throws {Assert-RecoveryWorkerExited $gate} '*activity after ownership loss*'
+ }
+ $gate.RecoveryOwner=$null;Throws {Assert-RecoveryWorkerExited $gate} '*evidence unavailable*'
+}
+Test 'replacement worker must not touch the interrupted cycle' {
+ Reset;$gate=RecoveryGate
+ $script:FullLogs=@('INFO startup','INFO scheduler operation=OPPORTUNITY_CYCLE_SKIP phase=RECOVERY_PAUSED reason=pause_active');Assert-RecoveryNotResumed $gate
+ foreach($line in @("INFO anything cycleId=$($script:CycleId)",'INFO opportunity_cycle_claimed cycleId=x owner=y resumeCount=0','INFO opportunity_cycle_operator_resume_admitted cycleId=x')){
+  $script:FullLogs=@($line);Throws {Assert-RecoveryNotResumed $gate} '*touched the interrupted cycle*'
+ }
+}
 function Invoke-DeploymentObservation {param($Gate);return @{status='QUIET_SNAPSHOT';fingerprint=$script:Fingerprint}}
 Test 'quiet sample passes without mutations' {Reset;Assert-DeploymentQuietSample $script:Gate;Assert (@($script:Calls|Where-Object {$_ -match '^(patch|create|delete)'}).Count -eq 0) 'Mutation'}
 Test 'database fingerprint changes abort' {Reset;$script:Fingerprint='b'*64;Throws {Assert-DeploymentQuietSample $script:Gate} '*Durable state changed*'}
 Test 'API traffic aborts' {Reset;$script:Logs=@('INFO "POST /api/v1/etf-radar/cycles HTTP/1.1" 202');Throws {Assert-DeploymentQuietSample $script:Gate} '*traffic*'}
 Test 'health access log allowed' {Reset;$script:Logs=@('INFO "GET /health HTTP/1.1" 200 OK');Assert-DeploymentQuietSample $script:Gate}
+Test 'recovery quiet sample rechecks old-worker exit evidence every sample' {
+ Reset;$gate=RecoveryGate;$gate.RecoveryOwner='worker-old'
+ Throws {Assert-DeploymentQuietSample $gate} '*exit not evidenced*'
+ $script:FullLogs=@("WARNING opportunity_cycle_ownership_lost cycleId=$($script:CycleId) owner=worker-old")
+ Assert-DeploymentQuietSample $gate
+ $script:FullLogs+="INFO opportunity_cycle_claimed cycleId=$($script:CycleId) owner=worker-new resumeCount=1"
+ Throws {Assert-DeploymentQuietSample $gate} '*activity after ownership loss*'
+ Reset;Assert-DeploymentQuietSample $script:Gate;Assert (@($script:Calls|Where-Object {$_ -match '^logs' -and $_ -notmatch 'since-time'}).Count -eq 0) 'Ordinary sample consulted recovery evidence'
+}
 Test 'pod restart aborts' {Reset;$script:Pod.status.containerStatuses[0].restartCount=1;Throws {Assert-DeploymentQuietSample $script:Gate} '*pod changed*'}
 Test 'verified OCI child accepted but foreign digest blocked' {
  $script:VerifiedDeploymentDigests=@{'expected'=@(('sha256:'+('a'*64)),('sha256:'+('b'*64)))}

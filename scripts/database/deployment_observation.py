@@ -5,11 +5,16 @@ snapshot is mandatory; pagination bounds work per statement, never total coverag
 """
 import hashlib
 import json
+import re
 import time
 from datetime import datetime
 
 TERMINAL = {'COMPLETED', 'FAILED', 'CANCELLED'}
 STATES = TERMINAL | {'ACCEPTED', 'RUNNING', 'PUBLISHED', 'CANCEL_REQUESTED'}
+# Recovery-only deployment: exactly one named, lapsed manual Equity cycle may
+# remain RUNNING/slotted. Anything else keeps the ordinary BLOCKED verdict.
+RECOVERY_MARKETS = {'NSE'}
+RECOVERY_CYCLE_ID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
 
 class Unknown(RuntimeError):
@@ -97,10 +102,60 @@ TABLES = {
 }
 
 
-def observe(conn, expected_migrations=None, seconds=60):
+def recovery_target(conn, recovery, durable_work, slots):
+    """Recovery invariants, evaluated inside the caller's read-only snapshot.
+
+    Returns (reasons, block). Expiry is judged by database time (now() of the
+    snapshot transaction), never by the observer's clock.
+    """
+    reasons = []
+    cycle_id, market = recovery['cycle_id'], recovery['market']
+    if durable_work != [cycle_id]:
+        reasons.append('DURABLE_WORK')  # other durable work, or target not active
+    row = conn.execute(
+        "SELECT cycle_id,market,status,owner_id,lease_expires_at,resume_count,updated_at,error_code,"
+        " now() AS observed_at,"
+        " (lease_expires_at IS NOT NULL AND lease_expires_at::timestamptz < now()) AS lease_expired,"
+        " EXTRACT(EPOCH FROM (now() - lease_expires_at::timestamptz))::float8 AS lease_expired_seconds"
+        " FROM research.global_opportunity_cycle_run WHERE cycle_id = %s", (cycle_id,)).fetchone()
+    if row is None:
+        return reasons + ['RECOVERY_TARGET_MISSING'], None
+    if row['market'] != market:
+        reasons.append('RECOVERY_MARKET_MISMATCH')
+    if row['status'] != 'RUNNING':
+        reasons.append('RECOVERY_TARGET_NOT_RUNNING')
+    if row['owner_id'] is None:
+        reasons.append('RECOVERY_OWNER_MISSING')
+    if row['lease_expired'] is not True:
+        reasons.append('RECOVERY_LEASE_LIVE')
+    slot_rows = conn.execute(
+        'SELECT market,cycle_id FROM research.global_opportunity_cycle_active ORDER BY market').fetchall()
+    if slots != [market] or [(r['market'], r['cycle_id']) for r in slot_rows] != [(market, cycle_id)]:
+        reasons.append('ACTIVE_SLOT')
+    checkpoint = conn.execute(
+        "SELECT count(*) AS rows, encode(sha256(coalesce(string_agg(sha256(convert_to(t::text,'UTF8')),"
+        " ''::bytea ORDER BY phase, global_instrument_id), ''::bytea)),'hex') AS fingerprint"
+        " FROM research.global_opportunity_cycle_progress AS t WHERE cycle_id = %s", (cycle_id,)).fetchone()
+    block = {'cycle_id': row['cycle_id'], 'market': row['market'], 'status': row['status'],
+             'owner_id': row['owner_id'], 'lease_expires_at': row['lease_expires_at'],
+             'resume_count': row['resume_count'], 'updated_at': row['updated_at'],
+             'error_code': row['error_code'], 'lease_expired': row['lease_expired'] is True,
+             'lease_expired_seconds': row['lease_expired_seconds'], 'observed_at': str(row['observed_at']),
+             'slot': [[r['market'], r['cycle_id']] for r in slot_rows],
+             'checkpoint_rows': checkpoint['rows'], 'checkpoint_fingerprint': checkpoint['fingerprint']}
+    return reasons, block
+
+
+def observe(conn, expected_migrations=None, seconds=60, recovery=None):
+    if recovery is not None:
+        if (not isinstance(recovery, dict) or set(recovery) != {'cycle_id', 'market'}
+                or not isinstance(recovery['cycle_id'], str) or not RECOVERY_CYCLE_ID.match(recovery['cycle_id'])
+                or recovery['market'] not in RECOVERY_MARKETS):
+            raise Unknown('INVALID_RECOVERY_REQUEST')
     deadline = time.monotonic() + seconds
     digest = hashlib.sha256()
     durable, active, counts = {}, [], {}
+    durable_work, slots = [], []
     # Incomplete refresh runs may be live workers or historical orphans.
     # No durable worker identity, heartbeat or lease distinguishes them.
     # Scheduler/recovery flags and ingress isolation do not drain existing work;
@@ -127,8 +182,10 @@ def observe(conn, expected_migrations=None, seconds=60):
                         durable[r['cycle_id']] = r['status']
                         if r['status'] not in TERMINAL or r['owner_id'] is not None:
                             active.append('DURABLE_WORK')
+                            durable_work.append(r['cycle_id'])
                     elif table == 'global_opportunity_cycle_active':
                         active.append('ACTIVE_SLOT')
+                        slots.append(r['market'])
                     elif table in ('research_refresh_runs',) and r['completed_at'] is None:
                         # Fail-closed: every incomplete refresh run blocks. The
                         # refresh worker does not heartbeat or update progress
@@ -156,15 +213,24 @@ def observe(conn, expected_migrations=None, seconds=60):
             actual = {r['script']: r['checksum'] for r in versioned if r['success']}
             if len(actual) != len(versioned) or actual != expected_migrations:
                 raise Unknown('MIGRATION_MISMATCH')
+        block = None
+        if recovery is not None:
+            # Only the target's own DURABLE_WORK/ACTIVE_SLOT may be waived; every
+            # other reason (refresh, legacy, other cycles/slots) still blocks.
+            reasons, block = recovery_target(conn, recovery, durable_work, slots)
+            active = [a for a in active if a not in ('DURABLE_WORK', 'ACTIVE_SLOT')] + reasons
         if time.monotonic() >= deadline:
             raise Unknown('INCOMPLETE_OBSERVATION')
-        return {'status': 'BLOCKED' if active else 'QUIET_SNAPSHOT', 'reasons': sorted(set(active)),
-                'fingerprint': digest.hexdigest(), 'counts': counts, **jobs}
+        if recovery is None:
+            return {'status': 'BLOCKED' if active else 'QUIET_SNAPSHOT', 'reasons': sorted(set(active)),
+                    'fingerprint': digest.hexdigest(), 'counts': counts, **jobs}
+        return {'status': 'BLOCKED' if active else 'RECOVERY_SNAPSHOT', 'reasons': sorted(set(active)),
+                'fingerprint': digest.hexdigest(), 'counts': counts, 'recovery': block, **jobs}
     finally:
         conn.rollback()
 
 
-def main(expected_migrations=None):
+def main(expected_migrations=None, recovery=None):
     # Only Settings is imported; never main, persistence constructors or workers.
     import psycopg
     from psycopg.rows import dict_row
@@ -178,9 +244,10 @@ def main(expected_migrations=None):
                 password=s.research_database_password or '', sslmode=s.research_database_ssl_mode,
                 connect_timeout=5, options='-c default_transaction_read_only=on -c statement_timeout=5000',
                 row_factory=dict_row) as conn:
-            result = observe(conn, expected_migrations)
+            result = observe(conn, expected_migrations, recovery=recovery)
     except Exception as exc:
         # Never print exception connection strings, credentials or malformed payloads.
         result = {'status': 'UNKNOWN', 'reason': str(exc) if isinstance(exc, Unknown) else type(exc).__name__}
     print(json.dumps(result, sort_keys=True))
-    return 0 if result['status'] == 'QUIET_SNAPSHOT' else 2
+    expected = 'QUIET_SNAPSHOT' if recovery is None else 'RECOVERY_SNAPSHOT'
+    return 0 if result['status'] == expected else 2

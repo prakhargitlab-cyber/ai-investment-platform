@@ -15,6 +15,11 @@
     [switch]$ConfirmCallerFreeze,
     # Resume only the explicitly reviewed, still-isolated LOCAL deployment.
     [string]$ResumeAuditTag,
+    # Recovery-only research-engine deployment while exactly this one lapsed
+    # manual Equity cycle remains RUNNING/slotted. Both are required; see
+    # Get-InterruptedCycleRecoveryRequest. Never valid for other deployments.
+    [string]$RecoverInterruptedCycleId,
+    [switch]$AuthorizeInterruptedCycleRecovery,
     [switch]$SkipBuild,
     [switch]$NoCache,
     [switch]$KeepOldImages,
@@ -50,6 +55,9 @@
 )
 
 $ErrorActionPreference = "Stop"
+if (($RecoverInterruptedCycleId -or $AuthorizeInterruptedCycleRecovery) -and $Command -ne 'deploy') {
+    throw 'Interrupted-cycle recovery parameters are valid only for: deploy -Component research-engine'
+}
 
 # StrictMode safety net: this script is sometimes invoked (via '&') from a
 # caller that has already set Set-StrictMode -Version Latest in its own
@@ -1862,17 +1870,89 @@ function Invoke-DeploymentObservation {
     param($Gate)
     $source=Get-Content -Raw (Join-Path $ProjectRoot 'scripts\database\deployment_observation.py')
     $expected=if($Gate.Migrations){$Gate.Migrations | ConvertTo-Json -Compress}else{'null'}
-    $source += "`nraise SystemExit(main(json.loads('$expected')))`n"
+    if ($Gate.Recovery) {
+        # Values were strictly validated (UUID/market allow-list); no quoting is possible.
+        $recovery=[ordered]@{cycle_id=[string]$Gate.Recovery.cycle_id;market=[string]$Gate.Recovery.market} | ConvertTo-Json -Compress
+        if ($recovery -notmatch '^\{"cycle_id":"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}","market":"NSE"\}$') { throw 'Invalid interrupted-cycle recovery request' }
+        $source += "`nraise SystemExit(main(json.loads('$expected'), json.loads('$recovery')))`n"
+    } else {
+        $source += "`nraise SystemExit(main(json.loads('$expected')))`n"
+    }
     $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($source))
     $result=Invoke-DeploymentKubectl @('exec',"pod/$($Gate.ResearchPod)",'-c','research-engine','--','python','-c',"import base64;exec(base64.b64decode('$encoded'))")
     $value=($result | Out-String) | ConvertFrom-Json
     if ($value.fingerprint -notmatch '^[a-f0-9]{64}$') { throw 'Database observation missing fingerprint' }
     if ($value.status -eq 'UNKNOWN') { throw 'Database observation UNKNOWN' }
+    if ($Gate.Recovery) { return (Assert-RecoveryObservation $Gate $value) }
     # Incomplete refresh runs have no authoritative worker-termination proof.
     # Pausing admission, isolation, stable pod identity, quiet logs and unchanged
     # fingerprints cannot exclude a silent worker. Preserve every BLOCKED result.
     if ($value.status -ne 'QUIET_SNAPSHOT') { throw 'Database observation UNKNOWN/BLOCKED' }
     return $value
+}
+
+function Get-InterruptedCycleRecoveryRequest {
+    # Explicit operator authorization for a recovery-only research-engine
+    # deployment. Returns $null (ordinary gate, unchanged) unless requested.
+    param([string[]]$Names)
+    if (-not $RecoverInterruptedCycleId -and -not $AuthorizeInterruptedCycleRecovery) { return $null }
+    if (-not $RecoverInterruptedCycleId -or -not $AuthorizeInterruptedCycleRecovery) { throw 'Interrupted-cycle recovery requires both -RecoverInterruptedCycleId and -AuthorizeInterruptedCycleRecovery' }
+    if ($RecoverInterruptedCycleId -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { throw 'Invalid interrupted-cycle id' }
+    if (@($Names).Count -ne 1 -or $Names[0] -ne 'research-engine') { throw 'Interrupted-cycle recovery deploys research-engine alone' }
+    if ($DryRun -or $ResumeAuditTag -or $Profile) { throw 'Interrupted-cycle recovery is incompatible with -DryRun, -ResumeAuditTag and -Profile' }
+    if (-not $AcceptBootstrapRisk -or -not $ConfirmCallerFreeze) { throw 'Explicit bootstrap risk acceptance and caller freeze are required' }
+    return @{cycle_id=$RecoverInterruptedCycleId;market='NSE'}
+}
+
+function Assert-RecoveryObservation {
+    # Every recovery observation must be a RECOVERY_SNAPSHOT for exactly the
+    # authorized cycle, and must equal the first one in ownership, lease,
+    # resume count, update time, error code, slot and checkpoint.
+    param($Gate,$Value)
+    if ((Get-DeploymentOptionalProperty $Value 'status') -ne 'RECOVERY_SNAPSHOT' -or @(Get-DeploymentOptionalProperty $Value 'reasons' | Where-Object { $_ }).Count) { throw 'Recovery observation UNKNOWN/BLOCKED' }
+    $r=Get-DeploymentOptionalProperty $Value 'recovery'
+    $field=@{}
+    foreach ($name in @('cycle_id','market','status','owner_id','lease_expires_at','lease_expired','resume_count','updated_at','error_code','checkpoint_rows','checkpoint_fingerprint')) { $field[$name]=Get-DeploymentOptionalProperty $r $name }
+    if ($null -eq $r -or $field.cycle_id -cne $Gate.Recovery.cycle_id -or $field.market -cne $Gate.Recovery.market -or $field.status -cne 'RUNNING' -or
+        [string]::IsNullOrWhiteSpace([string]$field.owner_id) -or $field.lease_expired -isnot [bool] -or -not $field.lease_expired -or
+        [string]::IsNullOrWhiteSpace([string]$field.lease_expires_at) -or [string]$field.checkpoint_fingerprint -notmatch '^[a-f0-9]{64}$') { throw 'Recovery invariants not satisfied' }
+    $pin=[ordered]@{owner_id=[string]$field.owner_id;lease_expires_at=[string]$field.lease_expires_at;resume_count=[string]$field.resume_count;updated_at=[string]$field.updated_at;error_code=[string]$field.error_code;slot=(Get-DeploymentOptionalProperty $r 'slot' | ConvertTo-Json -Compress -Depth 5);checkpoint_rows=[string]$field.checkpoint_rows;checkpoint_fingerprint=[string]$field.checkpoint_fingerprint} | ConvertTo-Json -Compress
+    if (-not $Gate.RecoveryPin) {
+        $Gate.RecoveryPin=$pin
+        $Gate.RecoveryOwner=[string]$field.owner_id
+    } elseif ($pin -cne $Gate.RecoveryPin) { throw 'Interrupted cycle ownership/lease/checkpoint/slot changed' }
+    return $Value
+}
+
+function Assert-RecoveryWorkerExited {
+    # The old worker must have logged loss of ownership for exactly the pinned
+    # owner in the CURRENT container (restarts are excluded by pod identity),
+    # and nothing may have claimed, resumed or touched the cycle since.
+    param($Gate)
+    if (-not $Gate.Recovery -or -not $Gate.RecoveryOwner) { throw 'Recovery evidence unavailable' }
+    $id=[regex]::Escape($Gate.Recovery.cycle_id)
+    $owner=[regex]::Escape($Gate.RecoveryOwner)
+    $logs=@(Invoke-DeploymentKubectl @('logs',$Gate.ResearchPod,'-c','research-engine','--timestamps'))
+    $lost=-1
+    for ($i=0; $i -lt $logs.Count; $i++) {
+        if ([string]$logs[$i] -cmatch "opportunity_cycle_ownership_lost cycleId=$id owner=$owner(\s|$)") { $lost=$i; break }
+    }
+    if ($lost -lt 0) { throw 'Old worker exit not evidenced: no ownership-lost record for the interrupted cycle owner' }
+    for ($i=$lost+1; $i -lt $logs.Count; $i++) {
+        $line=[string]$logs[$i]
+        if ($line -match 'opportunity_cycle_(claimed|claim_skipped|resume_enqueued|operator_resume_admitted|cancel_drain_takeover|owned_elsewhere|lease_renew)|takeover|acquisition|Traceback' -or
+            ($line -match $id -and $line -cnotmatch "opportunity_cycle_status_suppressed cycleId=$id ")) { throw 'Interrupted cycle activity after ownership loss' }
+    }
+}
+
+function Assert-RecoveryNotResumed {
+    # Post-rollout: the replacement pod (recovery paused) must not have
+    # claimed, resumed or referenced the interrupted cycle.
+    param($Gate)
+    $id=[regex]::Escape($Gate.Recovery.cycle_id)
+    foreach ($line in @(Invoke-DeploymentKubectl @('logs',$Gate.ResearchPod,'-c','research-engine','--timestamps'))) {
+        if ([string]$line -match $id -or [string]$line -match 'opportunity_cycle_(claimed|resume_enqueued|operator_resume_admitted|cancel_drain_takeover)|takeover') { throw 'Replacement worker touched the interrupted cycle' }
+    }
 }
 
 function Get-DeploymentInventory {
@@ -2008,7 +2088,7 @@ function Assert-DeploymentIsolation {
 }
 
 function Initialize-DeploymentSafety {
-    param([string[]]$Names,[switch]$ExistingIsolation)
+    param([string[]]$Names,[switch]$ExistingIsolation,$Recovery)
     $pods=Get-DeploymentInventory
     # Strict-mode-safe: ObjectMeta.Labels is 'omitempty' -- any pod in this
     # namespace that happens to carry no 'app.kubernetes.io/component' label
@@ -2026,6 +2106,7 @@ function Initialize-DeploymentSafety {
     $envs=($deployment.spec.template.spec.containers | Where-Object name -eq 'research-engine').env
     if (($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED').value -ne 'false') { throw 'Old scheduler state unsafe/unknown' }
     if ('research-engine' -notin $Names -and ($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED').value -ne 'true') { throw 'Research replacement or existing recovery pause required' }
+    if ($Recovery -and ($envs | Where-Object name -eq 'AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED').value -ne 'true') { throw 'Interrupted-cycle recovery requires the running worker to be recovery-paused' }
     $gate.Selector=$deployment.spec.selector
     $labels=$gate.Selector.matchLabels
     if ($labels.'app.kubernetes.io/component' -ne 'research-engine' -or $labels.'app.kubernetes.io/instance' -ne 'ai-investment-platform' -or $labels.'app.kubernetes.io/name' -ne 'ai-investment-platform' -or @($labels.PSObject.Properties).Count -ne 3) { throw 'Unexpected research selector' }
@@ -2062,7 +2143,9 @@ function Initialize-DeploymentSafety {
         if ($gate.Frontend.authDevLoginEnabled -notin @('true','false') -or $null -eq $gate.Frontend.apiBaseUrl) { throw 'Frontend build configuration unknown' }
     }
     Set-DeploymentPhase 'INITIAL_POSTGRES_OBSERVATION'
+    if ($Recovery) { $gate.Recovery=$Recovery }
     $gate.Baseline=Invoke-DeploymentObservation $gate
+    if ($Recovery) { Assert-RecoveryWorkerExited $gate }
     $gate.Workloads=Invoke-DeploymentKubectl @('get','deployments,statefulsets','-o','json') | ConvertFrom-Json
     return $gate
 }
@@ -2107,6 +2190,7 @@ function Assert-DeploymentQuietSample {
     }
     $sample=Invoke-DeploymentObservation $Gate
     if ($sample.fingerprint -ne $Gate.Baseline.fingerprint) { throw 'Durable state changed during observation' }
+    if ($Gate.Recovery) { Assert-RecoveryWorkerExited $Gate }
     $sample | ConvertTo-Json -Depth 10 -Compress | Add-Content -LiteralPath (Join-Path $Gate.AuditPath 'observations.jsonl') -Encoding UTF8
 }
 
@@ -2148,6 +2232,7 @@ function Complete-DeploymentSafety {
     $Gate.ResearchPod=($pods.items | Where-Object {(Get-DeploymentOptionalProperty (Get-DeploymentOptionalProperty $_.metadata 'labels') 'app.kubernetes.io/component') -eq 'research-engine'}).metadata.name
     $sample=Invoke-DeploymentObservation $Gate
     if ($sample.fingerprint -ne $Gate.Baseline.fingerprint) { throw 'Durable state changed during rollout' }
+    if ($Gate.Recovery) { Assert-RecoveryNotResumed $Gate }
     $release=Invoke-DeploymentCommand helm @('--kube-context','k3d-ai-investment-dev','-n','ai-investment','status','ai-investment-platform','-o','json') | ConvertFrom-Json
     if ($release.version -ne $Gate.HelmRevision) { throw 'Helm revision changed' }
     Invoke-DeploymentKubectl @('delete','networkpolicy','research-bootstrap-isolation','--wait=true') | Out-Null
@@ -2650,6 +2735,7 @@ function Deploy-VerifiedRadarComponentsCore {
     if ($SkipBuild) { throw 'SkipBuild is not supported for verified deployment' }
     if ($ResumeAuditTag -and $NoCache) { throw 'NoCache is invalid for artifact-reuse recovery' }
     if ($ResumeAuditTag -and $ResumeAuditTag -notmatch '^review-\d{8}-\d{6}-[0-9a-f]{32}$') { throw 'Unreviewed recovery tag' }
+    $cycleRecovery = Get-InterruptedCycleRecoveryRequest -Names $Names
     Assert-LocalPrerequisites
     # Every operation is pinned; never rely on mutable current-context state.
     $ready = Invoke-DeploymentKubectl @('get','--raw=/readyz','--request-timeout=10s')
@@ -2733,7 +2819,7 @@ function Deploy-VerifiedRadarComponentsCore {
     if ($DryRun) { Write-Host "Verified artifact preflight: $($Names -join ', '). No build, push or patch. Database/isolation/quiet gates NOT executed; this is not deployment readiness."; return }
     if (-not $AcceptBootstrapRisk -or -not $ConfirmCallerFreeze) { throw 'Explicit bootstrap risk acceptance and caller freeze are required' }
     Set-DeploymentPhase 'READ_ONLY_PREFLIGHT'
-    $gate = Initialize-DeploymentSafety -Names $Names -ExistingIsolation:([bool]$ResumeAuditTag)
+    $gate = Initialize-DeploymentSafety -Names $Names -ExistingIsolation:([bool]$ResumeAuditTag) -Recovery $cycleRecovery
     $gate.HelmRevision=($release | ConvertFrom-Json).version
     $tag = if ($ResumeAuditTag) { $ResumeAuditTag } else { 'review-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N') }
     Ensure-RuntimeDirectory
@@ -2840,7 +2926,7 @@ function Deploy-SelectedComponents {
         # fail closed to the verified path whenever it is not confirmed
         # LOW_RISK (schema migration, infrastructure/Helm change, or
         # worker-state transition; or classification itself was unverifiable).
-        if ($AcceptBootstrapRisk -or $ConfirmCallerFreeze -or $ResumeAuditTag) {
+        if ($AcceptBootstrapRisk -or $ConfirmCallerFreeze -or $ResumeAuditTag -or $RecoverInterruptedCycleId -or $AuthorizeInterruptedCycleRecovery) {
             Deploy-VerifiedRadarComponents -Names $safeSelection
             return
         }
@@ -2852,6 +2938,7 @@ function Deploy-SelectedComponents {
         return
     }
     if (@($safeSelection | Where-Object { $_ -in @('api-gateway','research-engine','portfolio-service','frontend') }).Count) { throw 'Protected components cannot use the general deployment path' }
+    if ($RecoverInterruptedCycleId -or $AuthorizeInterruptedCycleRecovery) { throw 'Interrupted-cycle recovery deploys research-engine alone' }
     Assert-LocalPrerequisites
     Assert-ExistingCluster
 

@@ -450,3 +450,250 @@ def test_flyway_complete_fingerprint_remains_intact(conn, monkeypatch):
     assert result['status'] == 'QUIET_SNAPSHOT'
     assert result['fingerprint'] and len(result['fingerprint']) == 64
     assert result['counts']['research_refresh_runs'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Recovery-only deployment: one named lapsed Equity cycle may stay RUNNING.
+# ---------------------------------------------------------------------------
+
+TARGET = '86f0567d-978e-4fcc-a9c5-337ed729db69'
+OTHER = '11111111-2222-4333-8444-555555555555'
+RECOVERY = {'cycle_id': TARGET, 'market': 'NSE'}
+RECOVERY_TABLES = {'global_opportunity_cycle_run': ['cycle_id'], 'global_opportunity_cycle_active': ['market'],
+                   'global_opportunity_cycle_progress': ['cycle_id', 'phase', 'global_instrument_id']}
+
+
+def lease(seconds):
+    """Lease text in the application's fixed-width UTC format, relative to DB time."""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec='microseconds')
+
+
+def create_cycle_tables(conn):
+    # Production DDL (app/cycle_checkpoint.py), under the research schema.
+    conn.execute("""CREATE TABLE research.global_opportunity_cycle_run (
+        cycle_id TEXT PRIMARY KEY, market TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ACCEPTED','RUNNING','PUBLISHED','CANCEL_REQUESTED','COMPLETED','FAILED','CANCELLED')),
+        parameters TEXT NOT NULL, as_of TEXT, selection TEXT, owner_id TEXT, lease_expires_at TEXT,
+        resume_count INTEGER NOT NULL DEFAULT 0, error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE research.global_opportunity_cycle_active (
+        market TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES research.global_opportunity_cycle_run(cycle_id))""")
+    conn.execute("""CREATE TABLE research.global_opportunity_cycle_progress (
+        cycle_id TEXT NOT NULL REFERENCES research.global_opportunity_cycle_run(cycle_id),
+        phase TEXT NOT NULL, global_instrument_id TEXT NOT NULL, state TEXT NOT NULL, disposition TEXT,
+        failure_reason TEXT, attempts INTEGER NOT NULL DEFAULT 0, payload TEXT, updated_at TEXT NOT NULL,
+        PRIMARY KEY (cycle_id, phase, global_instrument_id))""")
+
+
+def put_run(conn, cycle_id, status='RUNNING', owner='worker-old', expires=-900, market='NSE', resume_count=0):
+    conn.execute('INSERT INTO research.global_opportunity_cycle_run (cycle_id,market,status,parameters,owner_id,'
+                 'lease_expires_at,resume_count,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                 (cycle_id, market, status, '{}', owner, None if expires is None else lease(expires), resume_count,
+                  '2026-10-29T00:00:00.000000+00:00', '2026-10-29T01:00:00.000000+00:00'))
+
+
+def lapsed_target(conn):
+    create_cycle_tables(conn)
+    put_run(conn, TARGET)
+    put_run(conn, OTHER, status='COMPLETED', owner=None, expires=None)
+    conn.execute("INSERT INTO research.global_opportunity_cycle_active VALUES ('NSE',%s)", (TARGET,))
+    for n, state in enumerate(['COMPLETED', 'IN_PROGRESS', 'PENDING']):
+        conn.execute("INSERT INTO research.global_opportunity_cycle_progress VALUES (%s,'DEEP',%s,%s,NULL,NULL,1,%s,%s)",
+                     (TARGET, f'inst-{n}', state, '{"checkpoint":%d}' % n, '2026-10-29T01:00:00.000000+00:00'))
+    conn.commit()
+
+
+def observe_cycles(conn, monkeypatch, recovery=RECOVERY, tables=None):
+    monkeypatch.setattr(obs, 'TABLES', tables or RECOVERY_TABLES)
+    return obs.observe(conn, recovery=recovery)
+
+
+def test_recovery_snapshot_accepts_only_the_named_lapsed_cycle(conn, monkeypatch):
+    lapsed_target(conn)
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'RECOVERY_SNAPSHOT' and result['reasons'] == []
+    r = result['recovery']
+    assert (r['cycle_id'], r['market'], r['status'], r['owner_id']) == (TARGET, 'NSE', 'RUNNING', 'worker-old')
+    assert r['lease_expired'] is True and r['lease_expired_seconds'] > 800
+    assert r['slot'] == [['NSE', TARGET]] and r['checkpoint_rows'] == 3
+    assert len(r['checkpoint_fingerprint']) == 64 and len(result['fingerprint']) == 64
+    # Stable across repeated observations; a checkpoint change is visible.
+    again = observe_cycles(conn, monkeypatch)
+    assert again['recovery'] == {**r, 'lease_expired_seconds': again['recovery']['lease_expired_seconds'],
+                                 'observed_at': again['recovery']['observed_at']}
+    assert again['fingerprint'] == result['fingerprint']
+    conn.execute("UPDATE research.global_opportunity_cycle_progress SET state='COMPLETED' WHERE global_instrument_id='inst-2'")
+    conn.commit()
+    changed = observe_cycles(conn, monkeypatch)
+    assert changed['recovery']['checkpoint_fingerprint'] != r['checkpoint_fingerprint']
+    assert changed['fingerprint'] != result['fingerprint']
+
+
+def test_ordinary_gate_still_blocks_the_lapsed_cycle(conn, monkeypatch):
+    lapsed_target(conn)
+    result = observe_cycles(conn, monkeypatch, recovery=None)
+    assert result['status'] == 'BLOCKED' and result['reasons'] == ['ACTIVE_SLOT', 'DURABLE_WORK']
+    assert 'recovery' not in result
+
+
+def test_recovery_live_lease_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    conn.execute('UPDATE research.global_opportunity_cycle_run SET lease_expires_at=%s WHERE cycle_id=%s',
+                 (lease(600), TARGET))
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'BLOCKED' and 'RECOVERY_LEASE_LIVE' in result['reasons']
+
+
+def test_recovery_expiry_uses_database_time_not_observer_clock(conn, monkeypatch):
+    lapsed_target(conn)
+    # The lease is 5 s in the future per DB time; a skewed observer clock must not matter.
+    conn.execute("UPDATE research.global_opportunity_cycle_run SET lease_expires_at=to_char(clock_timestamp() "
+                 "AT TIME ZONE 'UTC' + interval '5 seconds','YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00' WHERE cycle_id=%s",
+                 (TARGET,))
+    conn.commit()
+    monkeypatch.setattr(obs, 'datetime', None)  # observer never consults its own clock for expiry
+    assert 'RECOVERY_LEASE_LIVE' in observe_cycles(conn, monkeypatch)['reasons']
+
+
+@pytest.mark.parametrize('lease_value', [None])
+def test_recovery_missing_lease_blocks(conn, monkeypatch, lease_value):
+    lapsed_target(conn)
+    conn.execute('UPDATE research.global_opportunity_cycle_run SET lease_expires_at=%s WHERE cycle_id=%s',
+                 (lease_value, TARGET))
+    conn.commit()
+    assert 'RECOVERY_LEASE_LIVE' in observe_cycles(conn, monkeypatch)['reasons']
+
+
+@pytest.mark.parametrize('status', ['ACCEPTED', 'PUBLISHED', 'CANCEL_REQUESTED'])
+def test_recovery_target_not_running_blocks(conn, monkeypatch, status):
+    lapsed_target(conn)
+    conn.execute('UPDATE research.global_opportunity_cycle_run SET status=%s WHERE cycle_id=%s', (status, TARGET))
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'BLOCKED' and 'RECOVERY_TARGET_NOT_RUNNING' in result['reasons']
+
+
+@pytest.mark.parametrize('status', ['COMPLETED', 'FAILED', 'CANCELLED'])
+def test_recovery_terminal_target_blocks(conn, monkeypatch, status):
+    lapsed_target(conn)
+    conn.execute('UPDATE research.global_opportunity_cycle_run SET status=%s, owner_id=NULL WHERE cycle_id=%s',
+                 (status, TARGET))
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'BLOCKED'
+    assert {'DURABLE_WORK', 'RECOVERY_TARGET_NOT_RUNNING', 'RECOVERY_OWNER_MISSING'} <= set(result['reasons'])
+
+
+def test_recovery_missing_owner_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    conn.execute('UPDATE research.global_opportunity_cycle_run SET owner_id=NULL WHERE cycle_id=%s', (TARGET,))
+    conn.commit()
+    assert 'RECOVERY_OWNER_MISSING' in observe_cycles(conn, monkeypatch)['reasons']
+
+
+def test_recovery_successor_owner_with_live_lease_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    conn.execute('UPDATE research.global_opportunity_cycle_run SET owner_id=%s, lease_expires_at=%s, '
+                 'resume_count=resume_count+1 WHERE cycle_id=%s', ('worker-new', lease(300), TARGET))
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'BLOCKED' and 'RECOVERY_LEASE_LIVE' in result['reasons']
+    assert result['recovery']['owner_id'] == 'worker-new'
+
+
+@pytest.mark.parametrize('status,owner', [('RUNNING', 'worker-x'), ('ACCEPTED', None), ('COMPLETED', 'worker-x')])
+def test_recovery_additional_durable_work_blocks(conn, monkeypatch, status, owner):
+    lapsed_target(conn)
+    put_run(conn, '22222222-2222-4333-8444-555555555555', status=status, owner=owner, market='ETF')
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'BLOCKED' and 'DURABLE_WORK' in result['reasons']
+
+
+def test_recovery_extra_slot_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    conn.execute("INSERT INTO research.global_opportunity_cycle_active VALUES ('ETF',%s)", (OTHER,))
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'BLOCKED' and 'ACTIVE_SLOT' in result['reasons']
+
+
+def test_recovery_missing_or_foreign_slot_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    conn.execute('DELETE FROM research.global_opportunity_cycle_active')
+    conn.commit()
+    assert 'ACTIVE_SLOT' in observe_cycles(conn, monkeypatch)['reasons']
+    conn.execute("INSERT INTO research.global_opportunity_cycle_active VALUES ('NSE',%s)", (OTHER,))
+    conn.commit()
+    assert 'ACTIVE_SLOT' in observe_cycles(conn, monkeypatch)['reasons']
+
+
+def test_recovery_wrong_market_row_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    conn.execute("UPDATE research.global_opportunity_cycle_run SET market='ETF' WHERE cycle_id=%s", (TARGET,))
+    conn.commit()
+    assert 'RECOVERY_MARKET_MISMATCH' in observe_cycles(conn, monkeypatch)['reasons']
+
+
+def test_recovery_unrelated_cycle_id_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    result = observe_cycles(conn, monkeypatch, recovery={'cycle_id': OTHER, 'market': 'NSE'})
+    assert result['status'] == 'BLOCKED'
+    assert {'DURABLE_WORK', 'ACTIVE_SLOT', 'RECOVERY_TARGET_NOT_RUNNING'} <= set(result['reasons'])
+    missing = observe_cycles(conn, monkeypatch, recovery={'cycle_id': '99999999-2222-4333-8444-555555555555', 'market': 'NSE'})
+    assert missing['status'] == 'BLOCKED' and 'RECOVERY_TARGET_MISSING' in missing['reasons']
+
+
+@pytest.mark.parametrize('recovery', [
+    {'cycle_id': TARGET, 'market': 'ETF'}, {'cycle_id': TARGET.upper(), 'market': 'NSE'},
+    {'cycle_id': TARGET + "' OR '1'='1", 'market': 'NSE'}, {'cycle_id': TARGET}, 'not-a-dict',
+    {'cycle_id': TARGET, 'market': 'NSE', 'force': True}])
+def test_recovery_request_is_strictly_validated(conn, monkeypatch, recovery):
+    lapsed_target(conn)
+    with pytest.raises(obs.Unknown, match='INVALID_RECOVERY_REQUEST'):
+        observe_cycles(conn, monkeypatch, recovery=recovery)
+
+
+def test_recovery_background_refresh_still_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    create_refresh_runs_table(conn)
+    insert_refresh_run(conn, str(uuid4()), datetime.now(timezone.utc), None, 'RUNNING')
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch, tables={**RECOVERY_TABLES, 'research_refresh_runs': ['refresh_run_id']})
+    assert result['status'] == 'BLOCKED' and result['reasons'] == ['BACKGROUND_REFRESH']
+
+
+def test_recovery_legacy_work_still_blocks(conn, monkeypatch):
+    lapsed_target(conn)
+    put(conn, 'evt', 'legacy-job', 'RUNNING')
+    conn.commit()
+    result = observe_cycles(conn, monkeypatch)
+    assert result['status'] == 'BLOCKED' and result['reasons'] == ['LEGACY_WORK']
+
+
+def test_recovery_snapshot_is_read_only(conn, monkeypatch):
+    lapsed_target(conn)
+    before = conn.execute('SELECT t::text FROM research.global_opportunity_cycle_run t ORDER BY cycle_id').fetchall()
+    conn.commit()
+    observe_cycles(conn, monkeypatch)
+    after = conn.execute('SELECT t::text FROM research.global_opportunity_cycle_run t ORDER BY cycle_id').fetchall()
+    assert before == after
+    import re
+    source = inspect.getsource(obs.recovery_target)
+    assert not re.search(r'\b(UPDATE|INSERT|DELETE|NOTIFY|LOCK|FOR UPDATE)\b', source)
+
+
+def test_main_exit_code_requires_mode_specific_verdict(monkeypatch, capsys):
+    import sys, types
+    psycopg_stub = types.SimpleNamespace(connect=lambda **k: __import__('contextlib').nullcontext(None))
+    settings = types.SimpleNamespace(research_database_backend='postgres', research_database_schema='research',
+        research_database_host='h', research_database_port=1, research_database_name='d', research_database_user='u',
+        research_database_password='', research_database_ssl_mode='disable')
+    monkeypatch.setitem(sys.modules, 'app', types.ModuleType('app'))
+    monkeypatch.setitem(sys.modules, 'app.settings', types.SimpleNamespace(Settings=lambda: settings))
+    monkeypatch.setitem(sys.modules, 'psycopg', psycopg_stub)
+    for status, recovery, code in [('QUIET_SNAPSHOT', None, 0), ('RECOVERY_SNAPSHOT', None, 2),
+                                   ('RECOVERY_SNAPSHOT', RECOVERY, 0), ('QUIET_SNAPSHOT', RECOVERY, 2),
+                                   ('BLOCKED', RECOVERY, 2)]:
+        monkeypatch.setattr(obs, 'observe', lambda c, m, recovery=None, s=status: {'status': s})
+        assert obs.main(None, recovery) == code

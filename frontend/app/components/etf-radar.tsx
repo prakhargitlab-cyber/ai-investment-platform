@@ -109,6 +109,12 @@ export type EtfCycleResult = {
   // claim that every entry is an interchangeable, single "best" pick.
   top_opportunities?: EtfCandidate[];
   excluded_by_reason: Record<string, number>;
+  recommendation_evidence?: {
+    screening_opportunities: number;
+    missing_verified_metrics: Record<string, number>;
+    entry_assessed: number;
+    entry_insufficient_evidence: number;
+  };
 };
 
 function factorByName(result: EtfRuleEngineResult | null, name: string): EtfFactorResult | undefined {
@@ -646,6 +652,31 @@ export function EtfRadarContent({ data, initialTab }: { data: EtfCycleResult; in
           <div><dt>Ranked ETFs</dt><dd>{data.ranked.length}</dd></div>
         </dl>
         {data.scope === "FULL_OFFICIAL_NSE_ETF" ? <p>Complete official NSE snapshot assessed. Rankings compare verified peers only; missing peer classification cannot produce a buy shortlist.</p> : null}
+        {data.recommendation_evidence ? (
+          <section aria-label="Recommendation evidence readiness">
+            <h3>Evidence still needed for actionable research</h3>
+            <p>
+              {data.recommendation_evidence.screening_opportunities} research opportunities were ranked,
+              but a screening rank is not a buy or entry recommendation. These evidence gaps can overlap
+              across ETFs and do not alter the underlying rule-engine results.
+            </p>
+            <dl className="radar-progress-counters">
+              <div><dt>Entry conditions verified</dt><dd>{data.recommendation_evidence.entry_assessed} / {data.recommendation_evidence.screening_opportunities}</dd></div>
+              <div><dt>Entry evidence incomplete</dt><dd>{data.recommendation_evidence.entry_insufficient_evidence}</dd></div>
+              {[
+                ["expense_ratio", "Missing verified expense ratio"],
+                ["aum", "Missing verified AUM"],
+                ["tracking_error", "Missing verified tracking error"],
+                ["tracking_difference", "Missing verified tracking difference"],
+                ["bid_ask_spread", "Missing verified bid/ask spread"],
+              ].map(([key, label]) => (
+                <div key={key}><dt>{label}</dt><dd>{data.recommendation_evidence?.missing_verified_metrics[key] ?? "Unavailable"}</dd></div>
+              ))}
+            </dl>
+            <p>Only source-backed evidence can close these gaps. Missing facts are never treated as zero or favorable.</p>
+          </section>
+        ) : null}
+
         <EtfAnalysisPanels data={data} evaluated={evaluated} eligible={eligible} dataGaps={dataGaps} failures={failures} excluded={excluded} coveragePct={coveragePct} leaders={leaders} categories={categories} />
         {(data.universe_count ?? data.candidates.length) === 0
           ? <p role="alert">No ETF instruments were evaluated. ETF universe setup or discovery needs attention.</p>

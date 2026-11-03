@@ -1113,9 +1113,16 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
   };
   // Live counts come only from this cycle's durable official-snapshot checkpoints.
   const terminalData = activeCycle?.status === "COMPLETED" && data?.cycle_id === activeCycle.cycleId ? data : null;
+  // The live status endpoint reports only BASELINE completion, not ETF_ONBOARD
+  // history ingestion, final scoring, or publication. Never pass that fraction
+  // as overall progress: 359/359 first-pass outcomes can precede minutes of work.
+  const firstPassOfficial = activeCycle?.coverage?.official ?? null;
+  const firstPassCompleted = activeCycle?.coverage?.completed ?? null;
   const counters: RadarProgressCounter[] = !terminalData ? (activeCycle?.coverage ? [
-    { label: "Official NSE universe", value: activeCycle.coverage.official },
-    { label: "First-pass outcomes", value: activeCycle.coverage.completed },
+    { label: "Official NSE ETF universe", value: firstPassOfficial },
+    { label: "First-pass processed (not final evaluations)", value: firstPassCompleted },
+    { label: "First-pass remaining", value: firstPassOfficial != null && firstPassCompleted != null
+        ? Math.max(firstPassOfficial - firstPassCompleted, 0) : null },
   ] : []) : [
     { label: "Total universe", value: terminalData.candidates.length },
     { label: "Evaluated candidates", value: terminalData.candidates.filter((c) => c.disposition === "EVALUATED").length },
@@ -1153,9 +1160,17 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
           </button>
         </div>
         {activeCycle ? (
-          <RadarProgressPanel radarType="ETF" cycleId={activeCycle.cycleId} status={activeCycle.status}
-            startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={counters}
-            percent={null} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+          <>
+            <RadarProgressPanel radarType="ETF" cycleId={activeCycle.cycleId} status={activeCycle.status}
+              startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={counters}
+              percent={null} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+            {running ? <p className="etf-coverage-caveat">
+              First-pass processed counts do not measure the entire run. Historical evidence onboarding,
+              final scoring, peer ranking and publication may still be running after first-pass reaches
+              the official universe total. The overall progress bar is intentionally indeterminate
+              until the backend exposes trustworthy per-phase totals.
+            </p> : null}
+          </>
         ) : null}
       </Card>
       {roles.includes("ADMIN") ? (

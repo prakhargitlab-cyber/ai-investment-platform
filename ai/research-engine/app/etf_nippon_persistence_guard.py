@@ -97,7 +97,7 @@ def stage_nippon_factsheet(
     if any(c.status not in {"MATCH_EXACT_NAME_REVIEW_REQUIRED", "NAME_DIFFERS_REVIEW_REQUIRED"}
            or c.evidence_authenticated or c.identity_verified_for_scoring
            or c.nse_isin != EXPECTED_ISINS[c.ticker]
-           or c.nse_symbol != c.ticker or not c.nse_security_name or c.nse_csv_row_number is None
+           or c.nse_symbol != c.ticker or not c.nse_scheme_name or c.nse_row_number is None
            for c in expected):
         raise ValueError("NIPPON_STAGING_IDENTITY_REVIEW_UNRESOLVED")
     candidate = month_candidate(reviewed.publication_month.year, reviewed.publication_month.month)

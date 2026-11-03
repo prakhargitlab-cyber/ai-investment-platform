@@ -68,6 +68,9 @@ def listing(*, isin=ISIN, symbol="NIFTYBEES", observed=NOW, instrument_id=ID,
 
 
 def test_fresh_nse_listing_and_explicit_attestation_only_pass_preflight():
+    # ResearchBaseModel has use_enum_values=True: persisted authority is a string.
+    assert listing().provenance.authority == "OFFICIAL_EXCHANGE"
+    assert type(listing().provenance.authority) is str
     result = preflight_scheme_identity(FakeStore([listing()]), metric(), attestation(), now=NOW)
     assert result.status == "READY_FOR_MANUAL_REVIEW"
     assert result.isin == ISIN

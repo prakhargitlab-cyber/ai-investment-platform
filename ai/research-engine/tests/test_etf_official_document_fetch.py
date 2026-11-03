@@ -492,7 +492,8 @@ def test_hash_mismatch_between_registered_approval_and_ingested_text_fails_close
 # Authenticity cross-check against the real, previously hash-verified PDFs
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not VALIDATION_DIR.exists(), reason="real validation fixtures not present in this checkout")
+@pytest.mark.skipif(not (VALIDATION_DIR / "NIFTYBEES-official.pdf").is_file(),
+                    reason="optional NIFTYBEES-official.pdf fixture not present in this checkout")
 @pytest.mark.asyncio
 async def test_fetching_the_real_niftybees_pdf_extracts_the_same_text_already_verified():
     real_pdf = (VALIDATION_DIR / "NIFTYBEES-official.pdf").read_bytes()

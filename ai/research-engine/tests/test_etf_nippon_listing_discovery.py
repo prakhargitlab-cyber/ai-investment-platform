@@ -81,9 +81,9 @@ def test_exact_listing_location_required():
 
 def test_html_limit_and_link_limit():
     with pytest.raises(ValueError, match="NIPPON_LISTING_SIZE_LIMIT"):
-        parse(b"x" * (256 * 1024 + 1))
+        parse(b"x" * (1024 * 1024 + 1))
     with pytest.raises(ValueError, match="NIPPON_LISTING_LINK_LIMIT"):
-        parse(b'<a href="x"></a>' * 501)
+        parse(b'<a href="x"></a>' * 2001)
 
 
 @pytest.mark.asyncio
@@ -133,3 +133,24 @@ async def test_wrong_content_type_rejected():
     ) as client:
         with pytest.raises(ValueError, match="NIPPON_LISTING_NOT_HTML"):
             await discover_listing(approved_listing_url=PAGE, enabled=True, client=client)
+
+
+def test_realistic_issuer_sid_listing_with_675_unrelated_pdf_links():
+    """Issuer page exposed 675 PDF links; parser should not fail early."""
+    unrelated = b'<a href="/InvestorServices/SIDEquity/unrelated.pdf">Other</a>' * 675
+    sid = (b'<a href="/InvestorServices/SIDETF/'
+           b'NipponIndia-ETF-Nifty-Next-50-Junior-BeES.pdf">Junior SID</a>')
+    result = parse(unrelated + sid)
+    assert len(result.candidates) == 1
+    assert result.candidates[0].document_family == "ETF_SID"
+    assert result.candidates[0].url.endswith("/SIDETF/NipponIndia-ETF-Nifty-Next-50-Junior-BeES.pdf")
+    assert not result.candidates[0].identity_verified_for_scoring
+
+
+def test_still_bounded_when_too_many_eligible_sid_documents():
+    entries = b''.join(
+        f'<a href="/InvestorServices/SIDETF/scheme-{i}.pdf">scheme</a>'.encode()
+        for i in range(101)
+    )
+    with pytest.raises(ValueError, match="NIPPON_LISTING_CANDIDATE_LIMIT"):
+        parse(entries)

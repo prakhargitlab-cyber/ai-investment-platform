@@ -79,6 +79,12 @@ export type EtfCandidate = {
   // app.etf_full_universe._classify_historical_acquisition). Never
   // affects scoring/eligibility; purely informational.
   historical_acquisition?: { status: string; reason: string | null; observations: number | null } | null;
+  document_acquisition?: {
+    status: string;
+    reason: string | null;
+    url: string;
+    facts?: Record<string, { outcome: string | null; reason: string | null }>;
+  } | null;
   // Fund quality / liquidity / cost / risk / tracking evidence, when
   // app.etf_screening.screening_evidence found fresh backing facts; a
   // metric present with quality UNAVAILABLE is shown as "--", never 0.
@@ -274,6 +280,18 @@ export function EtfRadarCard({ item }: { item: EtfCandidate }) {
           {item.positive_signals?.length ? <span className="signal-positive">+ {item.positive_signals.join(", ")}</span> : null}
           {item.negative_signals?.length ? <span className="signal-negative"> − {item.negative_signals.join(", ")}</span> : null}
         </p>
+      ) : null}
+      {item.document_acquisition ? (
+        <details className="etf-fund-quality">
+          <summary>Official document acquisition · {item.document_acquisition.status.replaceAll("_", " ")}</summary>
+          <p>{item.document_acquisition.reason ?? "No additional detail recorded."}</p>
+          <p>Approved source: {item.document_acquisition.url}</p>
+          {item.document_acquisition.facts ? <ul>
+            {Object.entries(item.document_acquisition.facts).map(([metric, result]) => (
+              <li key={metric}>{metric}: {result.outcome ?? "Unavailable"}{result.reason ? ` (${result.reason})` : ""}</li>
+            ))}
+          </ul> : null}
+        </details>
       ) : null}
       {item.missing_data?.length ? <p>Missing data: {item.missing_data.join(", ")}</p> : null}
       {item.limitations?.length ? <ul>{item.limitations.map(text => <li key={text}>{text}</li>)}</ul> : null}

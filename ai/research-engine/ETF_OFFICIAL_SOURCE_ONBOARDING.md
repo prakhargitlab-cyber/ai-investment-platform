@@ -76,3 +76,12 @@ Next safe step: obtain an AMC/exchange document with a **labelled exact ISIN** f
 - The return type always reports `status=DOCUMENT_REVIEW_ONLY` and `identity_verified=False`. It cannot create `EtfFact`, authenticate an issuer, set `PUBLIC_UNAUTHENTICATED`, or influence scoring. It is a staging step, **not finished ingestion**.
 - `tests/test_etf_nippon_monthly_source.py` checks month boundaries, URL shapes, ambiguity, and review-only semantics. Genuine-document tests are optional and use the gitignored `.tmp/etf-validation/Nippon-FS-October-2026.pdf` path.
 - Still pending: independent official ISIN-to-section corroboration; real clean-session HTTP verification; a separately reviewed policy allowing controlled monthly family URLs; a one-download-per-publication cache and durable provenance; a fund-metric ingestion adapter built without weakening `verified_scheme_section`; and a guarded live test. Do **not** enable the existing automated-fetch flag based only on these resolver/parser files.
+
+
+## Phase 2 staging coordinator (2026-11-03)
+
+`app.etf_nippon_shared_review.review_approved_shared_month` is a strictly bounded **staging-only** coordinator. Its injected async PDF provider is called **once** after exact URL / issuer-host / public-access approvals have been established for each ETF, and then the reviewed PDF sections are parsed. It independently rejects unexpected report dates and mismatched document hashes. The coordinator does not perform HTTP, find sources, or write ETF evidence.
+
+`tests/test_etf_nippon_shared_review.py` covers one-call/two-section semantics, missing/auth-gated/wrong-month approval, duplicate identities, date mismatch, and digest mismatch without a network call.
+
+**Critical remaining blocks:** This staging coordinator has no production network adapter: the approved source registry still only includes authenticated Product Notes, and `PUBLIC_UNAUTHENTICATED` approval for the combined factsheet remains unverified. A real exchange-issued scheme-to-ISIN identity binding is still needed; matching a section heading is not sufficient. No `EtfFact` may be persisted by this code, and no buy recommendation becomes investment-ready merely because review-only metrics parse. Keep document fetch disabled and PR draft.

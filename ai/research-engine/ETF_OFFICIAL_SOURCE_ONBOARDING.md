@@ -127,3 +127,15 @@ New `app/etf_nippon_nse_comparison.py` compares a separately supplied NSE listin
 `python -m app.etf_nippon_nse_comparison_cli --factsheet "C:\\path\\to\\Nippon-FS-October-2026.pdf" --nse-csv "C:\\path\\to\\official-NSE-ETF-list.csv"` prints JSON with both source hashes, pages, report dates, row matches, and review statuses. It never fetches documents, writes facts or changes ETF scores. The CLI accepts NSE CSV headers such as `SYMBOL`, `NAME OF COMPANY`, `ISIN NUMBER` (plus a small explicit alias set). Test with `python -m pytest tests/test_etf_nippon_nse_comparison.py -q`.
 
 **Source authenticity still requires manual verification** of how and when the NSE CSV was obtained (official exchange URL, response details and preferably retained original bytes). Merely naming a local CSV file `official-...` is not proof it came from the exchange. Even an exact matching row emits `MATCH_EXACT_NAME_REVIEW_REQUIRED`, with `evidence_authenticated=False` and `identity_verified_for_scoring=False`. The comparison is only a reproducible preflight and does not approve ingestion. No user-specific NSE CSV was supplied or reviewed in this commit; local tests still need execution.
+
+
+## Official NSE CSV schema and identity evidence (2026-11-03)
+
+Operator obtained `https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv` via an anonymous Python `httpx` request (200 OK, `text/csv`, no redirect, 38,362 bytes; SHA256 `3c802209ee0e2becfc356253ba2b48ab4a2743cc680283a4f575452b07b97e9a`). Windows Schannel curl timed out; this isolated OpenSSL-backed request succeeded. This verifies that particular retrieval; no assertion about future endpoint availability is made.
+
+Observed actual CSV columns: `Symbol`, `Underlying Asset`, `SecurityName`, `DateofListing`, `MarketLot`, `ISINNumber`, `FaceValue`, `ETF Underlying`, `Underlying Key`. The operator's two source rows:
+
+- `NIFTYBEES`: `ISINNumber=INF204KB14I2`; `SecurityName=NIPINDETFNIFTYBEES`; `Underlying Asset=Nifty 50`.
+- `JUNIORBEES`: `ISINNumber=INF732E01045`; `SecurityName=NIP IND ETF JUNIOR BEES`; `Underlying Asset=Nippon India ETF Nifty Next 50 Junior BeES`.
+
+`app.etf_nippon_nse_comparison` now supports the NSE-specific headers `SecurityName` and `ISINNumber`, and exposes the separate `Underlying Asset` evidence without conflating it with the exchange security name. Since both exchange `SecurityName` strings differ from the full Nippon factsheet heading, the comparison retains `NAME_DIFFERS_REVIEW_REQUIRED`. JUNIORBEES' `Underlying Asset` is a supporting exact full-name match; NIFTYBEES' field is the index name, not the full fund name. Neither observation constitutes an automatic scheme-to-ISIN approval. Original NSE bytes remain only on the operator's gitignored local path; they have not been uploaded to or reproduced in the repo. New offline regression tests still require local execution.

@@ -34,6 +34,25 @@ async def test_opt_in_approved_document_fact_reaches_final_published_score(repo,
     repo.settings = SimpleNamespace(research_etf_official_document_fetch_enabled=True)
 
     async def fake_ingest(repository, orchestrator, selected, client, **kwargs):
+        # The rule engine requires fresh MARKET_PRICE and TRADING_VOLUME.
+        # This isolated fixture must persist them, not merely claim READY.
+        for selected_row in selected:
+            instrument_id = UUID(selected_row['globalInstrumentId'])
+            for metric, value, unit in (
+                (EtfMetric.MARKET_PRICE, '100', 'INR'),
+                (EtfMetric.TRADING_VOLUME, '500000', 'shares'),
+            ):
+                repository.persistence.save_etf_evidence(EtfFact(
+                    instrument_id=instrument_id, metric=metric,
+                    value=Decimal(value), unit=unit, as_of_date=NOW.date(),
+                    provenance=EtfProvenance(
+                        provider='NSE', source_type='NSE_MARKET_WATCH',
+                        source_identity=f'{selected_row["primarySymbol"]}:{metric}:fixture',
+                        source_url='https://www.nseindia.com/',
+                        authority=EtfAuthority.OFFICIAL_EXCHANGE,
+                        reliability_level='LEVEL_A', retrieved_at=NOW,
+                    ),
+                ))
         return {'instruments': [{'instrument_id':r['globalInstrumentId'], 'status':'READY',
                                  'attempts':[]} for r in selected]}
     monkeypatch.setattr(full, 'ingest_quotes', fake_ingest)

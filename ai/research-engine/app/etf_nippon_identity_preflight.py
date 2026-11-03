@@ -75,7 +75,7 @@ def preflight_scheme_identity(
     p = listing.provenance
     if (listing.asset_type != "ETF" or listing.exchange != "NSE"
             or listing.symbol != attestation.ticker or listing.isin != attestation.isin
-            or p.provider != "NSE" or p.authority is not EtfAuthority.OFFICIAL_EXCHANGE
+            or p.provider != "NSE" or p.authority != EtfAuthority.OFFICIAL_EXCHANGE
             or p.source_mode != "REAL"
             or document_host(p.source_url) not in NSE_HOSTS
             or any(item.isin == attestation.isin and item.instrument_id != attestation.nse_instrument_id

@@ -46,3 +46,24 @@ The default-source guard test is intentionally expected to require updating **af
 - Remaining unavailable mandatory/supporting evidence:
 
 No public replacement URL has been independently checked yet. Until that happens, this is a **review-ready procedure**, not completed live acquisition.
+
+
+## Uploaded October 2026 combined factsheet review (2026-11-03)
+
+User-supplied source URL (not independently HTTP-verified in this review):
+`https://mf.nipponindiaim.com/InvestorServices/FactSheetsDocuments/Nippon-FS-October-2026.pdf`
+
+Local review of the user-provided PDF: **371 physical PDF pages**, **13,264,965 bytes**, raw SHA-256 `9bdb8948221d19c62392dae1bebb1cda5ff2e2a4e09713f8cc9e7967973ccf0c`. PDF physical page 207 (printed page 207) has **Nippon India ETF Nifty 50 BeES**, reporting **2026-09-30**:
+
+- AUM (not AAUM): INR **65,178.85 crore**; separately AAUM INR **66,163.18 crore**.
+- Monthly-average expense ratio, Direct: **0.04%**. Annexure 1 (physical PDF page 368) separately lists Direct Plan Total TER **0.04%**, date 2026-09-30.
+- Tracking error 1Y **0.02%**, tracking difference 1Y **-0.02%**, benchmark **Nifty 50 TRI**, NAV **258.0021**.
+- Junior BeES also has a separately labelled section (physical PDF page 216); the PDF is **multi-scheme**, so whole-document parsing cannot safely select one fund by URL.
+
+**FAIL CLOSED / NOT YET APPROVABLE FOR AUTOMATED METRIC INGESTION:**
+1. Across the searchable PDF text, neither canonical `INF204KB14I2` nor Junior BeES `INF732E01045` is present. This is not proof that the printed artifact contains no image-only ISIN, but no matching text was discovered.
+2. `app.etf_document_parser.verified_scheme_section` demands exactly one `ISIN: <canonical>` within a hash-bound scheme section. `app.etf_official_document_pipeline` does not currently pass an explicitly reviewed `section_span` to registration for this combined document.
+3. `parse_metric` demands a labelled one-line metric with an accepted unit and ISO as-of format, whereas the actual factsheet uses multi-line table layout and `September 30, 2026`. Adding artificial ISIN lines, relabelling the text, or assuming the AMC URL proves scheme identity would bypass the evidence contract.
+4. Uploaded bytes prove the PDF can be inspected offline. They do **not** prove unauthenticated live HTTP retrieval, redirect chain, or final host. Do not mark `PUBLIC_UNAUTHENTICATED` solely because the file was supplied.
+
+Next safe step: obtain an AMC/exchange document with a **labelled exact ISIN** for the scheme and establish an independently verified binding between that identity source and each clearly bounded scheme section before engineering a dedicated multi-scheme table extractor. Keep data `DOCUMENT_REVIEW_ONLY`, do not persist it as a trusted ETF fact or change the default registry yet.

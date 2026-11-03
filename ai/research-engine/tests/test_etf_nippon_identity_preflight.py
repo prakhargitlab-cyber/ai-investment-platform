@@ -43,17 +43,14 @@ def metric():
 
 
 def attestation(**kwargs):
-    return SchemeIdentityAttestation(
+    values = dict(
         ticker="NIFTYBEES", isin=ISIN,
         scheme_heading=HEADINGS["NIFTYBEES"], nse_instrument_id=ID,
-        review_reference="manual-NSE-scheme-cross-check-2026-11-03",
+        review_reference="offline-example-review-reference",
         reviewed_source_url=NSE_URL,
-    ).__class__(**({
-        "ticker": "NIFTYBEES", "isin": ISIN,
-        "scheme_heading": HEADINGS["NIFTYBEES"], "nse_instrument_id": ID,
-        "review_reference": "manual-NSE-scheme-cross-check-2026-11-03",
-        "reviewed_source_url": NSE_URL,
-    } | kwargs))
+    )
+    values.update(kwargs)
+    return SchemeIdentityAttestation(**values)
 
 
 def listing(*, isin=ISIN, symbol="NIFTYBEES", observed=NOW, instrument_id=ID,
@@ -80,7 +77,7 @@ def test_fresh_nse_listing_and_explicit_attestation_only_pass_preflight():
 
 @pytest.mark.parametrize("broken,reason", [
     (lambda: FakeStore([]), "SCHEME_IDENTITY_NSE_LISTING_NOT_FRESH"),
-    (lambda: FakeStore([listing(observed=NOW-timedelta(days=120))]), "SCHEME_IDENTITY_NSE_LISTING_NOT_FRESH"),
+    (lambda: FakeStore([listing(observed=NOW-timedelta(days=900))]), "SCHEME_IDENTITY_NSE_LISTING_NOT_FRESH"),
     (lambda: FakeStore([listing(isin="INF999999999")]), "SCHEME_IDENTITY_OFFICIAL_LISTING_CONFLICT"),
     (lambda: FakeStore([listing(symbol="WRONG")]), "SCHEME_IDENTITY_OFFICIAL_LISTING_CONFLICT"),
     (lambda: FakeStore([listing(authority=EtfAuthority.SECONDARY)]), "SCHEME_IDENTITY_NSE_LISTING_NOT_FRESH"),

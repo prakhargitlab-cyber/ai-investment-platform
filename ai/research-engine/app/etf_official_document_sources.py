@@ -14,7 +14,7 @@ labelled ISIN, AUM or TER -- the downstream identity gate
 (parse_metric) independently decide that from the document's own content,
 and this module must never bypass or relax those checks.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -93,6 +93,48 @@ class ApprovedSourceRegistry:
 
     def instrument_count(self) -> int:
         return len(self._by_instrument)
+
+
+
+def bind_approved_sources_to_canonical_universe(
+    approved_sources: ApprovedSourceRegistry, canonical_etfs: list[dict],
+) -> ApprovedSourceRegistry:
+    """Resolve reviewed URLs to THIS installation's verified ETF identities.
+
+    Source approvals are attached to the exact ISIN AND ticker, never an
+    archived database UUID. Reject ambiguous canonical matches rather than
+    silently attaching an approved PDF to the wrong instrument. This only
+    rebinds identities; it grants no new URL or access-tier approval.
+    """
+    canonical = {}
+    seen_instrument_ids = set()
+    for row in canonical_etfs:
+        if not isinstance(row, dict):
+            raise ValueError("CANONICAL_ETF_ROW_INVALID")
+        isin = row.get("isin")
+        ticker = row.get("primarySymbol")
+        exchange = row.get("exchange") or row.get("primaryExchange")
+        # Rebinding only from the verified portfolio-service ETF projection.
+        if (not isinstance(isin, str) or not isinstance(ticker, str)
+                or row.get("assetType") != "ETF" or row.get("status") != "ACTIVE"
+                or exchange != "NSE"):
+            raise ValueError("CANONICAL_ETF_IDENTITY_UNVERIFIED")
+        try:
+            instrument_id = UUID(str(row["globalInstrumentId"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("CANONICAL_ETF_UUID_INVALID") from exc
+        key = (isin, ticker)
+        if key in canonical or instrument_id in seen_instrument_ids:
+            raise ValueError("CANONICAL_ETF_IDENTITY_AMBIGUOUS")
+        canonical[key] = instrument_id
+        seen_instrument_ids.add(instrument_id)
+
+    bound = ApprovedSourceRegistry()
+    for source in approved_sources.all_sources():
+        instrument_id = canonical.get((source.isin, source.ticker))
+        if instrument_id is not None:
+            bound.add(replace(source, instrument_id=instrument_id))
+    return bound
 
 
 def default_bounded_registry() -> ApprovedSourceRegistry:

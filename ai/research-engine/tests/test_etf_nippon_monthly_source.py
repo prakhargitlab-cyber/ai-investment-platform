@@ -8,7 +8,7 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app.etf_nippon_monthly_source import (
-    bounded_candidates, is_reviewed_path_shape, month_candidate,
+    bounded_candidates, is_reviewed_path_shape, month_candidate, reporting_period_matches,
 )
 from app.etf_nippon_factsheet_review import extract_review_only
 
@@ -29,6 +29,8 @@ def test_month_name_and_reporting_date_are_not_conflated():
         "Nippon-FS-November-2026.pdf", "Nippon-FS-October-2026.pdf"
     ]
     assert is_reviewed_path_shape(OCT_URL)
+    assert reporting_period_matches(october, date(2026, 9, 30))
+    assert not reporting_period_matches(october, date(2026, 10, 31))
 
 
 @pytest.mark.parametrize("url", [

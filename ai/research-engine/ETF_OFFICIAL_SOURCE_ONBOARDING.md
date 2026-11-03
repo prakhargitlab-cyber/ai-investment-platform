@@ -85,3 +85,14 @@ Next safe step: obtain an AMC/exchange document with a **labelled exact ISIN** f
 `tests/test_etf_nippon_shared_review.py` covers one-call/two-section semantics, missing/auth-gated/wrong-month approval, duplicate identities, date mismatch, and digest mismatch without a network call.
 
 **Critical remaining blocks:** This staging coordinator has no production network adapter: the approved source registry still only includes authenticated Product Notes, and `PUBLIC_UNAUTHENTICATED` approval for the combined factsheet remains unverified. A real exchange-issued scheme-to-ISIN identity binding is still needed; matching a section heading is not sufficient. No `EtfFact` may be persisted by this code, and no buy recommendation becomes investment-ready merely because review-only metrics parse. Keep document fetch disabled and PR draft.
+
+
+## Phase 3: identity preflight added (2026-11-03)
+
+`app.etf_nippon_identity_preflight` adds a strict, **non-persisting** preflight for each extracted factsheet section and for both sections as one unit. A caller must supply an explicit, reviewed scheme-heading -> exact ISIN/ticker/instrument UUID attestation and a separate, recent, persisted NSE ETF listing; the code reuses the existing `_check_identity_ready` freshness/conflict gate, verifies listing provenance/source host, and rejects missing or cross-instrument ISIN collisions. It returns `READY_FOR_MANUAL_REVIEW` with `identity_verified_for_scoring=False`, **not investment evidence**.
+
+Important: the attestation object is an operator assertion. A nonempty `review_reference` and an NSE-domain URL are structural checks, **not proof that a reviewer truly verified an exchange source**. This work has not established new external exchange evidence and has not tied the October PDF to an ISIN through an independently checked published document. The independent review process and its evidence manifest still need to be completed before any future ingestion adapter is considered.
+
+The code has **not been run against the user's Windows worktree yet**. Run `python -m pytest tests/test_etf_nippon_identity_preflight.py tests/test_etf_nippon_shared_review.py tests/test_etf_nippon_monthly_source.py -q` after pulling, and keep PR draft and fetch flag disabled.
+
+Pending before automating anything beyond manual review: actual public PDF HTTP verification and approved month-family policy; exact source document provenance/caching; independently reviewed NSE identity documents and corresponding attestations; ingest integration preserving immutable source and page provenance; backend and frontend regression tests, and no admission to investment-ready scoring without all other mandatory sources.

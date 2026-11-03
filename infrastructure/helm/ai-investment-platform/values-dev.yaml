@@ -73,11 +73,9 @@ research:
   # prerequisites in the handoff report before relying on this flag
   # alone to unblock manual Equity submission).
   equityManualExecutionEnabled: true
-  # LOCAL/DEV: kept explicitly false unless a controlled validation run
-  # has been expressly approved. Flip to true only for that run, and only
-  # with recovery paused and the scheduler disabled (both set above); see
-  # research_etf_manual_execution_enabled in app/settings.py.
-  etfManualExecutionEnabled: false
+  # LOCAL/DEV: permit ADMIN-initiated ETF Radar after canonical initialization.
+  # Does not schedule or auto-submit a full-universe run.
+  etfManualExecutionEnabled: true
   # LOCAL/DEV: independent full-NSE-universe permission, also kept
   # explicitly false unless expressly approved for a controlled run; see
   # research_etf_full_universe_execution_enabled in app/settings.py.

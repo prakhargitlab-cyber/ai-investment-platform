@@ -321,7 +321,7 @@ async def _ensure_etf_history(repository, row, *, now, checkpoint, provider=None
 
 async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, identity_headers,
                              correlation_id=None, limits=None, client=None, clock=None, sleep=asyncio.sleep,
-                             history_acquirer=None):
+                             history_acquirer=None, document_acquirer=None):
     if checkpoint is None:
         raise ValueError('DURABLE_ETF_CHECKPOINT_REQUIRED')
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -340,7 +340,8 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as live_client:
             return await run_full_etf_cycle(repository, orchestrator, checkpoint=checkpoint, cycle_id=cycle_id,
                 identity_headers=identity_headers, correlation_id=correlation_id, limits=limits,
-                client=live_client, clock=clock, sleep=sleep, history_acquirer=history_acquirer)
+                client=live_client, clock=clock, sleep=sleep, history_acquirer=history_acquirer,
+                document_acquirer=document_acquirer)
     transport = BudgetClient(client, checkpoint, selection, sleep=sleep)
 
     async def body():
@@ -444,6 +445,61 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                               else CandidateState.RETRYABLE_FAILURE)
             await checkpoint.finish('ETF_ONBOARD', item['isin'], history_state,
                 disposition=history_result['status'], payload=history_result)
+        # Optional, strictly approved document acquisition before final scoring.
+        # This is deliberately not a discovery crawler or an expanded source
+        # allowlist. Resumed cycles skip completed document outcomes stored in
+        # the fenced selection, avoiding repeat HTTP requests on recovery.
+        # The default reviewed sources require authentication; no network
+        # request is made for them, even when the feature flag is enabled.
+        document_results = selection.setdefault('document_acquisition', {})
+        if getattr(getattr(repository, 'settings', None),
+                   'research_etf_official_document_fetch_enabled', False):
+            from app.etf_official_document_pipeline import EtfOfficialDocumentAcquisitionPipeline
+            from app.etf_official_document_sources import (
+                AccessTier, default_bounded_registry, bind_approved_sources_to_canonical_universe,
+            )
+            approved = bind_approved_sources_to_canonical_universe(
+                default_bounded_registry(),
+                [item['canonical'] for item in selection['universe'] if item['canonical']],
+            )
+            pipeline = (None if document_acquirer is not None else
+                        EtfOfficialDocumentAcquisitionPipeline(approved, repository.settings, clock=now))
+            # Only the exact reviewed sources (max two instruments) are attempted.
+            for source in approved.all_sources():
+                isin = source.isin
+                if isin in document_results:
+                    continue
+                owned = await checkpoint.run()
+                if not owned or owned['status'] != 'RUNNING' or owned.get('owner_id') != checkpoint.owner_id:
+                    raise CycleOwnershipLost(checkpoint.cycle_id)
+                if source.access_tier is not AccessTier.PUBLIC_UNAUTHENTICATED:
+                    diagnostic = {'status': 'AUTHENTICATION_REQUIRED_NOT_SUITABLE',
+                                  'reason': 'APPROVED_SOURCE_NOT_PUBLIC', 'url': source.document_url}
+                else:
+                    item = next((item for item in selection['universe']
+                                 if item['isin'] == isin and item['canonical']), None)
+                    if item is None:
+                        continue
+                    from app.models import EtfResearchProfile
+                    row = item['canonical']
+                    profile = EtfResearchProfile(
+                        instrument_id=UUID(str(row['globalInstrumentId'])),
+                        fund_id=UUID(str(row['globalInstrumentId'])),
+                        fund_name=row['canonicalName'], ticker=row['primarySymbol'],
+                        exchange='NSE', mic='XNSE', isin=row['isin'], currency='INR',
+                        known_domains=[source.document_host],
+                    )
+                    if document_acquirer is None:
+                        result = await pipeline.acquire(repository.persistence, profile, source.document_url)
+                    else:
+                        result = await document_acquirer(repository.persistence, profile, source.document_url)
+                    diagnostic = {'status': result.status, 'reason': result.reason, 'url': source.document_url,
+                                  'facts': {key: {'outcome': value.get('outcome'),
+                                                   'reason': value.get('reason')}
+                                            for key, value in (result.facts or {}).items()}}
+                document_results[isin] = diagnostic
+                await checkpoint.save_selection(selection)
+
         # Re-evaluate from current persisted evidence at publication time; old checkpoint scores are not freshened.
         # A BASELINE technical failure (bad quote/market-watch acquisition for
         # THIS instrument) must never be fed into the rule engine as if its
@@ -502,6 +558,7 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                 # run_full_etf_cycle() invocation -- no extra I/O, and never
                 # consulted by the rule engine/scoring above, which already
                 # ran inside evaluate().
+                candidate['document_acquisition'] = document_results.get(item['isin'])
                 candidate['historical_acquisition'] = _classify_historical_acquisition(
                     checkpoint.row('ETF_ONBOARD', item['isin']))
                 candidate['missing_data'] = [f['factor'] for f in (candidate.get('rule_engine_result') or {}).get('factor_results', []) if f['status'] == 'UNAVAILABLE']
@@ -536,6 +593,7 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
             'coverage': counts, 'outcomes': outcomes, 'candidates': candidates, 'ranked': ranked,
             'top_opportunities': top_opportunities,
             'recommendation_evidence': recommendation_evidence_gaps(candidates),
+            'document_acquisition': {isin: result for isin, result in sorted(document_results.items())},
             'comparison_scope': 'WITHIN_VERIFIED_PEER_ONLY', 'official_sha256': selection['official_sha256'],
             'official_as_of': selection['official_as_of'], 'official_source_url': NSE_ETF_LIST_URL, 'excluded_by_reason': {}}
         for c in candidates:

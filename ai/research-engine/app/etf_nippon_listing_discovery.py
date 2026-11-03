@@ -21,10 +21,11 @@ ISSUER_HOST = "mf.nipponindiaim.com"
 FAMILIES = {
     "MONTHLY_FACTSHEET": "/InvestorServices/FactSheetsDocuments/",
     "ETF_DIFFERENTIATION": "/InvestorServices/SchemeDifferentiationTable/",
+    "ETF_SID": "/InvestorServices/SIDETF/",
 }
-MAX_HTML_BYTES = 256 * 1024
-MAX_LINKS = 500
-MAX_CANDIDATES = 30
+MAX_HTML_BYTES = 1024 * 1024
+MAX_LINKS = 2000
+MAX_CANDIDATES = 100
 
 
 @dataclass(frozen=True)

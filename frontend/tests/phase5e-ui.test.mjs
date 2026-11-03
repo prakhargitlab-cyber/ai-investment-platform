@@ -35,7 +35,7 @@ test("research selection uses global instrument identity rather than a display t
 });
 
 test("refresh eligibility is based on canonical global identity, not a portfolio-summary row or existing research", () => {
-  const eligibility = workspace.match(/function canRefreshResearch[\s\S]*?\n}\n\nfunction researchEmptyTitle/)?.[0] ?? "";
+  const eligibility = workspace.match(/function canRefreshResearch[\s\S]*?\r?\n}\r?\n\r?\nfunction researchEmptyTitle/)?.[0] ?? "";
   assert.match(eligibility, /Boolean\(company\?\.instrumentId\)/);
   assert.doesNotMatch(eligibility, /documentCount|eventCount|confidence|freshness|lastRefresh/);
   assert.match(eligibility, /"COMPANY_NOT_RESOLVED"/);
@@ -49,7 +49,7 @@ test("refresh eligibility is based on canonical global identity, not a portfolio
 });
 
 test("Talbros/Ujjivan-shaped global selections are refreshable while unresolved and unsupported selections are not", () => {
-  const eligibility = workspace.match(/function canRefreshResearchIdentity[\s\S]*?\n}\n\nfunction researchEmptyTitle/)?.[0] ?? "";
+  const eligibility = workspace.match(/function canRefreshResearchIdentity[\s\S]*?\r?\n}\r?\n\r?\nfunction researchEmptyTitle/)?.[0] ?? "";
   // The helper deliberately ignores documents/events/confidence/freshness and
   // gates only canonical identity, active loading, explicit status, and asset type.
   assert.doesNotMatch(eligibility, /documentCount|eventCount|confidence|freshness|lastRefresh/);
@@ -62,7 +62,7 @@ test("Talbros/Ujjivan-shaped global selections are refreshable while unresolved 
 });
 
 test("portfolio detail and research-table drawers join global research to a different local holding ID", () => {
-  const holdingsView = workspace.match(/function HoldingsTable\([\s\S]*?\n}\n\nfunction metricText/)?.[0] ?? "";
+  const holdingsView = workspace.match(/function HoldingsTable\([\s\S]*?\r?\n}\r?\n\r?\nfunction metricText/)?.[0] ?? "";
   assert.match(holdingsView, /company\.instrumentId === position\.instrument\.globalInstrumentId/);
   assert.match(holdingsView, /company\.instrumentId === position\.instrument\.instrumentId/);
   assert.match(holdingsView, /<StockResearchDrawer position=\{detail\.position\} research=\{detail\.researchInstrumentId \? portfolioResearch\?\.companies\.find/);

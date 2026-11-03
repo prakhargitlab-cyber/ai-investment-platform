@@ -134,6 +134,20 @@ def verify_metadata(meta, row):
 def evidence(profile, metric, row, stamp, envelope, metadata, now):
     field = {EtfMetric.MARKET_PRICE: "lastPrice", EtfMetric.TRADING_VOLUME: "totalTradedVolume",
              EtfMetric.NAV: "nav"}[metric]
+    # NSE reports NAV=0 as a known "unavailable today" marker, distinct from
+    # absent/missing (None/""/"-") and from technically invalid values.
+    # Intercept before numeric(positive=True) would raise INVALID_NSE_NUMBER,
+    # so the caller can record SUCCESS_EMPTY with a specific audit reason
+    # instead of TECHNICAL_FAILURE.  numeric() itself stays strict: zero
+    # remains invalid for all positive financial values.
+    if metric == EtfMetric.NAV:
+        raw = row.get(field)
+        if raw is not None and raw != "-" and raw != "" and not isinstance(raw, bool):
+            try:
+                if Decimal(str(raw)) == 0:
+                    raise NseContractError("NSE_NAV_ZERO_UNAVAILABLE")
+            except InvalidOperation:
+                pass  # fall through to numeric() for standard malformed-value rejection
     value = numeric(row.get(field), positive=metric != EtfMetric.TRADING_VOLUME,
                     integer=metric == EtfMetric.TRADING_VOLUME)
     if value is None:

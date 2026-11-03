@@ -140,6 +140,52 @@ def test_zero_volume_does_not_make_carried_price_fresh():
         evidence(PROFILE, EtfMetric.TRADING_VOLUME, ROW | {"totalTradedVolume": 0.5}, stamp, envelope, META, NOW)
 
 
+@pytest.mark.parametrize("raw", [0, 0.0, "0", "0.0", "0.00"])
+def test_zero_nav_raises_unavailable_not_invalid(raw):
+    """Zero is NSE's 'NAV unavailable today' marker. It must NOT be treated
+    as INVALID_NSE_NUMBER (the old behavior), and it must NOT produce an
+    EtfNavObservation.  evidence() raises NSE_NAV_ZERO_UNAVAILABLE so the
+    caller can record SUCCESS_EMPTY with a distinct audit reason."""
+    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    with pytest.raises(ValueError, match="NSE_NAV_ZERO_UNAVAILABLE"):
+        evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": raw}, stamp, envelope, META, NOW)
+
+
+def test_positive_nav_produces_observation():
+    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    obs = evidence(PROFILE, EtfMetric.NAV, ROW, stamp, envelope, META, NOW)
+    assert obs is not None
+    assert obs.nav == Decimal("206.2542")
+    assert obs.currency == "INR"
+
+
+@pytest.mark.parametrize("raw", [None, "", "-"])
+def test_absent_nav_returns_none(raw):
+    """None, empty string and dash are legitimately absent — no observation."""
+    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    assert evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": raw}, stamp, envelope, META, NOW) is None
+
+
+@pytest.mark.parametrize("raw", ["NaN", -1, True, float("inf"), "garbage"])
+def test_malformed_nav_raises_invalid_nse_number(raw):
+    """Negative, nonfinite, boolean and malformed NAV values must still raise
+    INVALID_NSE_NUMBER — only exact zero gets the unavailable classification."""
+    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    with pytest.raises(ValueError, match="INVALID_NSE_NUMBER"):
+        evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": raw}, stamp, envelope, META, NOW)
+
+
+def test_zero_nav_does_not_affect_market_price_or_volume():
+    """Zero-NAV interception is NAV-specific. Market price and volume must
+    be completely unaffected — zero volume is valid, zero price is rejected
+    as INVALID_NSE_NUMBER (not NSE_NAV_ZERO_UNAVAILABLE)."""
+    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    vol = evidence(PROFILE, EtfMetric.TRADING_VOLUME, ROW | {"totalTradedVolume": 0}, stamp, envelope, META, NOW)
+    assert vol is not None and vol.value == 0
+    with pytest.raises(ValueError, match="INVALID_NSE_NUMBER"):
+        evidence(PROFILE, EtfMetric.MARKET_PRICE, ROW | {"lastPrice": 0}, stamp, envelope, META, NOW)
+
+
 def test_absent_supporting_nav_and_future_nav_are_distinct():
     stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
     assert evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": "-"}, stamp, envelope, META, NOW) is None

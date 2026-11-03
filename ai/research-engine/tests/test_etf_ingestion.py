@@ -230,6 +230,60 @@ async def test_nav_parse_rejection_logs_only_symbol_and_capped_raw_value(repo, m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_nav", [0, "0"])
+async def test_zero_nav_records_success_empty_not_technical_failure(repo, raw_nav):
+    """NAV=0 is NSE's 'unavailable today' marker. It must record as
+    SUCCESS_EMPTY with reason NSE_NAV_ZERO_UNAVAILABLE (not TECHNICAL_FAILURE
+    with INVALID_NSE_NUMBER), and the overall ingestion status must be
+    COMPLETED — not PARTIAL_FAILURE — because zero NAV is not a failure."""
+    data = snapshot()
+    data["data"]["data"][0]["nav"] = raw_nav
+    result, _ = await ingest(repo, data)
+    attempts = {a["metric"]: a for a in result["instruments"][0]["attempts"]}
+    assert attempts["NAV"]["outcome"] == "SUCCESS_EMPTY"
+    assert attempts["NAV"]["reason"] == "NSE_NAV_ZERO_UNAVAILABLE"
+    assert attempts["MARKET_PRICE"]["outcome"] == "SUCCESS_WITH_DATA"
+    assert attempts["TRADING_VOLUME"]["outcome"] == "SUCCESS_WITH_DATA"
+    assert result["instruments"][0]["summary"]["mandatory_ready"] == 3
+    assert result["status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_zero_nav_does_not_persist_nav_observation(repo):
+    """Zero-NAV must not persist an EtfNavObservation — it is unavailable,
+    not a valid NAV."""
+    data = snapshot()
+    data["data"]["data"][0]["nav"] = 0
+    await ingest(repo, data)
+    assert repo.persistence.etf_navs(ID) == []
+
+
+@pytest.mark.asyncio
+async def test_zero_nav_does_not_fire_parse_rejection_log(repo, monkeypatch):
+    """The etf_nav_parse_rejected diagnostic log is for genuinely malformed
+    values. Zero NAV is a known marker, so the log must NOT fire."""
+    import app.etf_ingestion as etf_ingestion
+    captured = []
+    monkeypatch.setattr(etf_ingestion.logger, "warning",
+                        lambda msg, *args: captured.append(msg % args))
+    data = snapshot()
+    data["data"]["data"][0]["nav"] = 0
+    await ingest(repo, data)
+    assert not any("etf_nav_parse_rejected" in line for line in captured)
+
+
+@pytest.mark.asyncio
+async def test_nav_date_mismatch_still_enforced_with_valid_nav(repo):
+    """NAV/market-price date alignment must remain enforced — a valid NAV
+    with a future navDate must still raise, regardless of zero-NAV changes."""
+    data = snapshot()
+    data["data"]["navDate"] = "10-Oct-2026"
+    result, _ = await ingest(repo, data)
+    nav_attempt = next(a for a in result["instruments"][0]["attempts"] if a["metric"] == "NAV")
+    assert nav_attempt["outcome"] == "TECHNICAL_FAILURE"
+
+
+@pytest.mark.asyncio
 async def test_metadata_conflict_blocks_quote_without_yahoo_fallback(repo):
     await ingest(repo)
     provider = SimpleNamespace(collect_baseline=AsyncMock())

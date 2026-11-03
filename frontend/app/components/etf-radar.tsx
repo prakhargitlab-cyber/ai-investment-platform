@@ -942,6 +942,12 @@ type EtfActiveCycle = {
   errorCode: string | null;
   pollError: boolean;
   coverage?: { official: number | null; completed: number; stages?: { baseline: { completed: number; total: number | null }; onboarding: { completed: number; total: number | null } } };
+  authoritativeProgress?: {
+    phase?: string | null;
+    stages?: Array<{ phase: string; completed: number; total: number | null; percentage: number | null }>;
+    overall_percentage?: number | null;
+    baseline_failed?: number | null;
+  } | null;
 };
 
 // Response shape of GET /api/v1/etf-radar/preflight (app/etf_ingestion.py's
@@ -1042,7 +1048,7 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
     if (!cycleId) return;
     let active = true;
     const poll = () => {
-      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string; coverage?: NonNullable<EtfActiveCycle["coverage"]> }>(
+      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string; coverage?: NonNullable<EtfActiveCycle["coverage"]>; authoritative_progress?: EtfActiveCycle["authoritativeProgress"] }>(
         `/api/v1/etf-radar/cycles/${cycleId}/status`
       )
         .then((value) => {
@@ -1050,7 +1056,8 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
           setActiveCycle((previous) => previous && previous.cycleId === cycleId
             ? { ...previous, status: value.status, updatedAt: value.updated_at ?? previous.updatedAt,
                 startedAt: previous.startedAt ?? value.created_at ?? null,
-                errorCode: value.error_code ?? previous.errorCode, pollError: false, coverage: value.coverage }
+                errorCode: value.error_code ?? previous.errorCode, pollError: false, coverage: value.coverage,
+                authoritativeProgress: value.authoritative_progress ?? null }
             : previous);
           if (isTerminalRadarStatus(value.status)) {
             try { window.sessionStorage.removeItem(ETF_ACTIVE_CYCLE_STORAGE_KEY); } catch { /* ignore */ }
@@ -1169,6 +1176,21 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
   const firstPassCompleted = activeCycle?.coverage?.stages?.baseline?.completed
     ?? activeCycle?.coverage?.completed ?? null;
   const historyOnboarded = activeCycle?.coverage?.stages?.onboarding?.completed ?? null;
+  // Stage completion must never be presented as overall cycle completion.
+  const authoritative = activeCycle?.authoritativeProgress;
+  const currentStage = authoritative?.stages?.find((stage) => stage.phase === authoritative.phase);
+  const stageCompleted = currentStage?.completed;
+  const stageTotal = currentStage?.total;
+  const stagePercent = currentStage && typeof currentStage.percentage === "number"
+    && Number.isFinite(currentStage.percentage) && currentStage.percentage >= 0 && currentStage.percentage <= 100
+    && typeof stageCompleted === "number" && Number.isFinite(stageCompleted) && stageCompleted >= 0
+    && typeof stageTotal === "number" && Number.isFinite(stageTotal) && stageTotal > 0
+    && stageCompleted <= stageTotal
+    ? currentStage.percentage : null;
+  const stageName = currentStage?.phase === "BASELINE" ? "Baseline"
+    : currentStage?.phase === "DEEP" ? "Deep investigation"
+    : currentStage?.phase === "ETF_ONBOARD" ? "Historical onboarding"
+    : currentStage?.phase ?? "Current stage";
   const counters: RadarProgressCounter[] = !terminalData ? (activeCycle?.coverage ? [
     { label: "Official NSE ETF universe", value: firstPassOfficial },
     { label: "First-pass processed (not final evaluations)", value: firstPassCompleted },
@@ -1217,7 +1239,17 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
           <>
             <RadarProgressPanel radarType="ETF" cycleId={activeCycle.cycleId} status={activeCycle.status}
               startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={counters}
-              percent={null} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+              percent={stagePercent} progressLabel={stagePercent == null ? "Research phase progress" : stageName + " progress"}
+              errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+            {running && currentStage ? (
+              <p className="etf-coverage-caveat">
+                {stageName}: {stageCompleted} / {stageTotal ?? "unknown"} processed
+                {stagePercent != null ? " (" + stagePercent + "%)" : " (percentage unavailable)"}.
+                {currentStage.phase === "BASELINE" && authoritative?.baseline_failed != null
+                  ? " " + authoritative.baseline_failed + " baseline evaluations failed." : ""}
+                {" "}Overall cycle progress: unavailable until subsequent stages are measurable.
+              </p>
+            ) : null}
             {running ? <p className="etf-coverage-caveat">
               First-pass and historical onboarding are separate persisted stages. A recorded onboarding
               outcome may be successful, insufficient, or failed; it does not mean usable history was acquired.

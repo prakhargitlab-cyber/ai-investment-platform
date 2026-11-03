@@ -91,7 +91,13 @@ test('ETF live counters require durable coverage; legacy cycles stay indetermina
   assert.match(etfRadarSource, /value: firstPassCompleted/);
   assert.match(etfRadarSource, /value: historyOnboarded/);
   assert.match(etfRadarSource, /Historical onboarding recorded \(including failures\)/);
-  assert.match(etfRadarSource, /percent=\{null\}/);
+  assert.match(etfRadarSource, /authoritativeProgress: value\.authoritative_progress/);
+  assert.match(etfRadarSource, /currentStage = authoritative\?\.stages\?\.find/);
+  assert.match(etfRadarSource, /percent=\{stagePercent\}/);
+  assert.match(etfRadarSource, /Overall cycle progress: unavailable/);
+  assert.match(etfRadarSource, /baseline_failed/);
+  assert.match(progressSource, /progressLabel \?\?/);
+  assert.doesNotMatch(etfRadarSource, /percent=\{firstPassCompleted/);
 });
 
 test('ETF progress counters, once COMPLETED, come only from the full persisted candidates set, never the truncated top-N ranked list', () => {

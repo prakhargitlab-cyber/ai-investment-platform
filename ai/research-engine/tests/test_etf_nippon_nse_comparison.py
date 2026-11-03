@@ -81,3 +81,33 @@ def test_review_only_identity_cannot_be_forced_true():
 def test_identical_ticker_duplicates_scope_rejected():
     with pytest.raises(ValueError, match="NSE_SCHEME_COMPARISON_SCOPE_INVALID"):
         compare_nse_csv_to_factsheet_sections(CSV, (METRICS[0], METRICS[0]))
+
+
+def test_actual_nse_etf_security_list_columns_and_underlying_name():
+    # Production-format header reported in anonymous NSE CSV on 2026-11-03.
+    # Abbreviated SecurityName is NOT silently treated as the AMC scheme.
+    actual_csv = (
+        b"Symbol,Underlying Asset,SecurityName,DateofListing,MarketLot,ISINNumber,FaceValue,ETF Underlying,Underlying Key\n"
+        b"NIFTYBEES,Nifty 50,NIPINDETFNIFTYBEES,08-Jan-02,1,INF204KB14I2,1,EQUITY,Nifty 50\n"
+        b"JUNIORBEES,Nippon India ETF Nifty Next 50 Junior BeES,NIP IND ETF JUNIOR BEES,06-Mar-03,1,INF732E01045,1.25,EQUITY,Nifty Next 50\n"
+    )
+    report = review_report(actual_csv, METRICS)
+    assert report["nse_csv_sha256"] == sha256(actual_csv).hexdigest()
+    assert [s["nse_isin"] for s in report["schemes"]] == ["INF204KB14I2", "INF732E01045"]
+    assert [s["status"] for s in report["schemes"]] == [
+        "NAME_DIFFERS_REVIEW_REQUIRED", "NAME_DIFFERS_REVIEW_REQUIRED"
+    ]
+    assert report["schemes"][0]["nse_underlying_asset"] == "Nifty 50"
+    assert report["schemes"][0]["underlying_asset_matches_scheme_heading"] is False
+    assert report["schemes"][1]["underlying_asset_matches_scheme_heading"] is True
+    assert not report["evidence_authenticated"]
+    assert not report["identity_verified_for_scoring"]
+
+
+def test_underlying_asset_is_not_accepted_as_security_name_replacement():
+    csv_data = (
+        b"Symbol,Underlying Asset,ISINNumber\n"
+        b"JUNIORBEES,Nippon India ETF Nifty Next 50 Junior BeES,INF732E01045\n"
+    )
+    with pytest.raises(ValueError, match="NSE_IDENTITY_CSV_COLUMN_MISSING_OR_AMBIGUOUS"):
+        compare_nse_csv_to_factsheet_sections(csv_data, (METRICS[1],))

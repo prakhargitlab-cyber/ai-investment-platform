@@ -16,6 +16,7 @@ from app.etf_official_document_sources import (
 )
 from test_etf_full_universe import checkpoint, universe
 from test_etf_ingestion import NOW, repo
+from test_etf_preflight import compatible_dispatch  # autouse: checkpoint-compatible async dispatcher
 
 
 @pytest.mark.asyncio

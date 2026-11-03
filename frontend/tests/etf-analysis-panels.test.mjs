@@ -56,8 +56,11 @@ test('ETF Radar has its own 3-column analysis area, deliberately never using BAS
   assert.match(etfRadarSource, /aria-label="Category coverage"/);
   assert.match(etfRadarSource, /aria-label="Failure reason distribution"/);
   assert.match(etfRadarSource, /aria-label="Research results and publication status"/);
-  // Never copies Equity Radar's own two-stage pipeline vocabulary.
-  assert.doesNotMatch(etfRadarSource, /\bBASELINE\b|\bbaseline_completed\b|\bdeep_completed\b|\bdeep_ready\b/);
+  // ETF now has its own persisted BASELINE and ETF_ONBOARD checkpoints.
+  // It must still never reuse Equity's DEEP-stage progress vocabulary.
+  assert.match(etfRadarSource, /stages\?\.baseline\?\.completed/);
+  assert.match(etfRadarSource, /stages\?\.onboarding\?\.completed/);
+  assert.doesNotMatch(etfRadarSource, /\bdeep_completed\b|\bdeep_ready\b/);
 });
 
 test('EtfAnalysisPanels never imports from opportunity-radar.tsx and uses its own local donut', () => {

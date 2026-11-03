@@ -146,7 +146,7 @@
    Protected LOCAL/DEV research execution policy. These three settings are
    the safety invariants a LOCAL/DEV render must never silently drift away
    from: recovery stays paused, the in-process scheduler stays disabled,
-   and the bounded ETF manual-execution diagnostic gate stays off. Each
+   and both ADMIN-initiated manual Radars are permitted. Each
    must be an actual boolean (a string like "false" is truthy in Helm
    templates, and an explicit null must not be silently treated as the
    safe value) equal to the one safe invariant -- this deliberately does
@@ -172,8 +172,10 @@
 {{- if or (not (kindIs "bool" $schedulerEnabled)) (ne $schedulerEnabled false) -}}
 {{- fail "protected LOCAL/DEV research.opportunityScheduler.enabled must remain the boolean false" -}}
 {{- end -}}
-{{- $etfManualExecutionEnabled := .Values.research.etfManualExecutionEnabled -}}
-{{- if or (not (kindIs "bool" $etfManualExecutionEnabled)) (ne $etfManualExecutionEnabled false) -}}
-{{- fail "protected LOCAL/DEV research.etfManualExecutionEnabled must remain the boolean false" -}}
+{{- range $flag := (list "equityManualExecutionEnabled" "etfManualExecutionEnabled" "etfFullUniverseExecutionEnabled") -}}
+{{- $value := index $.Values.research $flag -}}
+{{- if or (not (kindIs "bool" $value)) (ne $value true) -}}
+{{- fail (printf "protected LOCAL/DEV research.%s must remain the boolean true" $flag) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}

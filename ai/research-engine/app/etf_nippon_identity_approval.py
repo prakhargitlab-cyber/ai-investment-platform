@@ -6,7 +6,7 @@ scheme-labelled issuer document is required before review can be *prepared*.
 
 This module performs no fetching, no authentication of retrieved bytes, no
 human decision, no source registry mutation, no DB writes, no scoring changes.
-A caller-supplied excerpt or approval string alone can never authorize ingest.
+A caller-supplied extracted text or approval string alone can never authorize ingest.
 """
 from __future__ import annotations
 
@@ -35,10 +35,11 @@ class IssuerSchemeIdentityEvidence:
     isin: str
     scheme_heading: str
     source_url: str
-    source_sha256: str
-    # The exact bounded issuer document supplied to the review, not a
-    # typed assertion. Cryptographic hash binds the review to its bytes.
-    source_bytes: bytes
+    issuer_pdf_sha256: str  # reviewer-asserted ORIGINAL PDF hash; not authenticated here
+    extracted_text_sha256: str
+    # The caller-supplied, bounded, UTF-8 extraction from a separate issuer PDF.
+    # This is NOT the original PDF, and may be forged until independently reviewed.
+    extracted_text_bytes: bytes
     reviewer_reference: str
     reviewer_id: str
     reviewed_at: datetime
@@ -52,7 +53,8 @@ class SchemeIdentityReviewRecord:
     instrument_id: UUID
     scheme_heading: str
     source_url: str
-    source_sha256: str
+    issuer_pdf_sha256: str
+    extracted_text_sha256: str
     pdf_sha256: str
     nse_csv_sha256: str
     staging_id: str
@@ -144,17 +146,18 @@ def prepare_identity_review_packet(
                 or source.reviewed_at > datetime.now(timezone.utc)
                 or not _issuer_url(source.source_url)):
             raise ValueError("NIPPON_IDENTITY_REVIEW_NOT_ESTABLISHED")
-        if (not isinstance(source.source_bytes, bytes)
-                or not 0 < len(source.source_bytes) <= MAX_IDENTITY_DOCUMENT_BYTES
-                or sha256(source.source_bytes).hexdigest() != source.source_sha256
-                or not _SHA256.fullmatch(source.source_sha256)):
+        if (not isinstance(source.extracted_text_bytes, bytes)
+                or not 0 < len(source.extracted_text_bytes) <= MAX_IDENTITY_DOCUMENT_BYTES
+                or not _SHA256.fullmatch(source.issuer_pdf_sha256)
+                or sha256(source.extracted_text_bytes).hexdigest() != source.extracted_text_sha256
+                or not _SHA256.fullmatch(source.extracted_text_sha256)):
             raise ValueError("NIPPON_IDENTITY_SOURCE_HASH_MISMATCH")
         # This contract accepts only a bounded plain-text evidence extraction
         # from an already reviewed issuer PDF, not arbitrary cross-page matches.
         # Human review must still authenticate the original document and
         # validate that its text extraction is faithful.
         try:
-            text = source.source_bytes.decode("utf-8")
+            text = source.extracted_text_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError("NIPPON_IDENTITY_SOURCE_TEXT_INVALID") from exc
         isins = _ISIN_LABEL.findall(text)
@@ -169,7 +172,9 @@ def prepare_identity_review_packet(
             status="ISSUER_IDENTITY_EVIDENCE_PENDING_AUTHENTICATION",
             ticker=source.ticker, isin=source.isin, instrument_id=p.instrument_id,
             scheme_heading=source.scheme_heading, source_url=source.source_url,
-            source_sha256=source.source_sha256, pdf_sha256=staged.pdf_sha256,
+            issuer_pdf_sha256=source.issuer_pdf_sha256,
+            extracted_text_sha256=source.extracted_text_sha256,
+            pdf_sha256=staged.pdf_sha256,
             nse_csv_sha256=staged.nse_csv_sha256, staging_id=staged.staging_id,
             reviewer_id=source.reviewer_id, review_reference=source.reviewer_reference,
             reviewed_at=source.reviewed_at,

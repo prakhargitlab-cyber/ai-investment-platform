@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from calendar import monthrange
 from urllib.parse import urlsplit
 
 BASE = "https://mf.nipponindiaim.com/InvestorServices/FactSheetsDocuments/"
@@ -58,3 +57,8 @@ def is_reviewed_path_shape(url: str) -> bool:
             if url == month_candidate(year, month).url:
                 return True
     return False
+
+
+def reporting_period_matches(candidate: MonthlyFactsheetCandidate, reported_as_of: date) -> bool:
+    """Do not trust URL month to establish financial metric freshness."""
+    return reported_as_of == candidate.expected_reporting_date

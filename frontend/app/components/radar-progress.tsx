@@ -91,6 +91,7 @@ export function RadarProgressPanel({
   updatedAt,
   counters,
   percent,
+  progressLabel,
   phase,
   acquisition,
   errorCode,
@@ -105,6 +106,8 @@ export function RadarProgressPanel({
   counters: RadarProgressCounter[];
   /** A genuine completed/admitted ratio (0-100), or null for indeterminate. */
   percent: number | null;
+  /** Explicit stage-scoped progress label; never implies overall completion. */
+  progressLabel?: string;
   phase?: string;
   /** Durable full-universe scan counts, never the deep shortlist. */
   acquisition?: { scanned: number | null; total: number | null };
@@ -146,7 +149,7 @@ export function RadarProgressPanel({
         </section>
       ) : null}
       {!terminal && !(radarType === "Equity" && acquisition && phase === "BASELINE") ? (
-        <div className={`bar-track${percent == null ? " bar-track-indeterminate" : ""}`} role="progressbar" aria-label={radarType === "Equity" && phase === "DEEP" ? "Deep processing" : "Research phase progress"}
+        <div className={`bar-track${percent == null ? " bar-track-indeterminate" : ""}`} role="progressbar" aria-label={progressLabel ?? (radarType === "Equity" && phase === "DEEP" ? "Deep processing" : "Research phase progress")}
           aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent == null ? undefined : Math.min(Math.max(percent, 0), 100)}>
           <span style={percent == null ? undefined : { width: `${Math.min(Math.max(percent, 0), 100)}%` }} />
         </div>

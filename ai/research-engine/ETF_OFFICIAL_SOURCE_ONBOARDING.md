@@ -139,3 +139,12 @@ Observed actual CSV columns: `Symbol`, `Underlying Asset`, `SecurityName`, `Date
 - `JUNIORBEES`: `ISINNumber=INF732E01045`; `SecurityName=NIP IND ETF JUNIOR BEES`; `Underlying Asset=Nippon India ETF Nifty Next 50 Junior BeES`.
 
 `app.etf_nippon_nse_comparison` now supports the NSE-specific headers `SecurityName` and `ISINNumber`, and exposes the separate `Underlying Asset` evidence without conflating it with the exchange security name. Since both exchange `SecurityName` strings differ from the full Nippon factsheet heading, the comparison retains `NAME_DIFFERS_REVIEW_REQUIRED`. JUNIORBEES' `Underlying Asset` is a supporting exact full-name match; NIFTYBEES' field is the index name, not the full fund name. Neither observation constitutes an automatic scheme-to-ISIN approval. Original NSE bytes remain only on the operator's gitignored local path; they have not been uploaded to or reproduced in the repo. New offline regression tests still require local execution.
+
+
+## Operator-executed authentic NSE/AMC comparison checkpoint — 2026-11-03
+
+Operator pulled branch through `572b17b`, ran `pytest tests/test_etf_nippon_nse_comparison.py -q` (12 passed, 0 failed), and ran `python -m app.etf_nippon_nse_comparison_cli` with the locally retained original October Nippon PDF and the anonymously retrieved NSE ETF CSV.
+
+Observed cross-source JSON: `status=IDENTITY_CROSS_SOURCE_REVIEW_ONLY`; CSV SHA256 `3c802209ee0e2becfc356253ba2b48ab4a2743cc680283a4f575452b07b97e9a`; Nippon PDF SHA256 `9bdb8948221d19c62392dae1bebb1cda5ff2e2a4e09713f8cc9e7967973ccf0c`. `NIFTYBEES` NSE CSV row 2 symbol and ISIN `INF204KB14I2`; `SecurityName=NIPINDETFNIFTYBEES`; `Underlying Asset=Nifty 50`, versus PDF section heading `Nippon India ETF Nifty 50 BeES`, PDF page 207. `JUNIORBEES` NSE CSV row 3 symbol and ISIN `INF732E01045`; `SecurityName=NIP IND ETF JUNIOR BEES`; `Underlying Asset=Nippon India ETF Nifty Next 50 Junior BeES` (exact normalized full-heading match), PDF page 216. Both PDF sections report 2026-09-30.
+
+For **both** records the emitted status is `NAME_DIFFERS_REVIEW_REQUIRED`; `evidence_authenticated=false`; `identity_verified_for_scoring=false`. The exchange symbol–ISIN matches and independently observed live CSV support the identity candidates, but this checkpoint did NOT approve either abbreviated NSE name as an AMC scheme-to-ISIN bridge, persist investment facts, or enable production fetch/scoring. The original downloads remain gitignored local evidence. The operator reported nonblocking pypdf/fontTools warnings.

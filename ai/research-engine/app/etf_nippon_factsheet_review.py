@@ -75,9 +75,9 @@ def extract_review_only(pdf_bytes: bytes, ticker: str) -> ReviewOnlyEtfMetrics:
         report_raw = _one(text, r"Date as on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})",
                           "MISSING_OR_AMBIGUOUS_REPORT_DATE")
         reporting_date = datetime.strptime(report_raw, "%B %d, %Y").date()
-        aum = _decimal(_one(text, r"^AUM:\s*[`₹]?\s*([\d,]+\.\d+)\s*Cr\s*$",
+        aum = _decimal(_one(text, r"^AUM:\s*[`‘’₹]?\s*([\d,]+\.\d+)\s*Cr\s*$",
                             "MISSING_OR_AMBIGUOUS_AUM"))
-        aaum = _decimal(_one(text, r"^AAUM:\s*[`₹]?\s*([\d,]+\.\d+)\s*Cr\s*$",
+        aaum = _decimal(_one(text, r"^AAUM:\s*[`‘’₹]?\s*([\d,]+\.\d+)\s*Cr\s*$",
                              "MISSING_OR_AMBIGUOUS_AVERAGE_AUM"))
         expense = _decimal(_one(text, r"^Expense Ratio\s*\nDirect\s+(\d+(?:\.\d+)?)%",
                                "MISSING_OR_AMBIGUOUS_EXPENSE_RATIO"))

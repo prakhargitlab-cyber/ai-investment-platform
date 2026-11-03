@@ -923,7 +923,7 @@ type EtfActiveCycle = {
   updatedAt: string | null;
   errorCode: string | null;
   pollError: boolean;
-  coverage?: { official: number | null; completed: number };
+  coverage?: { official: number | null; completed: number; stages?: { baseline: { completed: number; total: number | null }; onboarding: { completed: number; total: number | null } } };
 };
 
 // Response shape of GET /api/v1/etf-radar/preflight (app/etf_ingestion.py's
@@ -1024,7 +1024,7 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
     if (!cycleId) return;
     let active = true;
     const poll = () => {
-      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string; coverage?: { official: number | null; completed: number } }>(
+      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string; coverage?: NonNullable<EtfActiveCycle["coverage"]> }>(
         `/api/v1/etf-radar/cycles/${cycleId}/status`
       )
         .then((value) => {
@@ -1148,12 +1148,17 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
   // history ingestion, final scoring, or publication. Never pass that fraction
   // as overall progress: 359/359 first-pass outcomes can precede minutes of work.
   const firstPassOfficial = activeCycle?.coverage?.official ?? null;
-  const firstPassCompleted = activeCycle?.coverage?.completed ?? null;
+  const firstPassCompleted = activeCycle?.coverage?.stages?.baseline?.completed
+    ?? activeCycle?.coverage?.completed ?? null;
+  const historyOnboarded = activeCycle?.coverage?.stages?.onboarding?.completed ?? null;
   const counters: RadarProgressCounter[] = !terminalData ? (activeCycle?.coverage ? [
     { label: "Official NSE ETF universe", value: firstPassOfficial },
     { label: "First-pass processed (not final evaluations)", value: firstPassCompleted },
     { label: "First-pass remaining", value: firstPassOfficial != null && firstPassCompleted != null
         ? Math.max(firstPassOfficial - firstPassCompleted, 0) : null },
+    { label: "Historical onboarding recorded (including failures)", value: historyOnboarded },
+    { label: "Historical onboarding remaining", value: firstPassOfficial != null && historyOnboarded != null
+        ? Math.max(firstPassOfficial - historyOnboarded, 0) : null },
   ] : []) : [
     { label: "Total universe", value: terminalData.candidates.length },
     { label: "Evaluated candidates", value: terminalData.candidates.filter((c) => c.disposition === "EVALUATED").length },
@@ -1196,10 +1201,10 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
               startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={counters}
               percent={null} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
             {running ? <p className="etf-coverage-caveat">
-              First-pass processed counts do not measure the entire run. Historical evidence onboarding,
-              final scoring, peer ranking and publication may still be running after first-pass reaches
-              the official universe total. The overall progress bar is intentionally indeterminate
-              until the backend exposes trustworthy per-phase totals.
+              First-pass and historical onboarding are separate persisted stages. A recorded onboarding
+              outcome may be successful, insufficient, or failed; it does not mean usable history was acquired.
+              Final scoring, peer ranking and publication follow both stages. Overall progress remains
+              indeterminate because those final stages have no trustworthy instrument counters.
             </p> : null}
           </>
         ) : null}

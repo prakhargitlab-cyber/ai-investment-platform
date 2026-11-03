@@ -67,3 +67,12 @@ Local review of the user-provided PDF: **371 physical PDF pages**, **13,264,965 
 4. Uploaded bytes prove the PDF can be inspected offline. They do **not** prove unauthenticated live HTTP retrieval, redirect chain, or final host. Do not mark `PUBLIC_UNAUTHENTICATED` solely because the file was supplied.
 
 Next safe step: obtain an AMC/exchange document with a **labelled exact ISIN** for the scheme and establish an independently verified binding between that identity source and each clearly bounded scheme section before engineering a dedicated multi-scheme table extractor. Keep data `DOCUMENT_REVIEW_ONLY`, do not persist it as a trusted ETF fact or change the default registry yet.
+
+
+## Implemented in PR #5: safe monthly resolver and review-only layout parser
+
+- `app.etf_nippon_monthly_source.month_candidate(year, month)` produces the **exact expected filename** from the fixed Nippon issuer path; `bounded_candidates` returns at most two recent URL candidates. It does **not** make an HTTP request or grant source approval. A URL is only a candidate until verified against the issuer and registered through the existing allowlist controls.
+- `app.etf_nippon_factsheet_review.extract_review_only(pdf_bytes, ticker)` scans the bounded 25 MB / 500-page PDF for an exact fund title and `Fund Details` section, rejects duplicates, and separately extracts fund AUM, **AAUM**, monthly average expense ratio, and 1-year tracking error/difference for NIFTYBEES and JUNIORBEES.
+- The return type always reports `status=DOCUMENT_REVIEW_ONLY` and `identity_verified=False`. It cannot create `EtfFact`, authenticate an issuer, set `PUBLIC_UNAUTHENTICATED`, or influence scoring. It is a staging step, **not finished ingestion**.
+- `tests/test_etf_nippon_monthly_source.py` checks month boundaries, URL shapes, ambiguity, and review-only semantics. Genuine-document tests are optional and use the gitignored `.tmp/etf-validation/Nippon-FS-October-2026.pdf` path.
+- Still pending: independent official ISIN-to-section corroboration; real clean-session HTTP verification; a separately reviewed policy allowing controlled monthly family URLs; a one-download-per-publication cache and durable provenance; a fund-metric ingestion adapter built without weakening `verified_scheme_section`; and a guarded live test. Do **not** enable the existing automated-fetch flag based only on these resolver/parser files.

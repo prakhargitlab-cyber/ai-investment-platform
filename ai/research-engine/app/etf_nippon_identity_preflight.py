@@ -87,3 +87,28 @@ def preflight_scheme_identity(
         review_reference=attestation.review_reference,
         nse_listing_source_url=p.source_url,
     )
+
+
+def preflight_shared_review_identities(
+    store, reviewed_document, attestations_by_ticker: dict[str, SchemeIdentityAttestation],
+    *, now: datetime | None = None,
+) -> tuple[SchemeIdentityPreflight, ...]:
+    """All-or-nothing identity preflight for a shared factsheet, no persistence.
+
+    A review result with any missing or duplicate attestation fails as a unit.
+    Nothing in the return value authorizes downstream score/readiness changes.
+    """
+    if (reviewed_document.status != "DOCUMENT_REVIEW_ONLY"
+            or reviewed_document.identity_verified
+            or not 1 <= len(reviewed_document.metrics) <= 2):
+        raise ValueError("SHARED_SCHEME_REVIEW_INVALID")
+    tickers = [metric.ticker for metric in reviewed_document.metrics]
+    if len(set(tickers)) != len(tickers) or set(tickers) != set(attestations_by_ticker):
+        raise ValueError("SHARED_SCHEME_IDENTITY_ATTESTATIONS_INCOMPLETE")
+    validated = tuple(
+        preflight_scheme_identity(store, metric, attestations_by_ticker[metric.ticker], now=now)
+        for metric in reviewed_document.metrics
+    )
+    if len({item.instrument_id for item in validated}) != len(validated):
+        raise ValueError("SHARED_SCHEME_CANONICAL_IDENTITY_CONFLICT")
+    return validated

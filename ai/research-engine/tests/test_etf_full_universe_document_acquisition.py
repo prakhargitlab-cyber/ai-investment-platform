@@ -33,30 +33,6 @@ async def test_opt_in_approved_document_fact_reaches_final_published_score(repo,
     monkeypatch.setattr(sources, 'default_bounded_registry', lambda: approved)
     repo.settings = SimpleNamespace(research_etf_official_document_fetch_enabled=True)
 
-    async def fake_ingest(repository, orchestrator, selected, client, **kwargs):
-        # The rule engine requires fresh MARKET_PRICE and TRADING_VOLUME.
-        # This isolated fixture must persist them, not merely claim READY.
-        for selected_row in selected:
-            instrument_id = UUID(selected_row['globalInstrumentId'])
-            for metric, value, unit in (
-                (EtfMetric.MARKET_PRICE, '100', 'INR'),
-                (EtfMetric.TRADING_VOLUME, '500000', 'shares'),
-            ):
-                repository.persistence.save_etf_evidence(EtfFact(
-                    instrument_id=instrument_id, metric=metric,
-                    value=Decimal(value), unit=unit, as_of_date=NOW.date(),
-                    provenance=EtfProvenance(
-                        provider='NSE', source_type='NSE_MARKET_WATCH',
-                        source_identity=f'{selected_row["primarySymbol"]}:{metric}:fixture',
-                        source_url='https://www.nseindia.com/',
-                        authority=EtfAuthority.OFFICIAL_EXCHANGE,
-                        reliability_level='LEVEL_A', retrieved_at=NOW,
-                    ),
-                ))
-        return {'instruments': [{'instrument_id':r['globalInstrumentId'], 'status':'READY',
-                                 'attempts':[]} for r in selected]}
-    monkeypatch.setattr(full, 'ingest_quotes', fake_ingest)
-
     async def fake_history(repository, row, *, now, checkpoint):
         return {'status':'SUCCESS_EMPTY', 'reason':'HISTORICAL_COVERAGE_INSUFFICIENT',
                 'observations':0}
@@ -84,11 +60,19 @@ async def test_opt_in_approved_document_fact_reaches_final_published_score(repo,
     def handler(request):
         if request.url.path.endswith('.csv'):
             return httpx.Response(200, text=csv)
-        return httpx.Response(200, json={'data': {'timestamp': NOW.strftime('%d-%b-%Y %H:%M:%S'),
-            'navDate': NOW.strftime('%d-%b-%Y'),
-            'data':[{'symbol':row['primarySymbol'],'series':'EQ',
-                     'identifier':row['primarySymbol']+'EQN','lastPrice':100,
-                     'totalTradedVolume':500000,'nav':100}]}})
+        if 'marketWatchApi' in request.url.path:
+            return httpx.Response(200, json={'data': {
+                'timestamp': NOW.strftime('%d-%b-%Y %H:%M:%S'),
+                'navDate': NOW.strftime('%d-%b-%Y'),
+                'data': [{'symbol':row['primarySymbol'], 'series':'EQ',
+                          'identifier':row['primarySymbol']+'EQN', 'lastPrice':100,
+                          'totalTradedVolume':500000, 'nav':100}]}})
+        # Offline NSE per-symbol metadata: the real ingestion path verifies
+        # the instrument-scoped listing and mandatory price/volume facts.
+        return httpx.Response(200, json={
+            'symbol':row['primarySymbol'], 'isin':row['isin'],
+            'isETFSec':'true', 'isDelisted':'false', 'isSuspended':'false',
+            'activeSeries':['EQ'], 'marketType':'N'})
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         await full.run_full_etf_cycle(repo, orchestrator, checkpoint=cp, cycle_id=cp.cycle_id,
             identity_headers={}, client=client, clock=lambda: NOW, sleep=AsyncMock(),
@@ -97,6 +81,7 @@ async def test_opt_in_approved_document_fact_reaches_final_published_score(repo,
     assert calls == [doc_url]
     saved = repo.persistence.etf_radar_cycle(cp.cycle_id)
     candidate = saved['candidates'][0]
+    assert candidate['disposition'] == 'EVALUATED', candidate['reason']
     assert saved['document_acquisition'][row['isin']]['status'] == 'INGESTED'
     assert candidate['document_acquisition']['status'] == 'INGESTED'
     assert any(ref['metric'] == 'EXPENSE_RATIO' and ref['value'] == '0.25'

@@ -96,3 +96,14 @@ Important: the attestation object is an operator assertion. A nonempty `review_r
 The code has **not been run against the user's Windows worktree yet**. Run `python -m pytest tests/test_etf_nippon_identity_preflight.py tests/test_etf_nippon_shared_review.py tests/test_etf_nippon_monthly_source.py -q` after pulling, and keep PR draft and fetch flag disabled.
 
 Pending before automating anything beyond manual review: actual public PDF HTTP verification and approved month-family policy; exact source document provenance/caching; independently reviewed NSE identity documents and corresponding attestations; ingest integration preserving immutable source and page provenance; backend and frontend regression tests, and no admission to investment-ready scoring without all other mandatory sources.
+
+
+## Phase 3: bounded monthly HTTP review adapter (2026-11-03)
+
+`app.etf_nippon_monthly_acquisition.NipponMonthlyReviewAcquisition` wires one explicitly invoked monthly document review to the EXISTING `BoundedOfficialDocumentFetcher`. The existing network/security pipeline validates public-access exact URL approval, redirect host, response content type, PDF signature/extraction, timeouts, and size. The internal `BoundedFetchResult.raw_pdf_bytes` field carries the validated original bytes so both schemes are parsed without downloading the publication twice. No generic public URL allowlist and no user-controlled arbitrary URL fetching were introduced.
+
+- Default `research_etf_official_document_fetch_enabled=False` remains unchanged. This adapter requires the flag AND a specifically approved PUBLIC_UNAUTHENTICATED FACTSHEET URL for each requested ETF in the caller-supplied registry; default registry still only contains auth-restricted Product Notes. There is NO new default publicly approved factsheet.
+- `tests/test_etf_nippon_monthly_acquisition.py` covers single HTTP request for two scheme sections via `httpx.MockTransport`, disabled flag, auth-required/no approval, redirect to another host, and HTML login response. **Local test execution required.**
+- Review-only result remains `DOCUMENT_REVIEW_ONLY`; no `EtfFact` persistence or readiness/scoring change, no automated source discovery or scheduler invocation. The adapter is not connected to production orchestration yet.
+- This is **invocation-scoped reuse**, not a durable cross-cycle cache. A durable cache, publication audit record, final host/provenance persistence, and single-flight concurrency across jobs are future work.
+- IMPORTANT: mock transport tests cannot certify that the user-supplied October 2026 URL is publicly reachable without OTP or that issuer-host DNS/redirects are valid in a real clean HTTP session. Independently review the source and the exchange identity-to-scheme binding before approving this monthly URL or enabling the flag.

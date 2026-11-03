@@ -130,6 +130,6 @@ async def test_wrong_content_type_rejected():
     async with httpx.AsyncClient(transport=httpx.MockTransport(
         lambda req: httpx.Response(200, headers={"content-type": "application/pdf"},
                                   content=b"%PDF"))
-    )) as client:
+    ) as client:
         with pytest.raises(ValueError, match="NIPPON_LISTING_NOT_HTML"):
             await discover_listing(approved_listing_url=PAGE, enabled=True, client=client)

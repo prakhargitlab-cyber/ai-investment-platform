@@ -17,8 +17,8 @@ from app.etf_nippon_factsheet_review import HEADINGS, ReviewOnlyEtfMetrics
 EXPECTED_ISINS = {"NIFTYBEES": "INF204KB14I2", "JUNIORBEES": "INF732E01045"}
 MAX_EXCHANGE_CSV_BYTES = 10 * 1024 * 1024
 SYMBOL_COLUMNS = ("SYMBOL", "SYMBOL NAME", "TRADING SYMBOL", "NSE SYMBOL", "TICKER")
-ISIN_COLUMNS = ("ISIN", "ISIN NUMBER", "ISIN NO", "ISIN CODE")
-NAME_COLUMNS = ("NAME", "NAME OF COMPANY", "SECURITY NAME", "NAME OF SECURITY", "SCHEME NAME")
+ISIN_COLUMNS = ("ISIN", "ISIN NUMBER", "ISINNUMBER", "ISIN NO", "ISIN CODE")
+NAME_COLUMNS = ("NAME", "NAME OF COMPANY", "SECURITY NAME", "SECURITYNAME", "NAME OF SECURITY", "SCHEME NAME")
 
 
 def _column(headers: list[str], allowed: tuple[str, ...]) -> str:
@@ -42,6 +42,8 @@ class NseSchemeIdentityComparison:
     nse_isin: str | None
     nse_row_number: int | None
     nse_csv_sha256: str
+    nse_underlying_asset: str | None
+    underlying_asset_matches_scheme_heading: bool
     status: str  # MATCH_EXACT_NAME_REVIEW_REQUIRED | NAME_DIFFERS_REVIEW_REQUIRED | ...
     evidence_authenticated: bool = False
     identity_verified_for_scoring: bool = False
@@ -64,6 +66,10 @@ def compare_nse_csv_to_factsheet_sections(
         symbol_col = _column(headers, SYMBOL_COLUMNS)
         isin_col = _column(headers, ISIN_COLUMNS)
         name_col = _column(headers, NAME_COLUMNS)
+        underlying_cols = [h for h in headers if h.strip().upper() == "UNDERLYING ASSET"]
+        if len(underlying_cols) > 1:
+            raise ValueError("NSE_IDENTITY_CSV_COLUMN_MISSING_OR_AMBIGUOUS")
+        underlying_col = underlying_cols[0] if underlying_cols else None
         rows = list(reader)
         if len(rows) > 100_000 or any(None in row for row in rows):
             raise ValueError("NSE_IDENTITY_CSV_MALFORMED")
@@ -103,7 +109,12 @@ def compare_nse_csv_to_factsheet_sections(
             nse_symbol=chosen[1][symbol_col] if chosen else None,
             nse_isin=chosen[1][isin_col] if chosen else None,
             nse_row_number=chosen[0] if chosen else None,
-            nse_csv_sha256=digest, status=status,
+            nse_csv_sha256=digest,
+            nse_underlying_asset=chosen[1][underlying_col] if chosen and underlying_col else None,
+            underlying_asset_matches_scheme_heading=bool(
+                chosen and underlying_col and _name(chosen[1][underlying_col] or "") == _name(metric.scheme_heading)
+            ),
+            status=status,
         ))
     return tuple(result)
 

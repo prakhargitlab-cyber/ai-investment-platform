@@ -18,7 +18,7 @@ from app.global_opportunity_cycle import UniverseUnavailableError
 from app.etf_ingestion import ingest_quotes
 from app.etf_history import acquire_etf_history
 from app.etf_opportunity_cycle import run_etf_radar_cycle, etf_cycle_result_to_dict
-from app.etf_screening import screening_evidence, enrich_candidate, research_overview
+from app.etf_screening import screening_evidence, enrich_candidate, research_overview, recommendation_evidence_gaps
 from app.nse_historical_daily import verified_identity
 from app.portfolio_orchestration import _trusted_nse_provider_mapping
 
@@ -535,6 +535,7 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
             'as_of': now().isoformat(), 'correlation_id': correlation_id, 'universe_count': len(outcomes),
             'coverage': counts, 'outcomes': outcomes, 'candidates': candidates, 'ranked': ranked,
             'top_opportunities': top_opportunities,
+            'recommendation_evidence': recommendation_evidence_gaps(candidates),
             'comparison_scope': 'WITHIN_VERIFIED_PEER_ONLY', 'official_sha256': selection['official_sha256'],
             'official_as_of': selection['official_as_of'], 'official_source_url': NSE_ETF_LIST_URL, 'excluded_by_reason': {}}
         for c in candidates:

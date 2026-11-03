@@ -12,7 +12,7 @@ test("immediate connected IBKR authentication bootstraps its broker portfolio ex
 });
 
 test("IBKR polling bootstraps once on authenticated CONNECTED and never on page load", () => {
-  const refresh = workspace.match(/async function refreshAuthenticatedBroker[\s\S]*?\n  }\n\n  async function bootstrapIbkrPortfolio/)?.[0] ?? "";
+  const refresh = workspace.match(/async function refreshAuthenticatedBroker[\s\S]*?\r?\n  }\r?\n\r?\n  async function bootstrapIbkrPortfolio/)?.[0] ?? "";
   assert.match(refresh, /if \(!authStatus\.authenticated \|\| authStatus\.state !== "CONNECTED"\) return false/);
   assert.match(refresh, /pendingBrokerAuthRef\.current\?\.provider === "IBKR"[\s\S]*?await bootstrapIbkrPortfolio\(connectionId\)/);
   assert.match(workspace, /if \(provider === "IBKR"\)[\s\S]*?ibkrBootstrapSyncsRef\.current\.delete\(connectionId\);[\s\S]*?pendingBrokerAuthRef\.current = \{ connectionId, provider \}/);
@@ -21,7 +21,7 @@ test("IBKR polling bootstraps once on authenticated CONNECTED and never on page 
 });
 
 test("bootstrap refreshes portfolios and selects only a returned or connection-linked portfolio", () => {
-  const bootstrap = workspace.match(/async function bootstrapIbkrPortfolio[\s\S]*?\n  }\n\n  async function finishBrokerAuthentication/)?.[0] ?? "";
+  const bootstrap = workspace.match(/async function bootstrapIbkrPortfolio[\s\S]*?\r?\n  }\r?\n\r?\n  async function finishBrokerAuthentication/)?.[0] ?? "";
   assert.match(bootstrap, /const dashboard = await portfolioApi\.getDashboard\(\)/);
   assert.match(bootstrap, /setPortfolios\(dashboard\.portfolios\)/);
   assert.match(bootstrap, /result\.portfolios\.find\(\(portfolio\) =>[\s\S]*?portfolio\.brokerConnectionId === connectionId/);
@@ -31,10 +31,10 @@ test("bootstrap refreshes portfolios and selects only a returned or connection-l
 });
 
 test("bootstrap failure is sanitized, leaves authentication state untouched, and does not sync non-IBKR auth outcomes", () => {
-  const bootstrap = workspace.match(/async function bootstrapIbkrPortfolio[\s\S]*?\n  }\n\n  async function finishBrokerAuthentication/)?.[0] ?? "";
+  const bootstrap = workspace.match(/async function bootstrapIbkrPortfolio[\s\S]*?\r?\n  }\r?\n\r?\n  async function finishBrokerAuthentication/)?.[0] ?? "";
   assert.match(bootstrap, /Interactive Brokers connected, but portfolio sync failed\. Try syncing again\./);
   assert.doesNotMatch(bootstrap, /setBrokerConnections\(\[\]|DISCONNECTED|authenticationAction/);
-  const completion = workspace.match(/async function completeBrokerAuthentication[\s\S]*?\n  }\n\n  async function login/)?.[0] ?? "";
+  const completion = workspace.match(/async function completeBrokerAuthentication[\s\S]*?\r?\n  }\r?\n\r?\n  async function login/)?.[0] ?? "";
   assert.match(completion, /action\.action === "NONE"/);
   const redirectBranch = completion.match(/if \(action\.action === "REDIRECT_REQUIRED"[\s\S]*?authWindow\.close\(\);/)?.[0] ?? "";
   assert.doesNotMatch(redirectBranch, /bootstrapIbkrPortfolio/);

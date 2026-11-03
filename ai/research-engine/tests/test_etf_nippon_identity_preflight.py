@@ -9,7 +9,7 @@ import pytest
 from app.etf_evidence import EtfAuthority, EtfListing, EtfProvenance
 from app.etf_nippon_factsheet_review import ReviewOnlyEtfMetrics, HEADINGS
 from app.etf_nippon_identity_preflight import (
-    SchemeIdentityAttestation, preflight_scheme_identity,
+    SchemeIdentityAttestation, preflight_scheme_identity, preflight_shared_review_identities,
 )
 
 ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -104,3 +104,26 @@ def test_tampered_review_only_state_cannot_enter_preflight():
     with pytest.raises(ValueError, match="SCHEME_TO_ISIN_REVIEW_NOT_ESTABLISHED"):
         preflight_scheme_identity(FakeStore([listing()]),
                                   replace(metric(), identity_verified=True), attestation(), now=NOW)
+
+
+def test_shared_review_requires_every_explicit_attestation():
+    from types import SimpleNamespace
+    shared = SimpleNamespace(status="DOCUMENT_REVIEW_ONLY", identity_verified=False,
+                             metrics=(metric(), replace(metric(), ticker="JUNIORBEES",
+                               scheme_heading=HEADINGS["JUNIORBEES"])))
+    with pytest.raises(ValueError, match="SHARED_SCHEME_IDENTITY_ATTESTATIONS_INCOMPLETE"):
+        preflight_shared_review_identities(
+            FakeStore([listing()]), shared, {"NIFTYBEES": attestation()}, now=NOW)
+
+
+def test_shared_review_rejects_duplicate_canonical_identity():
+    from types import SimpleNamespace
+    shared = SimpleNamespace(status="DOCUMENT_REVIEW_ONLY", identity_verified=False,
+                             metrics=(metric(), replace(metric(), ticker="JUNIORBEES",
+                               scheme_heading=HEADINGS["JUNIORBEES"])))
+    with pytest.raises(ValueError, match="SCHEME_IDENTITY_OFFICIAL_LISTING_CONFLICT"):
+        preflight_shared_review_identities(
+            FakeStore([listing()]), shared,
+            {"NIFTYBEES": attestation(),
+             "JUNIORBEES": attestation(ticker="JUNIORBEES",
+                scheme_heading=HEADINGS["JUNIORBEES"])}, now=NOW)

@@ -61,8 +61,9 @@ def issuer_evidence(ticker, *, body=None, **changes):
            f"Scheme Name: {HEADINGS[ticker]}\nISIN: {ISINS[ticker]}\n").encode("utf-8")
     fields = dict(
         ticker=ticker, isin=ISINS[ticker], scheme_heading=HEADINGS[ticker],
-        source_url=SOURCE_URL, source_sha256=sha256(raw).hexdigest(),
-        source_bytes=raw, reviewer_id="reviewer@example.test",
+        source_url=SOURCE_URL, issuer_pdf_sha256="d" * 64,
+        extracted_text_sha256=sha256(raw).hexdigest(),
+        extracted_text_bytes=raw, reviewer_id="reviewer@example.test",
         reviewer_reference="operator-reviewed-external-source",
         reviewed_at=NOW,
     )
@@ -121,7 +122,7 @@ def test_wrong_source_bytes_hash_rejected():
     first, second = inputs()
     with pytest.raises(ValueError, match="NIPPON_IDENTITY_SOURCE_HASH_MISMATCH"):
         prepare_identity_review_packet(staged(), preflights(),
-            (replace(first, source_bytes=first.source_bytes + b"modified"), second))
+            (replace(first, extracted_text_bytes=first.extracted_text_bytes + b"modified"), second))
 
 
 def test_missing_one_identity_rejected():

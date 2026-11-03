@@ -107,3 +107,14 @@ Pending before automating anything beyond manual review: actual public PDF HTTP 
 - Review-only result remains `DOCUMENT_REVIEW_ONLY`; no `EtfFact` persistence or readiness/scoring change, no automated source discovery or scheduler invocation. The adapter is not connected to production orchestration yet.
 - This is **invocation-scoped reuse**, not a durable cross-cycle cache. A durable cache, publication audit record, final host/provenance persistence, and single-flight concurrency across jobs are future work.
 - IMPORTANT: mock transport tests cannot certify that the user-supplied October 2026 URL is publicly reachable without OTP or that issuer-host DNS/redirects are valid in a real clean HTTP session. Independently review the source and the exchange identity-to-scheme binding before approving this monthly URL or enabling the flag.
+
+
+## Live clean-session PDF accessibility verification — 2026-11-03
+
+Operator performed a direct PowerShell `curl.exe` anonymous GET from their Windows checkout against this **exact October 2026** issuer URL (not an inferred URL family):
+
+`https://mf.nipponindiaim.com/InvestorServices/FactSheetsDocuments/Nippon-FS-October-2026.pdf`
+
+Observed: `curl_exit_code=0`; `HTTP/1.1 200 OK`; `Content-Type: application/pdf`; `Content-Length: 13264965`; downloaded 13,264,965 bytes; effective URL exactly unchanged (no redirect in this request); first five bytes `%PDF-`; SHA256 `9bdb8948221d19c62392dae1bebb1cda5ff2e2a4e09713f8cc9e7967973ccf0c`, **identical** to the user-provided October PDF independently parsed in the prior CLI and genuine PDF regression tests.
+
+**Review scope:** This is a successful unauthenticated download of the exact October object from the operator's connection. It is not a claim about future publication months, continuous service availability, an issuer-wide URL-family public-access guarantee, or a published fund-section-to-ISIN association. No new `ApprovedDocumentSource` entries, monthly-family auto-approval policy, default flag changes, or trusted ETF facts are created by recording this evidence. The ISIN-to-scheme mapping still requires an independently reviewed authoritative bridge and persistence integration remains gated.

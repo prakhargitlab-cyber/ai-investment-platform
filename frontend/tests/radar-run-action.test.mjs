@@ -87,8 +87,10 @@ test('a failed status poll keeps the panel showing the last known state rather t
 test('ETF live counters require durable coverage; legacy cycles stay indeterminate', () => {
   assert.match(etfRadarSource, /const terminalData = activeCycle\?\.status === "COMPLETED" && data\?\.cycle_id === activeCycle\.cycleId \? data : null;/);
   assert.match(etfRadarSource, /activeCycle\?\.coverage \? \[/);
-  assert.match(etfRadarSource, /value: activeCycle\.coverage\.official/);
-  assert.match(etfRadarSource, /value: activeCycle\.coverage\.completed/);
+  assert.match(etfRadarSource, /value: firstPassOfficial/);
+  assert.match(etfRadarSource, /value: firstPassCompleted/);
+  assert.match(etfRadarSource, /value: historyOnboarded/);
+  assert.match(etfRadarSource, /Historical onboarding recorded \(including failures\)/);
   assert.match(etfRadarSource, /percent=\{null\}/);
 });
 

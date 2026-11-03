@@ -72,6 +72,7 @@ class BoundedFetchResult:
     status_code: int | None = None
     content_type: str | None = None
     raw_bytes_sha256: str | None = None
+    raw_pdf_bytes: bytes | None = None  # internal-only validated original bytes for shared review
     normalized_text: str | None = None
     normalized_text_sha256: str | None = None
     retrieved_at: datetime | None = None
@@ -189,7 +190,7 @@ class BoundedOfficialDocumentFetcher:
         return BoundedFetchResult(
             BoundedFetchOutcome.FETCHED, "Fetched and extracted within the approved allowlist",
             source=source, final_url=network.final_url, status_code=network.status_code,
-            content_type=content_type, raw_bytes_sha256=raw_sha256,
+            content_type=content_type, raw_bytes_sha256=raw_sha256, raw_pdf_bytes=network.content,
             normalized_text=normalized_text, normalized_text_sha256=normalized_sha256,
             retrieved_at=retrieved_at,
         )

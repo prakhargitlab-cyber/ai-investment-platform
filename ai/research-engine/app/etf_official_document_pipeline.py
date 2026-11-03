@@ -27,7 +27,7 @@ from app.etf_document_discovery import (
     register_official_document,
 )
 from app.etf_official_document_fetch import BoundedOfficialDocumentFetcher
-from app.etf_official_document_sources import ApprovedSourceRegistry
+from app.etf_official_document_sources import ApprovedSourceRegistry, bind_approved_sources_to_canonical_universe
 from app.models import EtfResearchProfile
 from app.settings import Settings
 
@@ -53,6 +53,19 @@ class EtfOfficialDocumentAcquisitionPipeline:
         self._fetcher = fetcher or BoundedOfficialDocumentFetcher(approved_sources, settings, clock=clock)
         self._document_registry = document_registry if document_registry is not None else OfficialDocumentRegistry()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    @classmethod
+    def for_canonical_universe(cls, approved_sources: ApprovedSourceRegistry,
+                               canonical_etfs: list[dict], settings: Settings, *,
+                               document_registry: OfficialDocumentRegistry | None = None,
+                               clock=None):
+        """Build this bounded pipeline for the current deployment's ETF UUIDs.
+
+        Only explicitly reviewed ISIN/ticker pairs are rebound. Unmatched
+        sources are omitted; auth-required source restrictions remain intact.
+        """
+        current_sources = bind_approved_sources_to_canonical_universe(approved_sources, canonical_etfs)
+        return cls(current_sources, settings, document_registry=document_registry, clock=clock)
 
     async def acquire(self, persistence, profile: EtfResearchProfile, url: str) -> AcquisitionPipelineResult:
         if not self._settings.research_etf_official_document_fetch_enabled:

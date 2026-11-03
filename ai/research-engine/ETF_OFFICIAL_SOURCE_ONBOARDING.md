@@ -1,0 +1,168 @@
+# ETF official source onboarding — first live PDF
+
+## Scope and current finding (2026-11-03)
+
+The checked-in source registry contains two reviewed Nippon India Mutual Fund Product Notes:
+
+| ETF | ISIN | Registry access | Why not usable for unattended facts |
+| --- | --- | --- | --- |
+| NIFTYBEES | INF204KB14I2 | REQUIRES_AUTHENTICATION | ProductNotes endpoint requires OTP; reviewed document has no labelled ISIN/AUM/TER accepted by the existing strict parsers |
+| JUNIORBEES | INF732E01045 | REQUIRES_AUTHENTICATION | Same restrictions |
+
+These conclusions come from the checked-in source review documentation, not a fresh online verification. **There is currently no source in the default registry approved as PUBLIC_UNAUTHENTICATED.** Enabling `research_etf_official_document_fetch_enabled` alone must not be interpreted as successful acquisition.
+
+## Operator review for one replacement factsheet
+
+1. Select **one** exact PDF on the AMC's own HTTPS host for NIFTYBEES (ISIN `INF204KB14I2`) or JUNIORBEES (ISIN `INF732E01045`). Do not infer URLs from filenames, issuer homepages, search snippets or a second-hand URL.
+2. Open the exact PDF in a clean browser session without AMC login, cookies, OTP or CAPTCHA. Record final URL, final host, status, content type, any redirects, date reviewed, and the AMC ownership evidence. If access is not clearly public, classify as `REQUIRES_AUTHENTICATION`.
+3. Download only with the site's normal published access. Verify it is a parseable PDF and records an exact scheme identity (prefer a clearly labelled ISIN) plus labelled **AUM** and **expense ratio/TER** values with as-of dates and units. Do not substitute neighbouring-scheme figures from a combined factsheet.
+4. Feed the downloaded document into the existing `registered_official_document` + `ingest_etf_facts_from_document` identity/metric path **offline** first; inspect rejection codes and produced provenance. Never edit the gates merely to make a document pass.
+5. If the identity/metric proof passes, record exact `document_url`, `document_host`, `issuer_name`, `document_type`, verified `isin` and `ticker`, and a human review reference in `app/etf_official_document_sources.py`. Assign `PUBLIC_UNAUTHENTICATED` **only after** actual unauthenticated access is demonstrated and approved. Keep the rollout bounded to at most two approved instruments.
+6. With explicit operator authorization, enable the existing feature flag in a controlled local environment. Verify only the allowlisted URL is contacted and final host is checked; verify persisted evidence is fresh, correctly scoped, and appears in final rule-engine COST and fund-quality metrics. Missing tracking, bid/ask spread, entry assessment, etc. must still remain unavailable, never fabricated.
+7. Preserve the test contract and keep the PR in draft until a real URL is reviewed and a controlled live run produces source-backed facts. Do not deploy the flag to production as part of this source review.
+
+## Offline test commands
+
+From `C:\workspace\ai-investment-platform-etf-fix\ai\research-engine`:
+
+```powershell
+& C:\workspace\ai-investment-platform\.venv\Scripts\python.exe -m pytest tests/test_etf_default_source_live_gate.py tests/test_etf_document_canonical_binding.py tests/test_etf_official_document_fetch.py tests/test_etf_full_universe_document_acquisition.py -q
+```
+
+The default-source guard test is intentionally expected to require updating **after** an actually reviewed public source is added. Do not weaken it to a mere instrument-count check.
+
+## Review record (fill only from firsthand evidence)
+
+- Instrument / ISIN:
+- AMC and proof of issuer-owned host:
+- Exact PDF URL and verified redirect final URL:
+- Reviewed UTC date/time, clean-browser accessibility:
+- Response status, MIME type, bytes and PDF hash:
+- Scheme identity label and location in PDF:
+- AUM label, value, unit, as-of and page:
+- TER/expense ratio label, value, unit, as-of and page:
+- Existing strict parser outcome and persisted evidence:
+- Human reviewer and unique approval reference:
+- Remaining unavailable mandatory/supporting evidence:
+
+No public replacement URL has been independently checked yet. Until that happens, this is a **review-ready procedure**, not completed live acquisition.
+
+
+## Uploaded October 2026 combined factsheet review (2026-11-03)
+
+User-supplied source URL (not independently HTTP-verified in this review):
+`https://mf.nipponindiaim.com/InvestorServices/FactSheetsDocuments/Nippon-FS-October-2026.pdf`
+
+Local review of the user-provided PDF: **371 physical PDF pages**, **13,264,965 bytes**, raw SHA-256 `9bdb8948221d19c62392dae1bebb1cda5ff2e2a4e09713f8cc9e7967973ccf0c`. PDF physical page 207 (printed page 207) has **Nippon India ETF Nifty 50 BeES**, reporting **2026-09-30**:
+
+- AUM (not AAUM): INR **65,178.85 crore**; separately AAUM INR **66,163.18 crore**.
+- Monthly-average expense ratio, Direct: **0.04%**. Annexure 1 (physical PDF page 368) separately lists Direct Plan Total TER **0.04%**, date 2026-09-30.
+- Tracking error 1Y **0.02%**, tracking difference 1Y **-0.02%**, benchmark **Nifty 50 TRI**, NAV **258.0021**.
+- Junior BeES also has a separately labelled section (physical PDF page 216); the PDF is **multi-scheme**, so whole-document parsing cannot safely select one fund by URL.
+
+**FAIL CLOSED / NOT YET APPROVABLE FOR AUTOMATED METRIC INGESTION:**
+1. Across the searchable PDF text, neither canonical `INF204KB14I2` nor Junior BeES `INF732E01045` is present. This is not proof that the printed artifact contains no image-only ISIN, but no matching text was discovered.
+2. `app.etf_document_parser.verified_scheme_section` demands exactly one `ISIN: <canonical>` within a hash-bound scheme section. `app.etf_official_document_pipeline` does not currently pass an explicitly reviewed `section_span` to registration for this combined document.
+3. `parse_metric` demands a labelled one-line metric with an accepted unit and ISO as-of format, whereas the actual factsheet uses multi-line table layout and `September 30, 2026`. Adding artificial ISIN lines, relabelling the text, or assuming the AMC URL proves scheme identity would bypass the evidence contract.
+4. Uploaded bytes prove the PDF can be inspected offline. They do **not** prove unauthenticated live HTTP retrieval, redirect chain, or final host. Do not mark `PUBLIC_UNAUTHENTICATED` solely because the file was supplied.
+
+Next safe step: obtain an AMC/exchange document with a **labelled exact ISIN** for the scheme and establish an independently verified binding between that identity source and each clearly bounded scheme section before engineering a dedicated multi-scheme table extractor. Keep data `DOCUMENT_REVIEW_ONLY`, do not persist it as a trusted ETF fact or change the default registry yet.
+
+
+## Implemented in PR #5: safe monthly resolver and review-only layout parser
+
+- `app.etf_nippon_monthly_source.month_candidate(year, month)` produces the **exact expected filename** from the fixed Nippon issuer path; `bounded_candidates` returns at most two recent URL candidates. It does **not** make an HTTP request or grant source approval. A URL is only a candidate until verified against the issuer and registered through the existing allowlist controls.
+- `app.etf_nippon_factsheet_review.extract_review_only(pdf_bytes, ticker)` scans the bounded 25 MB / 500-page PDF for an exact fund title and `Fund Details` section, rejects duplicates, and separately extracts fund AUM, **AAUM**, monthly average expense ratio, and 1-year tracking error/difference for NIFTYBEES and JUNIORBEES.
+- The return type always reports `status=DOCUMENT_REVIEW_ONLY` and `identity_verified=False`. It cannot create `EtfFact`, authenticate an issuer, set `PUBLIC_UNAUTHENTICATED`, or influence scoring. It is a staging step, **not finished ingestion**.
+- `tests/test_etf_nippon_monthly_source.py` checks month boundaries, URL shapes, ambiguity, and review-only semantics. Genuine-document tests are optional and use the gitignored `.tmp/etf-validation/Nippon-FS-October-2026.pdf` path.
+- Still pending: independent official ISIN-to-section corroboration; real clean-session HTTP verification; a separately reviewed policy allowing controlled monthly family URLs; a one-download-per-publication cache and durable provenance; a fund-metric ingestion adapter built without weakening `verified_scheme_section`; and a guarded live test. Do **not** enable the existing automated-fetch flag based only on these resolver/parser files.
+
+
+## Phase 2 staging coordinator (2026-11-03)
+
+`app.etf_nippon_shared_review.review_approved_shared_month` is a strictly bounded **staging-only** coordinator. Its injected async PDF provider is called **once** after exact URL / issuer-host / public-access approvals have been established for each ETF, and then the reviewed PDF sections are parsed. It independently rejects unexpected report dates and mismatched document hashes. The coordinator does not perform HTTP, find sources, or write ETF evidence.
+
+`tests/test_etf_nippon_shared_review.py` covers one-call/two-section semantics, missing/auth-gated/wrong-month approval, duplicate identities, date mismatch, and digest mismatch without a network call.
+
+**Critical remaining blocks:** This staging coordinator has no production network adapter: the approved source registry still only includes authenticated Product Notes, and `PUBLIC_UNAUTHENTICATED` approval for the combined factsheet remains unverified. A real exchange-issued scheme-to-ISIN identity binding is still needed; matching a section heading is not sufficient. No `EtfFact` may be persisted by this code, and no buy recommendation becomes investment-ready merely because review-only metrics parse. Keep document fetch disabled and PR draft.
+
+
+## Phase 3: identity preflight added (2026-11-03)
+
+`app.etf_nippon_identity_preflight` adds a strict, **non-persisting** preflight for each extracted factsheet section and for both sections as one unit. A caller must supply an explicit, reviewed scheme-heading -> exact ISIN/ticker/instrument UUID attestation and a separate, recent, persisted NSE ETF listing; the code reuses the existing `_check_identity_ready` freshness/conflict gate, verifies listing provenance/source host, and rejects missing or cross-instrument ISIN collisions. It returns `READY_FOR_MANUAL_REVIEW` with `identity_verified_for_scoring=False`, **not investment evidence**.
+
+Important: the attestation object is an operator assertion. A nonempty `review_reference` and an NSE-domain URL are structural checks, **not proof that a reviewer truly verified an exchange source**. This work has not established new external exchange evidence and has not tied the October PDF to an ISIN through an independently checked published document. The independent review process and its evidence manifest still need to be completed before any future ingestion adapter is considered.
+
+The code has **not been run against the user's Windows worktree yet**. Run `python -m pytest tests/test_etf_nippon_identity_preflight.py tests/test_etf_nippon_shared_review.py tests/test_etf_nippon_monthly_source.py -q` after pulling, and keep PR draft and fetch flag disabled.
+
+Pending before automating anything beyond manual review: actual public PDF HTTP verification and approved month-family policy; exact source document provenance/caching; independently reviewed NSE identity documents and corresponding attestations; ingest integration preserving immutable source and page provenance; backend and frontend regression tests, and no admission to investment-ready scoring without all other mandatory sources.
+
+
+## Phase 3: bounded monthly HTTP review adapter (2026-11-03)
+
+`app.etf_nippon_monthly_acquisition.NipponMonthlyReviewAcquisition` wires one explicitly invoked monthly document review to the EXISTING `BoundedOfficialDocumentFetcher`. The existing network/security pipeline validates public-access exact URL approval, redirect host, response content type, PDF signature/extraction, timeouts, and size. The internal `BoundedFetchResult.raw_pdf_bytes` field carries the validated original bytes so both schemes are parsed without downloading the publication twice. No generic public URL allowlist and no user-controlled arbitrary URL fetching were introduced.
+
+- Default `research_etf_official_document_fetch_enabled=False` remains unchanged. This adapter requires the flag AND a specifically approved PUBLIC_UNAUTHENTICATED FACTSHEET URL for each requested ETF in the caller-supplied registry; default registry still only contains auth-restricted Product Notes. There is NO new default publicly approved factsheet.
+- `tests/test_etf_nippon_monthly_acquisition.py` covers single HTTP request for two scheme sections via `httpx.MockTransport`, disabled flag, auth-required/no approval, redirect to another host, and HTML login response. **Local test execution required.**
+- Review-only result remains `DOCUMENT_REVIEW_ONLY`; no `EtfFact` persistence or readiness/scoring change, no automated source discovery or scheduler invocation. The adapter is not connected to production orchestration yet.
+- This is **invocation-scoped reuse**, not a durable cross-cycle cache. A durable cache, publication audit record, final host/provenance persistence, and single-flight concurrency across jobs are future work.
+- IMPORTANT: mock transport tests cannot certify that the user-supplied October 2026 URL is publicly reachable without OTP or that issuer-host DNS/redirects are valid in a real clean HTTP session. Independently review the source and the exchange identity-to-scheme binding before approving this monthly URL or enabling the flag.
+
+
+## Live clean-session PDF accessibility verification — 2026-11-03
+
+Operator performed a direct PowerShell `curl.exe` anonymous GET from their Windows checkout against this **exact October 2026** issuer URL (not an inferred URL family):
+
+`https://mf.nipponindiaim.com/InvestorServices/FactSheetsDocuments/Nippon-FS-October-2026.pdf`
+
+Observed: `curl_exit_code=0`; `HTTP/1.1 200 OK`; `Content-Type: application/pdf`; `Content-Length: 13264965`; downloaded 13,264,965 bytes; effective URL exactly unchanged (no redirect in this request); first five bytes `%PDF-`; SHA256 `9bdb8948221d19c62392dae1bebb1cda5ff2e2a4e09713f8cc9e7967973ccf0c`, **identical** to the user-provided October PDF independently parsed in the prior CLI and genuine PDF regression tests.
+
+**Review scope:** This is a successful unauthenticated download of the exact October object from the operator's connection. It is not a claim about future publication months, continuous service availability, an issuer-wide URL-family public-access guarantee, or a published fund-section-to-ISIN association. No new `ApprovedDocumentSource` entries, monthly-family auto-approval policy, default flag changes, or trusted ETF facts are created by recording this evidence. The ISIN-to-scheme mapping still requires an independently reviewed authoritative bridge and persistence integration remains gated.
+
+
+## Offline NSE-to-Nippon identity comparison (2026-11-03)
+
+New `app/etf_nippon_nse_comparison.py` compares a separately supplied NSE listing CSV with the two verified scheme headings extracted from the **actual October Nippon factsheet**. It requires a unique exchange CSV row whose ticker and ISIN match the known candidate pair, records the CSV SHA256 and row number, and reports exact-name matches versus name differences, missing rows, ambiguous rows, or symbol/ISIN conflicts.
+
+`python -m app.etf_nippon_nse_comparison_cli --factsheet "C:\\path\\to\\Nippon-FS-October-2026.pdf" --nse-csv "C:\\path\\to\\official-NSE-ETF-list.csv"` prints JSON with both source hashes, pages, report dates, row matches, and review statuses. It never fetches documents, writes facts or changes ETF scores. The CLI accepts NSE CSV headers such as `SYMBOL`, `NAME OF COMPANY`, `ISIN NUMBER` (plus a small explicit alias set). Test with `python -m pytest tests/test_etf_nippon_nse_comparison.py -q`.
+
+**Source authenticity still requires manual verification** of how and when the NSE CSV was obtained (official exchange URL, response details and preferably retained original bytes). Merely naming a local CSV file `official-...` is not proof it came from the exchange. Even an exact matching row emits `MATCH_EXACT_NAME_REVIEW_REQUIRED`, with `evidence_authenticated=False` and `identity_verified_for_scoring=False`. The comparison is only a reproducible preflight and does not approve ingestion. No user-specific NSE CSV was supplied or reviewed in this commit; local tests still need execution.
+
+
+## Official NSE CSV schema and identity evidence (2026-11-03)
+
+Operator obtained `https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv` via an anonymous Python `httpx` request (200 OK, `text/csv`, no redirect, 38,362 bytes; SHA256 `3c802209ee0e2becfc356253ba2b48ab4a2743cc680283a4f575452b07b97e9a`). Windows Schannel curl timed out; this isolated OpenSSL-backed request succeeded. This verifies that particular retrieval; no assertion about future endpoint availability is made.
+
+Observed actual CSV columns: `Symbol`, `Underlying Asset`, `SecurityName`, `DateofListing`, `MarketLot`, `ISINNumber`, `FaceValue`, `ETF Underlying`, `Underlying Key`. The operator's two source rows:
+
+- `NIFTYBEES`: `ISINNumber=INF204KB14I2`; `SecurityName=NIPINDETFNIFTYBEES`; `Underlying Asset=Nifty 50`.
+- `JUNIORBEES`: `ISINNumber=INF732E01045`; `SecurityName=NIP IND ETF JUNIOR BEES`; `Underlying Asset=Nippon India ETF Nifty Next 50 Junior BeES`.
+
+`app.etf_nippon_nse_comparison` now supports the NSE-specific headers `SecurityName` and `ISINNumber`, and exposes the separate `Underlying Asset` evidence without conflating it with the exchange security name. Since both exchange `SecurityName` strings differ from the full Nippon factsheet heading, the comparison retains `NAME_DIFFERS_REVIEW_REQUIRED`. JUNIORBEES' `Underlying Asset` is a supporting exact full-name match; NIFTYBEES' field is the index name, not the full fund name. Neither observation constitutes an automatic scheme-to-ISIN approval. Original NSE bytes remain only on the operator's gitignored local path; they have not been uploaded to or reproduced in the repo. New offline regression tests still require local execution.
+
+
+## Operator-executed authentic NSE/AMC comparison checkpoint — 2026-11-03
+
+Operator pulled branch through `572b17b`, ran `pytest tests/test_etf_nippon_nse_comparison.py -q` (12 passed, 0 failed), and ran `python -m app.etf_nippon_nse_comparison_cli` with the locally retained original October Nippon PDF and the anonymously retrieved NSE ETF CSV.
+
+Observed cross-source JSON: `status=IDENTITY_CROSS_SOURCE_REVIEW_ONLY`; CSV SHA256 `3c802209ee0e2becfc356253ba2b48ab4a2743cc680283a4f575452b07b97e9a`; Nippon PDF SHA256 `9bdb8948221d19c62392dae1bebb1cda5ff2e2a4e09713f8cc9e7967973ccf0c`. `NIFTYBEES` NSE CSV row 2 symbol and ISIN `INF204KB14I2`; `SecurityName=NIPINDETFNIFTYBEES`; `Underlying Asset=Nifty 50`, versus PDF section heading `Nippon India ETF Nifty 50 BeES`, PDF page 207. `JUNIORBEES` NSE CSV row 3 symbol and ISIN `INF732E01045`; `SecurityName=NIP IND ETF JUNIOR BEES`; `Underlying Asset=Nippon India ETF Nifty Next 50 Junior BeES` (exact normalized full-heading match), PDF page 216. Both PDF sections report 2026-09-30.
+
+For **both** records the emitted status is `NAME_DIFFERS_REVIEW_REQUIRED`; `evidence_authenticated=false`; `identity_verified_for_scoring=false`. The exchange symbol–ISIN matches and independently observed live CSV support the identity candidates, but this checkpoint did NOT approve either abbreviated NSE name as an AMC scheme-to-ISIN bridge, persist investment facts, or enable production fetch/scoring. The original downloads remain gitignored local evidence. The operator reported nonblocking pypdf/fontTools warnings.
+
+
+## Phase 3 guarded persistence staging — 2026-11-03
+
+`app.etf_nippon_persistence_guard` now constructs **deterministic, immutable, non-ingestible staged metric records** from a `SharedFactsheetReview` plus original PDF and NSE CSV bytes and a recomputed, matching NSE comparison. It binds four supported ETF fields per scheme (AUM in INR crore, monthly average expense percentage, one-year tracking error percentage, one-year tracking difference percentage) with PDF SHA256, NSE CSV SHA256, exact URL, 1-based physical PDF page, reporting period, matching exchange symbol/ISIN, security name and source row. AAUM is deliberately omitted because no dedicated `EtfMetric` enum entry exists. Stable content hash serves as a repeat staging key; a conflicting revision for the same source URL/month fails closed.
+
+**This is not trusted DB persistence.** The current `EtfPersistenceMixin.save_etf_evidence(EtfFact)` immediately publishes evidence to ETF readiness and scoring, while the cross-source name comparisons for both schemes remain `NAME_DIFFERS_REVIEW_REQUIRED` and the exact AMC-heading-to-NSE-name association has not passed independent approval. Therefore this new module never constructs an `EtfFact` and its deliberate `persist_nippon_staging_to_etf_facts` entrypoint always rejects with `NIPPON_TRUSTED_PERSISTENCE_NOT_AUTHORIZED`. The local staging results are Python values only (no database table, file write, scheduler, or API route was added). A reviewed approval and independently validated source-document-to-scheme bridge are mandatory before implementing actual trusted persistence. Default production fetch stays disabled.
+
+New offline tests `tests/test_etf_nippon_persistence_guard.py` cover source-hash mismatch, stale period, forged CSV comparison, repeated-staging identity, conflicting metric revision, duplicate scheme and hard write denial. Run locally after pulling: `python -m pytest tests/test_etf_nippon_persistence_guard.py tests/test_etf_nippon_nse_comparison.py tests/test_etf_nippon_identity_preflight.py -q`. This commit has not been locally executed in the user's Windows environment yet.
+
+
+## Phase 4: scheme-to-ISIN identity review contract (2026-11-03)
+
+`app.etf_nippon_identity_approval` adds a **fail-closed, non-authorizing** two-scheme review packet. It consumes (i) an untrusted staged factsheet snapshot with both source hashes and metric page/date context, (ii) fresh NSE canonical identity preflight results, and (iii) per-scheme reviewer-supplied evidence for a *separate* issuer-owned document explicitly labelling both `Scheme Name:` and `ISIN:`. Both labelled values must be unambiguous and exact for each target. The review record binds ticker, ISIN, canonical UUID, stage ID, original Nippon factsheet PDF SHA256, NSE CSV SHA256, asserted separate issuer PDF SHA256, extracted UTF-8 scheme/ISIN text SHA256, exact source URL and reviewer metadata. The original issuer PDF hash is a **reviewer claim**, not verified against issuer bytes by this offline method; the extracted text hash is actually recomputed against the supplied text bytes.
+
+**Critical limitation:** Matching caller-provided text and an issuer-looking HTTPS URL does not prove those bytes came from that site. The actual additional issuer PDF for the two scheme-to-ISIN bridges has **not** been located, verified, or supplied. Therefore the output is always `IDENTITY_EVIDENCE_REVIEW_ONLY`, every record stays `ISSUER_IDENTITY_EVIDENCE_PENDING_AUTHENTICATION`, the authentication/approval/scoring flags remain false, and `authorize_identity_for_scoring` always rejects. This is an approval *review contract*, NOT a completed approval or an ingestible authorization. Existing `EtfFact` ingestion, strict labelled-ISIN parser, fetching flags and scoring logic are unchanged.
+
+Offline negative tests: `tests/test_etf_nippon_identity_approval.py`; run with the existing staging, NSE comparison and preflight suites. The new tests have not yet been executed in the user's Windows environment.

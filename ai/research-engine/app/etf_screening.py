@@ -97,6 +97,34 @@ def screening_evidence(store, key, selected, candidate, *, now):
             'holdings_coverage': str(coverage['coverage']) if coverage['coverage'] is not None else None}
 
 
+def recommendation_evidence_gaps(candidates):
+    """Diagnostic counts for research opportunities, not an alternate buy gate.
+
+    Each missing count is independently assessed against the source-backed
+    screening metrics. The categories overlap: one ETF may lack all of them.
+    The authoritative scoring and peer-ranking decisions remain unchanged.
+    """
+    selected = [c for c in candidates if c.get('recommendation') in
+                ('OPPORTUNITY', 'STRONG_OPPORTUNITY') and c.get('rank') is not None]
+    required = ('expense_ratio', 'aum', 'tracking_error', 'tracking_difference',
+                'bid_ask_spread')
+    missing = {}
+    for metric in required:
+        missing[metric] = sum(
+            (c.get('screening_metrics') or {}).get(metric, {}).get('quality') != 'VALID'
+            or (c.get('screening_metrics') or {}).get(metric, {}).get('value') is None
+            for c in selected)
+    entry_ready = sum((c.get('entry_assessment') or {}).get('classification') in
+                      ('FAVORABLE_ENTRY_ZONE', 'NEUTRAL_WAIT', 'EXTENDED_AVOID_CHASING')
+                      for c in selected)
+    return {
+        'screening_opportunities': len(selected),
+        'missing_verified_metrics': missing,
+        'entry_assessed': entry_ready,
+        'entry_insufficient_evidence': len(selected) - entry_ready,
+    }
+
+
 def screen_page(payload, *, filters=None, search='', sort='symbol', descending=False, page=1, page_size=25):
     if page < 1 or not 1 <= page_size <= 100:
         raise ValueError('INVALID_PAGINATION')

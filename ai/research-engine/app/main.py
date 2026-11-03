@@ -604,10 +604,20 @@ async def etf_radar_cycle_lifecycle_status(cycle_id: UUID):
             run = _etf_owned_run(repository.persistence, str(cycle_id))
             selection = run.get('selection') or {}
             if value is not None and selection.get('scope') == 'FULL_OFFICIAL_NSE_ETF':
-                progress = repository.persistence.cycle_progress(str(cycle_id), 'BASELINE')
+                baseline = repository.persistence.cycle_progress(str(cycle_id), 'BASELINE')
+                onboarding = repository.persistence.cycle_progress(str(cycle_id), 'ETF_ONBOARD')
+                official = len(selection['universe']) if 'universe' in selection else None
+                baseline_count = sum(p.get('payload') is not None for p in baseline.values())
+                onboarding_count = sum(p.get('payload') is not None for p in onboarding.values())
+                # Both stages are persisted per instrument. The second count
+                # includes recorded history failures/unavailability: it is NOT
+                # a claim that all instruments have sufficient price history.
+                # Final rescoring/publication has no granular durable counts,
+                # so do not invent a completion percentage for that phase.
                 value = {**value, 'scope': selection['scope'], 'coverage': {
-                    'official': len(selection['universe']) if 'universe' in selection else None,
-                    'completed': sum(bool(p.get('payload')) for p in progress.values())}}
+                    'official': official, 'completed': baseline_count,
+                    'stages': {'baseline': {'completed': baseline_count, 'total': official},
+                               'onboarding': {'completed': onboarding_count, 'total': official}}}}
             return value
 
     if run_blocking is not None:

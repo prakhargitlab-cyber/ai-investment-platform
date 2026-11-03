@@ -117,6 +117,35 @@ def test_status_endpoint_rejects_unknown_and_non_etf_cycle_ids(monkeypatch, repo
     assert response.status_code == 404
 
 
+def test_status_separates_persisted_baseline_and_onboarding_counts(monkeypatch, repo):
+    """First-pass completion must not masquerade as full-cycle completion."""
+    from app.cycle_checkpoint import CandidateState
+    cycle_id = str(uuid4())
+    store = repo.persistence
+    store.create_cycle_run(cycle_id, {}, market="ETF")
+    assert store.claim_cycle_run(cycle_id, "owner")
+    store.update_cycle_run(cycle_id, "owner", selection={
+        "scope": "FULL_OFFICIAL_NSE_ETF",
+        "universe": [{"isin": "IN0000000001"}, {"isin": "IN0000000002"}],
+    })
+    store.record_cycle_progress(cycle_id, "owner", "BASELINE", "IN0000000001",
+                                CandidateState.TERMINAL_OUTCOME, payload={"outcome": "VERIFIED"})
+    store.record_cycle_progress(cycle_id, "owner", "BASELINE", "IN0000000002",
+                                CandidateState.TERMINAL_OUTCOME, payload={"outcome": "VERIFIED"})
+    store.record_cycle_progress(cycle_id, "owner", "ETF_ONBOARD", "IN0000000001",
+                                CandidateState.EVIDENCE_UNAVAILABLE,
+                                payload={"status": "SUCCESS_EMPTY"})
+
+    monkeypatch.setattr(main, "repository", repo)
+    monkeypatch.setattr(store, "opportunity_job", lambda _: {"status": "RUNNING"}, raising=False)
+    response = TestClient(fastapi_app).get(f"/api/v1/etf-radar/cycles/{cycle_id}/status")
+    assert response.status_code == 200, response.text
+    coverage = response.json()["coverage"]
+    assert coverage["official"] == 2 and coverage["completed"] == 2
+    assert coverage["stages"]["baseline"] == {"completed": 2, "total": 2}
+    assert coverage["stages"]["onboarding"] == {"completed": 1, "total": 2}
+
+
 def test_explicit_candidate_ids_skip_universe_lookup(monkeypatch, repo):
     monkeypatch.setattr(main, "repository", repo)
     fake = FakeEtfOrchestrator([])

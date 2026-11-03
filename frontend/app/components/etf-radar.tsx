@@ -79,6 +79,12 @@ export type EtfCandidate = {
   // app.etf_full_universe._classify_historical_acquisition). Never
   // affects scoring/eligibility; purely informational.
   historical_acquisition?: { status: string; reason: string | null; observations: number | null } | null;
+  document_acquisition?: {
+    status: string;
+    reason: string | null;
+    url: string;
+    facts?: Record<string, { outcome: string | null; reason: string | null }>;
+  } | null;
   // Fund quality / liquidity / cost / risk / tracking evidence, when
   // app.etf_screening.screening_evidence found fresh backing facts; a
   // metric present with quality UNAVAILABLE is shown as "--", never 0.
@@ -109,6 +115,12 @@ export type EtfCycleResult = {
   // claim that every entry is an interchangeable, single "best" pick.
   top_opportunities?: EtfCandidate[];
   excluded_by_reason: Record<string, number>;
+  recommendation_evidence?: {
+    screening_opportunities: number;
+    missing_verified_metrics: Record<string, number>;
+    entry_assessed: number;
+    entry_insufficient_evidence: number;
+  };
 };
 
 function factorByName(result: EtfRuleEngineResult | null, name: string): EtfFactorResult | undefined {
@@ -268,6 +280,18 @@ export function EtfRadarCard({ item }: { item: EtfCandidate }) {
           {item.positive_signals?.length ? <span className="signal-positive">+ {item.positive_signals.join(", ")}</span> : null}
           {item.negative_signals?.length ? <span className="signal-negative"> − {item.negative_signals.join(", ")}</span> : null}
         </p>
+      ) : null}
+      {item.document_acquisition ? (
+        <details className="etf-fund-quality">
+          <summary>Official document acquisition · {item.document_acquisition.status.replaceAll("_", " ")}</summary>
+          <p>{item.document_acquisition.reason ?? "No additional detail recorded."}</p>
+          <p>Approved source: {item.document_acquisition.url}</p>
+          {item.document_acquisition.facts ? <ul>
+            {Object.entries(item.document_acquisition.facts).map(([metric, result]) => (
+              <li key={metric}>{metric}: {result.outcome ?? "Unavailable"}{result.reason ? ` (${result.reason})` : ""}</li>
+            ))}
+          </ul> : null}
+        </details>
       ) : null}
       {item.missing_data?.length ? <p>Missing data: {item.missing_data.join(", ")}</p> : null}
       {item.limitations?.length ? <ul>{item.limitations.map(text => <li key={text}>{text}</li>)}</ul> : null}
@@ -646,6 +670,31 @@ export function EtfRadarContent({ data, initialTab }: { data: EtfCycleResult; in
           <div><dt>Ranked ETFs</dt><dd>{data.ranked.length}</dd></div>
         </dl>
         {data.scope === "FULL_OFFICIAL_NSE_ETF" ? <p>Complete official NSE snapshot assessed. Rankings compare verified peers only; missing peer classification cannot produce a buy shortlist.</p> : null}
+        {data.recommendation_evidence ? (
+          <section aria-label="Recommendation evidence readiness">
+            <h3>Evidence still needed for actionable research</h3>
+            <p>
+              {data.recommendation_evidence.screening_opportunities} research opportunities were ranked,
+              but a screening rank is not a buy or entry recommendation. These evidence gaps can overlap
+              across ETFs and do not alter the underlying rule-engine results.
+            </p>
+            <dl className="radar-progress-counters">
+              <div><dt>Entry conditions verified</dt><dd>{data.recommendation_evidence.entry_assessed} / {data.recommendation_evidence.screening_opportunities}</dd></div>
+              <div><dt>Entry evidence incomplete</dt><dd>{data.recommendation_evidence.entry_insufficient_evidence}</dd></div>
+              {[
+                ["expense_ratio", "Missing verified expense ratio"],
+                ["aum", "Missing verified AUM"],
+                ["tracking_error", "Missing verified tracking error"],
+                ["tracking_difference", "Missing verified tracking difference"],
+                ["bid_ask_spread", "Missing verified bid/ask spread"],
+              ].map(([key, label]) => (
+                <div key={key}><dt>{label}</dt><dd>{data.recommendation_evidence?.missing_verified_metrics[key] ?? "Unavailable"}</dd></div>
+              ))}
+            </dl>
+            <p>Only source-backed evidence can close these gaps. Missing facts are never treated as zero or favorable.</p>
+          </section>
+        ) : null}
+
         <EtfAnalysisPanels data={data} evaluated={evaluated} eligible={eligible} dataGaps={dataGaps} failures={failures} excluded={excluded} coveragePct={coveragePct} leaders={leaders} categories={categories} />
         {(data.universe_count ?? data.candidates.length) === 0
           ? <p role="alert">No ETF instruments were evaluated. ETF universe setup or discovery needs attention.</p>
@@ -892,7 +941,7 @@ type EtfActiveCycle = {
   updatedAt: string | null;
   errorCode: string | null;
   pollError: boolean;
-  coverage?: { official: number | null; completed: number };
+  coverage?: { official: number | null; completed: number; stages?: { baseline: { completed: number; total: number | null }; onboarding: { completed: number; total: number | null } } };
 };
 
 // Response shape of GET /api/v1/etf-radar/preflight (app/etf_ingestion.py's
@@ -993,7 +1042,7 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
     if (!cycleId) return;
     let active = true;
     const poll = () => {
-      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string; coverage?: { official: number | null; completed: number } }>(
+      request<{ status: string; updated_at?: string; created_at?: string; error_code?: string; coverage?: NonNullable<EtfActiveCycle["coverage"]> }>(
         `/api/v1/etf-radar/cycles/${cycleId}/status`
       )
         .then((value) => {
@@ -1113,9 +1162,21 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
   };
   // Live counts come only from this cycle's durable official-snapshot checkpoints.
   const terminalData = activeCycle?.status === "COMPLETED" && data?.cycle_id === activeCycle.cycleId ? data : null;
+  // The live status endpoint reports only BASELINE completion, not ETF_ONBOARD
+  // history ingestion, final scoring, or publication. Never pass that fraction
+  // as overall progress: 359/359 first-pass outcomes can precede minutes of work.
+  const firstPassOfficial = activeCycle?.coverage?.official ?? null;
+  const firstPassCompleted = activeCycle?.coverage?.stages?.baseline?.completed
+    ?? activeCycle?.coverage?.completed ?? null;
+  const historyOnboarded = activeCycle?.coverage?.stages?.onboarding?.completed ?? null;
   const counters: RadarProgressCounter[] = !terminalData ? (activeCycle?.coverage ? [
-    { label: "Official NSE universe", value: activeCycle.coverage.official },
-    { label: "First-pass outcomes", value: activeCycle.coverage.completed },
+    { label: "Official NSE ETF universe", value: firstPassOfficial },
+    { label: "First-pass processed (not final evaluations)", value: firstPassCompleted },
+    { label: "First-pass remaining", value: firstPassOfficial != null && firstPassCompleted != null
+        ? Math.max(firstPassOfficial - firstPassCompleted, 0) : null },
+    { label: "Historical onboarding recorded (including failures)", value: historyOnboarded },
+    { label: "Historical onboarding remaining", value: firstPassOfficial != null && historyOnboarded != null
+        ? Math.max(firstPassOfficial - historyOnboarded, 0) : null },
   ] : []) : [
     { label: "Total universe", value: terminalData.candidates.length },
     { label: "Evaluated candidates", value: terminalData.candidates.filter((c) => c.disposition === "EVALUATED").length },
@@ -1153,9 +1214,17 @@ export function EtfRadar({ roles = [] }: { roles?: string[] } = {}) {
           </button>
         </div>
         {activeCycle ? (
-          <RadarProgressPanel radarType="ETF" cycleId={activeCycle.cycleId} status={activeCycle.status}
-            startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={counters}
-            percent={null} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+          <>
+            <RadarProgressPanel radarType="ETF" cycleId={activeCycle.cycleId} status={activeCycle.status}
+              startedAt={activeCycle.startedAt} updatedAt={activeCycle.updatedAt} counters={counters}
+              percent={null} errorCode={activeCycle.errorCode} pollError={activeCycle.pollError} />
+            {running ? <p className="etf-coverage-caveat">
+              First-pass and historical onboarding are separate persisted stages. A recorded onboarding
+              outcome may be successful, insufficient, or failed; it does not mean usable history was acquired.
+              Final scoring, peer ranking and publication follow both stages. Overall progress remains
+              indeterminate because those final stages have no trustworthy instrument counters.
+            </p> : null}
+          </>
         ) : null}
       </Card>
       {roles.includes("ADMIN") ? (

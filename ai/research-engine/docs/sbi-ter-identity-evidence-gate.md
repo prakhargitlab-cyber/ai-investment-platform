@@ -66,3 +66,25 @@ No official identity PDF URL has been independently authenticated in the
 available material as of this implementation. This milestone implements
 the strict, inspectable evidence-discovery primitive, **not** source-backed
 ETF expense ratio publication.
+
+
+## Produce a real, bounded NSDL-code inventory for issuer review
+
+From the project root (this is **one intentional live SBI workbook download**,
+not the complete 359-ETF cycle):
+
+```powershell
+Set-Location "C:\workspace\ai-investment-platform\ai\research-engine"
+& "..\..\.venv\Scripts\python.exe" -m app.sbi_ter_live_smoke --include-staged-schemes
+```
+
+Output now lists the actual scheme code and published scheme name from the
+fresh, hash-recorded official workbook. Each row deliberately reports
+`isin: null`, `identity_verified: false` and
+`canonical_instrument_id: null`. Names are only search aids for an
+independent, authoritative crosswalk; they are **never join keys**.
+Do not copy these names into a manufactured identity mapping.
+
+The default `python -m app.sbi_ter_live_smoke` output remains compact.
+Neither command alters a production DB, requires a reviewer identity record,
+or starts a scheduled/full-universe run.

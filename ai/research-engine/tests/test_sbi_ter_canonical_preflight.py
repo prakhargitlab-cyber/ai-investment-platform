@@ -14,8 +14,8 @@ from app.sbi_ter_nse_circular_review import (
 NOW = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
 ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER = UUID("22222222-2222-4222-8222-222222222222")
-ISIN = "INF200KA1FS1"  # Example candidate only: not a scheme-code crosswalk
-SYMBOL = "SBINIFTY50"
+ISIN = "INF999999999"  # Synthetic test ISIN, not a real approved mapping
+SYMBOL = "TESTETF"
 NSE_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
 
@@ -105,7 +105,7 @@ def test_absent_canonical_is_missing_not_approved():
     [canonical(assetType="EQUITY")],
     [canonical(), canonical(globalInstrumentId=str(OTHER))],
     [canonical(globalInstrumentId="not-uuid")],
-    [canonical(), canonical(isin="INF999999999")],
+    [canonical(), canonical(isin="INF888888888")],
 ])
 def test_bad_canonical_rows_fail_closed(rows):
     assert result(canonical_rows=rows).status == "CONFLICT"
@@ -113,7 +113,7 @@ def test_bad_canonical_rows_fail_closed(rows):
 
 @pytest.mark.parametrize("listings,status", [
     ([], "MISSING_NSE_LISTING"),
-    ([listing(isin="INF999999999")], "CONFLICT"),
+    ([listing(isin="INF888888888")], "CONFLICT"),
     ([listing(symbol="SBIOTHER")], "CONFLICT"),
     ([listing(instrument_id=OTHER)], "CONFLICT"),
     ([listing(), listing(instrument_id=OTHER)], "CONFLICT"),

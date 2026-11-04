@@ -188,7 +188,8 @@ class EtfAcquisitionService:
 
     def acquire_official_document(self, profile: EtfResearchProfile, document: ResearchDocument, metric: EtfMetric):
         """Acquire one authorized metric; unsupported or unverified inputs fail closed."""
-        if metric not in {EtfMetric.EXPENSE_RATIO, EtfMetric.AUM}:
+        if metric not in {EtfMetric.EXPENSE_RATIO, EtfMetric.AUM,
+                          EtfMetric.TRACKING_ERROR, EtfMetric.TRACKING_DIFFERENCE}:
             return self._record(profile.instrument_id, metric, "OFFICIAL_DOCUMENT", outcome=Outcome.NOT_IMPLEMENTED,
                 reason="NO_PROVEN_OFFICIAL_FIELD_PARSER")
         from app.etf_document_parser import verified_scheme_section, parse_metric

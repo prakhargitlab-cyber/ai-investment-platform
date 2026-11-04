@@ -94,6 +94,7 @@ def preflight_sbi_candidates(
             and (item.get("primaryExchange") or item.get("exchange")) == "NSE"
         )]
         uuid = None
+        listing_source_url = None
         if len(relevant) != 1 or len(exact) != 1:
             status = "MISSING_CANONICAL_IDENTITY" if not relevant else "CONFLICT"
             reason = "CANONICAL_PAIR_ABSENT" if not relevant else "CANONICAL_IDENTITY_COLLISION_OR_INACTIVE"
@@ -141,19 +142,13 @@ def preflight_sbi_candidates(
                             status, reason = (
                                 "VERIFIED_CANONICAL_CANDIDATE", "FRESH_OFFICIAL_NSE_LISTING_MATCH"
                             )
+                            listing_source_url = provenance.source_url
         rows.append(SbiCanonicalPreflightRow(
             nsdl_scheme_code=code, isin=isin, nse_symbol=symbol,
             status=status, canonical_instrument_id=uuid,
             reason=reason,
-            nse_listing_source_url=(
-                exact_listings[0].provenance.source_url
-                if uuid is not None and "exact_listings" in locals()
-                and status == "VERIFIED_CANONICAL_CANDIDATE" else None
-            ),
+            nse_listing_source_url=listing_source_url,
         ))
-        # Avoid leaking the previous candidate's local binding.
-        if "exact_listings" in locals():
-            del exact_listings
     return SbiCanonicalPreflightReport(
         status="REVIEW_ONLY_CANONICAL_PREFLIGHT",
         rows=tuple(sorted(rows, key=lambda item: item.nsdl_scheme_code)),

@@ -10,10 +10,11 @@ from app.etf_readiness import (
     evaluate_etf_readiness, is_etf_ready_for_analysis,
 )
 from app.etf_evidence import (
-    EtfFact, EtfNavObservation, EtfListing, EtfProvenance,
+    EtfFact, EtfNavObservation, EtfHoldingsSnapshot, EtfListing, EtfProvenance,
     EtfAcquisitionAttempt as EtfAttempt, EtfAcquisitionOutcome as Outcome,
     EtfAuthority, EtfMetric
 )
+from app.models import EtfHolding
 from app.persistence import SqliteResearchPersistence
 from app.models import DailyMarketBar, SourceMode
 
@@ -662,3 +663,183 @@ class TestEtfReadinessNavAccessor:
         nav_status = next(s for s in statuses if s.requirement == "NAV")
         assert nav_status.status == EtfReadinessStatus.READY_FRESH
         assert nav_status.provider == "NSE"
+
+
+class TestEtfReadinessHoldingsAccessor:
+    """UNDERLYING_HOLDINGS is persisted via the dedicated EtfHoldingsSnapshot
+    evidence model (store.etf_holdings), not the generic EtfFact model
+    (store.etf_facts) -- these tests prove readiness reads holdings from the
+    correct accessor, paralleling the NAV accessor tests above."""
+
+    ID2 = UUID(int=2)
+
+    def _minimal_mandatory_evidence(self, store):
+        listing = EtfListing(instrument_id=ID, isin="IN0000000001", symbol="NIFTYBEES",
+            name="Nifty BeES ETF", underlying_reference="Nifty 50", provenance=provenance())
+        store.save_etf_evidence(listing)
+        price = EtfFact(instrument_id=ID, metric=EtfMetric.MARKET_PRICE, value=Decimal("100"), unit="INR",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(price)
+        volume = EtfFact(instrument_id=ID, metric=EtfMetric.TRADING_VOLUME, value=Decimal("500000"), unit="shares",
+            as_of_date=NOW.date(), provenance=provenance(provider="YAHOO_FINANCE"))
+        store.save_etf_evidence(volume)
+
+    def _make_holding(self, instrument_id, as_of_date, *, weight=Decimal("10.5"), provider="TEST_AMC"):
+        return EtfHolding(etf_instrument_id=instrument_id, constituent_name="Reliance Industries",
+            constituent_isin="INE002A01018", weight_percentage=weight, as_of_date=as_of_date,
+            source_provider=provider)
+
+    def _make_snapshot(self, instrument_id, as_of_date, holdings, *, provider="TEST_AMC"):
+        return EtfHoldingsSnapshot(instrument_id=instrument_id, as_of_date=as_of_date,
+            provenance=provenance(provider=provider, source_type="AMC_FACTSHEET",
+                authority=EtfAuthority.OFFICIAL_FUND),
+            holdings=holdings)
+
+    # --- Required: No holdings snapshot → MISSING ---
+    def test_no_holdings_snapshot_reports_missing(self, store):
+        """No holdings snapshot at all reports MISSING (supporting, non-blocking)."""
+        self._minimal_mandatory_evidence(store)
+        statuses, summary = evaluate_etf_readiness(store, ID)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.MISSING
+        assert h.role == "SUPPORTING"
+        assert summary.ready_for_analysis is True  # supporting, non-blocking
+
+    # --- Required: Valid fresh holdings snapshot → READY_FRESH ---
+    def test_fresh_holdings_snapshot_reports_ready_fresh(self, store):
+        """A fresh holdings snapshot (within 35-day window) reports READY_FRESH."""
+        self._minimal_mandatory_evidence(store)
+        as_of = NOW.date()
+        holding = self._make_holding(ID, as_of)
+        snapshot = self._make_snapshot(ID, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.READY_FRESH
+        assert h.as_of_date == as_of
+        assert h.provider == "TEST_AMC"
+        assert h.freshness == "FRESH"
+
+    # --- Required: Valid stale holdings snapshot → READY_STALE ---
+    def test_stale_holdings_snapshot_reports_ready_stale(self, store):
+        """A holdings snapshot older than 35 days reports READY_STALE, never MISSING."""
+        self._minimal_mandatory_evidence(store)
+        as_of = (NOW - timedelta(days=40)).date()
+        holding = self._make_holding(ID, as_of)
+        snapshot = self._make_snapshot(ID, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.READY_STALE
+        assert h.freshness == "STALE"
+
+    # --- Required: Future-dated snapshot → fail closed ---
+    def test_future_dated_holdings_snapshot_reports_technical_failure(self, store):
+        """A future-dated holdings snapshot fails closed as TECHNICAL_FAILURE."""
+        self._minimal_mandatory_evidence(store)
+        as_of = (NOW + timedelta(days=5)).date()
+        holding = self._make_holding(ID, as_of)
+        snapshot = self._make_snapshot(ID, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.TECHNICAL_FAILURE
+        assert h.reason == "FUTURE_DATED_HOLDINGS_SNAPSHOT"
+
+    # --- Required: Snapshot for another ETF must not satisfy readiness ---
+    def test_other_etf_holdings_do_not_satisfy_readiness(self, store):
+        """Holdings snapshot for ID2 must NOT satisfy readiness for ID."""
+        self._minimal_mandatory_evidence(store)
+        as_of = NOW.date()
+        holding = self._make_holding(self.ID2, as_of)
+        snapshot = self._make_snapshot(self.ID2, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.MISSING
+
+    # --- Required: Empty snapshot → MISSING (conservative) ---
+    def test_empty_holdings_snapshot_reports_missing(self, store):
+        """A snapshot with zero holdings is not usable evidence."""
+        self._minimal_mandatory_evidence(store)
+        snapshot = self._make_snapshot(ID, NOW.date(), [])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.MISSING
+        assert h.reason == "EMPTY_HOLDINGS_SNAPSHOT"
+
+    # --- Required: Holdings without weights must not satisfy CONCENTRATION ---
+    def test_holdings_without_weights_do_not_satisfy_concentration(self, store):
+        """Holdings that lack weight_percentage must not make CONCENTRATION ready."""
+        self._minimal_mandatory_evidence(store)
+        as_of = NOW.date()
+        holding = EtfHolding(etf_instrument_id=ID, constituent_name="Reliance Industries",
+            constituent_isin="INE002A01018", weight_percentage=None, as_of_date=as_of,
+            source_provider="TEST_AMC")
+        snapshot = self._make_snapshot(ID, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        conc = next(s for s in statuses if s.requirement == "CONCENTRATION")
+        assert conc.status == EtfReadinessStatus.MISSING
+        assert conc.reason == "HOLDINGS_LACK_WEIGHTS"
+        # But UNDERLYING_HOLDINGS itself IS ready (holdings exist, even without weights)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.READY_FRESH
+
+    # --- Required: Holdings must not change mandatory readiness ---
+    def test_holdings_do_not_affect_mandatory_readiness(self, store):
+        """Adding holdings does not change mandatory MARKET_PRICE/VOLUME/IDENTITY."""
+        self._minimal_mandatory_evidence(store)
+        as_of = NOW.date()
+        holding = self._make_holding(ID, as_of)
+        snapshot = self._make_snapshot(ID, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, summary = evaluate_etf_readiness(store, ID)
+        assert summary.mandatory_total == 3
+        assert summary.mandatory_ready == 3
+        assert summary.ready_for_analysis is True
+
+    # --- Required: No duplicate UNDERLYING_HOLDINGS status ---
+    def test_no_duplicate_underlying_holdings_in_statuses(self, store):
+        """UNDERLYING_HOLDINGS must appear exactly once in the status list."""
+        self._minimal_mandatory_evidence(store)
+        as_of = NOW.date()
+        holding = self._make_holding(ID, as_of)
+        snapshot = self._make_snapshot(ID, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        holdings_statuses = [s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS"]
+        assert len(holdings_statuses) == 1
+
+    # --- Regression: holdings found via etf_holdings, not etf_facts ---
+    def test_holdings_found_with_no_corresponding_etf_facts_row(self, store):
+        """This is the regression case: a persisted EtfHoldingsSnapshot must be
+        found via store.etf_holdings even though no row for UNDERLYING_HOLDINGS
+        can exist in etf_fact_observations (EtfFact rejects this metric).
+        Proves readiness no longer silently misses holdings evidence."""
+        self._minimal_mandatory_evidence(store)
+
+        # Confirm EtfFact rejects UNDERLYING_HOLDINGS
+        with pytest.raises(ValueError, match="holdings"):
+            EtfFact(instrument_id=ID, metric=EtfMetric.UNDERLYING_HOLDINGS,
+                value=Decimal("1"), unit="count", as_of_date=NOW.date(), provenance=provenance())
+
+        # Persist via the correct model
+        as_of = NOW.date()
+        holding = self._make_holding(ID, as_of)
+        snapshot = self._make_snapshot(ID, as_of, [holding])
+        store.save_etf_evidence(snapshot)
+
+        statuses, _ = evaluate_etf_readiness(store, ID)
+        h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
+        assert h.status == EtfReadinessStatus.READY_FRESH
+        assert h.provider == "TEST_AMC"

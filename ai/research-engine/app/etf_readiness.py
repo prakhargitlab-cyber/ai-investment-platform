@@ -368,6 +368,59 @@ def _check_momentum_ready(store: SqliteResearchPersistence, instrument_id, *, no
     return _derived_metric_status("INDEX_MOMENTUM", metrics.get(EtfMetricId.MOMENTUM_50_200), now=now or datetime.now(timezone.utc))
 
 
+def _check_holdings_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
+    """UNDERLYING_HOLDINGS is persisted via the dedicated EtfHoldingsSnapshot
+    evidence model (store.etf_holdings), not the generic EtfFact model
+    (store.etf_facts) that _check_supporting_ready reads -- route it
+    separately so acquired holdings snapshots are actually seen.
+
+    An empty snapshot (zero holdings) is conservatively treated as MISSING:
+    a document that yielded no position rows does not constitute usable
+    holdings evidence.
+    """
+    snapshots = store.etf_holdings(instrument_id)
+    if not snapshots:
+        return EtfRequirementStatus(
+            requirement="UNDERLYING_HOLDINGS",
+            role="SUPPORTING",
+            applicability="APPLICABLE",
+            status=EtfReadinessStatus.MISSING,
+        )
+    snapshot = snapshots[0]
+    if not snapshot.holdings:
+        return EtfRequirementStatus(
+            requirement="UNDERLYING_HOLDINGS",
+            role="SUPPORTING",
+            applicability="APPLICABLE",
+            status=EtfReadinessStatus.MISSING,
+            reason="EMPTY_HOLDINGS_SNAPSHOT",
+        )
+    now = now or datetime.now(timezone.utc)
+    freshness = etf_freshness(snapshot, EtfMetric.UNDERLYING_HOLDINGS, now=now)
+    if freshness == "FUTURE_DATED":
+        return EtfRequirementStatus(
+            requirement="UNDERLYING_HOLDINGS",
+            role="SUPPORTING",
+            applicability="APPLICABLE",
+            status=EtfReadinessStatus.TECHNICAL_FAILURE,
+            as_of_date=snapshot.as_of_date,
+            freshness=freshness,
+            reason="FUTURE_DATED_HOLDINGS_SNAPSHOT",
+        )
+    return EtfRequirementStatus(
+        requirement="UNDERLYING_HOLDINGS",
+        role="SUPPORTING",
+        applicability="APPLICABLE",
+        status=EtfReadinessStatus.READY_FRESH if freshness == "FRESH"
+               else EtfReadinessStatus.READY_STALE if freshness == "STALE"
+               else EtfReadinessStatus.MISSING,
+        evidence_id=snapshot.provenance.provider,
+        provider=snapshot.provenance.provider,
+        as_of_date=snapshot.as_of_date,
+        freshness=freshness,
+    )
+
+
 def _check_concentration_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     """CONCENTRATION is derived from the same UNDERLYING_HOLDINGS snapshot and
     freshness policy already used elsewhere -- not a separate evidence model."""
@@ -456,6 +509,12 @@ def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id, *, n
             # EtfMetric(metric)/_check_supporting_ready branch below reads --
             # route it separately rather than falling through that branch.
             statuses.append(_check_nav_ready(store, instrument_id, now=now))
+            continue
+        if metric == "UNDERLYING_HOLDINGS":
+            # UNDERLYING_HOLDINGS uses EtfHoldingsSnapshot / store.etf_holdings,
+            # not EtfFact (which rejects this metric with ValueError). Route it
+            # through the dedicated holdings check, paralleling NAV above.
+            statuses.append(_check_holdings_ready(store, instrument_id, now=now))
             continue
         try:
             m = EtfMetric(metric)

@@ -20,10 +20,10 @@ from app.sbi_ter_workbook_adapter import AdapterOutcome
 MAX_NSE_CIRCULAR_BYTES = 4 * 1024 * 1024
 MAX_NSE_CIRCULAR_PAGES = 20
 MAX_NSE_PAGE_TEXT = 200_000
-_ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]\\Z")
-_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9._-]*\\Z")
-_ROW_START = re.compile(r"^\\s*\\d{1,2}\\s{2,}")
-_DATE = re.compile(r"October\\s+30\\s*,\\s*2026", re.I)
+_ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]\Z")
+_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9._-]*\Z")
+_ROW_START = re.compile(r"^\s*\d{1,2}\s{2,}")
+_DATE = re.compile(r"October\s+30\s*,\s*2026", re.I)
 
 
 @dataclass(frozen=True)
@@ -108,9 +108,9 @@ def extract_nse_scheme_rows(pdf_bytes: bytes, *, claimed_source_url: str) -> tup
         raise ValueError("NSE_CIRCULAR_SOURCE_URL_NOT_REVIEWED")
     pages = _nse_pdf_pages(pdf_bytes)
     combined = "\n".join(pages)
-    if not re.search(r"Download Ref No:\\s*NSE/CML/\\s*77115", combined):
+    if not re.search(r"Download Ref No:\s*NSE/CML/\s*77115", combined):
         raise ValueError("NSE_CIRCULAR_REFERENCE_MISMATCH")
-    if not re.search(r"Change in scheme\\s+name and symbol", combined, re.I):
+    if not re.search(r"Change in scheme\s+name and symbol", combined, re.I):
         raise ValueError("NSE_CIRCULAR_SUBJECT_MISMATCH")
     if not _DATE.search(combined):
         raise ValueError("NSE_CIRCULAR_EFFECTIVE_DATE_MISSING")
@@ -120,7 +120,7 @@ def extract_nse_scheme_rows(pdf_bytes: bytes, *, claimed_source_url: str) -> tup
         for line in text.splitlines():
             if not _ROW_START.match(line):
                 continue
-            fields = re.split(r"\\s{2,}", line.strip())
+            fields = re.split(r"\s{2,}", line.strip())
             if len(fields) != 6:
                 raise ValueError("NSE_CIRCULAR_TABLE_ROW_LAYOUT_UNSUPPORTED")
             number, _old_name, new_name, isin, old_symbol, new_symbol = fields

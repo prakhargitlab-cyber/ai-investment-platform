@@ -84,3 +84,29 @@ def test_corrupt_pdf_bytes_do_not_produce_false_candidates():
 
 def test_no_evidence_is_explicitly_empty():
     assert scan("AMC scheme factsheet without labelled code or ISIN") == ()
+
+
+def test_real_but_empty_pdf_is_review_only():
+    from io import BytesIO
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    buffer = BytesIO()
+    writer.write(buffer)
+    original = buffer.getvalue()
+    result = inspect_sbi_identity_pdf(original, source_url=SOURCE)
+    assert result.pages_scanned == 1
+    assert result.candidates == ()
+    assert result.raw_pdf_sha256 == sha256(original).hexdigest()
+    assert result.identity_authenticated is False
+    assert result.eligible_for_fact_persistence is False
+
+
+def test_page_iterator_stops_at_hard_cap():
+    from app.sbi_ter_identity_document import MAX_IDENTITY_PDF_PAGES
+    with pytest.raises(ValueError, match="DOCUMENT_PAGE_LIMIT"):
+        inspect_labelled_identity_pages(
+            ("no IDs" for _ in range(MAX_IDENTITY_PDF_PAGES + 100)),
+            source_url=SOURCE, raw_pdf_sha256=HASH,
+        )

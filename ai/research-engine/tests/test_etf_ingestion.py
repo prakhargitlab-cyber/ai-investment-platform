@@ -303,7 +303,7 @@ async def test_metadata_conflict_blocks_quote_without_yahoo_fallback(repo):
     assert result["instruments"][0]["summary"]["mandatory_ready"] == 2
     cycle = run_etf_radar_cycle([META], repo.persistence, now=NOW)
     assert not cycle.ranked
-    assert result["instruments"][0]["attempts"][0]["reason"].endswith("NSE_METADATA_IDENTITY_CONFLICT")
+    assert result["instruments"][0]["attempts"][0]["reason"].startswith("NSE_METADATA_IDENTITY_CONFLICT")
     provider.collect_baseline.assert_not_called()
     # An equal-time success cannot arbitrarily win by random attempt UUID.
     tied, _ = await ingest(repo)

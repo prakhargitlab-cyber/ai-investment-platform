@@ -96,6 +96,7 @@ def market_snapshot(payload, listings, now, *, requested_symbols=None):
             raise NseContractError("AMBIGUOUS_OFFICIAL_SYMBOL")
         by_symbol[listing.symbol] = listing
     selected = {}
+    failures = {}
     for row in rows:
         # The official ETF security-list CSV (parse_nse_etf_list, above) is
         # normalized to .strip().upper() before becoming a by_symbol key.
@@ -111,24 +112,50 @@ def market_snapshot(payload, listings, now, *, requested_symbols=None):
         symbol = str(row["symbol"]).strip().upper()
         if requested_symbols is not None and symbol not in requested_symbols:
             continue
-        if symbol in selected or symbol not in by_symbol:
-            logger.warning("etf_market_snapshot_rejected symbol=%s category=%s", symbol, "UNVERIFIED_OR_DUPLICATE_MARKET_SYMBOL")
-            raise NseContractError("UNVERIFIED_OR_DUPLICATE_MARKET_SYMBOL")
-        if row["series"] != "EQ" or row["identifier"] != symbol + "EQN":
-            logger.warning("etf_market_snapshot_rejected symbol=%s category=%s", symbol, "UNSUPPORTED_NSE_LISTING")
-            raise NseContractError("UNSUPPORTED_NSE_LISTING")
+        if symbol in failures:
+            continue  # already recorded as failed, skip additional rows
+        error = None
+        if symbol in selected:
+            error = "DUPLICATE_MARKET_WATCH_SYMBOL"
+            del selected[symbol]  # can't trust either row
+        elif symbol not in by_symbol:
+            error = "UNVERIFIED_MARKET_WATCH_SYMBOL"
+        elif row["series"] != "EQ" or row["identifier"] != symbol + "EQN":
+            error = "UNSUPPORTED_NSE_LISTING"
+        if error:
+            logger.warning("etf_market_snapshot_rejected symbol=%s category=%s", symbol, error)
+            if requested_symbols is None:
+                raise NseContractError(error)
+            failures[symbol] = error
+            continue
         selected[symbol] = row
     # A missing watch row is an explicit per-instrument failure, never a fake quote.
-    return stamp, selected, {k: v for k, v in envelope.items() if k != "data"}
+    return stamp, selected, {k: v for k, v in envelope.items() if k != "data"}, failures
 
 
 def verify_metadata(meta, row):
-    if (meta.get("symbol") != row["primarySymbol"] or meta.get("isin") != row["isin"]
-            or meta.get("isETFSec") != "true" or meta.get("isDelisted") != "false"
-            or meta.get("isSuspended") != "false" or "EQ" not in meta.get("activeSeries", [])
-            or "EQ" in meta.get("tempSuspendedSeries", []) or meta.get("marketType") != "N"
-            or row.get("currency") != "INR"):
-        raise NseContractError("NSE_METADATA_IDENTITY_CONFLICT")
+    """Field-level identity verification without logging sensitive payloads.
+
+    Each mismatch category is a static, auditable label -- never a live value.
+    When multiple fields conflict, all labels are joined so the incident is
+    independently attributable to the specific source-data problems present.
+    """
+    checks = [
+        (meta.get("symbol") != row["primarySymbol"], "SYMBOL"),
+        (meta.get("isin") != row["isin"], "ISIN"),
+        (meta.get("isETFSec") != "true", "NOT_ETF"),
+        (meta.get("isDelisted") != "false", "DELISTED"),
+        (meta.get("isSuspended") != "false", "SUSPENDED"),
+        ("EQ" not in meta.get("activeSeries", []), "INACTIVE_SERIES"),
+        ("EQ" in meta.get("tempSuspendedSeries", []), "TEMP_SUSPENDED"),
+        (meta.get("marketType") != "N", "MARKET_TYPE"),
+        (row.get("currency") != "INR", "CURRENCY"),
+    ]
+    mismatches = [label for failed, label in checks if failed]
+    if mismatches:
+        category = "NSE_METADATA_IDENTITY_CONFLICT:" + "+".join(mismatches)
+        logger.warning("etf_metadata_identity_conflict fields=%s", "+".join(mismatches))
+        raise NseContractError(category)
 
 
 def evidence(profile, metric, row, stamp, envelope, metadata, now):

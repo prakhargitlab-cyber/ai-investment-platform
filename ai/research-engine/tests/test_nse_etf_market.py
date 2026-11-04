@@ -31,7 +31,8 @@ PROFILE = EtfResearchProfile(instrument_id=KEY, fund_id=KEY, fund_name="Silver E
 
 
 def test_session_and_nav_dates_provenance_totals_and_idempotency():
-    stamp, rows, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, rows, envelope, failures = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    assert failures == {}
     verify_metadata(META, CANONICAL)
     assert stamp.astimezone(timezone.utc).hour == 10
     price = evidence(PROFILE, EtfMetric.MARKET_PRICE, rows["SILVERBEES"], stamp, envelope, META, NOW)
@@ -53,24 +54,45 @@ def test_invalid_values_rejected(value):
         numeric(value)
 
 
-@pytest.mark.parametrize("change", [{"isin": "INF000000000"}, {"symbol": "OTHER"},
-    {"isETFSec": "false"}, {"isDelisted": "true"}, {"isSuspended": "true"},
-    {"activeSeries": []}, {"tempSuspendedSeries": ["EQ"]}, {"marketType": "X"}])
-def test_metadata_cannot_reassign_identity(change):
-    with pytest.raises(ValueError, match="IDENTITY_CONFLICT"):
+@pytest.mark.parametrize("change,expected_field", [
+    ({"isin": "INF000000000"}, "ISIN"),
+    ({"symbol": "OTHER"}, "SYMBOL"),
+    ({"isETFSec": "false"}, "NOT_ETF"),
+    ({"isDelisted": "true"}, "DELISTED"),
+    ({"isSuspended": "true"}, "SUSPENDED"),
+    ({"activeSeries": []}, "INACTIVE_SERIES"),
+    ({"tempSuspendedSeries": ["EQ"]}, "TEMP_SUSPENDED"),
+    ({"marketType": "X"}, "MARKET_TYPE"),
+])
+def test_metadata_cannot_reassign_identity(change, expected_field):
+    with pytest.raises(ValueError, match=f"NSE_METADATA_IDENTITY_CONFLICT:{expected_field}$"):
         verify_metadata(META | change, CANONICAL)
 
 
-@pytest.mark.parametrize("case", ["duplicate", "unknown", "series", "identifier", "future", "undated", "empty"])
-def test_unverified_market_snapshot_rejected(case):
+@pytest.mark.parametrize("case,expected_code", [
+    ("duplicate", "DUPLICATE_MARKET_WATCH_SYMBOL"),
+    ("unknown", "UNVERIFIED_MARKET_WATCH_SYMBOL"),
+    ("series", "UNSUPPORTED_NSE_LISTING"),
+    ("identifier", "UNSUPPORTED_NSE_LISTING"),
+    ("future", "FUTURE_NSE_SESSION"),
+    ("empty", "EMPTY_NSE_MARKET_SNAPSHOT"),
+])
+def test_unverified_market_snapshot_rejected(case, expected_code):
     payload = deepcopy(PAYLOAD)
     if case == "duplicate": payload["data"]["data"].append(dict(ROW))
     if case == "unknown": payload["data"]["data"][0]["symbol"] = "OTHER"
     if case == "series": payload["data"]["data"][0]["series"] = "BE"
     if case == "identifier": payload["data"]["data"][0]["identifier"] = "OTHER"
     if case == "future": payload["data"]["timestamp"] = "10-Oct-2026 16:00:00"
-    if case == "undated": payload["data"]["timestamp"] = ""
     if case == "empty": payload["data"]["data"] = []
+    with pytest.raises(ValueError, match=expected_code):
+        market_snapshot(payload, LISTINGS, NOW)
+
+
+def test_undated_market_snapshot_raises():
+    """Malformed timestamp raises ValueError from date parsing, not NseContractError."""
+    payload = deepcopy(PAYLOAD)
+    payload["data"]["timestamp"] = ""
     with pytest.raises(ValueError):
         market_snapshot(payload, LISTINGS, NOW)
 
@@ -91,22 +113,33 @@ def test_unrelated_duplicate_or_unknown_symbol_elsewhere_in_the_shared_feed_does
         "identifier": "UNRELATEDETFEQN", "lastPrice": 50, "totalTradedVolume": 1000, "nav": 49})
     payload["data"]["data"].append({"symbol": "UNRELATEDETF", "series": "EQ",  # duplicate, unrelated
         "identifier": "UNRELATEDETFEQN", "lastPrice": 51, "totalTradedVolume": 900, "nav": 49.2})
-    stamp, rows, envelope = market_snapshot(payload, LISTINGS, NOW, requested_symbols={"SILVERBEES"})
+    stamp, rows, envelope, failures = market_snapshot(payload, LISTINGS, NOW, requested_symbols={"SILVERBEES"})
     assert set(rows) == {"SILVERBEES"}
+    assert failures == {}  # unrelated symbols are skipped, not failed
 
 
-@pytest.mark.parametrize("case", ["duplicate", "unknown", "series", "identifier"])
-def test_requested_instruments_still_get_strict_checks_when_scoped(case):
+@pytest.mark.parametrize("case,expected_code", [
+    ("duplicate", "DUPLICATE_MARKET_WATCH_SYMBOL"),
+    ("unknown", "UNVERIFIED_MARKET_WATCH_SYMBOL"),
+    ("series", "UNSUPPORTED_NSE_LISTING"),
+    ("identifier", "UNSUPPORTED_NSE_LISTING"),
+])
+def test_requested_instruments_still_get_strict_checks_when_scoped(case, expected_code):
     # requested_symbols must never weaken validation for the instrument(s)
     # actually being requested -- only unrelated rows are skipped.
+    # Per-instrument failures are now collected in the failures dict rather
+    # than raising, so the instrument is excluded from selected rows.
     payload = deepcopy(PAYLOAD)
     if case == "duplicate": payload["data"]["data"].append(dict(ROW))
     if case == "unknown": payload["data"]["data"][0]["symbol"] = "OTHER"
     if case == "series": payload["data"]["data"][0]["series"] = "BE"
     if case == "identifier": payload["data"]["data"][0]["identifier"] = "OTHER"
+    failed_symbol = "SILVERBEES" if case != "unknown" else "OTHER"
     requested = {"SILVERBEES"} if case != "unknown" else {"SILVERBEES", "OTHER"}
-    with pytest.raises(ValueError):
-        market_snapshot(payload, LISTINGS, NOW, requested_symbols=requested)
+    stamp, rows, envelope, failures = market_snapshot(payload, LISTINGS, NOW, requested_symbols=requested)
+    assert failed_symbol in failures
+    assert failures[failed_symbol] == expected_code
+    assert failed_symbol not in rows  # failed symbol must not appear in selected
 
 
 @pytest.mark.parametrize("live_symbol", ["silverbees", " SILVERBEES", "SILVERBEES "])
@@ -127,12 +160,25 @@ def test_live_feed_symbol_case_or_whitespace_does_not_block_a_verified_instrumen
     payload = deepcopy(PAYLOAD)
     payload["data"]["data"][0]["symbol"] = live_symbol
     payload["data"]["data"][0]["identifier"] = "SILVERBEESEQN"
-    stamp, rows, envelope = market_snapshot(payload, LISTINGS, NOW)
+    stamp, rows, envelope, failures = market_snapshot(payload, LISTINGS, NOW)
     assert "SILVERBEES" in rows
+    assert failures == {}
+
+
+def test_metadata_currency_mismatch_reports_currency_field():
+    with pytest.raises(ValueError, match="NSE_METADATA_IDENTITY_CONFLICT:CURRENCY$"):
+        verify_metadata(META, CANONICAL | {"currency": "USD"})
+
+
+def test_metadata_multiple_mismatches_reports_all_fields():
+    """Multiple simultaneous mismatches must all appear in the error code."""
+    bad_meta = META | {"symbol": "OTHER", "isin": "INF000000000", "isDelisted": "true"}
+    with pytest.raises(ValueError, match=r"NSE_METADATA_IDENTITY_CONFLICT:SYMBOL\+ISIN\+DELISTED$"):
+        verify_metadata(bad_meta, CANONICAL)
 
 
 def test_zero_volume_does_not_make_carried_price_fresh():
-    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, _, envelope, _ = market_snapshot(PAYLOAD, LISTINGS, NOW)
     row = ROW | {"totalTradedVolume": 0}
     assert evidence(PROFILE, EtfMetric.MARKET_PRICE, row, stamp, envelope, META, NOW) is None
     assert evidence(PROFILE, EtfMetric.TRADING_VOLUME, row, stamp, envelope, META, NOW).value == 0
@@ -146,13 +192,13 @@ def test_zero_nav_raises_unavailable_not_invalid(raw):
     as INVALID_NSE_NUMBER (the old behavior), and it must NOT produce an
     EtfNavObservation.  evidence() raises NSE_NAV_ZERO_UNAVAILABLE so the
     caller can record SUCCESS_EMPTY with a distinct audit reason."""
-    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, _, envelope, _ = market_snapshot(PAYLOAD, LISTINGS, NOW)
     with pytest.raises(ValueError, match="NSE_NAV_ZERO_UNAVAILABLE"):
         evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": raw}, stamp, envelope, META, NOW)
 
 
 def test_positive_nav_produces_observation():
-    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, _, envelope, _ = market_snapshot(PAYLOAD, LISTINGS, NOW)
     obs = evidence(PROFILE, EtfMetric.NAV, ROW, stamp, envelope, META, NOW)
     assert obs is not None
     assert obs.nav == Decimal("206.2542")
@@ -162,7 +208,7 @@ def test_positive_nav_produces_observation():
 @pytest.mark.parametrize("raw", [None, "", "-"])
 def test_absent_nav_returns_none(raw):
     """None, empty string and dash are legitimately absent — no observation."""
-    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, _, envelope, _ = market_snapshot(PAYLOAD, LISTINGS, NOW)
     assert evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": raw}, stamp, envelope, META, NOW) is None
 
 
@@ -170,7 +216,7 @@ def test_absent_nav_returns_none(raw):
 def test_malformed_nav_raises_invalid_nse_number(raw):
     """Negative, nonfinite, boolean and malformed NAV values must still raise
     INVALID_NSE_NUMBER — only exact zero gets the unavailable classification."""
-    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, _, envelope, _ = market_snapshot(PAYLOAD, LISTINGS, NOW)
     with pytest.raises(ValueError, match="INVALID_NSE_NUMBER"):
         evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": raw}, stamp, envelope, META, NOW)
 
@@ -179,7 +225,7 @@ def test_zero_nav_does_not_affect_market_price_or_volume():
     """Zero-NAV interception is NAV-specific. Market price and volume must
     be completely unaffected — zero volume is valid, zero price is rejected
     as INVALID_NSE_NUMBER (not NSE_NAV_ZERO_UNAVAILABLE)."""
-    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, _, envelope, _ = market_snapshot(PAYLOAD, LISTINGS, NOW)
     vol = evidence(PROFILE, EtfMetric.TRADING_VOLUME, ROW | {"totalTradedVolume": 0}, stamp, envelope, META, NOW)
     assert vol is not None and vol.value == 0
     with pytest.raises(ValueError, match="INVALID_NSE_NUMBER"):
@@ -187,7 +233,7 @@ def test_zero_nav_does_not_affect_market_price_or_volume():
 
 
 def test_absent_supporting_nav_and_future_nav_are_distinct():
-    stamp, _, envelope = market_snapshot(PAYLOAD, LISTINGS, NOW)
+    stamp, _, envelope, _ = market_snapshot(PAYLOAD, LISTINGS, NOW)
     assert evidence(PROFILE, EtfMetric.NAV, ROW | {"nav": "-"}, stamp, envelope, META, NOW) is None
     with pytest.raises(ValueError):
         evidence(PROFILE, EtfMetric.NAV, ROW, stamp, envelope | {"navDate": "10-Oct-2026"}, META, NOW)

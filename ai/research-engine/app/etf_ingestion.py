@@ -57,8 +57,8 @@ async def ingest_quotes(repository, orchestrator, rows, client, *, clock=None, f
     requested_symbols = {str(row["primarySymbol"]).strip().upper() for row in rows}
     try:
         payload = await get_json(client, MARKET_URL)
-        stamp, market_rows, envelope = market_snapshot(payload, service.discovered_listings, service.clock(),
-                                                       requested_symbols=requested_symbols)
+        stamp, market_rows, envelope, symbol_failures = market_snapshot(payload, service.discovered_listings, service.clock(),
+                                                                       requested_symbols=requested_symbols)
     except Exception as exc:
         # Never persist arbitrary exception text (HTTP errors can contain secrets).
         market_error = failure_code(exc)
@@ -72,10 +72,16 @@ async def ingest_quotes(repository, orchestrator, rows, client, *, clock=None, f
                 listing = next(item for item in service.discovered_listings if item.instrument_id == key)
                 attempts.append(await service._record_async(key, EtfMetric.IDENTITY, "NSE", [listing],
                     reason="NSE_METADATA_IDENTITY_VERIFIED"))
-                quote = market_rows[row["primarySymbol"]]
+                symbol_key = str(row["primarySymbol"]).strip().upper()
+                if symbol_key in symbol_failures:
+                    failure = symbol_failures[symbol_key]
+                elif symbol_key not in market_rows:
+                    failure = "MISSING_MARKET_WATCH_SYMBOL"
+                else:
+                    quote = market_rows[symbol_key]
             except Exception as exc:
                 failure = failure_code(exc)
-                if failure == "NSE_METADATA_IDENTITY_CONFLICT":
+                if failure.startswith("NSE_METADATA_IDENTITY_CONFLICT"):
                     attempts.append(await service._record_async(key, EtfMetric.IDENTITY, "NSE",
                         outcome=Outcome.TECHNICAL_FAILURE, reason=failure))
         profile = EtfResearchProfile(instrument_id=key, fund_id=key, fund_name=row["canonicalName"],

@@ -138,8 +138,10 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
         line = raw.strip()
         match = shared.fullmatch(line)
         if match:
-            shared_dates.add(date.fromisoformat(match[1]))
-            locators.append(index + 1)
+            # The AUM/TER shared reporting date cannot date tracking metrics.
+            if metric in (EtfMetric.AUM, EtfMetric.EXPENSE_RATIO):
+                shared_dates.add(date.fromisoformat(match[1]))
+                locators.append(index + 1)
             continue
         match = date_line.fullmatch(line)
         if match:
@@ -175,12 +177,16 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
             locators.append(index + 1)
         elif re.search(rf"\b{label}\b", line, re.I):
             raise ValueError("AMBIGUOUS_OR_UNPARSEABLE_METRIC")
-    if source.as_of_date is not None and shared_dates != {source.as_of_date}:
+    if (metric in (EtfMetric.AUM, EtfMetric.EXPENSE_RATIO)
+            and source.as_of_date is not None and shared_dates != {source.as_of_date}):
         raise ValueError("REGISTERED_REPORTING_DATE_NOT_VERIFIED")
     dates |= shared_dates
     if len(dates) > 1 or len(values) > 1 or (declarations and values):
         raise ValueError("CONFLICTING_METRIC_VALUES_OR_DATES")
     as_of = next(iter(dates), None)
+    if (metric in (EtfMetric.TRACKING_ERROR, EtfMetric.TRACKING_DIFFERENCE)
+            and values and as_of is None):
+        raise ValueError("TRACKING_REPORTING_DATE_REQUIRED")
     if as_of and (as_of > now.date() or as_of > retrieved_at.date()):
         raise ValueError("FUTURE_METRIC_REPORTING_DATE")
     if declarations:

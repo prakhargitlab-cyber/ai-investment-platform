@@ -110,7 +110,8 @@ class EtfOfficialDocumentAcquisitionPipeline:
         try:
             results = ingest_etf_facts_from_document(
                 persistence, profile, fetch_result.normalized_text,
-                document_url=source.document_url, registry=self._document_registry, clock=self._clock,
+                document_url=source.document_url, registry=self._document_registry,
+                clock=self._clock, include_tracking=True,
             )
         except ValueError as exc:
             return AcquisitionPipelineResult("FETCH_FAILED", f"INGESTION_REJECTED:{exc}", url=url)

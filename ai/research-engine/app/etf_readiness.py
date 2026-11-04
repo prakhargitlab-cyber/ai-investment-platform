@@ -116,7 +116,7 @@ def _check_identity_ready(store: SqliteResearchPersistence, instrument_id, *, no
     # quotes. Only a strictly newer successful verification clears the conflict;
     # timestamps tied by a coarse clock fail closed, independent of UUID ordering.
     checks = [a for a in store.etf_attempts(instrument_id) if a.metric == "IDENTITY" and a.provider == "NSE"]
-    conflicts = [a.attempted_at for a in checks if a.reason == "NSE_METADATA_IDENTITY_CONFLICT"]
+    conflicts = [a.attempted_at for a in checks if a.reason is not None and a.reason.startswith("NSE_METADATA_IDENTITY_CONFLICT")]
     verified = [a.attempted_at for a in checks if a.reason == "NSE_METADATA_IDENTITY_VERIFIED"
                 and a.outcome == EtfAcquisitionOutcome.SUCCESS_WITH_DATA]
     if conflicts and (not verified or max(conflicts) >= max(verified)):

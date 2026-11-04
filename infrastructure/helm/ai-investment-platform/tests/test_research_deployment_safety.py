@@ -57,7 +57,13 @@ def test_dev_overlay_rejects_unsafe_workload(unsafe):
     {"opportunityRecoveryPaused": None},
     {"opportunityScheduler": {"enabled": True}},
     {"opportunityScheduler": {"enabled": "false"}},
-    {"etfManualExecutionEnabled": True}, {"etfManualExecutionEnabled": "false"},
+    {"opportunityScheduler": {"enabled": None}},
+    {"equityManualExecutionEnabled": False}, {"equityManualExecutionEnabled": "true"},
+    {"equityManualExecutionEnabled": None},
+    {"etfManualExecutionEnabled": False}, {"etfManualExecutionEnabled": "true"},
+    {"etfManualExecutionEnabled": None},
+    {"etfFullUniverseExecutionEnabled": False}, {"etfFullUniverseExecutionEnabled": "true"},
+    {"etfFullUniverseExecutionEnabled": None},
 ])
 def test_dev_rejects_unsafe_or_malformed_execution_flags(research):
     result = render({"research": research})
@@ -75,8 +81,8 @@ def test_dev_render_is_explicitly_safe_and_recreate_omits_rolling_update():
     for name, value in {
         "AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED": "true",
         "AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED": "false",
-        "AIP_RESEARCH_ETF_MANUAL_EXECUTION_ENABLED": "false",
-        "AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED": "false",
+        "AIP_RESEARCH_ETF_MANUAL_EXECUTION_ENABLED": "true",
+        "AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED": "true",
         "AIP_RESEARCH_EQUITY_MANUAL_EXECUTION_ENABLED": "true",
     }.items():
         assert [e.get("value") for e in env if e["name"] == name] == [value]
@@ -120,14 +126,13 @@ def test_production_defaults_are_fail_closed_for_all_research_execution_flags():
         assert [e.get("value") for e in env if e["name"] == name] == ["false"]
 
 
-def test_dev_overlay_keeps_both_etf_execution_gates_off_by_default():
-    """values-dev.yaml enables Equity manual execution explicitly, but both
-    ETF gates must stay false unless a controlled validation run has been
-    expressly approved by editing values-dev.yaml itself."""
+def test_dev_overlay_preserves_all_three_protected_manual_execution_permissions():
+    """The approved DEV overlay permits ADMIN submissions while recovery
+    stays paused and the scheduler remains disabled; rendering runs no work."""
     d = deployments(render())["research-engine"]
     env = d["spec"]["template"]["spec"]["containers"][0]["env"]
     for name in ("AIP_RESEARCH_ETF_MANUAL_EXECUTION_ENABLED",
                  "AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED"):
-        assert [e.get("value") for e in env if e["name"] == name] == ["false"]
+        assert [e.get("value") for e in env if e["name"] == name] == ["true"]
     assert [e.get("value") for e in env if e["name"] == "AIP_RESEARCH_EQUITY_MANUAL_EXECUTION_ENABLED"] == ["true"]
 

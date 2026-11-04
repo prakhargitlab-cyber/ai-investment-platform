@@ -2,6 +2,57 @@
 {{- .Chart.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- /*
+Preserve generated DEV credentials as encoded Secret.data. Values are bootstrap
+inputs only: an existing valid Secret always wins, including over explicit values.
+An upgrade must observe the existing Secret; offline/failed lookups must never
+silently replace credentials. Native lookup access/transport errors propagate.
+*/ -}}
+{{- define "aip.devCredential" -}}
+{{- $root := .root -}}
+{{- if or (not (kindIs "string" .name)) (empty .name) (not (kindIs "string" .key)) (empty .key) -}}
+{{- fail "DEV_CREDENTIAL_INVALID_VALUE: Secret name and key must be nonempty strings" -}}
+{{- end -}}
+{{- $secret := lookup "v1" "Secret" $root.Release.Namespace .name -}}
+{{- if $secret -}}
+{{- $metadata := get $secret "metadata" -}}
+{{- if or (ne (get $secret "apiVersion") "v1") (ne (get $secret "kind") "Secret") (ne (get $secret "type") "Opaque") (not (kindIs "map" $metadata)) -}}
+{{- fail "DEV_CREDENTIAL_MALFORMED_SECRET: expected an Opaque v1 Secret" -}}
+{{- end -}}
+{{- if or (ne (get $metadata "name") .name) (and (hasKey $metadata "namespace") (ne (get $metadata "namespace") $root.Release.Namespace)) -}}
+{{- fail "DEV_CREDENTIAL_MALFORMED_SECRET: Secret identity mismatch" -}}
+{{- end -}}
+{{- $data := get $secret "data" -}}
+{{- if not (kindIs "map" $data) -}}
+{{- fail "DEV_CREDENTIAL_MALFORMED_SECRET: data must be a map" -}}
+{{- end -}}
+{{- if not (hasKey $data .key) -}}
+{{- fail "DEV_CREDENTIAL_MALFORMED_SECRET: required data key is absent" -}}
+{{- end -}}
+{{- $encoded := get $data .key -}}
+{{- if or (not (kindIs "string" $encoded)) (empty $encoded) -}}
+{{- fail "DEV_CREDENTIAL_MALFORMED_SECRET: required data must be nonempty base64" -}}
+{{- end -}}
+{{- /* Sprig b64dec returns an error string on invalid input; round-trip it. */ -}}
+{{- $decoded := b64dec $encoded -}}
+{{- if or (empty $decoded) (ne (b64enc $decoded) $encoded) -}}
+{{- fail "DEV_CREDENTIAL_MALFORMED_SECRET: required data must be canonical nonempty base64" -}}
+{{- end -}}
+{{- $encoded -}}
+{{- else if or $root.Release.IsUpgrade (not $root.Release.IsInstall) -}}
+{{- fail "DEV_CREDENTIAL_MISSING_ON_UPGRADE: existing Secret is required; use a server-connected render to verify lookup" -}}
+{{- else -}}
+{{- if and (not (kindIs "invalid" .value)) (not (kindIs "string" .value)) -}}
+{{- fail "DEV_CREDENTIAL_INVALID_VALUE: bootstrap credential must be a string" -}}
+{{- end -}}
+{{- if .value -}}
+{{- .value | b64enc -}}
+{{- else -}}
+{{- randAlphaNum (int .length) | b64enc -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "aip.labels" -}}
 app.kubernetes.io/name: {{ include "aip.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}

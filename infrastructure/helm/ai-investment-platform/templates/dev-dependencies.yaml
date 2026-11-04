@@ -14,8 +14,8 @@ kind: Secret
 metadata:
   name: {{ .Values.devDependencies.postgres.passwordSecretName }}
 type: Opaque
-stringData:
-  POSTGRES_PASSWORD: {{ default (randAlphaNum 32) .Values.devDependencies.postgres.password | quote }}
+data:
+  POSTGRES_PASSWORD: {{ include "aip.devCredential" (dict "root" . "name" .Values.devDependencies.postgres.passwordSecretName "key" "POSTGRES_PASSWORD" "value" .Values.devDependencies.postgres.password "length" 32) | quote }}
 ---
 {{- if and .Values.devDependencies.postgres.persistence.enabled (not .Values.devDependencies.postgres.persistence.existingClaim) }}
 apiVersion: v1
@@ -262,8 +262,8 @@ kind: Secret
 metadata:
   name: {{ .Values.devDependencies.searxng.secretName }}
 type: Opaque
-stringData:
-  {{ .Values.devDependencies.searxng.secretKeyName }}: {{ default (randAlphaNum 48) .Values.devDependencies.searxng.secretKey | quote }}
+data:
+  {{ .Values.devDependencies.searxng.secretKeyName }}: {{ include "aip.devCredential" (dict "root" . "name" .Values.devDependencies.searxng.secretName "key" .Values.devDependencies.searxng.secretKeyName "value" .Values.devDependencies.searxng.secretKey "length" 48) | quote }}
 ---
 apiVersion: v1
 kind: ConfigMap

@@ -95,6 +95,16 @@ def market_snapshot(payload, listings, now, *, requested_symbols=None):
             logger.warning("etf_market_snapshot_rejected symbol=%s category=%s", listing.symbol, "AMBIGUOUS_OFFICIAL_SYMBOL")
             raise NseContractError("AMBIGUOUS_OFFICIAL_SYMBOL")
         by_symbol[listing.symbol] = listing
+    # For a bounded canonical ETF request, NSE can return both EQ and
+    # non-EQ records under the same symbol. Only an independently
+    # verifiable EQ/EQN record is eligible for ETF market evidence.
+    # Two EQ records remain a duplicate and must fail closed.
+    valid_eq_symbols = {
+        str(item["symbol"]).strip().upper()
+        for item in rows
+        if item["series"] == "EQ"
+        and item["identifier"] == str(item["symbol"]).strip().upper() + "EQN"
+    }
     selected = {}
     failures = {}
     for row in rows:
@@ -111,6 +121,13 @@ def market_snapshot(payload, listings, now, *, requested_symbols=None):
         # is still rejected exactly as before.
         symbol = str(row["symbol"]).strip().upper()
         if requested_symbols is not None and symbol not in requested_symbols:
+            continue
+        # Ignore a non-EQ series only when an eligible EQ/EQN record
+        # exists for this requested canonical symbol. Never replace
+        # an EQ row with a different series or choose between two EQ rows.
+        if (requested_symbols is not None
+                and symbol in valid_eq_symbols
+                and row["series"] != "EQ"):
             continue
         if symbol in failures:
             continue  # already recorded as failed, skip additional rows

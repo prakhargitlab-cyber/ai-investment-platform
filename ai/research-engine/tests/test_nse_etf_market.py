@@ -252,3 +252,104 @@ async def test_http_failure_is_bounded_and_does_not_log_body_or_headers(status):
             await get_json(client, MARKET_URL)
     assert failure_code(raised.value) == f"NSE_HTTP_{status}"
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_scoped_eq_and_rl_series_coexist_without_false_duplicate(reverse):
+    payload = deepcopy(PAYLOAD)
+    rl = dict(
+        ROW, series="RL", identifier="SILVERBEESRLN",
+        lastPrice=210.5, totalTradedVolume=0
+    )
+    payload["data"]["data"] = [ROW, rl] if not reverse else [rl, ROW]
+
+    stamp, rows, envelope, failures = market_snapshot(
+        payload, LISTINGS, NOW, requested_symbols={"SILVERBEES"}
+    )
+
+    assert failures == {}
+    assert rows["SILVERBEES"]["identifier"] == "SILVERBEESEQN"
+    assert rows["SILVERBEES"]["series"] == "EQ"
+    assert evidence(
+        PROFILE, EtfMetric.MARKET_PRICE,
+        rows["SILVERBEES"], stamp, envelope, META, NOW
+    ).value == Decimal("209.8")
+
+
+def test_scoped_duplicate_eq_rows_still_fail_closed():
+    payload = deepcopy(PAYLOAD)
+    payload["data"]["data"] = [ROW, dict(ROW)]
+    _, selected, _, failures = market_snapshot(
+        payload, LISTINGS, NOW, requested_symbols={"SILVERBEES"}
+    )
+    assert "SILVERBEES" not in selected
+    assert failures["SILVERBEES"] == "DUPLICATE_MARKET_WATCH_SYMBOL"
+
+
+def test_scoped_rl_only_still_fails_closed():
+    payload = deepcopy(PAYLOAD)
+    payload["data"]["data"] = [
+        dict(ROW, series="RL", identifier="SILVERBEESRLN")
+    ]
+    _, selected, _, failures = market_snapshot(
+        payload, LISTINGS, NOW, requested_symbols={"SILVERBEES"}
+    )
+    assert "SILVERBEES" not in selected
+    assert failures["SILVERBEES"] == "UNSUPPORTED_NSE_LISTING"
+
+
+def test_real_nxt100case_eq_rl_series_regression():
+    """NSE 04-Nov-2026: distinct EQ and RL rows share NXT100CASE."""
+    from app.etf_evidence import EtfProvenance
+    from app.etf_acquisition import parse_nse_etf_list
+
+    provenance = EtfProvenance(
+        provider="NSE",
+        source_type="NSE_OFFICIAL_ETF_SECURITY_LIST",
+        source_identity="fixture-nxt100case",
+        source_url="https://nsearchives.nseindia.com/fixture",
+        authority="OFFICIAL_EXCHANGE",
+        retrieved_at=NOW,
+    )
+
+    listings = parse_nse_etf_list(
+        "Symbol,SecurityName,ISINNumber\n"
+        "NXT100CASE,Next 100 ETF,INF000000001\n",
+        provenance,
+    )
+
+    eq = {
+        "symbol": "NXT100CASE",
+        "series": "EQ",
+        "identifier": "NXT100CASEEQN",
+        "lastPrice": 10.38,
+        "previousClose": 10.19,
+        "totalTradedVolume": 106785,
+        "nav": 10.2445,
+    }
+
+    rl = {
+        "symbol": "NXT100CASE",
+        "series": "RL",
+        "identifier": "NXT100CASERLN",
+        "lastPrice": 10.39,
+        "previousClose": 10.24,
+        "totalTradedVolume": 0,
+        "nav": 10.2445,
+    }
+
+    for rows in ([eq, rl], [rl, eq]):
+        payload = deepcopy(PAYLOAD)
+        payload["data"]["data"] = rows
+
+        _, selected, _, failures = market_snapshot(
+            payload,
+            listings,
+            NOW,
+            requested_symbols={"NXT100CASE"},
+        )
+
+        assert failures == {}
+        assert selected["NXT100CASE"]["identifier"] == "NXT100CASEEQN"
+        assert selected["NXT100CASE"]["lastPrice"] == 10.38
+        assert selected["NXT100CASE"]["totalTradedVolume"] == 106785

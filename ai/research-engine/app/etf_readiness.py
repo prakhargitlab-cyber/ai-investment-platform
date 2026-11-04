@@ -433,6 +433,13 @@ def _check_concentration_ready(store: SqliteResearchPersistence, instrument_id, 
         return EtfRequirementStatus(requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
             status=EtfReadinessStatus.MISSING, reason="HOLDINGS_LACK_WEIGHTS")
     freshness = etf_freshness(snapshot, EtfMetric.UNDERLYING_HOLDINGS, now=now or datetime.now(timezone.utc))
+    if freshness == "FUTURE_DATED":
+        return EtfRequirementStatus(
+            requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
+            status=EtfReadinessStatus.TECHNICAL_FAILURE,
+            as_of_date=snapshot.as_of_date, freshness=freshness,
+            reason="FUTURE_DATED_HOLDINGS_SNAPSHOT",
+        )
     return EtfRequirementStatus(
         requirement="CONCENTRATION", role="SUPPORTING", applicability="APPLICABLE",
         status=EtfReadinessStatus.READY_FRESH if freshness == "FRESH"

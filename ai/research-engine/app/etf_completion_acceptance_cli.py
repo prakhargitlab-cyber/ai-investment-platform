@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.etf_completion_acceptance import MAX_AUDIT_ETFS, evaluate_etf_completion
+from app.etf_completion_work_plan import build_etf_remediation_plan
 from app.postgres_persistence import PostgresResearchPersistence
 from app.settings import Settings
 
@@ -55,8 +56,11 @@ def main(argv=None):
         description="One-pass, read-only persisted ETF completion acceptance (no acquisition)"
     )
     parser.add_argument("--output", type=Path, help="Optional JSON output file (local report only)")
+    parser.add_argument("--work-plan", action="store_true", help="Include source-safe prioritized remediation plan; no acquisition")
     args = parser.parse_args(argv)
     report = run_postgres_acceptance(Settings(), now=datetime.now(timezone.utc))
+    if args.work_plan:
+        report["remediation_plan"] = build_etf_remediation_plan(report)
     result = json.dumps(report, indent=2)
     if args.output is None:
         print(result)

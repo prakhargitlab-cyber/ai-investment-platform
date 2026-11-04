@@ -125,6 +125,17 @@ def build_etf_remediation_plan(acceptance: dict) -> dict[str, Any]:
     if any(n > universe for n in source_gaps.values()):
         raise ValueError("ETF_REMEDIATION_SUPPORTING_DUPLICATE")
     counts = Counter(action["priority"] for action in actions)
+    # Exact canonical IDs from application acceptance; no provider calls.
+    # The existing authenticated evidence endpoint has a hard <=5 scope.
+    retry_ids = [action["instrument_id"] for action in actions
+                 if action["priority"] == "P0_BOUNDED_OFFICIAL_MARKET_RETRY"]
+    retry_batches = [
+        {"instrument_ids": retry_ids[i:i + 5],
+         "endpoint": "POST /api/v1/etf-radar/evidence",
+         "operator_authorization_required": True,
+         "automatic_execution": False}
+        for i in range(0, len(retry_ids), 5)
+    ]
     return {
         "version": WORK_PLAN_VERSION,
         "as_of": acceptance.get("as_of"),
@@ -133,6 +144,7 @@ def build_etf_remediation_plan(acceptance: dict) -> dict[str, Any]:
         "blocked_for_analysis": blocked,
         "mandatory_action_counts": dict(sorted(counts.items())),
         "mandatory_actions": actions,
+        "bounded_operator_quote_retry_batches": retry_batches,
         "source_onboarding": {
             "missing_or_stale_etfs_by_requirement": dict(sorted(source_gaps.items())),
             "not_implemented_etfs_by_requirement": dict(sorted(unsupported.items())),

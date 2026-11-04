@@ -76,10 +76,12 @@ def build_etf_remediation_plan(acceptance: dict) -> dict[str, Any]:
     candidates = acceptance.get("first_25_blocked")
     if not isinstance(candidates, list) or len(candidates) != blocked:
         raise ValueError("ETF_REMEDIATION_BLOCKER_SCOPE_INCOMPLETE")
+    if any(not isinstance(row, dict) for row in candidates):
+        raise ValueError("ETF_REMEDIATION_BLOCKER_INVALID")
     seen = set()
     actions = []
     for row in sorted(candidates, key=lambda r: (r.get("ticker", ""), r.get("instrument_id", ""))):
-        if not isinstance(row, dict) or not isinstance(row.get("ticker"), str):
+        if not isinstance(row.get("ticker"), str) or not row["ticker"].strip():
             raise ValueError("ETF_REMEDIATION_BLOCKER_INVALID")
         key = row.get("instrument_id")
         if not isinstance(key, str) or not key or key in seen:

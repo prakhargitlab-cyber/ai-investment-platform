@@ -19,7 +19,7 @@ Use the already-validated original circular at
 & "..\..\.venv\Scripts\python.exe" -m app.sbi_ter_nse_circular_review_cli `
   --nse-pdf ".tmp\etf-validation\CML77115.pdf" `
   > ".tmp\etf-validation\sbi-review.json"
-if ($LASTEXITCODE -ne 0) { throw "Source-derived SBI report failed" }
+if ($LASTEXITCODE -ne 0) { throw "Source-derived SBI report failed" }\n# Out-File -Encoding utf8 retains portable JSON encoding on Windows PowerShell.
 ```
 
 This is **one** intentional official SBI TER workbook download and in-memory

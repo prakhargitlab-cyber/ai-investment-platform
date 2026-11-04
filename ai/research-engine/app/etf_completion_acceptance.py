@@ -19,6 +19,51 @@ MAX_AUDIT_ETFS = 500
 MAX_EXAMPLE_BLOCKERS = 25
 
 
+class _ReadThroughEtfCache:
+    """Cache repeated per-instrument SELECTs within this one fixed-time audit.
+
+    The ETF evaluator asks for the same price bars four times for derived
+    metrics and the full listing universe once per instrument. This cache
+    retains the original store's selection semantics and fetches each key
+    only once. Nothing here issues writes or creates synthetic observations.
+    """
+    def __init__(self, store):
+        self._store = store
+        self._cache = {}
+
+    def _get(self, key, fetch):
+        if key not in self._cache:
+            self._cache[key] = fetch()
+        return self._cache[key]
+
+    def etf_listings(self):
+        return self._get(("listings",), self._store.etf_listings)
+
+    def etf_attempts(self, instrument_id):
+        return self._get(("attempts", instrument_id),
+                         lambda: self._store.etf_attempts(instrument_id))
+
+    def etf_facts(self, instrument_id, metric=None):
+        return self._get(("facts", instrument_id, str(metric)),
+                         lambda: self._store.etf_facts(instrument_id, metric))
+
+    def etf_navs(self, instrument_id):
+        return self._get(("navs", instrument_id),
+                         lambda: self._store.etf_navs(instrument_id))
+
+    def etf_holdings(self, instrument_id):
+        return self._get(("holdings", instrument_id),
+                         lambda: self._store.etf_holdings(instrument_id))
+
+    def load_daily_market_bars(self, instrument_ids, **kwargs):
+        key = ("bars", frozenset(instrument_ids), tuple(sorted(kwargs.items())))
+        return self._get(key, lambda: self._store.load_daily_market_bars(instrument_ids, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+
+
 def evaluate_etf_completion(canonical_rows, store, *, now: datetime | None = None) -> dict:
     """Produce a deterministic missing-evidence work queue, without acquisition.
 
@@ -54,6 +99,7 @@ def evaluate_etf_completion(canonical_rows, store, *, now: datetime | None = Non
         identities.add(key)
         normalized.append((key, row["primarySymbol"], identity))
 
+    store = _ReadThroughEtfCache(store)
     ready = 0
     mandatory_blockers = Counter()
     missing_supporting = Counter()

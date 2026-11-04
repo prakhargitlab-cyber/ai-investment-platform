@@ -61,6 +61,12 @@ def test_real_shape_plans_exactly_eight_without_untrusted_retry():
         "P0_SOURCE_IDENTITY_REVIEW": 6,
     }
     assert len(result["mandatory_actions"]) == 8
+    assert result["bounded_operator_quote_retry_batches"] == [{
+        "instrument_ids": ["uuid-GSEC10ABSL", "uuid-LIQUIDBETA"],
+        "endpoint": "POST /api/v1/etf-radar/evidence",
+        "operator_authorization_required": True,
+        "automatic_execution": False,
+    }]
     assert all(not action["automated_resolution_approved"]
                for action in result["mandatory_actions"])
     assert result["source_onboarding"]["missing_or_stale_etfs_by_requirement"] == {

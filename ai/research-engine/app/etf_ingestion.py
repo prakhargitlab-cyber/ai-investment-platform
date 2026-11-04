@@ -88,22 +88,21 @@ async def ingest_quotes(repository, orchestrator, rows, client, *, clock=None, f
                 attempt = await service._record_async(key, metric, "NSE", [fact] if fact else [],
                     reason="NSE_SESSION_OBSERVATION" if fact else "FIELD_ABSENT_OR_NO_SESSION_TRADE")
             except Exception as exc:
-                reason = "NSE_ACQUISITION_FAILED:" + (failure or failure_code(exc))
-                if metric == EtfMetric.NAV and failure is None:
-                    # Diagnostic only, no behavior change: numeric() in
-                    # nse_etf_market.py already treats None/""/"-" as a
-                    # legitimately absent value (returns None, no raise),
-                    # so an exception here means the live field held some
-                    # OTHER representation. Logs the symbol (public ticker,
-                    # not a secret) and a length-capped repr of only the
-                    # "nav" field itself -- never the full row/quote, no
-                    # price/volume payload, no credentials -- so the actual
-                    # marker can be identified on a future approved run
-                    # without guessing a parser change now.
-                    logger.warning("etf_nav_parse_rejected symbol=%s raw_nav=%s",
-                                    row.get("primarySymbol"), repr(quote.get("nav"))[:80] if quote else None)
-                attempt = await service._record_async(key, metric, "NSE", outcome=Outcome.TECHNICAL_FAILURE,
-                    reason=reason)
+                fc = failure or failure_code(exc)
+                # Zero NAV is a known NSE "unavailable today" marker, not a
+                # technical failure.  Record as SUCCESS_EMPTY with a distinct
+                # reason so auditors can distinguish it from genuinely absent
+                # fields (None/""/"-") without changing persisted schemas.
+                if metric == EtfMetric.NAV and failure is None and fc == "NSE_NAV_ZERO_UNAVAILABLE":
+                    attempt = await service._record_async(key, metric, "NSE",
+                        reason="NSE_NAV_ZERO_UNAVAILABLE")
+                else:
+                    reason = "NSE_ACQUISITION_FAILED:" + fc
+                    if metric == EtfMetric.NAV and failure is None:
+                        logger.warning("etf_nav_parse_rejected symbol=%s raw_nav=%s",
+                                        row.get("primarySymbol"), repr(quote.get("nav"))[:80] if quote else None)
+                    attempt = await service._record_async(key, metric, "NSE", outcome=Outcome.TECHNICAL_FAILURE,
+                        reason=reason)
             attempts.append(attempt)
         statuses, summary = await persisted(lambda: evaluate_etf_readiness(repository.persistence, key, now=service.clock()))
         success = summary.ready_for_analysis and all(a.outcome == "SUCCESS_WITH_DATA" for a in attempts if a.metric in {"MARKET_PRICE", "TRADING_VOLUME"})

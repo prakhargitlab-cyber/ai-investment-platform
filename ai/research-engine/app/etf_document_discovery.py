@@ -92,7 +92,8 @@ def register_official_document(instrument_id, document_url, *, registry: Officia
 
 
 def ingest_etf_facts_from_document(persistence, profile: EtfResearchProfile, document_text: str, *,
-                                  document_url: str, registry: OfficialDocumentRegistry, clock=None) -> dict:
+                                  document_url: str, registry: OfficialDocumentRegistry, clock=None,
+                                  include_tracking: bool = False) -> dict:
     """One approved local text, two metric attempts. Metadata comes from approval.
 
     Persisted listing evidence must independently match the section's ISIN.
@@ -114,7 +115,11 @@ def ingest_etf_facts_from_document(persistence, profile: EtfResearchProfile, doc
         reliability_level=source.reliability_level, source_mode="REAL")
     service = EtfAcquisitionService(persistence, clock=clock, document_registry=registry)
     results = {}
-    for name, metric in (("aum", EtfMetric.AUM), ("expense_ratio", EtfMetric.EXPENSE_RATIO)):
+    metrics = [("aum", EtfMetric.AUM), ("expense_ratio", EtfMetric.EXPENSE_RATIO)]
+    if include_tracking:
+        metrics.extend((("tracking_error", EtfMetric.TRACKING_ERROR),
+                        ("tracking_difference", EtfMetric.TRACKING_DIFFERENCE)))
+    for name, metric in metrics:
         attempt = service.acquire_official_document(profile, document, metric)
         # Report this attempt's evidence, never a different higher-precedence row.
         fact = next((f for f in persistence.etf_facts(profile.instrument_id, metric)
@@ -126,7 +131,8 @@ def ingest_etf_facts_from_document(persistence, profile: EtfResearchProfile, doc
 
 
 def ingest_all_registered_documents(persistence, profile, document_contents: dict[str, str], *,
-                                    registry: OfficialDocumentRegistry, clock=None) -> dict:
+                                    registry: OfficialDocumentRegistry, clock=None,
+                                    include_tracking: bool = False) -> dict:
     """At most five approved texts; missing content or rejected facts are visible."""
     sources = registry.sources_for(profile.instrument_id)
     if not sources:
@@ -142,7 +148,8 @@ def ingest_all_registered_documents(persistence, profile, document_contents: dic
             missing.append(source.document_url)
             continue
         result = ingest_etf_facts_from_document(persistence, profile, document_contents[source.document_url],
-            document_url=source.document_url, registry=registry, clock=clock)
+            document_url=source.document_url, registry=registry, clock=clock,
+            include_tracking=include_tracking)
         results.append({"source": {"url": source.document_url, "name": source.source_name,
                                    "authority": source.authority}, "result": result})
     failed = any(metric["outcome"] == "TECHNICAL_FAILURE"

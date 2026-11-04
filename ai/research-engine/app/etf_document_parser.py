@@ -17,6 +17,8 @@ NSE_HOSTS = {"nsearchives.nseindia.com", "www.nseindia.com", "nseindia.com"}
 LABELS = {
     EtfMetric.AUM: r"(?:AUM|assets under management|fund size)",
     EtfMetric.EXPENSE_RATIO: r"(?:total expense ratio|expense ratio|TER)",
+    EtfMetric.TRACKING_ERROR: r"(?:tracking error)",
+    EtfMetric.TRACKING_DIFFERENCE: r"(?:tracking difference)",
 }
 NUMBER = r"(?:\d+|[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d?(?:,\d{2})*,\d{3})(?:\.\d+)?"
 ISO_DATE = r"\d{4}-\d{2}-\d{2}"
@@ -123,6 +125,8 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
     suffix = rf"(?:\s+\((?:as of|as at|effective(?: from)?)\s+({ISO_DATE})\))?"
     if metric == EtfMetric.AUM:
         value_pattern = rf"(INR|Rs\.?|₹|EUR|USD|GBP)\s*({NUMBER})\s*(crores?|lakhs?|million|mn|billion|bn)"
+    elif metric == EtfMetric.TRACKING_DIFFERENCE:
+        value_pattern = r"([+-]?\d+(?:\.\d+)?)\s*%"
     else:
         value_pattern = r"(\d+(?:\.\d+)?)\s*%"
     value_line = re.compile(rf"{label}\s*[:=]?\s*{value_pattern}{suffix}", re.I)
@@ -134,8 +138,10 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
         line = raw.strip()
         match = shared.fullmatch(line)
         if match:
-            shared_dates.add(date.fromisoformat(match[1]))
-            locators.append(index + 1)
+            # The AUM/TER shared reporting date cannot date tracking metrics.
+            if metric in (EtfMetric.AUM, EtfMetric.EXPENSE_RATIO):
+                shared_dates.add(date.fromisoformat(match[1]))
+                locators.append(index + 1)
             continue
         match = date_line.fullmatch(line)
         if match:
@@ -155,9 +161,13 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
             else:
                 number, effective = match.groups()
                 value, unit = metric_decimal(number), "percent"
-                # Mathematical percent bounds; scoring/business thresholds are unchanged.
-                if not 0 <= value <= 100:
-                    raise ValueError("INVALID_TER_PERCENT")
+                # Tracking difference is signed; tracking error is never negative.
+                # For all percent metrics, reject physically nonsensical magnitude.
+                if metric == EtfMetric.TRACKING_DIFFERENCE:
+                    if not -100 <= value <= 100:
+                        raise ValueError("INVALID_TRACKING_DIFFERENCE_PERCENT")
+                elif not 0 <= value <= 100:
+                    raise ValueError("INVALID_PERCENT_VALUE")
             if effective:
                 dates.add(date.fromisoformat(effective))
             values.add((value, unit))
@@ -167,12 +177,16 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
             locators.append(index + 1)
         elif re.search(rf"\b{label}\b", line, re.I):
             raise ValueError("AMBIGUOUS_OR_UNPARSEABLE_METRIC")
-    if source.as_of_date is not None and shared_dates != {source.as_of_date}:
+    if (metric in (EtfMetric.AUM, EtfMetric.EXPENSE_RATIO)
+            and source.as_of_date is not None and shared_dates != {source.as_of_date}):
         raise ValueError("REGISTERED_REPORTING_DATE_NOT_VERIFIED")
     dates |= shared_dates
     if len(dates) > 1 or len(values) > 1 or (declarations and values):
         raise ValueError("CONFLICTING_METRIC_VALUES_OR_DATES")
     as_of = next(iter(dates), None)
+    if (metric in (EtfMetric.TRACKING_ERROR, EtfMetric.TRACKING_DIFFERENCE)
+            and values and as_of is None):
+        raise ValueError("TRACKING_REPORTING_DATE_REQUIRED")
     if as_of and (as_of > now.date() or as_of > retrieved_at.date()):
         raise ValueError("FUTURE_METRIC_REPORTING_DATE")
     if declarations:

@@ -102,6 +102,116 @@ class EtfAcquisitionService:
             return await self.run_blocking(lambda: self._record(*args, **kwargs))
         return self._record(*args, **kwargs)
 
+    def preflight_bse_recovery(self, rows, *, listings, nse_attempts):
+        """Plan at most five explicit recoveries without fetching or writing.
+
+        The caller supplies the original bounded NSE acquisition results and
+        canonical listings. Candidate codes are never an identity source.
+        Attempts returned here are in-memory diagnostics, not durable evidence.
+        """
+        return self._bse_recovery_plan(rows, listings=listings, nse_attempts=nse_attempts)[0]
+
+    def _bse_recovery_plan(self, rows, *, listings, nse_attempts):
+        from app.bse_etf_market import BseContractError, verified_bse_identity
+
+        if not 1 <= len(rows) <= 5:
+            raise ValueError("ETF_CANDIDATE_LIMIT_OR_DUPLICATES")
+        keys = [UUID(str(row["globalInstrumentId"])) for row in rows]
+        if len(set(keys)) != len(keys):
+            raise ValueError("ETF_CANDIDATE_LIMIT_OR_DUPLICATES")
+        originals = {key: [] for key in keys}
+        for item in nse_attempts:
+            attempt = EtfAcquisitionAttempt.model_validate(item.model_dump())
+            if attempt.provider != "NSE" or attempt.instrument_id not in originals:
+                raise ValueError("BSE_RECOVERY_REQUIRES_ORIGINAL_SCOPED_NSE_ATTEMPTS")
+            originals[attempt.instrument_id].append(attempt)
+        for attempts in originals.values():
+            metrics = [a.metric for a in attempts]
+            if (len(set(metrics)) != len(metrics)
+                    or not {"MARKET_PRICE", "TRADING_VOLUME"} <= set(metrics)):
+                raise ValueError("BSE_RECOVERY_REQUIRES_UNAMBIGUOUS_NSE_MARKET_PAIR")
+
+        # A discovery result may be supplied as an iterator; every bounded
+        # instrument must see the same canonical identity observations.
+        listings = tuple(listings)
+        instruments, bindings = [], {}
+        for key, row in zip(keys, rows):
+            attempts = originals[key]
+            market = [a for a in attempts if a.metric in {"MARKET_PRICE", "TRADING_VOLUME"}]
+            reason = None
+            if any("NSE_METADATA_IDENTITY_CONFLICT" in a.reason for a in attempts):
+                reason = "BSE_RECOVERY_BLOCKED_BY_NSE_IDENTITY_CONFLICT"
+            elif all(a.outcome == Outcome.SUCCESS_WITH_DATA for a in market):
+                instruments.append({"instrument_id": str(key), "symbol": row.get("primarySymbol"),
+                    "status": "NOT_REQUIRED", "reason": "NSE_MARKET_PAIR_ALREADY_AVAILABLE",
+                    "nse_attempts": [a.model_dump(mode="json") for a in attempts], "bse_attempts": []})
+                continue
+            else:
+                try:
+                    binding = verified_bse_identity(row, listings)
+                    if binding.listing_source_mode != "REAL":
+                        raise BseContractError("BSE_RECOVERY_REQUIRES_REAL_CANONICAL_LISTING")
+                    bindings[key] = binding
+                    reason = "BSE_LIVE_SOURCE_CONTRACT_UNVERIFIED"
+                except BseContractError as exc:
+                    reason = str(exc)
+            diagnostic = EtfAcquisitionAttempt(instrument_id=key,
+                metric="MARKET_PRICE_AND_TRADING_VOLUME", provider="BSE", attempted_at=self.clock(),
+                outcome=Outcome.NOT_IMPLEMENTED if key in bindings else Outcome.TECHNICAL_FAILURE,
+                reason=reason)
+            instruments.append({"instrument_id": str(key), "symbol": row.get("primarySymbol"),
+                "status": "BLOCKED", "reason": reason,
+                "nse_attempts": [a.model_dump(mode="json") for a in attempts],
+                "bse_attempts": [diagnostic.model_dump(mode="json")]})
+        return {"status": "BLOCKED" if any(i["status"] == "BLOCKED" for i in instruments) else "NOT_REQUIRED",
+            "scope": "BOUNDED_CANONICAL_ETF_BSE_RECOVERY", "candidate_count": len(keys),
+            "preflight": True, "persisted": False, "instruments": instruments}, bindings
+
+    async def acquire_bse_recovery(self, rows, *, listings, nse_attempts, provider=None):
+        """Explicit internal recovery boundary; never called by NSE ingestion.
+
+        Live source verification is deliberately unavailable. Validation/source
+        failures leave both evidence and attempts unpersisted, preserving the
+        caller's original NSE result. Once an official live contract is added,
+        its verified pair must pass the adapter gate before the existing writer
+        atomically saves both metrics and their BSE acquisition attempt.
+        """
+        from app.bse_etf_market import (
+            BseContractError, BseEtfMarketProvider, require_verified_live_pair,
+        )
+
+        report, bindings = self._bse_recovery_plan(rows, listings=listings, nse_attempts=nse_attempts)
+        report["preflight"] = False
+        source = provider if provider is not None else BseEtfMarketProvider()
+        for item in report["instruments"]:
+            key = UUID(item["instrument_id"])
+            if key not in bindings:
+                continue
+            try:
+                if source.provider_name != "BSE":
+                    raise BseContractError("UNVERIFIED_BSE_PROVIDER")
+                collected = await source.collect(bindings[key])
+                pair = require_verified_live_pair(bindings[key], collected, now=self.clock())
+            except Exception as exc:
+                # Arbitrary provider exceptions may contain request secrets.
+                reason = str(exc) if isinstance(exc, BseContractError) else "BSE_SOURCE_FAILURE"
+                attempt = EtfAcquisitionAttempt(instrument_id=key,
+                    metric="MARKET_PRICE_AND_TRADING_VOLUME", provider="BSE", attempted_at=self.clock(),
+                    outcome=Outcome.NOT_IMPLEMENTED if reason == "BSE_LIVE_SOURCE_CONTRACT_UNVERIFIED"
+                            else Outcome.TECHNICAL_FAILURE, reason=reason)
+                item.update(reason=reason, bse_attempts=[attempt.model_dump(mode="json")])
+                continue
+            # One existing transaction holds the pair. Never write one venue's
+            # price independently of its verified same-session volume.
+            attempt = await self._record_async(key, "MARKET_PRICE_AND_TRADING_VOLUME", "BSE", pair,
+                                              reason="BSE_VERIFIED_SESSION_PAIR")
+            item.update(status="ACQUIRED", reason=attempt.reason,
+                        bse_attempts=[attempt.model_dump(mode="json")])
+            report["persisted"] = True
+        if report["persisted"] and all(item["status"] != "BLOCKED" for item in report["instruments"]):
+            report["status"] = "ACQUIRED"
+        return report
+
     async def discover_nse(self, client, *, master_rows=(), instrument_ids=None):
         """One explicit list request; never loops over fund/provider endpoints.
 

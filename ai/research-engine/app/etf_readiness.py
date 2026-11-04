@@ -11,16 +11,17 @@ returns deterministic readiness states without implementing new providers.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import TYPE_CHECKING
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from app.etf_evidence import EtfMetric, etf_freshness, ETF_MAX_AGE, EtfAcquisitionOutcome, EtfListing
+from app.etf_evidence import EtfMetric, etf_freshness, ETF_MAX_AGE, EtfAcquisitionOutcome, EtfListing, EtfFact
 from app.etf_domain import EtfSubtype
 from app.etf_metrics import EtfMetricId, compute_etf_deterministic_metrics
 
@@ -195,9 +196,10 @@ def _missing_market_evidence(store, instrument_id, metric):
         reason=failures[0].reason if failures else None)
 
 
-def _check_market_price_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
+def _check_market_price_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None,
+                              facts=None) -> EtfRequirementStatus:
     """Check if MARKET_PRICE is ready."""
-    facts = store.etf_facts(instrument_id, EtfMetric.MARKET_PRICE)
+    facts = store.etf_facts(instrument_id, EtfMetric.MARKET_PRICE) if facts is None else facts
     if not facts:
         return _missing_market_evidence(store, instrument_id, "MARKET_PRICE")
 
@@ -219,9 +221,10 @@ def _check_market_price_ready(store: SqliteResearchPersistence, instrument_id, *
     )
 
 
-def _check_trading_volume_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
+def _check_trading_volume_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None,
+                                facts=None) -> EtfRequirementStatus:
     """Check if TRADING_VOLUME (LIQUIDITY) is ready."""
-    facts = store.etf_facts(instrument_id, EtfMetric.TRADING_VOLUME)
+    facts = store.etf_facts(instrument_id, EtfMetric.TRADING_VOLUME) if facts is None else facts
     if not facts:
         return _missing_market_evidence(store, instrument_id, "TRADING_VOLUME")
 
@@ -242,6 +245,120 @@ def _check_trading_volume_ready(store: SqliteResearchPersistence, instrument_id,
         as_of_date=fact.as_of_date,
         freshness=freshness,
     )
+
+
+def _market_pair_failure(store, instrument_id, price_status, volume_status, *, now, prices, volumes):
+    """Validate the selected pair; never replace one side with another venue.
+
+    BSE is an alternate market-data venue, not a new canonical identity. Its
+    extra contract is deliberately stricter than existing NSE zero-volume
+    semantics. Non-BSE stale/missing statuses retain their existing reasons.
+    """
+    price, volume = prices[0] if prices else None, volumes[0] if volumes else None
+    selected = [fact for fact in (price, volume) if fact is not None]
+    is_bse = any(
+        fact.provenance.provider.strip().upper() == "BSE"
+        or fact.provenance.source_type.upper().startswith("BSE_")
+        or str((fact.provenance.source_metadata or {}).get("exchange") or "").strip().upper() in {"BSE", "XBOM"}
+        for fact in selected
+    )
+    if not is_bse:
+        if (price_status.status != EtfReadinessStatus.READY_FRESH
+                or volume_status.status != EtfReadinessStatus.READY_FRESH):
+            return None
+        if price.provenance.provider != volume.provenance.provider:
+            return "ETF_MARKET_PAIR_PROVIDER_MISMATCH"
+        if price.instrument_id != volume.instrument_id or price.instrument_id != instrument_id:
+            return "ETF_MARKET_PAIR_SECURITY_MISMATCH"
+        if price.as_of_date != volume.as_of_date:
+            return "ETF_MARKET_PAIR_SESSION_MISMATCH"
+        for key in ("exchange", "session_date", "session_timestamp"):
+            values = [(fact.provenance.source_metadata or {}).get(key) for fact in selected]
+            if any(value is not None for value in values) and values[0] != values[1]:
+                return "ETF_MARKET_PAIR_SESSION_MISMATCH"
+        # NSE source identities include the metric field; compare its shared
+        # session and security record rather than those metric-specific IDs.
+        metadata = [fact.provenance.source_metadata or {} for fact in selected]
+        if all(isinstance(item.get("session"), dict) for item in metadata):
+            if metadata[0]["session"].get("timestamp") != metadata[1]["session"].get("timestamp"):
+                return "ETF_MARKET_PAIR_SESSION_MISMATCH"
+        if all(isinstance(item.get("record"), dict) for item in metadata):
+            for key in ("symbol", "identifier", "series"):
+                if metadata[0]["record"].get(key) != metadata[1]["record"].get(key):
+                    return "ETF_MARKET_PAIR_SECURITY_MISMATCH"
+        return None
+
+    if price is None or volume is None:
+        return "BSE_MARKET_PAIR_INCOMPLETE"
+    try:
+        price, volume = (EtfFact.model_validate(fact.model_dump()) for fact in (price, volume))
+        if any(fact.instrument_id != instrument_id for fact in (price, volume)):
+            return "BSE_MARKET_PAIR_SECURITY_MISMATCH"
+        if any(fact.provenance.provider != "BSE" for fact in (price, volume)):
+            return "BSE_MARKET_PAIR_PROVIDER_MISMATCH"
+        for fact in (price, volume):
+            provenance = fact.provenance
+            metadata = provenance.source_metadata or {}
+            if (provenance.source_mode != "REAL" or metadata.get("synthetic") is True
+                    or metadata.get("fixture_kind") == "SYNTHETIC"):
+                return "BSE_SYNTHETIC_MARKET_EVIDENCE"
+            url = urlsplit(provenance.source_url)
+            host = url.hostname or ""
+            if (provenance.authority != "OFFICIAL_EXCHANGE"
+                    or provenance.source_type != "BSE_VERIFIED_ETF_SESSION"
+                    or url.scheme != "https" or url.username is not None or url.password is not None
+                    or host not in {"bseindia.com", "www.bseindia.com"} or url.port not in {None, 443}):
+                return "BSE_MARKET_PROVENANCE_UNVERIFIED"
+            if (metadata.get("exchange") != "BSE" or metadata.get("currency") != "INR"
+                    or metadata.get("instrument_type") != "ETF" or metadata.get("identity_verified") is not True):
+                return "BSE_MARKET_IDENTITY_UNVERIFIED"
+            code = metadata.get("security_code")
+            if not isinstance(code, str) or len(code) != 6 or not code.isascii() or not code.isdecimal():
+                return "BSE_MARKET_IDENTITY_UNVERIFIED"
+            if (metadata.get("price_type") != "EXECUTED_TRADE"
+                    or metadata.get("volume_type") != "EXECUTED_QUANTITY"):
+                return "BSE_EXECUTED_TRADE_REQUIRED"
+            session_date = date.fromisoformat(metadata["session_date"])
+            stamp = datetime.fromisoformat(metadata["session_timestamp"])
+            trade_stamp = datetime.fromisoformat(metadata["last_trade_timestamp"])
+            if (stamp.tzinfo is None or stamp.utcoffset() is None
+                    or trade_stamp.tzinfo is None or trade_stamp.utcoffset() is None):
+                return "BSE_MARKET_SESSION_INVALID"
+            ist = timezone(timedelta(hours=5, minutes=30))
+            if (metadata["session_date"] != session_date.isoformat()
+                    or stamp.astimezone(ist).date() != session_date or fact.as_of_date != session_date
+                    or stamp > now or stamp > provenance.retrieved_at or provenance.retrieved_at > now
+                    or trade_stamp.astimezone(ist).date() != session_date or trade_stamp > stamp):
+                return "BSE_MARKET_SESSION_INVALID"
+            if (now.astimezone(ist).date() - session_date > ETF_MAX_AGE[fact.metric]
+                    or now - stamp > ETF_MAX_AGE[fact.metric]
+                    or now - trade_stamp > ETF_MAX_AGE[fact.metric]):
+                return "BSE_MARKET_SESSION_STALE"
+        p, v = price.provenance, volume.provenance
+        if p.source_identity != v.source_identity or p.source_url != v.source_url:
+            return "BSE_MARKET_PAIR_SOURCE_MISMATCH"
+        for key in ("exchange", "security_code", "isin", "session_date"):
+            if p.source_metadata.get(key) != v.source_metadata.get(key):
+                return "BSE_MARKET_PAIR_SECURITY_OR_SESSION_MISMATCH"
+        if datetime.fromisoformat(p.source_metadata["session_timestamp"]) != datetime.fromisoformat(v.source_metadata["session_timestamp"]):
+            return "BSE_MARKET_PAIR_SESSION_MISMATCH"
+        if datetime.fromisoformat(p.source_metadata["last_trade_timestamp"]) != datetime.fromisoformat(v.source_metadata["last_trade_timestamp"]):
+            return "BSE_MARKET_PAIR_SESSION_MISMATCH"
+        listings = [listing for listing in store.etf_listings() if listing.instrument_id == instrument_id]
+        if not listings or {listing.isin for listing in listings} != {p.source_metadata.get("isin")}:
+            return "BSE_MARKET_CANONICAL_ISIN_MISMATCH"
+        if (price.unit != "INR" or volume.unit != "shares"
+                or Decimal(price.value) <= 0 or Decimal(volume.value) <= 0
+                or Decimal(volume.value) != Decimal(volume.value).to_integral_value()):
+            return "BSE_EXECUTED_TRADE_REQUIRED"
+    except (ValidationError, ValueError, TypeError, KeyError, InvalidOperation):
+        return "BSE_MARKET_CONTRACT_INVALID"
+    # Shape and self-declared official provenance cannot approve an unknown
+    # live feed. The isolated adapter owns that explicit integration boundary.
+    from app.bse_etf_market import LIVE_SOURCE_CONTRACT
+    if LIVE_SOURCE_CONTRACT is None:
+        return "BSE_LIVE_SOURCE_CONTRACT_UNVERIFIED"
+    return None
 
 
 def _check_supporting_ready(store: SqliteResearchPersistence, instrument_id, metric: EtfMetric, *, now: datetime | None = None) -> EtfRequirementStatus:
@@ -498,11 +615,18 @@ def evaluate_etf_readiness(store: SqliteResearchPersistence, instrument_id, *, n
     identity_status = _check_identity_ready(store, instrument_id, now=now)
     statuses.append(identity_status)
 
-    market_price_status = _check_market_price_ready(store, instrument_id, now=now)
-    statuses.append(market_price_status)
-
-    volume_status = _check_trading_volume_ready(store, instrument_id, now=now)
-    statuses.append(volume_status)
+    prices = store.etf_facts(instrument_id, EtfMetric.MARKET_PRICE)
+    volumes = store.etf_facts(instrument_id, EtfMetric.TRADING_VOLUME)
+    market_price_status = _check_market_price_ready(store, instrument_id, now=now, facts=prices)
+    volume_status = _check_trading_volume_ready(store, instrument_id, now=now, facts=volumes)
+    pair_failure = _market_pair_failure(store, instrument_id, market_price_status, volume_status,
+                                       now=now or datetime.now(timezone.utc), prices=prices, volumes=volumes)
+    if pair_failure is not None:
+        market_price_status = replace(market_price_status, status=EtfReadinessStatus.TECHNICAL_FAILURE,
+                                      reason=pair_failure)
+        volume_status = replace(volume_status, status=EtfReadinessStatus.TECHNICAL_FAILURE,
+                                reason=pair_failure)
+    statuses.extend((market_price_status, volume_status))
 
     # Check supporting requirements. Every name in ETC3_SUPPORTING must be
     # handled by exactly one of: a direct EtfMetric/EtfFact check, a derived

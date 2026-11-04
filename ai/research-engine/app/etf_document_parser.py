@@ -17,6 +17,8 @@ NSE_HOSTS = {"nsearchives.nseindia.com", "www.nseindia.com", "nseindia.com"}
 LABELS = {
     EtfMetric.AUM: r"(?:AUM|assets under management|fund size)",
     EtfMetric.EXPENSE_RATIO: r"(?:total expense ratio|expense ratio|TER)",
+    EtfMetric.TRACKING_ERROR: r"(?:tracking error)",
+    EtfMetric.TRACKING_DIFFERENCE: r"(?:tracking difference)",
 }
 NUMBER = r"(?:\d+|[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d?(?:,\d{2})*,\d{3})(?:\.\d+)?"
 ISO_DATE = r"\d{4}-\d{2}-\d{2}"
@@ -123,6 +125,8 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
     suffix = rf"(?:\s+\((?:as of|as at|effective(?: from)?)\s+({ISO_DATE})\))?"
     if metric == EtfMetric.AUM:
         value_pattern = rf"(INR|Rs\.?|₹|EUR|USD|GBP)\s*({NUMBER})\s*(crores?|lakhs?|million|mn|billion|bn)"
+    elif metric == EtfMetric.TRACKING_DIFFERENCE:
+        value_pattern = r"([+-]?\d+(?:\.\d+)?)\s*%"
     else:
         value_pattern = r"(\d+(?:\.\d+)?)\s*%"
     value_line = re.compile(rf"{label}\s*[:=]?\s*{value_pattern}{suffix}", re.I)
@@ -155,9 +159,13 @@ def parse_metric(section, metric, source, *, now, retrieved_at):
             else:
                 number, effective = match.groups()
                 value, unit = metric_decimal(number), "percent"
-                # Mathematical percent bounds; scoring/business thresholds are unchanged.
-                if not 0 <= value <= 100:
-                    raise ValueError("INVALID_TER_PERCENT")
+                # Tracking difference is signed; tracking error is never negative.
+                # For all percent metrics, reject physically nonsensical magnitude.
+                if metric == EtfMetric.TRACKING_DIFFERENCE:
+                    if not -100 <= value <= 100:
+                        raise ValueError("INVALID_TRACKING_DIFFERENCE_PERCENT")
+                elif not 0 <= value <= 100:
+                    raise ValueError("INVALID_PERCENT_VALUE")
             if effective:
                 dates.add(date.fromisoformat(effective))
             values.add((value, unit))

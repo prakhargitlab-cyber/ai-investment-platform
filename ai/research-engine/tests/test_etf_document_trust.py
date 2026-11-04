@@ -221,3 +221,58 @@ def test_invalid_section_bounds_cannot_extract_a_metric(store, span):
     result = service.acquire_official_document(profile(), document(text), M.AUM)
     assert result.outcome == "TECHNICAL_FAILURE"
     assert store.etf_facts(ID) == []
+
+
+@pytest.mark.parametrize("metric,text,value,day", [
+    (M.TRACKING_ERROR, "Tracking Error: 0.23% (as of 2026-09-30)",
+     Decimal("0.23"), date(2026, 9, 30)),
+    (M.TRACKING_DIFFERENCE, "Tracking Difference: -0.42% (as of 2026-09-30)",
+     Decimal("-0.42"), date(2026, 9, 30)),
+    (M.TRACKING_DIFFERENCE, "Tracking Difference: +0.18% (as of 2026-09-30)",
+     Decimal("0.18"), date(2026, 9, 30)),
+])
+def test_verified_official_tracking_evidence_is_persisted(store, metric, text, value, day):
+    result = acquire(store, HEADER + text, metric)
+    assert result.outcome == "SUCCESS_WITH_DATA", result.reason
+    fact, = store.etf_facts(ID, metric)
+    assert fact.value == value
+    assert fact.unit == "percent"
+    assert fact.as_of_date == day
+    assert fact.provenance.authority == "OFFICIAL_FUND"
+
+
+@pytest.mark.parametrize("metric,text", [
+    (M.TRACKING_ERROR, "Tracking Error: -0.1% (as of 2026-09-30)"),
+    (M.TRACKING_ERROR, "Tracking Error: 0.1%"),
+    (M.TRACKING_DIFFERENCE, "Tracking Difference: 0.1%"),
+    (M.TRACKING_DIFFERENCE, "Tracking Difference: -101% (as of 2026-09-30)"),
+    (M.TRACKING_DIFFERENCE, "Tracking Difference: -0.5% (as of 2026-10-10)"),
+    (M.TRACKING_DIFFERENCE, "Tracking Difference: -0.5%\nAUM and TER as of 2026-09-30"),
+])
+def test_tracking_without_unambiguous_valid_report_date_is_rejected(store, metric, text):
+    result = acquire(store, HEADER + text, metric)
+    assert result.outcome == "TECHNICAL_FAILURE", result.reason
+    assert store.etf_facts(ID, metric) == []
+
+
+def test_tracking_does_not_borrow_aum_ter_shared_date(store):
+    result = acquire(store,
+        HEADER + "AUM and TER as of 2026-09-30\nTracking Error: 0.2%",
+        M.TRACKING_ERROR)
+    assert result.outcome == "TECHNICAL_FAILURE"
+    assert store.etf_facts(ID, M.TRACKING_ERROR) == []
+
+
+def test_approved_document_can_extract_all_four_metrics_in_one_pass(store):
+    from app.etf_document_discovery import ingest_etf_facts_from_document
+    text = (HEADER + "AUM: INR 10 crore (as of 2026-09-30)\n"
+        + "TER: 0.3% (as of 2026-09-30)\n"
+        + "Tracking Error: 0.12% (as of 2026-09-30)\n"
+        + "Tracking Difference: -0.06% (as of 2026-09-30)\n")
+    result = ingest_etf_facts_from_document(
+        store, profile(), text, document_url=URL,
+        registry=registry_for(text), clock=lambda: NOW, include_tracking=True)
+    assert set(result) == {"aum", "expense_ratio", "tracking_error", "tracking_difference"}
+    assert all(metric["outcome"] == "SUCCESS_WITH_DATA" for metric in result.values())
+    assert store.etf_facts(ID, M.TRACKING_ERROR)[0].value == Decimal("0.12")
+    assert store.etf_facts(ID, M.TRACKING_DIFFERENCE)[0].value == Decimal("-0.06")

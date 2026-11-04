@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
+from itertools import islice
 import re
 from urllib.parse import urlsplit
 
@@ -71,7 +72,7 @@ def inspect_labelled_identity_pages(page_texts, *, source_url: str, raw_pdf_sha2
     _validate_source_url(source_url)
     if not re.fullmatch(r"[0-9a-f]{64}", raw_pdf_sha256):
         raise ValueError("SBI_IDENTITY_ORIGINAL_PDF_HASH_INVALID")
-    texts = list(page_texts)
+    # Do not materialize an unbounded caller-supplied iterator.\n    texts = list(islice(page_texts, MAX_IDENTITY_PDF_PAGES + 1))
     if not texts or len(texts) > MAX_IDENTITY_PDF_PAGES:
         raise ValueError("SBI_IDENTITY_DOCUMENT_PAGE_LIMIT")
     candidates = []

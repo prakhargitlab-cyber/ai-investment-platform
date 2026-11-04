@@ -12,6 +12,10 @@
 {{- $strategy = dict "type" "Recreate" -}}
 {{- end -}}
 {{ $isResearch := eq $service.name "research-engine" -}}
+{{- $resolvedImage := include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) -}}
+{{- if and $isResearch (get $imageOverride "tag") -}}
+{{- $resolvedImage = include "aip.imageExplicitTag" (dict "root" $ "image" $config.image "tag" $config.tag) -}}
+{{- end -}}
 {{ $databaseSecretName := default $.Values.database.passwordSecretName $.Values.research.persistence.passwordSecretName -}}
 {{ $databaseSecretKey := default $.Values.database.passwordSecretKey $.Values.research.persistence.passwordSecretKey -}}
 apiVersion: apps/v1
@@ -73,7 +77,7 @@ spec:
       {{- if and $isResearch $.Values.research.persistence.enabled }}
       initContainers:
         - name: wait-for-research-migrations
-          image: {{ include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) | quote }}
+          image: {{ $resolvedImage | quote }}
           imagePullPolicy: {{ $.Values.global.imagePullPolicy | quote }}
           command: ["python", "-c"]
           args:
@@ -146,7 +150,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ $service.name }}
-          image: {{ include "aip.image" (dict "root" $ "image" $config.image "tag" $config.tag) | quote }}
+          image: {{ $resolvedImage | quote }}
           imagePullPolicy: {{ $.Values.global.imagePullPolicy | quote }}
           securityContext:
             {{- toYaml $.Values.global.containerSecurityContext | nindent 12 }}

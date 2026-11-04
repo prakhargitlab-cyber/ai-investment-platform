@@ -748,6 +748,13 @@ class TestEtfReadinessHoldingsAccessor:
         h = next(s for s in statuses if s.requirement == "UNDERLYING_HOLDINGS")
         assert h.status == EtfReadinessStatus.TECHNICAL_FAILURE
         assert h.reason == "FUTURE_DATED_HOLDINGS_SNAPSHOT"
+        # CONCENTRATION is derived from the same snapshot: future-dated
+        # positions must never be misreported as merely missing evidence.
+        concentration = next(s for s in statuses if s.requirement == "CONCENTRATION")
+        assert concentration.status == EtfReadinessStatus.TECHNICAL_FAILURE
+        assert concentration.reason == "FUTURE_DATED_HOLDINGS_SNAPSHOT"
+        assert concentration.freshness == "FUTURE_DATED"
+        assert concentration.as_of_date == as_of
 
     # --- Required: Snapshot for another ETF must not satisfy readiness ---
     def test_other_etf_holdings_do_not_satisfy_readiness(self, store):

@@ -137,19 +137,25 @@ def classify_scheme_name(name: str) -> SchemeClassification:
 
 def _parse_raw_rows(path: Path):
     workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    if workbook.sheetnames[:1] != [EXPECTED_SHEET_NAME]:
-        raise WorkbookSchemaError(f"WORKBOOK_SCHEMA_UNSUPPORTED_SHEET_NAME:{workbook.sheetnames!r}")
-    sheet = workbook[EXPECTED_SHEET_NAME]
-    rows = sheet.iter_rows(values_only=True)
-    header = next(rows, None)
-    if header != EXPECTED_HEADERS:
-        raise WorkbookSchemaError(f"WORKBOOK_SCHEMA_UNSUPPORTED_HEADER_ROW:{header!r}")
-    for row in rows:
-        if row is None or row[0] is None:
-            continue
-        if len(row) != len(EXPECTED_HEADERS):
-            raise WorkbookSchemaError(f"WORKBOOK_SCHEMA_UNSUPPORTED_COLUMN_COUNT:{len(row)}")
-        yield row
+    try:
+        if workbook.sheetnames[:1] != [EXPECTED_SHEET_NAME]:
+            raise WorkbookSchemaError(f"WORKBOOK_SCHEMA_UNSUPPORTED_SHEET_NAME:{workbook.sheetnames!r}")
+        sheet = workbook[EXPECTED_SHEET_NAME]
+        rows = sheet.iter_rows(values_only=True)
+        header = next(rows, None)
+        if header != EXPECTED_HEADERS:
+            raise WorkbookSchemaError(f"WORKBOOK_SCHEMA_UNSUPPORTED_HEADER_ROW:{header!r}")
+        for row in rows:
+            if row is None or row[0] is None:
+                continue
+            if len(row) != len(EXPECTED_HEADERS):
+                raise WorkbookSchemaError(f"WORKBOOK_SCHEMA_UNSUPPORTED_COLUMN_COUNT:{len(row)}")
+            yield row
+    finally:
+        # read_only=True keeps the XLSX ZIP archive open. Release it both on
+        # successful iteration and on schema/row errors so Windows can remove
+        # the runtime downloader's temporary workbook immediately afterward.
+        workbook.close()
 
 
 def build_staged_observations(path: str | Path) -> list[StagedTerObservation]:

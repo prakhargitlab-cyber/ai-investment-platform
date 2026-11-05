@@ -5,6 +5,7 @@ Run with repo venv Python and PyYAML. No cluster mutations. A passing result
 does not authorize upgrade and does not check per-node image cache/rollback.
 """
 import base64
+from copy import deepcopy
 import json
 from pathlib import Path
 import subprocess
@@ -89,6 +90,87 @@ def compare(desired, actual, path, differences):
         differences.append(path)
 
 
+
+APPROVED_FLAGS = {
+    "AIP_RESEARCH_EQUITY_MANUAL_EXECUTION_ENABLED": "true",
+    "AIP_RESEARCH_ETF_MANUAL_EXECUTION_ENABLED": "true",
+    "AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED": "true",
+}
+PROTECTED_FLAGS = {
+    "AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED": "true",
+    "AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED": "false",
+}
+
+
+def only_approved_revision_changes(baseline, proposed, actual):
+    """Require identical rendered revision except exact approved research fields.
+
+    Uses names, not array indexes, to avoid approving reordered fields.
+    This is NOT an emulation of Helm's strategic three-way patch.
+    """
+    if set(baseline) != set(proposed):
+        raise Blocked("RESOURCE_IDENTITY_CHANGE")
+    research_key = ("apps/v1", "Deployment", "research-engine")
+    if research_key not in baseline or research_key not in actual:
+        raise Blocked("RESEARCH_DEPLOYMENT_MISSING")
+    old = deepcopy(baseline)
+    new = deepcopy(proposed)
+    live = actual[research_key]
+    o = old[research_key]["spec"]["template"]["spec"]
+    n = new[research_key]["spec"]["template"]["spec"]
+    l = live["spec"]["template"]["spec"]
+
+    def by_name(array, what):
+        result = {x["name"]: x for x in array}
+        if len(result) != len(array):
+            raise Blocked("DUPLICATE_" + what)
+        return result
+
+    for kind in ("containers", "initContainers"):
+        old_containers = by_name(o.get(kind, []), "CONTAINER")
+        new_containers = by_name(n.get(kind, []), "CONTAINER")
+        live_containers = by_name(l.get(kind, []), "CONTAINER")
+        if set(old_containers) != set(new_containers):
+            raise Blocked("CONTAINER_IDENTITY_CHANGE")
+        for name, old_container in old_containers.items():
+            if kind == "containers" and name != "research-engine":
+                # Chart may name the app container unexpectedly; other containers
+                # must not be silently authorized to change image.
+                continue
+            expected_new = new_containers[name]["image"]
+            if expected_new != EXPECTED_IMAGE:
+                raise Blocked("RESEARCH_IMAGE_NOT_APPROVED")
+            if live_containers.get(name, {}).get("image") != expected_new:
+                raise Blocked("LIVE_RESEARCH_IMAGE_MISMATCH")
+            new_containers[name]["image"] = old_container["image"]
+
+    old_apps = by_name(o.get("containers", []), "APP_CONTAINER")
+    new_apps = by_name(n.get("containers", []), "APP_CONTAINER")
+    live_apps = by_name(l.get("containers", []), "APP_CONTAINER")
+    if len(old_apps) != 1 or set(old_apps) != set(new_apps) or set(old_apps) != set(live_apps):
+        raise Blocked("APP_CONTAINER_IDENTITY_CHANGE")
+    name = next(iter(old_apps))
+    old_env = by_name(old_apps[name].get("env", []), "ENV")
+    new_env = by_name(new_apps[name].get("env", []), "ENV")
+    live_env = by_name(live_apps[name].get("env", []), "ENV")
+    if set(old_env) != set(new_env):
+        raise Blocked("ENV_IDENTITY_CHANGE")
+    for flag, value in APPROVED_FLAGS.items():
+        if flag not in old_env or flag not in new_env or flag not in live_env:
+            raise Blocked("MISSING_PROTECTED_FLAG")
+        if new_env[flag].get("value") != value or live_env[flag].get("value") != value:
+            raise Blocked("PROTECTED_FLAG_VALUE_MISMATCH")
+        new_env[flag]["value"] = old_env[flag].get("value")
+    for flag, value in PROTECTED_FLAGS.items():
+        if new_env.get(flag, {}).get("value") != value or live_env.get(flag, {}).get("value") != value:
+            raise Blocked("SAFETY_FLAG_VALUE_MISMATCH")
+    # The chart generates the same full manifests for all other resources.
+    # Mask ONLY the approved fields, then require exact structural identity.
+    for key in old:
+        if old[key] != new[key]:
+            raise Blocked("UNAPPROVED_STORED_RELEASE_CHANGE: " + key[1] + "/" + key[2])
+    return True
+
 def main():
     if not CHART.is_dir():
         raise Blocked("CHART_DIRECTORY_MISSING")
@@ -160,6 +242,7 @@ def main():
         raise Blocked("STORED_RELEASE_IDENTITIES_MISMATCH")
     live_list = json.loads(kube("get", RESOURCE_KINDS, "-o", "json"))
     live = {rid(o): o for o in live_list["items"]}
+    scope_ok = only_approved_revision_changes(baseline, expected, live)
     missing = sorted(set(expected) - set(live))
     if missing:
         print("MISSING_LIVE_IDENTITIES_COUNT:", len(missing))
@@ -216,9 +299,11 @@ def main():
         print("DIFF_PATH:", path)  # paths only; no values
     if len(differences) > 25:
         print("ADDITIONAL_DIFF_PATHS:", len(differences) - 25)
-    if differences:
-        raise Blocked("UNEXPECTED_LIVE_VS_DESIRED_DRIFT")
-    print("SANITIZED_HELM_ACCEPTANCE_PASSED")
+    print("HISTORICAL_DRIFT_FIELDS:", len(differences))
+    if not scope_ok:
+        raise Blocked("RELEASE_SCOPE_GUARD_FAILED")
+    print("RELEASE_SCOPE_GUARD_PASSED")
+    print("HELM_THREE_WAY_PATCH_NOT_VERIFIED")
     print("NO_UPGRADE_PERFORMED; IMAGE_CACHE_AND_ROLLBACK_STILL_UNVERIFIED")
 
 

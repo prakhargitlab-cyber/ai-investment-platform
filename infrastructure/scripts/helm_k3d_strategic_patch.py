@@ -137,9 +137,41 @@ def main():
     return 0
 
 
+# Only exact reviewed literals are eligible for diagnostics. Never print
+# exception strings from subprocess/JSON/system errors: they might include
+# credential material or parser excerpts from input manifests.
+SAFE_FAILURE_CODES = frozenset({
+    "COMPILED_GO_PATCH_CALCULATOR_MISSING",
+    "KUBERNETES_PATCH_CALCULATION_FAILED",
+    "UNEXPECTED_PATCH_REPORT_VERSION",
+    "PATCH_RESOURCE_COUNT_MISMATCH",
+    "INVALID_PATCH_RISK_NAMES",
+    "UNKNOWN_PATCH_RISK_RESOURCE",
+    "INVALID_VERIFIED_SECRET_REPORT",
+    "UNKNOWN_VERIFIED_SECRET",
+    "VERIFIED_SECRET_STILL_IN_RISK_LIST",
+    "PATCH_RESULT_EXIT_MISMATCH",
+    "PATCH_CATEGORY_REPORT_MISSING",
+    "PATCH_CATEGORY_RESOURCE_SET_MISMATCH",
+    "UNRECOGNIZED_PATCH_CATEGORY",
+    "UNEXPECTED_JWT_DIAGNOSTIC",
+    "JWT_DIAGNOSTIC_COVERAGE_MISMATCH",
+    "JWT_DIAGNOSTIC_VERIFICATION_MISMATCH",
+    "INVALID_RESEARCH_AUDIT_LABELS",
+    "RESEARCH_AUDIT_COVERAGE_MISMATCH",
+})
+
+
+def safe_failure_code(exc):
+    if type(exc) is RuntimeError and len(exc.args) == 1:
+        if type(exc.args[0]) is str and exc.args[0] in SAFE_FAILURE_CODES:
+            return exc.args[0]
+    return "UNCLASSIFIED_READ_ONLY_CHECK_FAILURE"
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:
-        print("PATCH_IMPACT_CHECK_BLOCKED")
+    except Exception as exc:
+        print("PATCH_IMPACT_CHECK_BLOCKED:", safe_failure_code(exc))
         sys.exit(2)

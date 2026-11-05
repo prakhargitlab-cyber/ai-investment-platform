@@ -481,3 +481,35 @@ validator**. No upgrade is authorized; the unreviewed research-engine
 env patch and 17 unrelated Deployment patches still block revision 2.
 Do not rerun a full Go build until the remaining chart/value
 reconciliation is prepared.
+
+## Unrelated Deployment actual-spec-effect guard (pending operator validation)
+
+The Go strategic calculator now checks every nonempty patch for the **17
+specifically identified unrelated Deployments** by applying it to the current
+live resource *in memory* via Kubernetes strategic merge. It exempts a
+Deployment from the **spec-change risk** list only if:
+
+1. The patch has exactly one top-level key, `spec`, with a non-null value.
+2. The patch can be applied by Kubernetes' typed strategic merge implementation.
+3. The resulting entire `spec` is structurally identical to the original
+   live `spec`, including pod template, image, environment, replicas,
+   storage, scheduling, and rollout fields.
+4. The Deployment is one of the 17 explicitly allowlisted resource names;
+   research-engine and other kinds are never exempted.
+
+An image tag, env, replica, security, or any other spec change therefore
+remains blocked even if a report labels the patch as a strategic-list
+operation. This test handles benign nonempty patches that reassert exactly
+the same current values. **Important limitation:** a spec-identical strategic
+patch does not prove Helm will make zero API requests, and admission
+webhooks or concurrent updates can still affect upgrade safety. It does
+not alter the rendered chart, use a post-renderer, or approve the release.
+All original stored-v1/proposed-v2/live objects are used without
+modification. The Python wrapper now validates the 17-name allowlist and
+reports only `VERIFIED_DEPLOYMENT_SPEC_NOOP_PATCHES` and resource names.
+
+Synthetic Go tests reject changed image, environment, replica, metadata
+and actual Helm-style image update patches. This code has **not yet been
+operator-tested**. JWT live-preserving chart change is also awaiting final
+validation. Keep PR #24 draft and the release blocked until the new
+checker runs and all remaining patch effects are independently reviewed.

@@ -174,6 +174,30 @@ if __name__ == "__main__":
     except Exception as exc:
         print("IMAGE_PIN_IMPACT_REVIEW_BLOCKED")
         print("DIAGNOSTIC_PHASE:", PHASE)
+        if type(exc) is base.Blocked and len(exc.args) == 1 and isinstance(exc.args[0], str):
+            reason = exc.args[0]
+            approved = (
+                "RESOURCE_IDENTITY_CHANGE", "RESEARCH_DEPLOYMENT_MISSING",
+                "DUPLICATE_", "CONTAINER_IDENTITY_CHANGE", "RESEARCH_IMAGE_NOT_APPROVED",
+                "LIVE_RESEARCH_IMAGE_MISMATCH", "APP_CONTAINER_IDENTITY_CHANGE",
+                "ENV_IDENTITY_CHANGE", "MISSING_PROTECTED_FLAG",
+                "PROTECTED_FLAG_VALUE_MISMATCH", "SAFETY_FLAG_VALUE_MISMATCH",
+                "LIVE_SECRET_MISSING", "UNAPPROVED_SECRET_METADATA_CHANGE",
+                "UNAPPROVED_SECRET_CONTENT_CHANGE", "UNAPPROVED_STORED_RELEASE_CHANGE"
+            )
+            category = reason.split(":", 1)[0]
+            print("SCOPE_BLOCK_REASON:", category if category in approved or category.startswith("DUPLICATE_") else "OTHER")
+            if category == "UNAPPROVED_STORED_RELEASE_CHANGE":
+                resource = reason.split(": ", 1)[-1]
+                permitted_names = {
+                    "frontend", "ibkr-connector", "mcp-gateway",
+                    "portfolio-optimizer", "ranking-engine",
+                    "valuation-engine", "yahoo-finance-mcp", "kafka",
+                    "research-engine", "portfolio-service",
+                }
+                kind, separator, name = resource.partition("/")
+                if separator and kind == "Deployment" and name in permitted_names:
+                    print("SCOPE_BLOCK_RESOURCE:", name)
         # Only the exception class name is reported, never exception text or data.
         print("DIAGNOSTIC_KIND:", type(exc).__name__ if type(exc).__name__ in
               ("Blocked", "ImpactBlocked", "RuntimeError", "ValueError", "KeyError",

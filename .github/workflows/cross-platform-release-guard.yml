@@ -1,0 +1,26 @@
+name: Cross-platform release guard
+on:
+  pull_request:
+    paths:
+      - 'infrastructure/deploy/**'
+      - '.github/workflows/cross-platform-release-guard.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit-contract:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Python syntax, including offline Helm impact audit
+        run: python -m compileall -q infrastructure/deploy
+      - name: Pure read-only guard unit tests
+        run: python -m unittest discover -s infrastructure/deploy -p "test_*.py" -v
+      - name: Verify release spec parses and matches contract
+        run: python -c "import importlib.util,json,pathlib; p=pathlib.Path('infrastructure/deploy/release_guard.py'); s=importlib.util.spec_from_file_location('guard',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.validate_spec(json.loads(pathlib.Path('infrastructure/deploy/releases/auth-reset-pr28.k3d.json').read_text()))"

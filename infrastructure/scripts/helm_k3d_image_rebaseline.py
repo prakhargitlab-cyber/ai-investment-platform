@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build an OFFLINE Helm image-reconciliation candidate from current k3d state.
+"""Build a private Helm image-tag candidate from live k3d state.
 
-The output contains only 17 validated workload image tags. No Kubernetes
+The output contains only 16 validated first-party workload image tags.\nKafka is an externally sourced image and requires a separate chart-managed\nstartup/replica review, not a first-party image override. No Kubernetes
 writes, helm upgrade, Secret values, env values, Helm manifest bodies, or
 image repositories are persisted. Do not use this file as automatic approval.
 """
@@ -17,9 +17,9 @@ import helm_k3d_acceptance as base
 import helm_k3d_impact_gate as impact
 
 
-UNRELATED = frozenset({
+FIRST_PARTY = frozenset({
     "api-gateway", "auth-service", "broker-service", "company-service",
-    "frontend", "ibkr-connector", "kafka", "mcp-gateway",
+    "frontend", "ibkr-connector", "mcp-gateway",
     "notification-service", "portfolio-optimizer", "portfolio-service",
     "ranking-engine", "recommendation-service", "research-service",
     "risk-service", "valuation-engine", "yahoo-finance-mcp",
@@ -29,7 +29,7 @@ LOCAL_REPOS = ("localhost:5001/", "ai-investment-registry:5000/")
 OUTPUT = base.ROOT / ".tmp" / "helm-reconciliation-image-pins.yaml"
 
 
-def image_tag(image, name):
+def image_tag(image, name, *, allow_mutable=False):
     """Accept only the expected locally built image repo and an immutable tag."""
     if not isinstance(image, str):
         raise ValueError("INVALID_IMAGE_REFERENCE")
@@ -38,7 +38,7 @@ def image_tag(image, name):
     for prefix in candidates:
         if image.startswith(prefix):
             tag = image[len(prefix):]
-            if TAG.fullmatch(tag) and tag not in ("latest", "dev"):
+            if TAG.fullmatch(tag) and (allow_mutable or tag not in ("latest", "dev")):
                 return tag
     raise ValueError("UNREVIEWED_LIVE_IMAGE_REFERENCE")
 
@@ -48,7 +48,7 @@ def candidate_values(old, proposed, live):
             or set(old) - set(live)):
         raise ValueError("RESOURCE_IDENTITIES_CHANGED")
     result = {}
-    for name in sorted(UNRELATED):
+    for name in sorted(FIRST_PARTY):
         key = ("apps/v1", "Deployment", name)
         if key not in old:
             raise ValueError("EXPECTED_DEPLOYMENT_MISSING")
@@ -64,9 +64,9 @@ def candidate_values(old, proposed, live):
             raise ValueError("CONTAINER_IDENTITY_MISMATCH")
         # Expected template currently renders the same LOCAL repo. If a
         # different registry is required, that is a separate reviewed change.
-        _ = image_tag(candidate[0].get("image"), name)
+        _ = image_tag(candidate[0].get("image"), name, allow_mutable=True)
         result[name] = {"imageTagOverride": image_tag(observed[0].get("image"), name)}
-    if set(result) != UNRELATED:
+    if set(result) != FIRST_PARTY:
         raise ValueError("MISSING_IMAGE_PINS")
     return {"workloadOverrides": result}
 
@@ -90,7 +90,7 @@ def main():
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    print("LOCAL_HELM_IMAGE_PINS_PREPARED:", len(UNRELATED))
+    print("LOCAL_HELM_IMAGE_PINS_PREPARED:", len(FIRST_PARTY))
     print("CANDIDATE_PATH: .tmp/helm-reconciliation-image-pins.yaml")
     print("SECRETS_AND_ENV_VALUES_NOT_EXPORTED")
     print("IMAGE_REPOSITORIES_AND_TAGS_NOT_PRINTED")

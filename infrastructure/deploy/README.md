@@ -74,3 +74,25 @@ Keep the same Python core, but introduce an explicit Azure target profile
 with pinned kube-context, Azure Container Registry auth via workload identity,
 TLS verification, Key Vault integration, private networking, and backup policy.
 Do not reuse localhost:5001, local k3d node names, or insecure HTTP for Azure.
+
+## Current Helm upgrade diagnostic (November 5, 2026)
+
+The original Helm revision 1 is healthy and PR #28 images are published. The
+upgrade dry run still fails before any patch calculation. Both
+`--reuse-values` and `--reset-values` dry runs failed. Independent
+`helm template` succeeds. This **does not prove a stored-values defect**:
+the chart's `aip.devCredential` template helper uses
+`.Release.IsUpgrade` and mandatory Kubernetes Secret lookups, whereas
+an independent template render defaults to an installation context.
+
+The impact audit now verifies that the protected credential Secrets have
+their expected structural data keys, and extracts only categorized YAML
+error signatures, numeric error lines, and safe template basenames.
+All output is read-only and Secret values remain hidden. Do not try
+`helm upgrade --reset-values` as a workaround: it could replace important
+live configuration. Neither Helm revision 2 nor an Azure profile is
+authorized until the exact patch is classified and reviewed.
+
+Stage-2 full deployment requirements still include a fresh-cluster installer,
+an upgrade path, and Azure Linux profile with secure registry and secret
+management. The present wrappers expose only read-only `plan` and `verify`.

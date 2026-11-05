@@ -49,6 +49,7 @@ jobs:
           python -m pytest -q \
             infrastructure/scripts/test_helm_managed_deployment_sources.py \
             infrastructure/scripts/test_helm_k3d_image_rebaseline.py \
+            infrastructure/scripts/test_helm_k3d_image_pin_impact.py \
             infrastructure/scripts/test_helm_jwt_upgrade_guard.py \
             infrastructure/scripts/test_helm_k3d_strategic_patch.py
       - name: Validate rendered images, research init and Kafka probe

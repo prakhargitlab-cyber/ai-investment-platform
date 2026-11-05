@@ -139,6 +139,27 @@ def main():
         raise RuntimeError("JWT_DIAGNOSTIC_COVERAGE_MISMATCH")
     if (jwt_code == "VERIFIED") != ("Secret/aip-auth-jwt" in safe_secrets):
         raise RuntimeError("JWT_DIAGNOSTIC_VERIFICATION_MISMATCH")
+    jwt_shape = result.get("jwt_patch_shape", "")
+    allowed_shapes = {
+        "", "INVALID_PATCH_JSON", "EMPTY_PATCH", "NO_STRINGDATA_FIELD",
+        "STRINGDATA_WITH_OTHER_OPERATIONS", "STRINGDATA_NULL_ONLY",
+        "STRINGDATA_MALFORMED_OBJECT", "STRINGDATA_EMPTY_OBJECT",
+        "STRINGDATA_KEY_DELETIONS", "STRINGDATA_OBJECT_VALUES",
+        "STRINGDATA_OTHER_SHAPE"
+    }
+    if jwt_shape not in allowed_shapes or (bool(jwt_shape) != bool(jwt_code)):
+        raise RuntimeError("INVALID_JWT_PATCH_SHAPE_REPORT")
+    research_env = result.get("research_env_audit")
+    allowed_env_audits = {
+        "CONTAINER_ORDER_DIRECTIVE", "ENV_ORDER_DIRECTIVE",
+        "MALFORMED_CONTAINER_PATCH", "MALFORMED_ENV_PATCH",
+        "ENV_NAME_ONLY_PATCH_ENTRY", "APPROVED_ENV_PATCH_ENTRY",
+        "UNAPPROVED_ENV_PATCH_ENTRY"
+    }
+    if not isinstance(research_env, list) or any(
+        label not in allowed_env_audits for label in research_env
+    ) or (bool(research_env) and not result.get("research_patch")):
+        raise RuntimeError("INVALID_RESEARCH_ENV_AUDIT")
     research_labels = result.get("research_patch_labels")
     allowed_research_labels = {
         "STRATEGIC_LIST_DIRECTIVE", "OTHER_TOP_LEVEL",
@@ -168,8 +189,11 @@ def main():
         print("PATCH_CATEGORY:", name, ",".join(sorted(set(categories[name]))))
     if jwt_code:
         print("JWT_SECRET_PATCH_AUDIT:", jwt_code)
+        print("JWT_SECRET_PATCH_SHAPE:", jwt_shape)
     for label in research_labels:
         print("RESEARCH_PATCH_AUDIT:", label)
+    for label in research_env:
+        print("RESEARCH_ENV_PATCH_AUDIT:", label)
     print("RESEARCH_PATCH_NOT_YET_APPROVED")
     print("PATCH_BYTES_AND_SECRET_VALUES_NOT_DISPLAYED")
     print("SECRET_NOOP_MEANS_WRITE_ONLY_STRINGDATA_REMOVAL_AND_BYTE_EQUALITY")
@@ -204,6 +228,8 @@ SAFE_FAILURE_CODES = frozenset({
     "JWT_DIAGNOSTIC_VERIFICATION_MISMATCH",
     "INVALID_RESEARCH_AUDIT_LABELS",
     "RESEARCH_AUDIT_COVERAGE_MISMATCH",
+    "INVALID_JWT_PATCH_SHAPE_REPORT",
+    "INVALID_RESEARCH_ENV_AUDIT",
 })
 
 

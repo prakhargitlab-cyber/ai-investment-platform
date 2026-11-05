@@ -2528,6 +2528,11 @@ function Get-DeploymentFrontendBuildConfig {
 
 function Start-DeploymentFreshRollout {
     param([string[]]$Names)
+    # Component deployment currently writes directly to Helm-owned Deployments.
+    # Until the scoped Helm upgrade path has an approved exact three-way impact
+    # check, reject BEFORE building, pushing, patching, scaling, or touching
+    # recovery isolation. No risk-acceptance flags override this restriction.
+    throw 'HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED: component image updates must be recorded in the Helm release; see issue #25'
     if (-not $Names -or @($Names | Where-Object { $_ -notin @('api-gateway', 'research-engine', 'portfolio-service', 'frontend') }).Count) { throw 'Invalid fresh deployment selection' }
     if ($SkipBuild) { throw 'SkipBuild is not supported for fresh deployment' }
     Assert-LocalPrerequisites
@@ -2720,6 +2725,11 @@ function Assert-ResumeAudit {
 
 function Deploy-VerifiedRadarComponentsCore {
     param([string[]]$Names)
+    # Component deployment currently writes directly to Helm-owned Deployments.
+    # Until the scoped Helm upgrade path has an approved exact three-way impact
+    # check, reject BEFORE building, pushing, patching, scaling, or touching
+    # recovery isolation. No risk-acceptance flags override this restriction.
+    throw 'HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED: component image updates must be recorded in the Helm release; see issue #25'
     if (-not $Names -or @($Names | Where-Object { $_ -notin @('api-gateway','research-engine','portfolio-service','frontend') }).Count) { throw 'Invalid safe deployment selection' }
     if ($SkipBuild) { throw 'SkipBuild is not supported for verified deployment' }
     if ($ResumeAuditTag -and $NoCache) { throw 'NoCache is invalid for artifact-reuse recovery' }
@@ -2907,6 +2917,11 @@ function Deploy-VerifiedRadarComponentsCore {
 }
 
 function Deploy-SelectedComponents {
+    # Component deployment currently writes directly to Helm-owned Deployments.
+    # Until the scoped Helm upgrade path has an approved exact three-way impact
+    # check, reject BEFORE building, pushing, patching, scaling, or touching
+    # recovery isolation. No risk-acceptance flags override this restriction.
+    throw 'HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED: component image updates must be recorded in the Helm release; see issue #25'
     $safeSelection = @(Resolve-SelectedComponents -RequireSelection)
     if (@($safeSelection | Where-Object { $_ -notin @('api-gateway', 'research-engine', 'portfolio-service', 'frontend') }).Count -eq 0) {
         # Explicitly accepting the high-risk gate always routes to the

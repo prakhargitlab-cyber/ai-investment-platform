@@ -96,3 +96,21 @@ authorized until the exact patch is classified and reviewed.
 Stage-2 full deployment requirements still include a fresh-cluster installer,
 an upgrade path, and Azure Linux profile with secure registry and secret
 management. The present wrappers expose only read-only `plan` and `verify`.
+
+## Strict two-Deployment simulation (read-only)
+
+The full Helm upgrade candidate for auth reset correctly rendered but would
+patch 21 resources, including three Secrets and the pinned research-engine.
+Do **not** apply that candidate. To distinguish unrelated release drift from
+the necessary auth changes, run the same audit with
+`--simulate-scoped-candidate`. This reads the actual Helm preview and Helm
+revision-1 manifest, and creates an **in-memory simulation** that retains all
+non-target manifests exactly as recorded in revision 1. For auth-service and
+api-gateway it copies only the approved image and origin environment value,
+and verifies both against the immutable release specification. It then invokes
+the existing real strategic three-way patch calculator with the live objects.
+
+The simulation is **not** a Helm post-renderer and cannot be deployed. It
+does not authorize an upgrade, even when only two Deployment patches remain.
+A production-safe Helm post-renderer or equivalently strict release mechanism
+and an end-to-end apply rehearsal are separate required deliverables.

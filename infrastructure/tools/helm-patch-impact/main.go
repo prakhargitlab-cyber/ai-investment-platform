@@ -100,6 +100,10 @@ func calculatePatchDetailed(t triple) (bool, string, []string, bool, []byte, err
         o.Metadata.Name == "dev-postgres" ||
         o.Metadata.Name == "dev-searxng")
     verifiedNoop := allowedSecret && isVerifiedStringDataRemoval(t, patch)
+    if o.Kind == "Secret" && o.Metadata.Name == "aip-auth-jwt" &&
+        !verifiedNoop {
+        verifiedNoop = isVerifiedLiveJWTDataRewrite(t, patch)
+    }
     return true, o.Kind + "/" + o.Metadata.Name, categories, verifiedNoop, patch, nil
 }
 
@@ -118,7 +122,14 @@ func perform(r request) (report, error) {
         if name == "Secret/aip-auth-jwt" {
             out.JWTPatchShape = secretPatchShape(patch)
             out.JWTFailureCode = secretNoopFailure(t, patch)
-            if (out.JWTFailureCode == "VERIFIED") != secretNoop {
+            if secretNoop && out.JWTFailureCode != "VERIFIED" {
+                if !isVerifiedLiveJWTDataRewrite(t, patch) {
+                    return out, fmt.Errorf("SECRET_AUDIT_INCONSISTENT")
+                }
+                out.JWTFailureCode = "VERIFIED_LIVE_DATA_REWRITE"
+            }
+            if (out.JWTFailureCode == "VERIFIED" ||
+                out.JWTFailureCode == "VERIFIED_LIVE_DATA_REWRITE") != secretNoop {
                 return out, fmt.Errorf("SECRET_AUDIT_INCONSISTENT")
             }
         }

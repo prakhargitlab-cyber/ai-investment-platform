@@ -42,6 +42,8 @@ type report struct {
     VerifiedSecretNoop []string `json:"verified_secret_noop"`
     PatchCategories map[string][]string `json:"patch_categories"`
     ResearchPatch bool `json:"research_patch"`
+    JWTFailureCode string `json:"jwt_failure_code"`
+    ResearchPatchLabels []string `json:"research_patch_labels"`
     Blocked bool `json:"blocked"`
     Version string `json:"version"`
 }
@@ -63,40 +65,40 @@ func patchStructure(version, kind string) (interface{}, error) {
 }
 
 func calculatePatch(t triple) (bool, string, error) {
-    changed, name, _, _, err := calculatePatchDetailed(t)
+    changed, name, _, _, _, err := calculatePatchDetailed(t)
     return changed, name, err
 }
 
-func calculatePatchDetailed(t triple) (bool, string, []string, bool, error) {
+func calculatePatchDetailed(t triple) (bool, string, []string, bool, []byte, error) {
     var o, n, l resource
-    if err := json.Unmarshal(t.Old, &o); err != nil { return false, "", nil, false, err }
-    if err := json.Unmarshal(t.New, &n); err != nil { return false, "", nil, false, err }
-    if err := json.Unmarshal(t.Live, &l); err != nil { return false, "", nil, false, err }
+    if err := json.Unmarshal(t.Old, &o); err != nil { return false, "", nil, false, nil, err }
+    if err := json.Unmarshal(t.New, &n); err != nil { return false, "", nil, false, nil, err }
+    if err := json.Unmarshal(t.Live, &l); err != nil { return false, "", nil, false, nil, err }
     if o.Kind == "" || o.Metadata.Name == "" ||
         o != n || o != l {
-        return false, "", nil, false, fmt.Errorf("RESOURCE_IDENTITY_MISMATCH")
+        return false, "", nil, false, nil, fmt.Errorf("RESOURCE_IDENTITY_MISMATCH")
     }
     obj, err := patchStructure(o.APIVersion, o.Kind)
-    if err != nil { return false, "", nil, false, err }
+    if err != nil { return false, "", nil, false, nil, err }
     meta, err := strategicpatch.NewPatchMetaFromStruct(obj)
-    if err != nil { return false, "", nil, false, err }
+    if err != nil { return false, "", nil, false, nil, err }
     // Helm's built-in object path: CreateThreeWayMergePatch(oldData, newData,
     // currentData, patchMeta, true). This is a calculation, not an API call.
     patch, err := strategicpatch.CreateThreeWayMergePatch(
         t.Old, t.New, t.Live, meta, true)
-    if err != nil { return false, "", nil, false, err }
+    if err != nil { return false, "", nil, false, nil, err }
     trimmed := bytes.TrimSpace(patch)
-    if len(trimmed) == 0 { return false, "", nil, false, fmt.Errorf("EMPTY_PATCH_RESPONSE") }
-    if bytes.Equal(trimmed, []byte("{}")) { return false, o.Kind + "/" + o.Metadata.Name, []string{}, false, nil }
+    if len(trimmed) == 0 { return false, "", nil, false, nil, fmt.Errorf("EMPTY_PATCH_RESPONSE") }
+    if bytes.Equal(trimmed, []byte("{}")) { return false, o.Kind + "/" + o.Metadata.Name, []string{}, false, nil, nil }
     categories, err := classifyPatch(o.Kind, patch)
-    if err != nil { return false, "", nil, false, err }
+    if err != nil { return false, "", nil, false, nil, err }
         // Only the three reviewed release Secrets may receive a no-op exemption.
     allowedSecret := o.Kind == "Secret" && (
         o.Metadata.Name == "aip-auth-jwt" ||
         o.Metadata.Name == "dev-postgres" ||
         o.Metadata.Name == "dev-searxng")
     verifiedNoop := allowedSecret && isVerifiedStringDataRemoval(t, patch)
-    return true, o.Kind + "/" + o.Metadata.Name, categories, verifiedNoop, nil
+    return true, o.Kind + "/" + o.Metadata.Name, categories, verifiedNoop, patch, nil
 }
 
 func perform(r request) (report, error) {
@@ -104,13 +106,23 @@ func perform(r request) (report, error) {
     if len(r.Resources) != 54 { return out, fmt.Errorf("EXPECTED_54_RESOURCES") }
     seen := map[string]bool{}
     for _, t := range r.Resources {
-        changed, name, categories, secretNoop, err := calculatePatchDetailed(t)
+        changed, name, categories, secretNoop, patch, err := calculatePatchDetailed(t)
         if err != nil { return out, err }
         if seen[name] { return out, fmt.Errorf("DUPLICATE_RESOURCE") }
         seen[name] = true
         if !changed { continue }
         out.NonEmpty++
         out.PatchCategories[name] = categories
+        if name == "Secret/aip-auth-jwt" {
+            out.JWTFailureCode = secretNoopFailure(t, patch)
+            if (out.JWTFailureCode == "VERIFIED") != secretNoop {
+                return out, fmt.Errorf("SECRET_AUDIT_INCONSISTENT")
+            }
+        }
+        if name == "Deployment/research-engine" {
+            out.ResearchPatchLabels, err = researchPatchLabels(patch)
+            if err != nil { return out, err }
+        }
         if secretNoop {
             out.VerifiedSecretNoop = append(out.VerifiedSecretNoop, name)
         } else if name == "Deployment/research-engine" {

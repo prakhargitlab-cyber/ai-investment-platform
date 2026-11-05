@@ -152,6 +152,39 @@ def helm_dry_run(base, *arguments):
         for pattern, code in categories:
             if pattern in message:
                 raise Blocked(code)
+        # Inspect only fixed YAML error signatures and safe numeric locations.
+        # Never echo Helm's free-form text, values, or chart content.
+        import re
+        yaml_signatures = (
+            (b"yaml: unmarshal errors", "YAML_TYPE_UNMARSHAL"),
+            (b"cannot unmarshal", "YAML_TYPE_UNMARSHAL"),
+            (b"mapping values are not allowed", "YAML_MAPPING_SYNTAX"),
+            (b"did not find expected key", "YAML_EXPECTED_KEY_MISSING"),
+            (b"did not find expected '-' indicator", "YAML_LIST_STRUCTURE"),
+            (b"did not find expected", "YAML_STRUCTURE_ERROR"),
+            (b"found character that cannot start any token", "YAML_INVALID_TOKEN"),
+            (b"could not find expected", "YAML_STRUCTURE_ERROR"),
+            (b"yaml: line", "YAML_LINE_ERROR"),
+            (b"yaml error", "YAML_GENERAL_ERROR"),
+            (b"error parsing yaml", "YAML_PARSE_FAILURE"),
+            (b"error converting yaml", "YAML_CONVERSION_FAILURE"),
+        )
+        for signature, code in yaml_signatures:
+            if signature in message:
+                print("HELM_YAML_FAILURE_CLASS:", code, flush=True)
+                break
+        lines = re.findall(rb"\\bline[ :]+(\\d{1,6})\\b", message)
+        if lines:
+            print("HELM_YAML_ERROR_LINES:",
+                  ",".join(str(int(n)) for n in lines[:4]), flush=True)
+        # Extract only a safe Helm chart template basename (not an arbitrary
+        # filepath, username, or YAML snippet).
+        template_names = re.findall(
+            rb"templates/([a-z][a-z0-9_-]{0,60}\\.ya?ml)", message)
+        if template_names:
+            print("HELM_ERROR_TEMPLATE_NAMES:",
+                  ",".join(n.decode("ascii") for n in dict.fromkeys(template_names)),
+                  flush=True)
         # If Helm's phrasing is unknown, return only approved vocabulary
         # present in the diagnostic, never the raw error or identifiers.
         import re

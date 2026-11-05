@@ -16,19 +16,40 @@ ROOT = Path(__file__).resolve().parents[2]
 CALCULATOR = ROOT / ".tmp" / "helm-patch-impact" / "helm-patch-impact.exe"
 
 
+# This is the only diagnostic state emitted on unexpected exceptions.
+# Phase names are fixed literals and cannot contain Secret data.
+PHASE = "START"
+
+
+def phase(label):
+    global PHASE
+    if label not in {
+        "START", "LOAD_MANIFESTS", "VALIDATE_SCOPE", "SERIALIZE_IN_MEMORY",
+        "EXECUTE_CALCULATOR", "DECODE_SUMMARY", "VALIDATE_REPORT",
+        "PRINT_SUMMARY"
+    }:
+        raise RuntimeError("INVALID_DIAGNOSTIC_PHASE")
+    PHASE = label
+
+
 def main():
+    phase("START")
     if not CALCULATOR.is_file():
         raise RuntimeError("COMPILED_GO_PATCH_CALCULATOR_MISSING")
+    phase("LOAD_MANIFESTS")
     old, new, live = impact.load_manifests()
+    phase("VALIDATE_SCOPE")
     base.only_approved_revision_changes(old, new, live)
 
     # Gather exactly the existing 54 resources; never write manifests to disk.
+    phase("SERIALIZE_IN_MEMORY")
     keys = sorted(old)
     payload = json.dumps({"resources": [
         {"old": old[key], "new": new[key], "live": live[key]}
         for key in keys
     ]}, separators=(",", ":")).encode("utf-8")
 
+    phase("EXECUTE_CALCULATOR")
     proc = subprocess.run(
         [str(CALCULATOR)], input=payload,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
@@ -36,9 +57,11 @@ def main():
     )
     # The executable is expected to emit strictly a fixed-schema summary.
     # Do not echo raw stderr/stdout: values could be included by a bad binary.
+    phase("DECODE_SUMMARY")
     if proc.returncode not in (0, 3):
         raise RuntimeError("KUBERNETES_PATCH_CALCULATION_FAILED")
     result = json.loads(proc.stdout)
+    phase("VALIDATE_REPORT")
     if result.get("version") != "strategic-three-way-v1":
         raise RuntimeError("UNEXPECTED_PATCH_REPORT_VERSION")
     if result.get("resources") != 54:
@@ -110,6 +133,7 @@ def main():
         raise RuntimeError("INVALID_RESEARCH_AUDIT_LABELS")
     if bool(research_labels) != bool(result.get("research_patch")):
         raise RuntimeError("RESEARCH_AUDIT_COVERAGE_MISMATCH")
+    phase("PRINT_SUMMARY")
     print("KUBERNETES_STRATEGIC_PATCH_RESOURCES:", result["resources"])
     print("NONEMPTY_THREE_WAY_PATCHES:", result.get("nonempty"))
     print("RESEARCH_ENGINE_PATCH_NONEMPTY:", result.get("research_patch"))
@@ -169,9 +193,34 @@ def safe_failure_code(exc):
     return "UNCLASSIFIED_READ_ONLY_CHECK_FAILURE"
 
 
+def safe_failure_kind(exc):
+    # No exception messages or repr(), no arbitrary types or custom names.
+    allowed = {
+        RuntimeError: "RUNTIME_ERROR",
+        KeyError: "KEY_ERROR",
+        TypeError: "TYPE_ERROR",
+        ValueError: "VALUE_ERROR",
+        OSError: "OS_ERROR",
+        AttributeError: "ATTRIBUTE_ERROR",
+        IndexError: "INDEX_ERROR",
+        UnicodeError: "UNICODE_ERROR",
+    }
+    if isinstance(exc, json.JSONDecodeError):
+        return "JSON_DECODE_ERROR"
+    if type(exc) is base.Blocked:
+        return "HELM_ACCEPTANCE_BLOCKED"
+    if type(exc) is impact.ImpactBlocked:
+        return "IMPACT_MANIFEST_BLOCKED"
+    if type(exc) is subprocess.TimeoutExpired:
+        return "SUBPROCESS_TIMEOUT"
+    return allowed.get(type(exc), "OTHER_EXCEPTION")
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
         print("PATCH_IMPACT_CHECK_BLOCKED:", safe_failure_code(exc))
+        print("PATCH_DIAGNOSTIC_PHASE:", PHASE)
+        print("PATCH_DIAGNOSTIC_KIND:", safe_failure_kind(exc))
         sys.exit(2)

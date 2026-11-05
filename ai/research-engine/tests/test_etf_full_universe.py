@@ -63,6 +63,16 @@ async def test_complete_fixture_coverage(repo,size):
     assert len(cp._progress)==size*2
     assert all(cp._progress[('ETF_ONBOARD',r['isin'])]['disposition']=='SUCCESS_EMPTY' for r in rows)
     assert repo.persistence.active_cycle_run('NSE') is None
+    from app.etf_phase_progress import etf_phase_progress
+    progress = etf_phase_progress(repo.persistence.cycle_run(cp.cycle_id))
+    phases = {item['phase']:item for item in progress['phases']}
+    assert len(phases) == 8 and all(item['observed'] for item in phases.values())
+    assert phases['PUBLICATION']['succeeded'] == 1 and phases['PUBLICATION']['remaining'] == 0
+    assert phases['HISTORY_ONBOARDING']['skipped'] == size
+    assert phases['FUNDAMENTAL_ACQUISITION']['skipped'] == size
+    assert phases['READINESS_EVALUATION']['succeeded'] == size
+    assert phases['SCORING_RANKING']['succeeded'] == size
+    assert progress['overall_percentage'] is None
 
 
 @pytest.mark.asyncio

@@ -182,7 +182,7 @@ def test_admin_endpoint_routes_only_explicit_full_universe_gate(monkeypatch, ena
     assert manual.await_count == (1 if expected == 202 else 0)
     assert client.post('/api/v1/etf-radar/cycles', json={}, headers=ADMIN).status_code == 503
     if expected == 202:
-        assert manual.await_args.args[0]['full_universe_limits'] == dict(max_universe=2000, max_requests=1500, max_seconds=3600)
+        assert manual.await_args.args[0]['full_universe_limits'] == dict(max_universe=2000, max_requests=3000, max_seconds=7200)
         manual.side_effect = ManualEtfAdmissionError('ETF_ACTIVE_CYCLE_REQUIRES_REVIEW')
         blocked = client.post(path, json={}, headers=ADMIN)
         assert blocked.status_code == 409

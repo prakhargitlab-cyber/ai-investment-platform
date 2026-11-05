@@ -43,6 +43,13 @@ class EtfHistoryProvider(YahooHistoricalPriceProvider):
         super()._verify_identity_or_raise(instrument, ticker, access)
 
 
+# Five years of daily history is the onboarding target (366 days/year absorbs leap years). It is only a ceiling:
+# callers clamp to the listing date and the provider returns nothing before an ETF existed.
+ETF_HISTORY_TARGET_DAYS = 5 * 366
+# One provider request covers at most this many calendar days; longer gaps are fetched as sequential windows.
+ETF_HISTORY_WINDOW_DAYS = 731
+
+
 async def acquire_etf_history(repository, row, *, now, checkpoint, provider=None, start=None, end=None):
     """One sequential bounded request per instrument; retry occurs in a new cycle.
 
@@ -74,7 +81,7 @@ async def acquire_etf_history(repository, row, *, now, checkpoint, provider=None
     key = UUID(str(row['globalInstrumentId']))
     ticker = row['primarySymbol'] + '.NS'
     end_date = end.date() if end is not None else now.date() + timedelta(days=1)
-    start = start if start is not None else now-timedelta(days=400)
+    start = start if start is not None else now-timedelta(days=ETF_HISTORY_TARGET_DAYS)
     end = end if end is not None else now
     try:
         observations = await provider.closes({**row, 'structuredProviderTicker': ticker},

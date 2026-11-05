@@ -224,7 +224,8 @@ async def test_document_to_reopened_database_to_actual_radar_candidate(tmp_path,
         for key, expected, unit in [("aum", "50000000", "INR"), ("expense_ratio", "0.35", "PERCENT_PA")]:
             observation = candidate["screening_metrics"][key]
             assert observation == {"value": expected if dated else None, "unit": unit,
-                                   "quality": "VALID" if dated else "UNAVAILABLE"}
+                                   "quality": "VALID" if dated else "UNAVAILABLE",
+                                   "reason": None if dated else "UNKNOWN_AS_OF"}
         assert json.loads(json.dumps(payload)) == payload
     finally:
         reopened._connection.close()

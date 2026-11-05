@@ -99,6 +99,8 @@ class EtfCycleCandidateResult:
     risk_gates: tuple[EtfRiskGate, ...] = ()
     recommendation: str | None = None
     rank: int | None = None
+    fund_name: str | None = None
+    research_readiness: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -130,12 +132,16 @@ def etf_cycle_result_to_dict(result: EtfCycleResult) -> dict:
     structure; json.dumps's default handles the remaining leaf types
     (UUID/Decimal/datetime/Enum) that asdict leaves untouched."""
     payload = json.loads(json.dumps(dataclasses.asdict(result), default=_json_default))
+    from app.etf_screening import enrich_candidate
+    for candidate in [*payload['candidates'], *payload['ranked']]:
+        enrich_candidate(candidate, now=result.as_of)
     payload["universe_count"] = len(result.candidates)
     return payload
 
 
-def _bars(store, instrument_id: UUID):
-    return [bar for bar in store.load_daily_market_bars({instrument_id}) if bar.global_instrument_id == instrument_id]
+def _bars(store, instrument_id: UUID, *, now=None):
+    from app.etf_history_selection import select_etf_history_bars
+    return select_etf_history_bars(store.load_daily_market_bars({instrument_id}), instrument_id, now=now)[0]
 
 
 def _fact(store, instrument_id: UUID, metric: EtfMetric):
@@ -193,18 +199,22 @@ def evaluate_admitted_etf(decision: EtfAdmissionDecision, store, *, now: datetim
     touching readiness or scoring for this one instrument -- other
     candidates in the same cycle are entirely unaffected."""
     instrument_id = decision.global_instrument_id
+    from app.etf_screening import readiness_payload
+    presentation = {'fund_name': decision.candidate.get('canonicalName'),
+                    'research_readiness': readiness_payload()}
     if historical_failure_reason is not None:
         return EtfCycleCandidateResult(instrument_id, decision.symbol, EtfCycleDisposition.TECHNICAL_FAILURE,
-            f"HISTORICAL_ACQUISITION_FAILED:{historical_failure_reason}")
+            f"HISTORICAL_ACQUISITION_FAILED:{historical_failure_reason}", **presentation)
     try:
-        bars = _bars(store, instrument_id)
+        bars = _bars(store, instrument_id, now=now)
         statuses, summary = evaluate_etf_readiness(store, instrument_id, now=now)
+        presentation['research_readiness'] = readiness_payload(statuses, summary)
         if not summary.ready_for_analysis:
             reason = "MANDATORY_EVIDENCE_NOT_READY:" + ",".join(
                 f"{item.requirement}={item.status}" for item in statuses
                 if item.role == "MANDATORY" and item.status != "READY_FRESH")
             return EtfCycleCandidateResult(instrument_id, decision.symbol,
-                EtfCycleDisposition.INSUFFICIENT_DATA, reason)
+                EtfCycleDisposition.INSUFFICIENT_DATA, reason, **presentation)
         metrics = compute_etf_deterministic_metrics(instrument_id, bars)
         rule_input = EtfRuleEngineInput(
             instrument_id=instrument_id, readiness_statuses=statuses, readiness_summary=summary, metrics=metrics,
@@ -218,13 +228,13 @@ def evaluate_admitted_etf(decision: EtfAdmissionDecision, store, *, now: datetim
         )
     except Exception as exc:
         return EtfCycleCandidateResult(instrument_id, decision.symbol, EtfCycleDisposition.TECHNICAL_FAILURE,
-            f"EVIDENCE_LOOKUP_FAILED:{type(exc).__name__}:{str(exc)[:160]}")
+            f"EVIDENCE_LOOKUP_FAILED:{type(exc).__name__}:{str(exc)[:160]}", **presentation)
     result = score_etf(rule_input)
     gates = evaluate_etf_risk_gates(rule_input, result)
     recommendation = derive_etf_recommendation(result, gates)
     subtype = _subtype_for(decision, profile_lookup)
     return EtfCycleCandidateResult(instrument_id, decision.symbol, EtfCycleDisposition.EVALUATED, "EVALUATED",
-        subtype=subtype, rule_engine_result=result, risk_gates=tuple(gates), recommendation=str(recommendation))
+        subtype=subtype, rule_engine_result=result, risk_gates=tuple(gates), recommendation=str(recommendation), **presentation)
 
 
 def run_etf_radar_cycle(rows: list[dict], store, *, now: datetime | None = None, cycle_id: UUID | None = None,
@@ -261,7 +271,7 @@ def run_etf_radar_cycle(rows: list[dict], store, *, now: datetime | None = None,
         else:
             disposition = _ADMISSION_TO_DISPOSITION[decision.outcome]
             candidates.append(EtfCycleCandidateResult(decision.global_instrument_id, decision.symbol,
-                disposition, decision.reason))
+                disposition, decision.reason, fund_name=decision.candidate.get('canonicalName')))
 
     def _score_key(candidate: EtfCycleCandidateResult):
         score = candidate.rule_engine_result.overall_score if candidate.rule_engine_result else None
@@ -274,8 +284,7 @@ def run_etf_radar_cycle(rows: list[dict], store, *, now: datetime | None = None,
     ordered = sorted(evaluated, key=_score_key)
     limited = ordered[:top_n] if top_n is not None else ordered
     ranked = tuple(
-        EtfCycleCandidateResult(c.global_instrument_id, c.symbol, c.disposition, c.reason, c.subtype,
-            c.rule_engine_result, c.risk_gates, c.recommendation, rank=i + 1)
+        dataclasses.replace(c, rank=i + 1)
         for i, c in enumerate(limited)
     )
 
@@ -464,6 +473,9 @@ def _enrich_bounded_candidates_with_screening_evidence(payload, store, *, now):
             selected['NAV'] = navs[0]
         candidate.update(screening_evidence(store, key, selected, candidate, now=now))
         enrich_candidate(candidate, now=now)
+    by_id = {item.get('global_instrument_id'): item for item in payload.get('candidates', ())}
+    payload['ranked'] = [{**by_id.get(item.get('global_instrument_id'), item), 'rank': item['rank']}
+                         for item in payload.get('ranked', ())]
 
 
 async def run_etf_radar_cycle_async(repository, portfolio_orchestrator, *, top_n: int | None = 10,

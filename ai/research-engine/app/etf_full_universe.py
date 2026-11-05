@@ -21,6 +21,7 @@ from app.etf_opportunity_cycle import run_etf_radar_cycle, etf_cycle_result_to_d
 from app.etf_screening import screening_evidence, enrich_candidate, research_overview, recommendation_evidence_gaps
 from app.nse_historical_daily import verified_identity
 from app.portfolio_orchestration import _trusted_nse_provider_mapping
+from app.etf_phase_progress import record_etf_phase
 
 
 def reconcile(listings, canonical):
@@ -272,6 +273,7 @@ async def _ensure_etf_history(repository, row, *, now, checkpoint, provider=None
     from app.market_sessions import completed_sessions
     from app.session_history import missing_history_ranges
     from app.etf_metrics import TRADING_SESSIONS_PER_YEAR
+    from app.etf_history import ETF_HISTORY_TARGET_DAYS, ETF_HISTORY_WINDOW_DAYS
     key = UUID(str(row['globalInstrumentId']))
 
     def existing_history():
@@ -283,10 +285,11 @@ async def _ensure_etf_history(repository, row, *, now, checkpoint, provider=None
     if not schedules:
         return {'status': 'TECHNICAL_FAILURE', 'provider': None,
                 'reason': 'HISTORICAL_SESSION_CALENDAR_UNAVAILABLE', 'observations': 0}
-    start_date = (now - timedelta(days=400)).date()
+    start_date = (now - timedelta(days=ETF_HISTORY_TARGET_DAYS)).date()
     listing_date = row.get('listingDate')
-    if listing_date:
-        start_date = max(start_date, date.fromisoformat(str(listing_date)[:10]))
+    listed = date.fromisoformat(str(listing_date)[:10]) if listing_date else None
+    if listed:
+        start_date = max(start_date, listed)  # never request sessions before the ETF was listed
     sessions = dict(completed_sessions('NSE', schedules, exceptions, start_date, now.date(), now))
     symbol = row['primarySymbol']
     present = {b.trading_date for b in bars
@@ -295,8 +298,10 @@ async def _ensure_etf_history(repository, row, *, now, checkpoint, provider=None
                and b.provider_symbol in {symbol, symbol + '.NS'} and b.source_url
                and b.close is not None and b.close.is_finite() and b.close > 0
                and b.trading_date in sessions and sessions[b.trading_date] <= b.retrieved_at <= now}
-    if len(present) >= TRADING_SESSIONS_PER_YEAR + 1:
-        start_date = min(present)
+    # A leading gap is not re-requested every cycle: without a known listing date the first stored session is the
+    # provider's earliest data; with one, only a gap longer than two weeks after listing is still worth a request.
+    if len(present) >= TRADING_SESSIONS_PER_YEAR + 1 and (listed is None or min(present) - max(start_date, listed or start_date) <= timedelta(days=14)):
+        start_date = max(start_date, min(present))
     ranges = missing_history_ranges(present, market='NSE', schedules=schedules,
         exceptions=exceptions, start=start_date, as_of=now)
     if not ranges:
@@ -305,7 +310,13 @@ async def _ensure_etf_history(repository, row, *, now, checkpoint, provider=None
                     'reason': 'HISTORICAL_COVERAGE_INSUFFICIENT'}
         return {'status': 'SUFFICIENT_EXISTING_HISTORY', 'provider': None, 'observations': 0}
     written = 0
-    for start, end in ranges:
+    windows = []
+    for gap_start, gap_end in ranges:  # bounded provider windows, oldest first, so a failure never hides a leading gap
+        while gap_start < gap_end:
+            window_end = min(gap_end, gap_start + timedelta(days=ETF_HISTORY_WINDOW_DAYS))
+            windows.append((gap_start, window_end))
+            gap_start = window_end
+    for start, end in windows:
         # The same persisted request ceiling covers Yahoo as well as NSE.
         if before_request is not None:
             await before_request()
@@ -319,13 +330,56 @@ async def _ensure_etf_history(repository, row, *, now, checkpoint, provider=None
             'status': 'SUCCESS_WITH_DATA' if written else 'SUCCESS_EMPTY'}
 
 
+async def _acquire_fund_identity(repository, selection, checkpoint, client, now, fetcher):
+    """Persist AMC_FUND_HOUSE evidence by exact ISIN from AMFI NAVAll; one request, per-instrument outcomes."""
+    import httpx
+    from app.etf_amfi_navall import AMFI_NAVALL_URL, AmfiNavAllError, fund_identity_for, parse_amfi_navall
+    from app.etf_evidence import EtfAcquisitionAttempt, EtfAcquisitionOutcome, EtfMetric
+    items = [i for i in selection['universe'] if i['canonical']]
+    retrieved = now()
+    try:
+        if fetcher is not None:
+            text, published = await fetcher()
+        else:
+            owned = client or httpx.AsyncClient(timeout=60.0, follow_redirects=False)
+            try:
+                response = await owned.get(AMFI_NAVALL_URL, headers={'Accept': 'text/plain'})
+                response.raise_for_status()
+                text, published = response.content.decode('utf-8'), None
+                modified = response.headers.get('last-modified')
+                if modified:
+                    from email.utils import parsedate_to_datetime
+                    published = parsedate_to_datetime(modified)
+            finally:
+                if client is None:
+                    await owned.aclose()
+        index = parse_amfi_navall(text)
+        failure = None
+    except (httpx.HTTPError, AmfiNavAllError, UnicodeDecodeError, ValueError) as error:
+        index, published, failure = None, None, f'AMFI_NAVALL_{type(error).__name__}'
+    fence = (checkpoint.cycle_id, checkpoint.owner_id)
+    for item in items:
+        row = item['canonical']
+        instrument = UUID(str(row['globalInstrumentId']))
+        if index is None:
+            evidence, attempt = [], EtfAcquisitionAttempt(
+                instrument_id=instrument, metric=EtfMetric.AMC_FUND_HOUSE.value, provider='AMFI', attempted_at=retrieved,
+                outcome=EtfAcquisitionOutcome.TECHNICAL_FAILURE, reason=failure)
+        else:
+            evidence, attempt = fund_identity_for(index, isin=row['isin'], instrument_id=instrument,
+                                                  retrieved_at=retrieved, published_at=published)
+        await repository._run_blocking_persistence(repository.persistence.save_etf_acquisition, evidence, attempt, fence=fence)
+        await record_etf_phase(checkpoint, selection, 'FUNDAMENTAL_ACQUISITION', events=[(item['isin'],
+            'SUCCEEDED' if evidence else 'FAILED' if index is None else 'SKIPPED')])
+
+
 async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, identity_headers,
                              correlation_id=None, limits=None, client=None, clock=None, sleep=asyncio.sleep,
-                             history_acquirer=None, document_acquirer=None):
+                             history_acquirer=None, document_acquirer=None, fund_identity_fetcher=None):
     if checkpoint is None:
         raise ValueError('DURABLE_ETF_CHECKPOINT_REQUIRED')
     now = clock or (lambda: datetime.now(timezone.utc))
-    limits = limits or {'max_universe': 2000, 'max_requests': 1500, 'max_seconds': 3600}
+    limits = limits or {'max_universe': 2000, 'max_requests': 3000, 'max_seconds': 7200}
     selection = await checkpoint.selection()
     if selection is None:
         selection = {'scope': 'FULL_OFFICIAL_NSE_ETF', 'limits': limits, 'request_reservations': 0,
@@ -345,6 +399,9 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
     transport = BudgetClient(client, checkpoint, selection, sleep=sleep)
 
     async def body():
+        frozen_universe = 'universe' in selection
+        await record_etf_phase(checkpoint, selection, 'UNIVERSE_DISCOVERY', total=1,
+            events=[('official_snapshot', 'REUSED' if frozen_universe else 'IN_PROGRESS')])
         if 'universe' not in selection:
             # Fetch the canonical universe FIRST: if it is empty, unavailable,
             # or malformed there is no point downloading the official NSE
@@ -382,6 +439,14 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
             selection.update(universe=universe, official_csv=response.text,
                 official_sha256=hashlib.sha256(response.content).hexdigest(), official_as_of=now().isoformat())
             await checkpoint.save_selection(selection)
+        if not frozen_universe:
+            await record_etf_phase(checkpoint, selection, 'UNIVERSE_DISCOVERY', total=1,
+                events=[('official_snapshot', 'SUCCEEDED')])
+        await record_etf_phase(checkpoint, selection, 'IDENTITY_VALIDATION', total=len(selection['universe']),
+            events=[(i['isin'], 'REUSED' if frozen_universe else 'SUCCEEDED' if i['canonical'] else
+                     'FAILED' if i['identity_status'] == 'CANONICAL_IDENTITY_CONFLICT' else 'SKIPPED')
+                    for i in selection['universe']])
+        await record_etf_phase(checkpoint, selection, 'EVIDENCE_VALIDATION', total=len(selection['universe']))
         # Frozen official membership on recovery; next cycle discovers a new snapshot.
         transport.cache[(NSE_ETF_LIST_URL, 'null')] = httpx.Response(200, text=selection['official_csv'],
             request=httpx.Request('GET', NSE_ETF_LIST_URL))
@@ -392,6 +457,10 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
             rows = [item['canonical'] for item in pending if item['canonical']]
             for item in pending:
                 await checkpoint.start('BASELINE', item['isin'])
+            if pending:
+                await record_etf_phase(checkpoint, selection, 'EVIDENCE_VALIDATION',
+                    events=[(item['isin'], 'IN_PROGRESS') for item in pending],
+                    current_instrument_id=str(rows[0]['globalInstrumentId']) if len(rows) == 1 else None)
             acquired = {}
             if rows:
                 data = await ingest_quotes(repository, orchestrator, rows, transport, clock=now,
@@ -401,6 +470,8 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                 previous = checkpoint.restorable('BASELINE', item['isin'])
                 if previous:
                     outcomes.append(previous['payload'])
+                    await record_etf_phase(checkpoint, selection, 'EVIDENCE_VALIDATION',
+                        events=[(item['isin'], 'REUSED')])
                     continue
                 row = item['canonical']
                 key = str(row['globalInstrumentId']) if row else None
@@ -418,6 +489,10 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                 await checkpoint.finish('BASELINE', item['isin'], CandidateState.TERMINAL_OUTCOME,
                     disposition=record['outcome'], payload=record)
                 outcomes.append(record)
+                await record_etf_phase(checkpoint, selection, 'EVIDENCE_VALIDATION',
+                    events=[(item['isin'], 'SUCCEEDED' if record['outcome'] == 'VERIFIED' else
+                             'FAILED' if record['outcome'] == 'FAILED' else 'SKIPPED')],
+                    current_instrument_id=key)
             if transport.abort:
                 raise RuntimeError(transport.abort)
         if len(outcomes) != len(selection['universe']):
@@ -427,13 +502,19 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
         # per-batch resume/cancellation handling above. A crash here resumes
         # from wherever ETF_ONBOARD itself left off via its own checkpoint
         # phase, never re-running or interfering with BASELINE's.
+        await record_etf_phase(checkpoint, selection, 'HISTORY_ONBOARDING', total=len(selection['universe']))
         for item in selection['universe']:
-            if not item['canonical'] or checkpoint.restorable('ETF_ONBOARD', item['isin']):
+            previous = checkpoint.restorable('ETF_ONBOARD', item['isin'])
+            if not item['canonical'] or previous:
+                await record_etf_phase(checkpoint, selection, 'HISTORY_ONBOARDING',
+                    events=[(item['isin'], 'REUSED' if previous else 'SKIPPED')])
                 continue
             owned = await checkpoint.run()
             if not owned or owned['status'] != 'RUNNING' or owned.get('owner_id') != checkpoint.owner_id:
                 raise CycleOwnershipLost(checkpoint.cycle_id)
             await checkpoint.start('ETF_ONBOARD', item['isin'])
+            await record_etf_phase(checkpoint, selection, 'HISTORY_ONBOARDING',
+                events=[(item['isin'], 'IN_PROGRESS')], current_instrument_id=str(item['canonical']['globalInstrumentId']))
             if history_acquirer is None:
                 history_result = await _ensure_etf_history(repository, item['canonical'], now=now(),
                     checkpoint=checkpoint, before_request=transport.reserve_request)
@@ -445,6 +526,9 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                               else CandidateState.RETRYABLE_FAILURE)
             await checkpoint.finish('ETF_ONBOARD', item['isin'], history_state,
                 disposition=history_result['status'], payload=history_result)
+            await record_etf_phase(checkpoint, selection, 'HISTORY_ONBOARDING', events=[(item['isin'],
+                {'SUCCESS_WITH_DATA': 'SUCCEEDED', 'SUFFICIENT_EXISTING_HISTORY': 'REUSED',
+                 'SUCCESS_EMPTY': 'SKIPPED'}.get(history_result['status'], 'FAILED'))])
         # Optional, strictly approved document acquisition before final scoring.
         # This is deliberately not a discovery crawler or an expanded source
         # allowlist. Resumed cycles skip completed document outcomes stored in
@@ -452,6 +536,9 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
         # The default reviewed sources require authentication; no network
         # request is made for them, even when the feature flag is enabled.
         document_results = selection.setdefault('document_acquisition', {})
+        await record_etf_phase(checkpoint, selection, 'FUNDAMENTAL_ACQUISITION',
+            total=len(selection['universe']), events=[(i['isin'], 'REUSED' if i['isin'] in document_results else 'SKIPPED')
+                                                     for i in selection['universe']])
         if getattr(getattr(repository, 'settings', None),
                    'research_etf_official_document_fetch_enabled', False):
             from app.etf_official_document_pipeline import EtfOfficialDocumentAcquisitionPipeline
@@ -480,6 +567,8 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                                  if item['isin'] == isin and item['canonical']), None)
                     if item is None:
                         continue
+                    await record_etf_phase(checkpoint, selection, 'FUNDAMENTAL_ACQUISITION',
+                        events=[(isin, 'IN_PROGRESS')], current_instrument_id=str(item['canonical']['globalInstrumentId']))
                     from app.models import EtfResearchProfile
                     row = item['canonical']
                     profile = EtfResearchProfile(
@@ -499,6 +588,17 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                                             for key, value in (result.facts or {}).items()}}
                 document_results[isin] = diagnostic
                 await checkpoint.save_selection(selection)
+                await record_etf_phase(checkpoint, selection, 'FUNDAMENTAL_ACQUISITION', events=[(isin,
+                    'SKIPPED' if source.access_tier is not AccessTier.PUBLIC_UNAUTHENTICATED else
+                    'SUCCEEDED' if diagnostic['status'] == 'INGESTED' and any(
+                        f.get('outcome') == 'SUCCESS_WITH_DATA' for f in diagnostic.get('facts', {}).values()) else
+                    'SKIPPED' if diagnostic['status'] in {'INGESTED', 'DISABLED', 'NOT_APPROVED'} else 'FAILED')])
+
+        # AMFI NAVAll (official industry register): exact-ISIN fund-house evidence and the AMFI scheme code.
+        # One bounded GET for the whole universe; any failure is recorded per instrument and never fatal.
+        if fund_identity_fetcher is not None or getattr(getattr(repository, 'settings', None),
+                                                          'research_etf_amfi_navall_enabled', False):
+            await _acquire_fund_identity(repository, selection, checkpoint, client, now, fund_identity_fetcher)
 
         # Re-evaluate from current persisted evidence at publication time; old checkpoint scores are not freshened.
         # A BASELINE technical failure (bad quote/market-watch acquisition for
@@ -510,17 +610,27 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
         # cycle over one bad instrument).
         outcome_by_isin = {o['isin']: o.get('outcome') for o in outcomes}
         candidates, profiles = [], {}
+        # Scores are re-evaluated from current evidence after resume, so these
+        # diagnostics restart with this pass rather than reusing stale scores.
+        await record_etf_phase(checkpoint, selection, 'READINESS_EVALUATION', total=len(selection['universe']), reset=True)
+        await record_etf_phase(checkpoint, selection, 'SCORING_RANKING', total=len(selection['universe']), reset=True)
         for item in selection['universe']:
             owned = await checkpoint.run()
             if not owned or owned['status'] != 'RUNNING' or owned.get('owner_id') != checkpoint.owner_id:
                 raise CycleOwnershipLost(checkpoint.cycle_id)
             row = item['canonical']
+            if row:
+                await record_etf_phase(checkpoint, selection, 'READINESS_EVALUATION',
+                    events=[(item['isin'], 'IN_PROGRESS')], current_instrument_id=str(row['globalInstrumentId']))
             if row and outcome_by_isin.get(item['isin']) == 'FAILED':
                 candidates.append({'global_instrument_id': str(row['globalInstrumentId']), 'symbol': item['symbol'],
+                    'fund_name': row.get('canonicalName'),
                     'disposition': 'TECHNICAL_FAILURE', 'reason': 'BASELINE_ACQUISITION_TECHNICAL_FAILURE',
-                    'recommendation': None, 'missing_data': [], 'limitations': [],
+                    'recommendation': None,
                     'historical_acquisition': _classify_historical_acquisition(
                         checkpoint.row('ETF_ONBOARD', item['isin']))})
+                await record_etf_phase(checkpoint, selection, 'READINESS_EVALUATION', events=[(item['isin'], 'SKIPPED')])
+                await record_etf_phase(checkpoint, selection, 'SCORING_RANKING', events=[(item['isin'], 'FAILED')])
                 continue
             if row:
                 def evaluate():
@@ -546,6 +656,11 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                     enrich_candidate(candidate, now=moment)
                     return candidate, official_peer_profile(item, selected.get('MARKET_PRICE'))
                 candidate, profile = await repository._run_blocking_persistence(evaluate)
+                await record_etf_phase(checkpoint, selection, 'READINESS_EVALUATION', events=[(item['isin'],
+                    'SUCCEEDED' if (candidate.get('research_readiness') or {}).get('status') == 'READY' else 'FAILED')])
+                await record_etf_phase(checkpoint, selection, 'SCORING_RANKING', events=[(item['isin'],
+                    'SUCCEEDED' if candidate['disposition'] == 'EVALUATED' else
+                    'FAILED' if candidate['disposition'] == 'TECHNICAL_FAILURE' else 'SKIPPED')])
                 # Additive, backward-compatible diagnostics field: surfaces
                 # the ETF_ONBOARD phase's own persisted checkpoint outcome
                 # for THIS instrument (keyed by its canonical ISIN, exactly
@@ -561,7 +676,8 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                 candidate['document_acquisition'] = document_results.get(item['isin'])
                 candidate['historical_acquisition'] = _classify_historical_acquisition(
                     checkpoint.row('ETF_ONBOARD', item['isin']))
-                candidate['missing_data'] = [f['factor'] for f in (candidate.get('rule_engine_result') or {}).get('factor_results', []) if f['status'] == 'UNAVAILABLE']
+                candidate['missing_data'] = list(dict.fromkeys([*(candidate.get('missing_data') or []),
+                    *(f['factor'] for f in (candidate.get('rule_engine_result') or {}).get('factor_results', []) if f['status'] == 'UNAVAILABLE')]))
                 candidate['limitations'] = ['Price-history metrics are not verified total returns.',
                     'Corporate-action adjustment completeness and comparable benchmark returns are unavailable.']
                 candidates.append(candidate)
@@ -573,7 +689,13 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
                     'disposition': 'INELIGIBLE', 'reason': item['identity_status'], 'recommendation': None,
                     'historical_acquisition': _classify_historical_acquisition(
                         checkpoint.row('ETF_ONBOARD', item['isin']))})
+                await record_etf_phase(checkpoint, selection, 'READINESS_EVALUATION', events=[(item['isin'], 'SKIPPED')])
+                await record_etf_phase(checkpoint, selection, 'SCORING_RANKING', events=[(item['isin'], 'SKIPPED')])
         ranked = peer_results(candidates, profiles)
+        # Peer verification can downgrade a research opportunity; refresh only
+        # the presentation after that decision, never the authoritative score.
+        for candidate in candidates:
+            enrich_candidate(candidate, now=now())
         top_opportunities = research_overview(ranked)
         counts = {'official': len(outcomes), 'reconciled': sum(bool(i['canonical']) for i in selection['universe']),
             'activated': sum(bool(i['canonical']) for i in selection['universe']),
@@ -620,10 +742,28 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
         # FAILED) -- a genuine universe-wide acquisition outage, not one bad ETF.
         if counts['failed'] >= counts['reconciled']:
             raise ValueError('ETF_UNIVERSE_OR_ACQUISITION_UNAVAILABLE')
+        await record_etf_phase(checkpoint, selection, 'PUBLICATION', total=1,
+            events=[('result', 'IN_PROGRESS')])
         await repository._run_blocking_persistence(repository.persistence.save_etf_radar_cycle,
             cycle_id, 'ETF_RADAR_V1', correlation_id, now(), payload,
             fence=(checkpoint.cycle_id, checkpoint.owner_id))
         return {'cycle_id': str(cycle_id), 'universe_count': len(outcomes), 'coverage': counts}
 
     # Explicit per-invocation bound; request reservations are cumulative across recovery.
-    return await asyncio.wait_for(body(), timeout=limits['max_seconds'])
+    try:
+        return await asyncio.wait_for(body(), timeout=limits['max_seconds'])
+    except (CycleOwnershipLost, asyncio.CancelledError):
+        raise
+    except Exception:
+        # Record only an operation this invocation actually started. A fence
+        # loss or cancellation must never become permission to advance it.
+        progress = selection.get('etf_phase_progress') or {}
+        active_phase = progress.get('current_phase')
+        active_items = ((progress.get('phases') or {}).get(active_phase) or {}).get('items') or {}
+        failed = [(key, 'FAILED') for key, value in active_items.items() if value.get('state') == 'IN_PROGRESS']
+        if failed:
+            try:
+                await record_etf_phase(checkpoint, selection, active_phase, events=failed)
+            except Exception:
+                pass  # Diagnostic failure cannot replace the original error.
+        raise

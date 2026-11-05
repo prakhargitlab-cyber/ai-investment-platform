@@ -376,8 +376,8 @@ async def _controlled_etf_preflight(instrument_ids, request):
 
 class EtfFullUniverseRequest(BaseModel):
     max_universe: int = Field(default=2000, ge=1, le=5000)
-    max_requests: int = Field(default=1500, ge=1, le=15000)
-    max_seconds: int = Field(default=3600, ge=30, le=14400)
+    max_requests: int = Field(default=3000, ge=1, le=15000)
+    max_seconds: int = Field(default=7200, ge=30, le=14400)
 
 
 def _manual_etf_enabled() -> bool:
@@ -516,6 +516,36 @@ async def etf_radar_current():
     return result
 
 
+@app.get('/api/v1/etf-radar/instruments/{instrument_id}/history')
+async def etf_persisted_price_history(
+    instrument_id: UUID, request: Request,
+    range_name: Literal['1Y', '3Y', '5Y', 'MAX', 'CUSTOM'] = Query(default='1Y', alias='range'),
+    start: CalendarDate | None = None, end: CalendarDate | None = None,
+    after: CalendarDate | None = None, limit: int = Query(default=500, ge=1, le=500),
+    provider: Literal['NSE', 'YAHOO_FINANCE', 'YAHOO_FINANCE_MCP'] | None = None,
+):
+    """Authenticated canonical ETF read. Never acquires, backfills or writes."""
+    from app.etf_ingestion import canonical_etfs
+    from app.etf_history_read import read_etf_history
+    headers = request.headers
+    _require_research_user(headers.get('x-aip-user-id'), headers.get('x-aip-user-issuer'),
+                           headers.get('x-aip-user-subject'))
+    identity = _identity_headers(headers.get('x-aip-user-id'), headers.get('x-aip-user-issuer'),
+        headers.get('x-aip-user-subject'), None, None, headers.get('x-aip-user-roles'))
+    try:
+        rows = await canonical_etfs(portfolio_orchestrator, [instrument_id],
+            identity_headers=identity, correlation_id=headers.get('x-correlation-id'))
+        return await _radar_read(read_etf_history, repository.persistence, instrument_id, rows[0],
+            range_name=range_name, start=start, end=end, after=after, limit=limit, provider=provider)
+    except GlobalInstrumentNotFoundError as exc:
+        raise HTTPException(404, 'GLOBAL_INSTRUMENT_NOT_FOUND') from exc
+    except PortfolioServiceUnavailableError as exc:
+        raise HTTPException(503, 'CANONICAL_ETF_SOURCE_UNAVAILABLE') from exc
+    except ValueError as exc:
+        # Never expose a validation exception excerpt containing stored input.
+        raise HTTPException(422, 'ETF_HISTORY_IDENTITY_RANGE_OR_PERSISTED_DATA_INVALID') from exc
+
+
 @app.get('/api/v1/etf-radar/cycles/{cycle_id}')
 async def etf_radar_cycle_status(cycle_id: UUID):
     result = await _radar_read(repository.persistence.etf_radar_cycle, cycle_id)
@@ -618,6 +648,9 @@ async def etf_radar_cycle_lifecycle_status(cycle_id: UUID):
                     'official': official, 'completed': baseline_count,
                     'stages': {'baseline': {'completed': baseline_count, 'total': official},
                                'onboarding': {'completed': onboarding_count, 'total': official}}}}
+            if value is not None:
+                from app.etf_phase_progress import etf_phase_progress
+                value['etf_phase_progress'] = etf_phase_progress(run)
             return value
 
     if run_blocking is not None:

@@ -1,0 +1,25 @@
+Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Plan;Option;Net Asset Value;Date
+ 
+Open Ended Schemes(Other Scheme - FoF Domestic)
+ 
+SBI Mutual Fund
+ 
+152735;INF200KB1233;-;SBI Silver ETF Fund of Fund;Direct Plan;Growth;19.9067;05-Nov-2026
+ 
+Open Ended Schemes(Other Scheme - Gold ETF)
+ 
+Nippon India Mutual Fund
+ 
+140088;INF204KB17I5;-;Nippon India ETF Gold BeES;Direct Plan;;117.7147;05-Nov-2026
+ 
+Open Ended Schemes(Other Scheme - Other  ETFs)
+ 
+Nippon India Mutual Fund
+ 
+140084;INF204KB14I2;-;Nippon India ETF Nifty 50 BeES;Direct Plan;;279.9555;05-Nov-2026
+ 
+SBI Mutual Fund
+ 
+121109;INF200K01VT2;-;SBI BSE SENSEX ETF;Regular Plan;IDCW;885.1519;05-Nov-2026
+154826;INF200KB1CJ6;-;SBI BSE India Defence ETF;Regular Plan;Growth;76.5765;05-Nov-2026
+ 

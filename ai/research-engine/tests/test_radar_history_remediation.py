@@ -94,7 +94,8 @@ async def test_etf_reuses_sessions_but_200_closes_do_not_satisfy_year_history(et
     from app.market_sessions import completed_sessions
     cp = await checkpoint(etf_repo)
     schedules = etf_repo.persistence.load_market_schedules({"NSE"})
-    days = [day for day, _ in completed_sessions("NSE", schedules, [], NOW.date()-timedelta(days=400), NOW.date(), NOW)]
+    from app.etf_history import ETF_HISTORY_TARGET_DAYS, ETF_HISTORY_WINDOW_DAYS
+    days = [day for day, _ in completed_sessions("NSE", schedules, [], NOW.date()-timedelta(days=ETF_HISTORY_TARGET_DAYS), NOW.date(), NOW)]
     present = days[-count-1:-1] if missing_tail else days[-count:]
     etf_repo.persistence.upsert_daily_market_bars([etf_bar(day, NOW) for day in present])
     provider = SimpleNamespace(closes=AsyncMock(return_value=[]))
@@ -102,17 +103,20 @@ async def test_etf_reuses_sessions_but_200_closes_do_not_satisfy_year_history(et
     result = await _ensure_etf_history(etf_repo, META, now=NOW, checkpoint=cp,
                                       provider=provider, before_request=reserve)
     if count == 253 and not missing_tail:
+        # 253 closes satisfy the one-year metric need and no earlier data is re-requested (leading gap tolerated).
         assert result["status"] == "SUFFICIENT_EXISTING_HISTORY"
         provider.closes.assert_not_called()
         reserve.assert_not_called()
     else:
         assert result["status"] == "SUCCESS_EMPTY"
-        assert provider.closes.await_count == reserve.await_count == 1
-        request = provider.closes.call_args.kwargs
-        assert request["start"].date() == (days[-1] if missing_tail else days[0])
+        requests = [(c.kwargs["start"].date(), c.kwargs["end"].date()) for c in provider.closes.await_args_list]
+        assert provider.closes.await_count == reserve.await_count == len(requests) >= 1
+        assert all((end - start).days <= ETF_HISTORY_WINDOW_DAYS for start, end in requests)
+        assert requests == sorted(requests)
+        assert requests[0][0] == (days[-1] if missing_tail else days[0])
         last_missing = days[-1] if missing_tail else days[days.index(present[0])-1]
-        assert request["end"].date() == last_missing+timedelta(days=1)
-        assert not any(request["start"].date() <= day < request["end"].date() for day in present)
+        assert requests[-1][1] == last_missing+timedelta(days=1)
+        assert not any(start <= day < end for start, end in requests for day in present)
 
 
 @pytest.mark.asyncio

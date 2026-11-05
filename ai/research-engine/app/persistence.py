@@ -154,6 +154,10 @@ class ResearchPersistence(Protocol):
     def upsert_daily_market_bars(self, bars: list[DailyMarketBar]) -> int: ...
     def load_daily_market_bars(self, instrument_ids: set[UUID], *, start_date: date | None = None,
                               end_date: date | None = None, provider: str | None = None) -> list[DailyMarketBar]: ...
+    def daily_market_history_sources(self, instrument_id: UUID, *, end_date: date): ...
+    def daily_market_history_page(self, instrument_id: UUID, *, provider: str, start_date: date | None,
+                                 end_date: date, after: date | None = None, limit: int = 500,
+                                 descending: bool = False): ...
     def record_structured_market_failure(self, instrument_id: UUID, provider: str, attempted_at: datetime, code: str, message: str) -> None: ...
     def load_market_schedules(self, markets: set[str] | None = None): ...
     def load_market_calendar_exceptions(self, markets: set[str] | None = None): ...
@@ -235,6 +239,8 @@ class DisabledResearchPersistence:
     def upsert_daily_market_bar(self, bar): return None
     def upsert_daily_market_bars(self, bars): return 0
     def load_daily_market_bars(self, instrument_ids, *, start_date=None, end_date=None, provider=None): return []
+    def daily_market_history_sources(self, instrument_id, *, end_date): return []
+    def daily_market_history_page(self, instrument_id, *, provider, start_date, end_date, after=None, limit=500, descending=False): return []
     def record_structured_market_failure(self, *args): return None
     def load_market_schedules(self, markets=None): return []
     def load_market_calendar_exceptions(self, markets=None): return []
@@ -472,6 +478,44 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
                 result.extend(_daily_market_bar_from_row(row) for row in self._connection.execute(sql, params).fetchall())
         # Sort once more for identical ordering across database collations.
         return sorted(result, key=lambda bar: (str(bar.global_instrument_id), bar.trading_date, bar.provider))
+
+    def daily_market_history_sources(self, instrument_id: UUID, *, end_date: date):
+        """Stored source bounds only; individual plotted rows need validation."""
+        from app.etf_history_selection import HISTORY_PROVIDERS
+        with self._connection:
+            rows = self._connection.execute(
+                "SELECT provider, MIN(trading_date) AS first_date, MAX(trading_date) AS last_date, COUNT(*) AS stored_rows "
+                "FROM global_daily_market_bars WHERE global_instrument_id=? "
+                "AND source_mode='REAL' AND currency='INR' AND close_price IS NOT NULL "
+                "AND trading_date<=? AND provider IN (?,?,?) GROUP BY provider ORDER BY provider",
+                (str(UUID(str(instrument_id))), end_date.isoformat(), *HISTORY_PROVIDERS)).fetchall()
+        return [{"provider": row["provider"], "first_date": str(row["first_date"]),
+                 "last_date": str(row["last_date"]), "stored_rows": int(row["stored_rows"])} for row in rows]
+
+    def daily_market_history_page(self, instrument_id: UUID, *, provider: str, start_date: date | None,
+                                 end_date: date, after: date | None = None, limit: int = 500,
+                                 descending: bool = False):
+        from app.etf_history_selection import HISTORY_PROVIDERS
+        if provider not in HISTORY_PROVIDERS or type(limit) is not int or not 1 <= limit <= 501:
+            raise ValueError("INVALID_HISTORY_PAGE")
+        if type(end_date) is not date or any(v is not None and type(v) is not date for v in (start_date, after)):
+            raise ValueError("HISTORY_DATE_REQUIRED")
+        if start_date is not None and start_date > end_date:
+            raise ValueError("INVALID_HISTORY_RANGE")
+        sql = ("SELECT * FROM global_daily_market_bars WHERE global_instrument_id=? AND provider=? "
+               "AND source_mode='REAL' AND currency='INR' AND close_price IS NOT NULL AND trading_date<=?")
+        params = [str(UUID(str(instrument_id))), provider, end_date.isoformat()]
+        if start_date is not None:
+            sql += " AND trading_date>=?"
+            params.append(start_date.isoformat())
+        if after is not None:
+            sql += " AND trading_date>?"
+            params.append(after.isoformat())
+        sql += " ORDER BY trading_date " + ("DESC" if descending else "ASC") + " LIMIT ?"
+        params.append(limit)
+        with self._connection:
+            rows = self._connection.execute(sql, params).fetchall()
+        return [_daily_market_bar_from_row(row) for row in rows]
 
     def _filtered_rows(self, table, ids, *, column="instrument_id", order=None):
         """Internal identifiers only; values are parameterized in bounded batches.

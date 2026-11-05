@@ -459,29 +459,31 @@ def _derived_metric_status(requirement: str, metric_value, *, now: datetime) -> 
     )
 
 
-def _etf_deterministic_metrics(store: SqliteResearchPersistence, instrument_id):
+def _etf_deterministic_metrics(store: SqliteResearchPersistence, instrument_id, *, now=None):
+    from app.etf_history_selection import select_etf_history_bars
     bars = [bar for bar in store.load_daily_market_bars({instrument_id}) if bar.global_instrument_id == instrument_id]
+    bars, _ = select_etf_history_bars(bars, instrument_id, now=now)
     return compute_etf_deterministic_metrics(instrument_id, bars)
 
 
 def _check_historical_returns_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
     """HISTORICAL_RETURNS is ready once at least the shortest (1M) period return is computable."""
-    metrics = _etf_deterministic_metrics(store, instrument_id)
+    metrics = _etf_deterministic_metrics(store, instrument_id, now=now)
     return _derived_metric_status("HISTORICAL_RETURNS", metrics.get(EtfMetricId.RETURN_1M), now=now or datetime.now(timezone.utc))
 
 
 def _check_volatility_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
-    metrics = _etf_deterministic_metrics(store, instrument_id)
+    metrics = _etf_deterministic_metrics(store, instrument_id, now=now)
     return _derived_metric_status("VOLATILITY", metrics.get(EtfMetricId.ANNUALIZED_VOLATILITY), now=now or datetime.now(timezone.utc))
 
 
 def _check_drawdown_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
-    metrics = _etf_deterministic_metrics(store, instrument_id)
+    metrics = _etf_deterministic_metrics(store, instrument_id, now=now)
     return _derived_metric_status("DRAWDOWN", metrics.get(EtfMetricId.MAX_DRAWDOWN), now=now or datetime.now(timezone.utc))
 
 
 def _check_momentum_ready(store: SqliteResearchPersistence, instrument_id, *, now: datetime | None = None) -> EtfRequirementStatus:
-    metrics = _etf_deterministic_metrics(store, instrument_id)
+    metrics = _etf_deterministic_metrics(store, instrument_id, now=now)
     return _derived_metric_status("INDEX_MOMENTUM", metrics.get(EtfMetricId.MOMENTUM_50_200), now=now or datetime.now(timezone.utc))
 
 

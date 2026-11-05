@@ -82,6 +82,21 @@ def _canonical_etf(symbol="DIVIDEND"):
     }
 
 
+@pytest.fixture(autouse=True)
+def _provider_clock_matches_test_clock(monkeypatch):
+    """Provider stamps retrieved_at from the wall clock; history selection correctly
+    rejects rows retrieved after the evaluation clock (FUTURE_HISTORY). Pin the
+    provider's clock to NOW so these fixtures model a fetch at NOW."""
+    import app.historical_market_data as historical_market_data
+
+    class _PinnedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is None else NOW.astimezone(tz)
+
+    monkeypatch.setattr(historical_market_data, "datetime", _PinnedDatetime)
+
+
 def _provider(row, *, count=260, **metadata):
     info = {
         "symbol": row["primarySymbol"] + ".NS", "quoteType": "EQUITY",

@@ -178,7 +178,11 @@ def test_entry_conditions_consistent_no_price_targets():
     row = candidates(1)[0]
     enrich_candidate(row, now=NOW)
     assert row['entry_assessment']['classification'] == 'INSUFFICIENT_EVIDENCE'
-    row['entry_inputs'] = dict(current=True, premium_percent='0.2', momentum_percent='1', return_1m_percent='3', spread_percent='0.2', volume=10000)
+    # Classification-only fixture: production builds this verified context
+    # from aligned persisted observations (covered by product evidence tests).
+    row['disposition'] = 'EVALUATED'
+    row['research_readiness'] = {'observed': True, 'summary': {'ready_for_analysis': True}}
+    row['entry_inputs'] = dict(current=True, verified=True, premium_percent='0.2', momentum_percent='1', return_1m_percent='3', spread_percent='0.2', volume=10000)
     enrich_candidate(row, now=NOW)
     assert row['entry_assessment']['classification'] == 'FAVORABLE_ENTRY_ZONE'
     row['entry_inputs']['return_1m_percent'] = '11'
@@ -228,7 +232,10 @@ async def test_full_cycle_publishes_only_qualifying_top_ten_from_persisted_evide
             isDelisted='false', isSuspended='false', activeSeries=['EQ'], marketType='N'))
     async def history(repository, row, *, now, checkpoint):
         observations = [MarketPriceObservation(instrument_id=row['globalInstrumentId'], observed_at=now-timedelta(days=253-i),
-            price=Decimal(100), currency='INR', provider='YAHOO_FINANCE', source_url='https://fixture.invalid/history',
+                # Synthetic response with the real provider's URL shape;
+                # invalid-host fixtures must not enter trusted metrics.
+                price=Decimal(100), currency='INR', provider='YAHOO_FINANCE',
+                source_url=f"https://finance.yahoo.com/quote/{row['primarySymbol']}.NS/history",
             retrieved_at=now) for i in range(254)]
         return await acquire_etf_history(repository, row, now=now, checkpoint=checkpoint,
             provider=SimpleNamespace(closes=AsyncMock(return_value=observations)))

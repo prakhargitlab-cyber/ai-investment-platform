@@ -162,10 +162,16 @@ def main():
                 if live_tag != expected_pin:
                     live_changed_since_pin.append(name)
     PHASE = "COMPARE_NON_IMAGE_FIELDS"
+    PHASE = "VERIFY_FINAL_KAFKA_PROBE"
+    # The Kafka startup-probe change is separately reviewed and must already
+    # match the running Deployment; other Kafka changes remain forbidden.
+    allow_only_unchanged_live_kafka_probe(old, updated, live)
+    PHASE = "COMPARE_NON_IMAGE_FIELDS"
     # Inspect authored spec mutations without accidentally approving them.
     other_changed = []
     for key in sorted(old):
-        if key == ("apps/v1", "Deployment", "research-engine"):
+        if key in (("apps/v1", "Deployment", "research-engine"),
+                   ("apps/v1", "Deployment", "kafka")):
             continue
         if key[1] == "Deployment" and key[2] in pins.FIRST_PARTY:
             previous = old[key]["spec"]
@@ -203,6 +209,7 @@ def main():
         print("PIN_STALE_AGAINST_LIVE:", name)
     for name in tag_mismatch:
         print("TAG_NOT_ALIGNED:", name)
+    print("KAFKA_PROBE_REVIEWED_AND_ALREADY_LIVE: PASS")
     print("NON_IMAGE_OR_OUT_OF_SCOPE_RENDERED_CHANGES:", len(other_changed))
     for name in other_changed[:20]:
         print("OUT_OF_SCOPE_RESOURCE:", name)

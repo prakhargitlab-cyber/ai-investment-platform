@@ -52,6 +52,7 @@ class AmfiNavAllIndex:
     ambiguous_isins: set[str]
     row_count: int
     etf_row_count: int
+    no_isin_rows: int = 0   # ETF rows AMFI lists without any ISIN: never matched or enriched
 
 
 def _clean(value: str) -> str:
@@ -64,7 +65,7 @@ def parse_amfi_navall(text: str) -> AmfiNavAllIndex:
         raise AmfiNavAllError("AMFI_NAVALL_HEADER_MISMATCH")
     category = fund_house = None
     schemes: list[AmfiEtfScheme] = []
-    rows = 0
+    rows = no_isin_rows = 0
     for number, raw in enumerate(lines[1:], start=2):
         line = raw.strip()
         if not line:
@@ -86,7 +87,10 @@ def parse_amfi_navall(text: str) -> AmfiNavAllIndex:
         if fund_house is None or not _CODE.match(code) or not name:
             raise AmfiNavAllError(f"AMFI_NAVALL_MALFORMED_ETF_ROW:{number}")
         isins = tuple(v for v in (isin1, isin2) if v and v != "-")
-        if not isins or any(not _ISIN.match(v) for v in isins):
+        if not isins:
+            no_isin_rows += 1   # e.g. a newly launched ETF AMFI lists without an ISIN yet (scheme 154504 on 2026-11-05)
+            continue
+        if any(not _ISIN.match(v) for v in isins):
             raise AmfiNavAllError(f"AMFI_NAVALL_BAD_ISIN:{number}")
         try:
             parsed_date = datetime.strptime(nav_date, "%d-%b-%Y").date()
@@ -107,7 +111,7 @@ def parse_amfi_navall(text: str) -> AmfiNavAllIndex:
             ambiguous.update(scheme.isins)
     for isin in ambiguous:
         by_isin.pop(isin, None)
-    return AmfiNavAllIndex(by_isin, ambiguous, rows, len(schemes))
+    return AmfiNavAllIndex(by_isin, ambiguous, rows, len(schemes) + no_isin_rows, no_isin_rows)
 
 
 def fund_identity_for(index: AmfiNavAllIndex, *, isin: str, instrument_id, retrieved_at: datetime,

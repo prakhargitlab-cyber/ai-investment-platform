@@ -23,7 +23,7 @@ class Store:
 def workbook(tmp_path, rows):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Sheet1"; ws.append(EXPECTED_HEADERS)
     for code, name, d, ter in rows:
-        ws.append([code, name, datetime(*d), 0, 0, 0, 0, ter, 0, 0, 0, 0, 0])
+        ws.append([code, name, datetime(*d), ter, 0, 0, 0, ter, 0, 0, 0, 0, 0])
     p = tmp_path / "ter.xlsx"; wb.save(p); return p
 
 

@@ -43,7 +43,7 @@ def _write_workbook(path, rows, *, headers=EXPECTED_HEADERS):
 
 
 def _row(code, name, ter_date, regular_total, direct_total):
-    return (code, name, ter_date, 0, 0, 0, 0, regular_total, 0, 0, 0, 0, direct_total)
+    return (code, name, ter_date, regular_total, 0, 0, 0, regular_total, 0, 0, 0, 0, direct_total)  # BER == total: components reconcile
 
 
 # ---------------------------------------------------------------------------

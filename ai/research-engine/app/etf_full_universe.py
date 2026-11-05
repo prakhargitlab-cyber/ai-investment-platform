@@ -373,11 +373,13 @@ async def _acquire_fund_identity(repository, selection, checkpoint, client, now,
         await repository._run_blocking_persistence(repository.persistence.save_etf_acquisition, evidence, attempt, fence=fence)
         await record_etf_phase(checkpoint, selection, 'FUNDAMENTAL_ACQUISITION', events=[(item['isin'],
             'SUCCEEDED' if evidence else 'FAILED' if index is None else 'SKIPPED')])
+    return index
 
 
 async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, identity_headers,
                              correlation_id=None, limits=None, client=None, clock=None, sleep=asyncio.sleep,
-                             history_acquirer=None, document_acquirer=None, fund_identity_fetcher=None):
+                             history_acquirer=None, document_acquirer=None, fund_identity_fetcher=None,
+                             sbi_ter_fetchers=None):
     if checkpoint is None:
         raise ValueError('DURABLE_ETF_CHECKPOINT_REQUIRED')
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -598,9 +600,19 @@ async def run_full_etf_cycle(repository, orchestrator, *, checkpoint, cycle_id, 
 
         # AMFI NAVAll (official industry register): exact-ISIN fund-house evidence and the AMFI scheme code.
         # One bounded GET for the whole universe; any failure is recorded per instrument and never fatal.
-        if fund_identity_fetcher is not None or getattr(getattr(repository, 'settings', None),
-                                                          'research_etf_amfi_navall_enabled', False):
-            await _acquire_fund_identity(repository, selection, checkpoint, client, now, fund_identity_fetcher)
+        settings_ = getattr(repository, 'settings', None)
+        ter_enabled = sbi_ter_fetchers is not None or getattr(settings_, 'research_etf_sbi_ter_enabled', False)
+        navall_index = None
+        if fund_identity_fetcher is not None or ter_enabled or getattr(settings_, 'research_etf_amfi_navall_enabled', False):
+            navall_index = await _acquire_fund_identity(repository, selection, checkpoint, client, now, fund_identity_fetcher)
+        # SBI Mutual Fund TER (official disclosure workbook): only for ETFs whose identity is verified in both AMFI
+        # files and by an exact AMC-scoped name; every other AMC's TER and all AUM stay unavailable.
+        if ter_enabled:
+            from app.etf_sbi_ter_acquisition import acquire_sbi_ter
+            workbook_fetcher, master_fetcher = sbi_ter_fetchers or (None, None)
+            await acquire_sbi_ter(repository, selection, checkpoint, client, now, navall_index,
+                                  workbook_fetcher=workbook_fetcher, master_fetcher=master_fetcher)
+            await checkpoint.save_selection(selection)
 
         # Re-evaluate from current persisted evidence at publication time; old checkpoint scores are not freshened.
         # A BASELINE technical failure (bad quote/market-watch acquisition for

@@ -25,7 +25,7 @@ def workbook_bytes(ter, on_date=datetime(2026, 11, 3), *, headers=EXPECTED_HEADE
     workbook.active.title = "Sheet1"
     workbook.active.append(list(headers))
     workbook.active.append(
-        [CODE, "SBI Nifty 50 ETF", on_date, 0, 0, 0, 0, ter, 0, 0, 0, 0, 0]
+        [CODE, "SBI Nifty 50 ETF", on_date, ter, 0, 0, 0, ter, 0, 0, 0, 0, 0]
     )
     output = BytesIO()
     workbook.save(output)

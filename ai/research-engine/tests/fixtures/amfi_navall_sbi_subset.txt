@@ -1,0 +1,212 @@
+Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Plan;Option;Net Asset Value;Date
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+SBI Mutual Fund
+
+154826;INF200KB1CJ6;-;SBI BSE India Defence ETF;Regular Plan;Growth;76.5765;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+SBI Mutual Fund
+
+111954;INF200KA16D8;-;SBI Gold ETF;Regular Plan;Growth;121.4505;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Other  ETFs)
+
+SBI Mutual Fund
+
+134014;INF200KA1572;-;SBI BSE 100 ETF;Regular Plan;IDCW;289.2343;05-Nov-2026
+153435;INF200KB1712;-;SBI BSE PSU BANK ETF;Regular Plan;IDCW;49.8401;05-Nov-2026
+121109;INF200K01VT2;-;SBI BSE SENSEX ETF;Regular Plan;IDCW;885.1519;05-Nov-2026
+144916;INF200KA1VQ2;-;SBI BSE Sensex Next 50 ETF;Regular Plan;IDCW;927.2510;05-Nov-2026
+139430;INF200KA1JT1;-;SBI Nifty 10 yr Benchmark G-Sec ETF;Regular Plan;IDCW;263.2669;05-Nov-2026
+153796;INF200KB1969;-;SBI NIFTY 1D Rate Liquid ETF - Growth;Regular Plan;Growth;1063.4817;05-Nov-2026
+152168;-;INF200KA13Z8;SBI NIFTY 1D Rate Liquid ETF - IDCW;Regular Plan;IDCW;1000.0000;05-Nov-2026
+145648;INF200KA1WX6;-;SBI Nifty 200 Quality 30 ETF;Regular Plan;IDCW;216.9158;05-Nov-2026
+135106;INF200KA1FS1;-;SBI Nifty 50 ETF;Regular Plan;IDCW;264.5659;05-Nov-2026
+134008;INF200KA1580;-;SBI Nifty Bank ETF;Regular Plan;IDCW;594.0569;05-Nov-2026
+149041;INF200KA1X17;-;SBI Nifty Consumption ETF;Regular Plan;IDCW;122.0146;05-Nov-2026
+148542;INF200KA1S14;-;SBI Nifty IT ETF;Regular Plan;IDCW;365.2712;05-Nov-2026
+154305;INF200KB1AK8;-;SBI Nifty Midcap 150 ETF;Regular Plan;IDCW;22.3575;05-Nov-2026
+154237;INF200KB1AJ0;-;SBI Nifty Midcap 150 Momentum 50 ETF;Regular Plan;IDCW;62.1121;05-Nov-2026
+134013;INF200KA1598;-;SBI Nifty Next 50 ETF;Regular Plan;IDCW;770.5569;05-Nov-2026
+148541;INF200KA1S22;-;SBI Nifty Private Bank ETF;Regular Plan;IDCW;292.3876;05-Nov-2026
+154353;INF200KB1AY9;-;SBI Nifty Smallcap 250 ETF;Regular Plan;IDCW;17.5355;05-Nov-2026
+154354;INF200KB1AX1;-;SBI Nifty200 Value 30 ETF;Regular Plan;IDCW;14.4645;05-Nov-2026
+152749;INF200KB1282;-;SBI Nifty50 Equal Weight ETF;Regular Plan;IDCW;33.5278;05-Nov-2026
+152725;INF200KB1217;-;SBI Silver ETF;Regular Plan;Growth;182.7977;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Debt ETF)
+
+Aditya Birla Sun Life Mutual Fund
+
+151533;INF209KB18T9;-;Aditya Birla Sun Life CRISIL Liquid Overnight ETF;;;1000.0000;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Debt ETF)
+
+DSP Mutual Fund
+
+154593;INF740KA1ZI7;-;DSP NIFTY 10 YR BENCHMARK G-SEC ETF;;;26.5763;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Debt ETF)
+
+Groww Mutual Fund
+
+152891;INF666M01IP5;-;Groww Nifty 1D Rate Liquid ETF;;;111.4993;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Debt ETF)
+
+Mirae Asset Mutual Fund
+
+153045;INF769K01MY5;-;Mirae Asset Nifty 1D Rate Liquid ETF - Growth;;;1111.1814;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Debt ETF)
+
+Shriram Mutual Fund
+
+152741;INF680P01422;-;Shriram Nifty 1D Rate Liquid ETF;Direct Plan;Growth;1129.0849;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Debt ETF)
+
+UTI Mutual Fund
+
+152369;INF789F1AZF3;-;UTI Nifty 10 yr Benchmark G-Sec ETF;Direct Plan;Growth;26.4424;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Debt ETF)
+
+Zerodha CASE Mutual Fund
+
+152327;INF0R8F01034;-;Zerodha CASE Nifty 1D Rate Liquid ETF;Direct Plan;Growth Option;116.7475;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+360 ONE Mutual Fund
+
+154366;INF579M01BP5;-;360 ONE MSCI India ETF;Direct Plan;GROWTH Option;10.1390;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+Axis Mutual Fund
+
+151585;INF846K010Q0;-;Axis BSE Sensex ETF;;;82.4085;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+Bajaj Finserv Mutual Fund
+
+154492;INF0QA701CI0;-;Bajaj Finserv BSE Top 10 Banks ETF;;;21.4049;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+Edelweiss Mutual Fund
+
+154535;INF754K01XI7;-;Edelweiss BSE LargeMid (60:40) Stable dividend 50 ETF;;;36.5213;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+HDFC Mutual Fund
+
+154765;INF179KC1LA2;-;HDFC FTSE India Equity ETF;Direct Plan;Growth Option;32.5718;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+Invesco Mutual Fund
+
+154537;INF205KA1CA1;-;Invesco India BSE Sensex ETF;Regular Plan;Growth;79.3748;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+Jio BlackRock Mutual Fund
+
+154550;INF22M001184;-;JioBlackRock Nifty 50 ETF;;;12.5862;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+Kotak Mahindra Mutual Fund
+
+154491;INF174KA1A94;-;Kotak Nifty Private Bank ETF;;;28.656;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Equity ETF)
+
+Motilal Oswal Mutual Fund
+
+154551;INF247L01HG7;-;Motilal Oswal Nifty Metal ETF;;;12.6112;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Gold ETF)
+
+Baroda BNP Paribas Mutual Fund
+
+152231;INF251K01SU9;-;Baroda BNP Paribas Gold ETF;Regular Plan;Growth Option;137.9285;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Gold ETF)
+
+Choice Mutual Fund
+
+153933;INF2KCX01012;-;Choice Gold ETF;Direct Plan;Growth;141.4781;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Other ETF)
+
+ICICI Prudential Mutual Fund
+
+154503;INF109K1A567;-;ICICI Prudential BSE Insurance ETF;;;14.6469;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Other ETF)
+
+Nippon India Mutual Fund
+
+154789;INF204KC1HS1;-;Nippon India CRISIL-IBX FAR Gilt ETF;;Growth;134.1916;05-Nov-2026
+
+Open Ended Schemes(Exchange Traded Funds (ETFs) - Silver ETF)
+
+quant Mutual Fund
+
+154625;INF966L01EI5;-;quant Silver ETF;Direct Plan;;18.8657;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+Angel One Mutual Fund
+
+153826;INF1J2R01114;-;ANGEL ONE GOLD ETF;Direct Plan;;13.3179;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+Bandhan Mutual Fund
+
+153930;INF194KB1KJ7;-;Bandhan Gold ETF;Regular Plan;Growth;142.4167;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+HSBC Mutual Fund
+
+154294;INF336L01RX2;-;HSBC Gold ETF;Direct Plan;Growth;124.0344;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+LIC Mutual Fund
+
+151961;INF767K01SM1;-;LIC MF Gold Exchange Traded Fund;;;128.4174;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+Quantum Mutual Fund
+
+107693;INF082J01408;-;Quantum Gold ETF;;;118.0188;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+Tata Mutual Fund
+
+152284;INF277KA1976;-;Tata Gold Exchange Traded Fund;;;13.8542;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+The Wealth Company Mutual Fund
+
+154092;INF2F0001370;-;The Wealth Company Gold ETF;Regular Plan;Growth;141.8943;05-Nov-2026
+
+Open Ended Schemes(Other Scheme - Gold ETF)
+
+Union Mutual Fund
+
+153337;INF582M01KS4;-;Union Gold ETF;Direct Plan;Growth Option;139.5288;05-Nov-2026

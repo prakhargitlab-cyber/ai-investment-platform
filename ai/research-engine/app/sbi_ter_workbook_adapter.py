@@ -45,7 +45,7 @@ resolved instrument identities may be persisted to in a single
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -82,6 +82,12 @@ EXPECTED_HEADERS = (
     "Direct Plan - Total TER (%)",
 )
 MAX_TER_PERCENT = Decimal("100")
+# A published total above this is not a plausible ETF expense ratio (SEBI caps are far lower). The genuine
+# 2026-11-04 workbook carries 7.77% for a ten-day-old ETF (statutory levies 7.2%): such a row is withheld, not
+# persisted, and the metric stays unavailable.
+MAX_PLAUSIBLE_TER_PERCENT = Decimal("3")
+COMPONENT_SUM_TOLERANCE = Decimal("0.011")
+TER_DECIMALS = Decimal("0.0001")  # the workbook stores binary-float noise (0.22000000000000003); values are published to <=3 dp
 
 
 class WorkbookSchemaError(ValueError):
@@ -98,6 +104,7 @@ class AdapterOutcome(StrEnum):
     IDENTITY_UNRESOLVED_STAGED_ONLY = "IDENTITY_UNRESOLVED_STAGED_ONLY"
     INGESTED = "INGESTED"
     ALREADY_INGESTED = "ALREADY_INGESTED"
+    WITHHELD_IMPLAUSIBLE_VALUE = "WITHHELD_IMPLAUSIBLE_VALUE"
     CONFLICTING_OFFICIAL_METRIC_FOR_PERIOD = "CONFLICTING_OFFICIAL_METRIC_FOR_PERIOD"
 
 
@@ -111,6 +118,7 @@ class StagedTerObservation:
     regular_total_ter_percent: Decimal
     direct_total_ter_percent: Decimal
     direct_plan_applicable: bool
+    value_issue: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,12 @@ class SbiTerAdapterResult:
     outcome: AdapterOutcome
     instrument_id: UUID | None = None
     fact: EtfFact | None = None
+    detail: str | None = None
+
+
+def _clean_percent(value) -> Decimal:
+    """Round away the workbook's binary-float noise and drop trailing zeros ("0.0520" -> "0.052")."""
+    return Decimal(format(Decimal(str(value)).quantize(TER_DECIMALS).normalize(), "f"))
 
 
 def _normalize_code(value) -> str:
@@ -197,8 +211,9 @@ def build_staged_observations(path: str | Path) -> list[StagedTerObservation]:
 
     staged = []
     for code, (ter_date, row) in latest.items():
-        regular_total = Decimal(str(row[7]))
-        direct_total = Decimal(str(row[12]))
+        regular_total = _clean_percent(row[7])
+        direct_total = _clean_percent(row[12])
+        components = sum((Decimal(str(row[i])) for i in (3, 4, 5, 6)), Decimal(0))
         if not (0 <= regular_total <= MAX_TER_PERCENT):
             raise ValueError(f"INVALID_REGULAR_TOTAL_TER_PERCENT:{code}:{regular_total}")
         staged.append(StagedTerObservation(
@@ -209,6 +224,9 @@ def build_staged_observations(path: str | Path) -> list[StagedTerObservation]:
             # placeholder for "no Direct Plan exists for this exchange-traded
             # scheme" -- never a verified zero Direct-Plan expense ratio.
             direct_plan_applicable=direct_total != 0,
+            value_issue=("TOTAL_TER_ABOVE_PLAUSIBLE_LIMIT" if regular_total > MAX_PLAUSIBLE_TER_PERCENT else
+                         "COMPONENT_SUM_MISMATCH" if abs(components - regular_total) > COMPONENT_SUM_TOLERANCE
+                         else None),
         ))
     return staged
 
@@ -232,7 +250,8 @@ class BoundedSbiTerAdapter:
         self._clock = clock or datetime.now
 
     def acquire(self, persistence, workbook_path: str | Path, *, source_identity: str,
-                retrieved_at: datetime) -> list[SbiTerAdapterResult]:
+                retrieved_at: datetime, published_at: datetime | None = None,
+                extra_metadata: Mapping[str, dict] | None = None) -> list[SbiTerAdapterResult]:
         staged = build_staged_observations(workbook_path)
         results: list[SbiTerAdapterResult] = []
         resolved_instruments: set[UUID] = set()
@@ -243,23 +262,33 @@ class BoundedSbiTerAdapter:
                     scheme_code=observation.scheme_code, scheme_name=observation.scheme_name,
                     outcome=AdapterOutcome.IDENTITY_UNRESOLVED_STAGED_ONLY))
                 continue
+            if observation.value_issue is not None:
+                results.append(SbiTerAdapterResult(
+                    scheme_code=observation.scheme_code, scheme_name=observation.scheme_name,
+                    outcome=AdapterOutcome.WITHHELD_IMPLAUSIBLE_VALUE, instrument_id=instrument_id,
+                    detail=observation.value_issue))
+                continue
             resolved_instruments.add(instrument_id)
             if len(resolved_instruments) > self._max_instruments:
                 raise ValueError("BOUNDED_ROLLOUT_INSTRUMENT_LIMIT_EXCEEDED")
             results.append(self._ingest_one(persistence, observation, instrument_id,
-                                              source_identity=source_identity, retrieved_at=retrieved_at))
+                                              source_identity=source_identity, retrieved_at=retrieved_at,
+                                              published_at=published_at,
+                                              extra=(extra_metadata or {}).get(observation.scheme_code))) 
         return results
 
     def _ingest_one(self, persistence, observation: StagedTerObservation, instrument_id: UUID,
-                     *, source_identity: str, retrieved_at: datetime) -> SbiTerAdapterResult:
+                     *, source_identity: str, retrieved_at: datetime, published_at: datetime | None = None,
+                     extra: dict | None = None) -> SbiTerAdapterResult:
         provenance = EtfProvenance(
             provider="SBI_MUTUAL_FUND", source_type="SBI_MF_TER_DISCLOSURE_WORKBOOK",
             source_identity=f"{source_identity}#{observation.scheme_code}#{observation.ter_date.isoformat()}",
             source_url="https://www.sbimf.com/docs/default-source/ter_allschemes/current-year-ter.xlsx",
             source_locator=f"scheme_code:{observation.scheme_code}",
-            source_metadata={"scheme_name": observation.scheme_name,
-                              "direct_plan_applicable": observation.direct_plan_applicable},
-            retrieved_at=retrieved_at, authority=EtfAuthority.OFFICIAL_FUND, reliability_level="LEVEL_B")
+            source_metadata={"scheme_name": observation.scheme_name, "nsdl_scheme_code": observation.scheme_code,
+                              "ter_plan": "REGULAR_TOTAL_TER", "direct_plan_applicable": observation.direct_plan_applicable,
+                              **(extra or {})},
+            published_at=published_at, retrieved_at=retrieved_at, authority=EtfAuthority.OFFICIAL_FUND, reliability_level="LEVEL_B")
         fact = EtfFact(instrument_id=instrument_id, metric=EtfMetric.EXPENSE_RATIO,
                         value=observation.regular_total_ter_percent, unit="percent",
                         as_of_date=observation.ter_date, provenance=provenance)

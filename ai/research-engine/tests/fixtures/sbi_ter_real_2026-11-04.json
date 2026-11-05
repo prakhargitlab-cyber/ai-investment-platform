@@ -1,0 +1,275 @@
+{
+ "capture": {
+  "url": "https://www.sbimf.com/docs/default-source/ter_allschemes/current-year-ter.xlsx",
+  "captured_at": "2026-11-05T23:07Z",
+  "sha256": "7d02e65a60a18dc8390a4366ba31c51d988de0a0f4a4977fb4fb1372f19b4085",
+  "bytes": 1857508,
+  "last_modified": "Thu, 05 Nov 2026 03:23:13 GMT",
+  "ter_date_serial": 46330,
+  "ter_date": "2026-11-04",
+  "note": "raw cell values of the latest row per NSDL code, extracted from the real workbook; the workbook has 4490 non-FoF ETF rows over 22 codes"
+ },
+ "etf": [
+  [
+   "SBIM/O/O/GET/09/01/0032",
+   [
+    "SBI Gold ETF",
+    "SBI Gold ETF "
+   ],
+   "0.55000000000000004",
+   "0",
+   "0",
+   "0.1",
+   "0.65"
+  ],
+  [
+   "SBIM/O/O/EET/13/01/0037",
+   [
+    "SBI BSE Sensex ETF"
+   ],
+   "4.1000000000000002E-2",
+   "0",
+   "0",
+   "5.0000000000000001E-3",
+   "4.5999999999999999E-2"
+  ],
+  [
+   "SBIM/O/O/EET/14/10/0043",
+   [
+    "SBI Nifty Next 50 ETF"
+   ],
+   "0.1",
+   "0",
+   "0",
+   "0.08",
+   "0.18"
+  ],
+  [
+   "SBIM/O/O/EET/14/10/0044",
+   [
+    "SBI Nifty Bank ETF",
+    "SBI Nifty Bank ETF "
+   ],
+   "0.17",
+   "0",
+   "0",
+   "0.05",
+   "0.22000000000000003"
+  ],
+  [
+   "SBIM/O/O/EET/14/09/0041",
+   [
+    "SBI BSE 100 ETF"
+   ],
+   "0.12",
+   "0",
+   "0",
+   "0.03",
+   "0.15"
+  ],
+  [
+   "SBIM/O/O/EET/15/06/0046",
+   [
+    "SBI Nifty 50 ETF",
+    "SBI Nifty 50 ETF "
+   ],
+   "4.1000000000000002E-2",
+   "0",
+   "0",
+   "8.0000000000000002E-3",
+   "4.9000000000000002E-2"
+  ],
+  [
+   "SBIM/O/O/DET/15/12/0047",
+   [
+    "SBI Nifty 10 yr Benchmark G-Sec ETF"
+   ],
+   "0.12",
+   "0",
+   "0",
+   "0.02",
+   "0.13999999999999999"
+  ],
+  [
+   "SBIM/O/O/EET/18/06/0052",
+   [
+    "SBI BSE Sensex Next 50 ETF"
+   ],
+   "0.2",
+   "0",
+   "0",
+   "0.09",
+   "0.29000000000000004"
+  ],
+  [
+   "SBIM/O/O/EET/18/09/0059",
+   [
+    "SBI NIFTY 200 Quality 30 ETF"
+   ],
+   "0.25",
+   "0",
+   "0",
+   "0.08",
+   "0.33"
+  ],
+  [
+   "SBIM/O/O/EET/20/07/0120",
+   [
+    "SBI Nifty IT ETF",
+    "SBI Nifty IT ETF "
+   ],
+   "0.17",
+   "0",
+   "0",
+   "7.0000000000000007E-2",
+   "0.24000000000000002"
+  ],
+  [
+   "SBIM/O/O/EET/20/07/0117",
+   [
+    "SBI Nifty Private Bank ETF",
+    "SBI Nifty Private Bank ETF "
+   ],
+   "0.13",
+   "0",
+   "0",
+   "0.05",
+   "0.18"
+  ],
+  [
+   "SBIM/O/O/EET/20/07/0118",
+   [
+    "SBI Nifty Consumption ETF"
+   ],
+   "0.25",
+   "0",
+   "0",
+   "0.06",
+   "0.31"
+  ],
+  [
+   "SBIM/O/O/DET/23/09/0173",
+   [
+    "SBI NIFTY 1D Rate Liquid ETF - IDCW"
+   ],
+   "0.3",
+   "0",
+   "0.01",
+   "0.05",
+   "0.36"
+  ],
+  [
+   "SBIM/O/O/OET/24/05/0179",
+   [
+    "SBI Silver ETF"
+   ],
+   "0.35",
+   "0",
+   "0",
+   "0.06",
+   "0.41"
+  ],
+  [
+   "SBIM/O/O/OET/24/01/0181",
+   [
+    "SBI Nifty50 Equal Weight ETF"
+   ],
+   "0.15",
+   "0",
+   "0",
+   "0.06",
+   "0.21"
+  ],
+  [
+   "SBIM/O/O/EET/25/02/0189",
+   [
+    "SBI BSE PSU BANK ETF"
+   ],
+   "0.35",
+   "0",
+   "0",
+   "7.0000000000000007E-2",
+   "0.42"
+  ],
+  [
+   "SBIM/O/O/DET/25/04/0194",
+   [
+    "SBI NIFTY 1D Rate Liquid ETF - Growth"
+   ],
+   "0.21",
+   "0",
+   "0.04",
+   "0.04",
+   "0.28999999999999998"
+  ],
+  [
+   "SBIM/O/O/OET/26/01/0197",
+   [
+    "SBI Nifty Midcap 150 Momentum 50 ETF"
+   ],
+   "0.35",
+   "0",
+   "0",
+   "0.1",
+   "0.44999999999999996"
+  ],
+  [
+   "SBIM/O/O/OET/26/01/0198",
+   [
+    "SBI Nifty Midcap 150 ETF"
+   ],
+   "0.17",
+   "0",
+   "0",
+   "0.09",
+   "0.26"
+  ],
+  [
+   "SBIM/O/O/EET/26/01/0203",
+   [
+    "SBI Nifty200 Value 30 ETF"
+   ],
+   "0.25",
+   "0.01",
+   "0.01",
+   "0.28000000000000003",
+   "0.55000000000000004"
+  ],
+  [
+   "SBIM/O/O/EET/26/01/0202",
+   [
+    "SBI Nifty Smallcap 250 ETF"
+   ],
+   "0.21",
+   "0.01",
+   "0.01",
+   "0.37",
+   "0.6"
+  ],
+  [
+   "SBIM/O/O/EET/26/07/0209",
+   [
+    "SBI BSE India Defence ETF"
+   ],
+   "0.3",
+   "7.0000000000000007E-2",
+   "0.2",
+   "7.2",
+   "7.7700000000000005"
+  ]
+ ],
+ "fof": [
+  [
+   "SBIM/O/O/FOD/24/05/0180",
+   "SBI Silver ETF Fund of Fund"
+  ],
+  [
+   "SBIM/O/O/FOD/26/06/0206",
+   "SBI Nifty Midcap 150 Momentum 50 ETF FOF"
+  ],
+  [
+   "SBIM/O/O/FOD/26/07/0208 ",
+   "SBI Nifty200 Value 30 ETF FOF"
+  ]
+ ]
+}

@@ -256,6 +256,8 @@ class Settings(BaseSettings):
     research_etf_official_document_fetch_enabled: bool = False
     # AMFI NAVAll exact-ISIN fund-house evidence in the full ETF cycle (one GET). Default off until enabled.
     research_etf_amfi_navall_enabled: bool = False
+    # SBI Mutual Fund TER via exact-name identity (requires the AMFI NAVAll + scheme master); off by default
+    research_etf_sbi_ter_enabled: bool = False
     research_mcp_first_enabled: bool = False
     research_mcp_gateway_base_url: str = "http://mcp-gateway"
     research_mcp_gateway_timeout_seconds: float = 10.0

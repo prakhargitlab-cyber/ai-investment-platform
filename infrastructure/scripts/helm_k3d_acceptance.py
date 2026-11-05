@@ -138,6 +138,14 @@ def main():
             raise Blocked("HELM_MANIFEST_SECTION_MISSING")
         manifest = raw.split(marker, 1)[1].split("\nNOTES:\n", 1)[0]
         desired_docs = [d for d in yaml.safe_load_all(manifest) if isinstance(d, dict)]
+        baseline_cmd = [
+            "docker", "run", "--rm", "--network", "container:" + SERVER,
+            "--mount", "type=bind,source=" + str(cfg) + ",target=/tmp/kubeconfig,readonly",
+            "--entrypoint", "helm", IMAGE, "--kubeconfig", "/tmp/kubeconfig",
+            "get", "manifest", RELEASE, "--namespace", NAMESPACE, "--revision", "1"
+        ]
+        baseline_docs = [d for d in yaml.safe_load_all(call(baseline_cmd))
+                         if isinstance(d, dict)]
     if len(desired_docs) != EXPECTED_COUNT:
         raise Blocked("UNEXPECTED_RENDERED_RESOURCE_COUNT: " + str(len(desired_docs)))
     expected = {}
@@ -147,6 +155,9 @@ def main():
             raise Blocked("DUPLICATE_RENDERED_RESOURCE")
         expected[key] = obj
 
+    baseline = {rid(o): o for o in baseline_docs}
+    if len(baseline) != EXPECTED_COUNT or set(baseline) != set(expected):
+        raise Blocked("STORED_RELEASE_IDENTITIES_MISMATCH")
     live_list = json.loads(kube("get", RESOURCE_KINDS, "-o", "json"))
     live = {rid(o): o for o in live_list["items"]}
     missing = sorted(set(expected) - set(live))
@@ -154,12 +165,18 @@ def main():
         print("MISSING_LIVE_IDENTITIES_COUNT:", len(missing))
         raise Blocked("RENDERED_RESOURCE_MISSING_IN_LIVE")
 
+    # Compare three independent states to identify the source of drift.
+    # Stored v1 is the historical Helm baseline, not a substitute for live.
+    baseline_to_live = []
+    proposed_to_baseline = []
     differences = []
     for key, desired in sorted(expected.items()):
         current = live[key]
         # Keep credentials in memory and report only labels/paths, never values.
-        compare(selected(desired), selected(current),
-                key[1] + "/" + key[2], differences)
+        label = key[1] + "/" + key[2]
+        compare(selected(desired), selected(current), label, differences)
+        compare(selected(baseline[key]), selected(current), label, baseline_to_live)
+        compare(selected(desired), selected(baseline[key]), label, proposed_to_baseline)
     for secret_name, data_key in SECRET_KEYS.items():
         obj = next((o for o in desired_docs if o["kind"] == "Secret"
                     and o["metadata"]["name"] == secret_name), None)
@@ -183,7 +200,13 @@ def main():
     print("POSTGRES_CREDENTIAL_PRESERVED: yes")
     print("SEARXNG_CREDENTIAL_PRESERVED: yes")
     print("RESEARCH_IMAGES_APPROVED: yes")
+    print("STORED_V1_TO_LIVE_FIELD_DIFFERENCES:", len(baseline_to_live))
+    print("PROPOSED_V2_TO_STORED_V1_FIELD_DIFFERENCES:", len(proposed_to_baseline))
     print("DIFFERENT_DESIRED_FIELDS:", len(differences))
+    print("PROPOSED_V2_VS_STORED_V1_RESOURCES:",
+          ", ".join(sorted(set(p.split(".")[0] for p in proposed_to_baseline))) or "(none)")
+    print("STORED_V1_VS_LIVE_RESOURCES:",
+          ", ".join(sorted(set(p.split(".")[0] for p in baseline_to_live))) or "(none)")
     for path in differences[:25]:
         print("DIFF_PATH:", path)  # paths only; no values
     if len(differences) > 25:

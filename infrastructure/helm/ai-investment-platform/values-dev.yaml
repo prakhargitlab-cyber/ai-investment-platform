@@ -11,6 +11,8 @@ apiGateway:
       - http://localhost:3000
       - http://127.0.0.1:3000
       - http://localhost:13000
+      - http://localhost:18080
+      - http://localhost:18081
   ingress:
     enabled: true
 

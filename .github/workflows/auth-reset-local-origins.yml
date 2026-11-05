@@ -1,0 +1,37 @@
+name: Auth reset local origins
+
+on:
+  pull_request:
+    paths:
+      - 'services/auth-service/**'
+      - 'infrastructure/helm/ai-investment-platform/templates/java-services.yaml'
+      - 'infrastructure/helm/ai-investment-platform/values-dev.yaml'
+      - '.github/workflows/auth-reset-local-origins.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  auth-and-gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Test Java auth and gateway modules
+        run: mvn -B -pl services/auth-service,services/api-gateway -am test
+      - name: Ensure DEV origin allowlist and auth env wiring
+        shell: python
+        run: |
+          from pathlib import Path
+          values = Path("infrastructure/helm/ai-investment-platform/values-dev.yaml").read_text()
+          chart = Path("infrastructure/helm/ai-investment-platform/templates/java-services.yaml").read_text()
+          for origin in ("http://localhost:13000", "http://localhost:18080", "http://localhost:18081"):
+              assert ("- " + origin) in values
+          assert "AUTH_ALLOWED_PUBLIC_ORIGINS" in chart
+          assert 'join "," $.Values.apiGateway.cors.allowedOrigins' in chart

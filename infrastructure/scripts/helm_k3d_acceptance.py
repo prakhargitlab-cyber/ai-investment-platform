@@ -120,6 +120,10 @@ def main():
             "--mount", "type=bind,source=" + str(CHART) + ",target=/chart,readonly",
             "--entrypoint", "helm", IMAGE, "--kubeconfig", "/tmp/kubeconfig",
             "upgrade", RELEASE, "/chart", "--namespace", NAMESPACE,
+            # The original DEV install was composed from values-dev.yaml.
+            # --reuse-values alone does not reliably reconstruct that profile
+            # when Helm stored only explicit overrides in release.Config.
+            "-f", "/chart/values-dev.yaml",
             "--reuse-values", "--dry-run=server",
             "--set", "research.opportunityRecoveryPaused=true",
             "--set", "research.opportunityScheduler.enabled=false",

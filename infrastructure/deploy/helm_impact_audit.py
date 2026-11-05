@@ -206,6 +206,37 @@ def helm_dry_run(base, *arguments):
             print("HELM_ERROR_TEMPLATE_NAMES:",
                   ",".join(n.decode("ascii") for n in dict.fromkeys(template_names)),
                   flush=True)
+        # Never infer a YAML parse error from a filename ending .yaml.
+        # Classify only known Helm message structures, without raw error text.
+        structural_checks = (
+            (rb"(?i)UPGRADE FAILED: YAML parse error", "YAML_PARSE_CONFIRMED"),
+            (rb"(?i)UPGRADE FAILED: error parsing", "UPGRADE_INPUT_PARSE_ERROR"),
+            (rb"(?i)UPGRADE FAILED: cannot patch", "LIVE_PATCH_REJECTED"),
+            (rb"(?i)UPGRADE FAILED: failed to create", "DRY_RUN_CREATE_FAILED"),
+            (rb"(?i)UPGRADE FAILED: unable to build kubernetes objects", "RESOURCE_VALIDATION_FAILED"),
+            (rb"(?i)UPGRADE FAILED: rendered manifests contain a resource", "EXISTING_RESOURCE_CONFLICT"),
+            (rb"(?i)DEV_CREDENTIAL_[A-Z_]+", "UPGRADE_PROTECTED_SECRET_LOOKUP_FAILURE"),
+            (rb"(?i)UPGRADE FAILED: error validating", "RESOURCE_VALIDATION_FAILED"),
+            (rb"(?i)UPGRADE FAILED: failed to (?:replace|update)", "LIVE_UPDATE_REJECTED"),
+            (rb"(?i)UPGRADE FAILED: failed to (?:get|list)", "LIVE_RESOURCE_QUERY_FAILED"),
+            (rb"(?i)UPGRADE FAILED: another operation", "RELEASE_LOCKED"),
+            (rb"(?i)UPGRADE FAILED: (?:failed to|unable to) (?:load|parse)", "UPGRADE_LOAD_OR_PARSE_FAILED"),
+        )
+        import re
+        for regex, reason in structural_checks:
+            if re.search(regex, result.stderr + b"\\n" + result.stdout):
+                print("HELM_STRUCTURAL_FAILURE_CLASS:", reason, flush=True)
+                break
+        else:
+            print("HELM_STRUCTURAL_FAILURE_CLASS: UNRECOGNIZED", flush=True)
+        kinds = (b"Deployment", b"StatefulSet", b"ServiceAccount",
+                 b"Secret", b"PersistentVolumeClaim", b"Service",
+                 b"ConfigMap", b"Ingress")
+        found = [kind.decode("ascii") for kind in kinds
+                 if re.search(rb"\\b" + kind + rb"\\b",
+                              result.stderr + b"\\n" + result.stdout)]
+        print("HELM_ERROR_RESOURCE_KINDS:",
+              ",".join(found) if found else "none", flush=True)
         # If Helm's phrasing is unknown, return only approved vocabulary
         # present in the diagnostic, never the raw error or identifiers.
         import re

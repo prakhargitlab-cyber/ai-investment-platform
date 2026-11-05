@@ -52,6 +52,8 @@ jobs:
             infrastructure/scripts/test_helm_k3d_image_pin_impact.py \
             infrastructure/scripts/test_helm_jwt_upgrade_guard.py \
             infrastructure/scripts/test_helm_k3d_strategic_patch.py
+      - name: Compile pinned three-way patch checker without executing cluster access
+        run: python -m py_compile infrastructure/scripts/helm_k3d_pinned_strategic_patch.py
       - name: Validate rendered images, research init and Kafka probe
         run: python infrastructure/scripts/validate_helm_render_contract.py
       - name: Helm lint LOCAL chart

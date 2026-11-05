@@ -54,12 +54,34 @@ def main():
     if result.get("blocked") is not (proc.returncode == 3):
         raise RuntimeError("PATCH_RESULT_EXIT_MISMATCH")
 
+    permitted_categories = {
+        "metadata", "type", "secret-data-or-config-data", "secret-stringData",
+        "binary-data", "other", "spec", "spec-other",
+        "deployment-spec-other", "pod-template-other",
+        "pod-template-metadata", "pod-spec-other", "container-other",
+        "container-image", "container-env"
+    }
+    categories = result.get("patch_categories")
+    if not isinstance(categories, dict):
+        raise RuntimeError("PATCH_CATEGORY_REPORT_MISSING")
+    reported = {key for key, vals in categories.items()
+                if isinstance(key, str) and isinstance(vals, list)}
+    if len(reported) != result.get("nonempty") or (
+        reported != set(names) | ({"Deployment/research-engine"}
+                                  if result.get("research_patch") else set())
+    ):
+        raise RuntimeError("PATCH_CATEGORY_RESOURCE_SET_MISMATCH")
+    if any(not vals or any(v not in permitted_categories for v in vals)
+           for vals in categories.values()):
+        raise RuntimeError("UNRECOGNIZED_PATCH_CATEGORY")
     print("KUBERNETES_STRATEGIC_PATCH_RESOURCES:", result["resources"])
     print("NONEMPTY_THREE_WAY_PATCHES:", result.get("nonempty"))
     print("RESEARCH_ENGINE_PATCH_NONEMPTY:", result.get("research_patch"))
     print("UNRELATED_RESOURCE_PATCHES:", len(names))
     for name in names:
         print("PATCH_RESOURCE:", name)
+    for name in sorted(categories):
+        print("PATCH_CATEGORY:", name, ",".join(sorted(set(categories[name]))))
     print("PATCH_BYTES_AND_SECRET_VALUES_NOT_DISPLAYED")
     print("NO_KUBERNETES_WRITES_PERFORMED")
     if proc.returncode == 3:

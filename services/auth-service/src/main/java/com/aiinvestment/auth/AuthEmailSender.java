@@ -6,4 +6,7 @@ public interface AuthEmailSender {
     boolean isConfigured();
     void sendVerification(UUID userId, String email, String rawToken);
     void sendPasswordReset(UUID userId, String email, String rawToken);
+    default void sendPasswordReset(UUID userId, String email, String rawToken, String publicUrl) {
+        sendPasswordReset(userId, email, rawToken);
+    }
 }

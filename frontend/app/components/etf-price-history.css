@@ -1,0 +1,232 @@
+.etf-price-history {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  min-width: 0;
+  background: var(--surface, #fff);
+}
+.etf-price-history header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.etf-price-history h3 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+.etf-price-history p {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-muted, #64748b);
+}
+.etf-history-basis {
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 5px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.etf-history-toolbar,
+.etf-history-indicators,
+.etf-history-navigation {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 16px 0;
+}
+.etf-history-toolbar > div {
+  display: flex;
+  gap: 4px;
+}
+.etf-price-history button {
+  min-height: 36px;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 7px;
+  background: var(--surface, #fff);
+  color: var(--text, #17243b);
+  padding: 7px 11px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.etf-price-history button[aria-pressed="true"] {
+  background: var(--primary, #2563eb);
+  color: #fff;
+  border-color: transparent;
+}
+.etf-price-history button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.etf-price-history button:focus-visible,
+.etf-history-plot:focus-visible {
+  outline: 2px solid var(--primary, #2563eb);
+  outline-offset: 3px;
+}
+.etf-history-toolbar label,
+.etf-history-custom label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+}
+.etf-history-toolbar select,
+.etf-history-custom input {
+  max-width: 100%;
+  min-height: 36px;
+  padding: 5px 8px;
+  font-size: 13px;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 6px;
+  background: var(--surface, #fff);
+  color: inherit;
+}
+.etf-history-custom {
+  font-size: 13px;
+}
+.etf-history-custom summary {
+  cursor: pointer;
+  padding: 7px;
+}
+.etf-history-custom > div {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px;
+}
+.etf-history-indicators label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  min-height: 30px;
+}
+.etf-history-indicators input {
+  accent-color: #2563eb;
+}
+.etf-history-plot {
+  min-width: 0;
+  width: 100%;
+  touch-action: pan-y;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--surface-subtle, #f8fafc);
+}
+.etf-history-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  user-select: none;
+}
+.etf-history-svg text {
+  fill: var(--text-muted, #64748b);
+  font:
+    12px ui-sans-serif,
+    system-ui,
+    sans-serif;
+}
+.etf-history-gridline {
+  stroke: var(--border, #dce4ef);
+  stroke-width: 1;
+}
+.etf-history-line {
+  fill: none;
+  stroke: #2563eb;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.etf-history-sma-50 {
+  stroke: #d97706;
+  stroke-width: 1.5;
+}
+.etf-history-sma-150 {
+  stroke: #9333ea;
+  stroke-width: 1.5;
+}
+.etf-history-sma-200 {
+  stroke: #059669;
+  stroke-width: 1.5;
+}
+.etf-history-volume {
+  fill: #93b4e9;
+}
+.etf-history-crosshair {
+  stroke: #64748b;
+  stroke-dasharray: 4 4;
+}
+.etf-history-point {
+  fill: #2563eb;
+}
+.etf-history-ohlc {
+  stroke: #64748b;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.etf-history-hover,
+.etf-history-extremes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  padding: 14px 0;
+  margin: 0;
+  border-bottom: 1px solid var(--border, #dce4ef);
+}
+.etf-history-hover > div,
+.etf-history-extremes > div {
+  min-width: 0;
+}
+.etf-history-hover dt,
+.etf-history-extremes dt {
+  font-size: 11px;
+  color: var(--text-muted, #64748b);
+  line-height: 1.5;
+}
+.etf-history-hover dd,
+.etf-history-extremes dd {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+.etf-history-benchmark {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-subtle, #f8fafc);
+}
+.etf-history-warnings {
+  font-size: 12px;
+  color: var(--text-muted, #64748b);
+  line-height: 1.6;
+}
+.etf-history-warnings summary {
+  cursor: pointer;
+}
+.etf-history-warnings li {
+  margin: 6px 0;
+}
+@media (max-width: 600px) {
+  .etf-price-history {
+    padding: 12px;
+  }
+  .etf-history-toolbar {
+    align-items: flex-start;
+  }
+  .etf-history-toolbar > label {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+  }
+  .etf-history-navigation {
+    gap: 6px;
+  }
+  .etf-price-history button {
+    font-size: 12px;
+    padding: 7px 9px;
+  }
+  .etf-history-hover,
+  .etf-history-extremes {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

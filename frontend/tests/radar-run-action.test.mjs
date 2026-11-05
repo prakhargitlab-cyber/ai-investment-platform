@@ -41,7 +41,7 @@ test('the Equity run action explicitly requests the FULL analysis scope on every
 
 test('both run buttons are disabled while their own cycle is non-terminal (no double submit)', () => {
   assert.match(opportunityRadarSource, /disabled=\{running \|\| discoveryLoading\}/);
-  assert.match(etfRadarSource, /disabled=\{running\}/);
+  assert.match(etfRadarSource, /disabled=\{running \|\| starting\}/);
   assert.match(opportunityRadarSource, /const running = !!activeCycle && !isTerminalRadarStatus\(activeCycle\.status\);/);
   assert.match(etfRadarSource, /const running = !!activeCycle && !isTerminalRadarStatus\(activeCycle\.status\);/);
 });
@@ -85,33 +85,18 @@ test('a failed status poll keeps the panel showing the last known state rather t
 });
 
 test('ETF live counters require durable coverage; legacy cycles stay indeterminate', () => {
-  assert.match(etfRadarSource, /const terminalData = activeCycle\?\.status === "COMPLETED" && data\?\.cycle_id === activeCycle\.cycleId \? data : null;/);
-  assert.match(etfRadarSource, /activeCycle\?\.coverage \? \[/);
-  assert.match(etfRadarSource, /value: firstPassOfficial/);
-  assert.match(etfRadarSource, /value: firstPassCompleted/);
-  assert.match(etfRadarSource, /value: historyOnboarded/);
-  assert.match(etfRadarSource, /Historical onboarding recorded \(including failures\)/);
-  assert.match(etfRadarSource, /authoritativeProgress: value\.authoritative_progress/);
-  assert.match(etfRadarSource, /currentStage = authoritative\?\.stages\?\.find/);
-  assert.match(etfRadarSource, /percent=\{stagePercent\}/);
-  assert.match(etfRadarSource, /Overall cycle progress: unavailable/);
-  assert.match(etfRadarSource, /baseline_failed/);
-  assert.match(progressSource, /progressLabel \?\?/);
-  assert.doesNotMatch(etfRadarSource, /percent=\{firstPassCompleted/);
+  assert.match(etfRadarSource, /activeCycle\?\.status === "COMPLETED"\s*&&\s*data\?\.cycle_id === activeCycle\.cycleId/);
+  for (const value of ['firstPassOfficial','firstPassCompleted','historyOnboarded']) assert.match(etfRadarSource,new RegExp('value: '+value));
+  assert.match(etfRadarSource,/phaseProgress: value\.etf_phase_progress/);
+  assert.match(etfRadarSource,/percent=\{stagePercent\}/);
+  assert.doesNotMatch(etfRadarSource,/percent=\{firstPassCompleted/);
+  assert.match(progressSource,/progressLabel \?\?/);
 });
 
-test('ETF progress counters, once COMPLETED, come only from the full persisted candidates set, never the truncated top-N ranked list', () => {
-  assert.match(etfRadarSource, /terminalData\.candidates\.length/);
-  assert.match(etfRadarSource, /terminalData\.candidates\.filter\(\(c\) => c\.disposition === "EVALUATED"\)\.length/);
-  assert.match(etfRadarSource, /terminalData\.candidates\.filter\(\(c\) => c\.disposition === "TECHNICAL_FAILURE"\)\.length/);
-  assert.match(etfRadarSource, /terminalData\.candidates\.filter\(\(c\) => c\.disposition === "INSUFFICIENT_DATA"\)\.length/);
-  assert.match(etfRadarSource, /terminalData\.candidates\.filter\(\(c\) => c\.disposition === "INELIGIBLE" \|\| c\.disposition === "UNSUPPORTED"\)\.length/);
-  assert.match(etfRadarSource, /terminalData\.candidates\.filter\(\(c\) => c\.recommendation === "AVOID"\)\.length/);
-  // ETF's recommendation vocabulary has no literal BUY/SELL/HOLD -- never invented.
-  assert.match(etfRadarSource, /\{ label: "BUY count", value: null \}/);
-  assert.match(etfRadarSource, /\{ label: "SELL count", value: null \}/);
-  assert.match(etfRadarSource, /\{ label: "HOLD\/neutral count", value: null \}/);
-  assert.match(etfRadarSource, /\{ label: "Pod restarts", value: null \}/);
+test('ETF terminal counters use the completed cycle and full candidates, retaining unsupported action counts as unavailable', () => {
+  assert.match(etfRadarSource,/terminalData\.candidates\.length/);
+  for (const status of ['EVALUATED','TECHNICAL_FAILURE','INSUFFICIENT_DATA','INELIGIBLE','UNSUPPORTED']) assert.match(etfRadarSource,new RegExp('c\\.disposition === "'+status+'"'));
+  for (const label of ['BUY count','SELL count','HOLD/neutral count','Pod restarts']) assert.ok(etfRadarSource.includes(`label: "${label}", value: null`));
 });
 
 test('Equity progress counters and percentage come only from authoritative_progress, filtered to real values', () => {
@@ -138,16 +123,11 @@ test('OpportunityRadar and EtfRadar each own independent activeCycle state -- no
 
 // RADAR UI + API ROUTING -- item F.5, page-refresh recovery ---------------
 
-test('a page refresh recovers an in-progress ETF cycle from sessionStorage and resumes polling its real status endpoint', () => {
-  assert.match(
-    etfRadarSource,
-    /storedCycleId = window\.sessionStorage\.getItem\(ETF_ACTIVE_CYCLE_STORAGE_KEY\);/
-  );
-  assert.match(
-    etfRadarSource,
-    /if \(storedCycleId\) setActiveCycle\(previous => previous \?\? \{ cycleId: storedCycleId, status: "RUNNING",/
-  );
-  assert.match(etfRadarSource, /\}, \[cycleId\]\);/);
+test('a page refresh recovers only its own ETF cycle from sessionStorage and resumes real status polling', () => {
+  assert.match(etfRadarSource,/window\.sessionStorage\.getItem\(\s*ETF_ACTIVE_CYCLE_STORAGE_KEY/);
+  assert.match(etfRadarSource,/cycleId: storedCycleId/);
+  assert.match(etfRadarSource,/previous\s*\?\?/);
+  assert.match(etfRadarSource,/\}, \[cycleId\]\);/);
 });
 
 test('active keys are cleared on terminal status; Equity has no persisted history selection', () => {
@@ -174,6 +154,7 @@ function loadComponent(filename, api = {}) {
     }).outputText;
     const require = spec => {
       if (spec.endsWith('.css')) return {};
+      if (spec === './etf-price-history') return { EtfPriceHistory: () => null };
       if (spec.includes('portfolio-api')) return { request: api.request };
       if (spec.includes('admin-api')) return { adminApi: api };
       if (spec.startsWith('.')) {
@@ -552,7 +533,7 @@ for (const [name, filename, key, endpoint] of [
             cycles: [cycleSummary('terminal-cycle', terminalStatus)], active_cycle: null });
           const pending = deferred(); calls.push({ url, ...pending }); return pending.promise;
         } })[name];
-        await settle(() => { tree = create(React.createElement(Component, { heldIds: [], watchlistedIds: [] })); });
+        await settle(() => { tree = create(React.createElement(Component, { heldIds: [], watchlistedIds: [], ...(name === 'EtfRadar' ? { roles: ['ADMIN'] } : {}) })); });
         await settle(() => calls[1].resolve({ status: terminalStatus }));
         assert.equal(store.has(key), false);
         assert.equal(calls.length, 2);
@@ -748,129 +729,17 @@ for (const scenario of [
   });
 }
 
-// Bounded/controlled ETF Radar admin action -----------------------------
-
-const boundedPreflightResponse = (overrides = {}) => ({
-  status: 'READY', scope: 'BOUNDED_CANONICAL_ETF', candidate_count: 1, ready_count: 1,
-  instruments: [{ instrument_id: '11111111-1111-1111-1111-111111111111', symbol: 'NIFTYBEES', isin: 'INF1', canonical_identity_matches: true, mandatory_evidence_ready: true, blocking_reasons: [] }],
-  recovery_paused: true, active_cycle_id: null, manual_execution_authorized: true, can_submit: true,
-  ...overrides,
-});
-
-test('Bounded ETF Radar section is hidden without the ADMIN role', async () => {
-  const calls = [];
-  const Component = loadComponent('etf-radar.tsx', { request: url => { calls.push(url); return Promise.reject({ status: 404 }); } }).EtfRadar;
-  let tree;
-  await settle(() => { tree = create(React.createElement(Component, {})); });
-  assert.doesNotMatch(textOf(tree), /Run Bounded ETF Radar/);
-  await settle(() => tree.unmount());
-});
-
-test('Bounded ETF Radar: happy path checks preflight, requires confirmation, and submits only to /controlled-cycles', async () => {
-  const calls = [];
-  const originalWindow = globalThis.window;
-  const store = new Map();
-  try {
-    globalThis.window = { sessionStorage: { getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: k => store.delete(k) } };
-    const Component = loadComponent('etf-radar.tsx', { request: (url, init) => {
-      calls.push({ url, init });
-      if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
-      if (url.startsWith('/api/v1/etf-radar/full-universe-cycles')) return Promise.reject(new Error('bounded action must never call full-universe-cycles'));
-      if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse());
-      if (url === '/api/v1/etf-radar/controlled-cycles') return Promise.resolve({ cycle_id: 'bounded-1', status: 'ACCEPTED' });
-      return Promise.reject(new Error('unexpected url ' + url));
-    } }).EtfRadar;
-    let tree;
-    await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
-    assert.match(textOf(tree), /Run Bounded ETF Radar/);
-    await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
-    await settle(() => button(tree, 'Check preflight').props.onClick());
-    const preflightCall = calls.find(c => c.url.startsWith('/api/v1/etf-radar/preflight'));
-    assert.match(preflightCall.url, /instrument_ids=11111111-1111-1111-1111-111111111111/);
-    assert.match(textOf(tree), /status=/);
-    assert.match(textOf(tree), /READY/);
-    // Submit stays disabled until the explicit confirmation checkbox is checked.
-    assert.equal(button(tree, 'Run Bounded ETF Radar').props.disabled, true);
-    await settle(() => tree.root.findByType('input').props.onChange({ target: { checked: true } }));
-    assert.equal(button(tree, 'Run Bounded ETF Radar').props.disabled, false);
-    await settle(() => button(tree, 'Run Bounded ETF Radar').props.onClick());
-    const submitCall = calls.find(c => c.url === '/api/v1/etf-radar/controlled-cycles');
-    assert.ok(submitCall, 'controlled-cycles was called');
-    assert.deepEqual(JSON.parse(submitCall.init.body), { instrument_ids: ['11111111-1111-1111-1111-111111111111'] });
-    assert.equal(calls.some(c => c.url.startsWith('/api/v1/etf-radar/full-universe-cycles')), false);
-    assert.equal(store.get('aip.etfRadar.activeCycleId'), 'bounded-1');
-    await settle(() => tree.unmount());
-  } finally { globalThis.window = originalWindow; }
-});
-
-test('Bounded ETF Radar: invalid instrument ID input is rejected client-side without any network call', async () => {
-  const calls = [];
-  const Component = loadComponent('etf-radar.tsx', { request: url => { calls.push(url); return Promise.reject({ status: 404 }); } }).EtfRadar;
-  let tree;
-  await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
-  await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: 'not-a-uuid' } }));
-  await settle(() => button(tree, 'Check preflight').props.onClick());
-  assert.match(textOf(tree), /Not a valid instrument ID/);
-  assert.equal(calls.filter(u => u.includes('preflight')).length, 0);
-  await settle(() => tree.unmount());
-});
-
-test('Bounded ETF Radar: a BLOCKED preflight explains why and never offers a confirm/submit control', async () => {
-  const Component = loadComponent('etf-radar.tsx', { request: url => {
-    if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
-    if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse({
-      status: 'BLOCKED', can_submit: false, ready_count: 0,
-      instruments: [{ instrument_id: '11111111-1111-1111-1111-111111111111', symbol: 'NIFTYBEES', isin: 'INF1', canonical_identity_matches: true, mandatory_evidence_ready: false, blocking_reasons: ['EVIDENCE_INSUFFICIENT_WITHIN_PLAN'] }],
-    }));
-    return Promise.reject(new Error('unexpected url ' + url));
-  } }).EtfRadar;
-  let tree;
-  await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
-  await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
-  await settle(() => button(tree, 'Check preflight').props.onClick());
-  assert.match(textOf(tree), /mandatory evidence ready/);
-  assert.match(textOf(tree), /EVIDENCE_INSUFFICIENT_WITHIN_PLAN/);
-  assert.equal(tree.root.findAllByType('input').length, 0);
-  assert.equal(button(tree, 'Run Bounded ETF Radar'), undefined);
-  await settle(() => tree.unmount());
-});
-
-test('Bounded ETF Radar: recovery-paused-without-authorization preflight is explained, not silently blocked', async () => {
-  const Component = loadComponent('etf-radar.tsx', { request: url => {
-    if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
-    if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse({
-      recovery_paused: true, manual_execution_authorized: false, can_submit: false,
-    }));
-    return Promise.reject(new Error('unexpected url ' + url));
-  } }).EtfRadar;
-  let tree;
-  await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
-  await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
-  await settle(() => button(tree, 'Check preflight').props.onClick());
-  assert.match(textOf(tree), /not authorized in this environment/);
-  await settle(() => tree.unmount());
-});
-
-test('Bounded ETF Radar: submission is disabled while another ETF cycle is active, even if preflight says READY', async () => {
-  const originalWindow = globalThis.window;
-  const store = new Map([['aip.etfRadar.activeCycleId', 'already-running']]);
-  try {
-    globalThis.window = { sessionStorage: { getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: k => store.delete(k) } };
-    const calls = [];
-    const Component = loadComponent('etf-radar.tsx', { request: url => {
-      calls.push(url);
-      if (url === '/api/v1/etf-radar/current') return Promise.reject({ status: 404 });
-      if (url.endsWith('/cycles/already-running/status')) return Promise.resolve({ status: 'RUNNING' });
-      if (url.startsWith('/api/v1/etf-radar/preflight')) return Promise.resolve(boundedPreflightResponse());
-      if (url === '/api/v1/etf-radar/controlled-cycles') return Promise.reject(new Error('must never submit while a cycle is active'));
-      return Promise.reject(new Error('unexpected url ' + url));
-    } }).EtfRadar;
-    let tree;
-    await settle(() => { tree = create(React.createElement(Component, { roles: ['ADMIN'] })); });
-    await settle(() => tree.root.findByType('textarea').props.onChange({ target: { value: '11111111-1111-1111-1111-111111111111' } }));
-    await settle(() => button(tree, 'Check preflight').props.onClick());
-    await settle(() => tree.root.findByType('input').props.onChange({ target: { checked: true } }));
-    assert.equal(button(tree, 'Another ETF cycle is running…').props.disabled, true);
-    await settle(() => tree.unmount());
-  } finally { globalThis.window = originalWindow; }
-});
+// ETF acquisition controls remain absent for every role; server APIs are unchanged.
+for (const roles of [[], ['USER'], ['ADMIN']]) {
+ test(`ETF user surface has no bounded acquisition controls for ${roles.join(',') || 'anonymous'}`, async()=>{
+   const calls=[];
+   const Component=loadComponent('etf-radar.tsx',{request:async url=>{calls.push(url);throw {status:404};}}).EtfRadar;
+   let tree;
+   await settle(()=>{tree=create(React.createElement(Component,{roles}));});
+   assert.equal(tree.root.findAllByType('textarea').length,0);
+   assert.doesNotMatch(textOf(tree),/Run Bounded ETF Radar|Check preflight|Refresh market price/);
+   assert.equal(!!button(tree,'Run full NSE ETF Radar'),roles.includes('ADMIN'));
+   assert.deepEqual(calls,['/api/v1/etf-radar/current']);
+   await settle(()=>tree.unmount());
+ });
+}

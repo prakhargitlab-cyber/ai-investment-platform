@@ -1,183 +1,384 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import { createRequire } from 'node:module';
-import ts from 'typescript';
-import React from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  React,
+  create,
+  act,
+  renderToStaticMarkup,
+  loadEtfModule,
+  candidate,
+  cycle,
+  textOf,
+  button,
+  change,
+} from "./etf-test-helpers.mjs";
+const { EtfRadarContent } = loadEtfModule();
+const settle = async (fn) => {
+  await act(async () => {
+    fn?.();
+    await Promise.resolve();
+  });
+};
+const tab = (tree, label) =>
+  tree.root
+    .findAll((n) => n.props.role === "tab")
+    .find((n) => n.children.join("") === label);
+const rowNodes = (tree) =>
+  tree.root.findAll((n) => n.props.className === "etf-screener-row");
+const names = (tree) =>
+  rowNodes(tree).map((n) =>
+    n
+      .findAll((n) => n.props.className === "etf-symbol-button")[0]
+      .children.join(""),
+  );
+const many = (count) =>
+  Array.from({ length: count }, (_, i) =>
+    candidate({
+      global_instrument_id: `synthetic-${String(i).padStart(3, "0")}`,
+      symbol: `ETF${String(i).padStart(3, "0")}`,
+      fund_name: `Synthetic Fund ${i}`,
+      rank: i + 1,
+    }),
+  );
 
-const require = createRequire(import.meta.url);
-const moduleCache = new Map();
-
-function resolveLocalModuleUrl(baseUrl, specifier) {
-  for (const ext of ['.tsx', '.ts']) {
-    const candidate = new URL(specifier + ext, baseUrl);
-    if (fs.existsSync(candidate)) return candidate;
+for (const branch of [
+  {
+    global_instrument_id: "synthetic-failed",
+    symbol: "FAILED",
+    disposition: "TECHNICAL_FAILURE",
+    reason: "BASELINE_ACQUISITION_TECHNICAL_FAILURE",
+    recommendation: null,
+    missing_data: [],
+    limitations: [],
+    historical_acquisition: null,
+  },
+  {
+    global_instrument_id: null,
+    symbol: "UNRESOLVED",
+    disposition: "INELIGIBLE",
+    reason: "CANONICAL_IDENTITY_NOT_FOUND",
+    recommendation: null,
+    historical_acquisition: null,
+  },
+])
+  test(`production branch ${branch.disposition} renders Universe and lazy analysis without missing-array crash`, async () => {
+    let tree;
+    await settle(() => {
+      tree = create(
+        React.createElement(EtfRadarContent, {
+          data: cycle([branch]),
+          initialTab: "universe",
+        }),
+      );
+    });
+    assert.equal(
+      tree.root.findAll(
+        (n) => n.props.className === "opportunity-card etf-radar-card",
+      ).length,
+      0,
+    );
+    assert.match(textOf(tree), new RegExp(branch.symbol));
+    await settle(() => button(tree, "Analysis").props.onClick());
+    assert.match(textOf(tree), /Analysis not recorded/);
+    assert.match(textOf(tree), /Risk assessment not recorded/);
+    await settle(() => tree.unmount());
+  });
+test("Universe and Advanced Screener include unranked candidates, while Opportunities remains the full ranked set", () => {
+  const ranked = candidate(),
+    excluded = candidate({
+      global_instrument_id: "excluded",
+      symbol: "EXCLUDED",
+      disposition: "INSUFFICIENT_DATA",
+      rank: null,
+      rule_engine_result: null,
+    });
+  for (const initialTab of ["universe", "screener"]) {
+    const html = renderToStaticMarkup(
+      React.createElement(EtfRadarContent, {
+        data: cycle([ranked, excluded]),
+        initialTab,
+      }),
+    );
+    assert.match(html, /EXCLUDED/);
+    assert.match(html, /2 of 2 results/);
+    assert.doesNotMatch(
+      html,
+      /Qualified opportunity|buy recommendation unless/,
+    );
   }
-  return null;
-}
-
-function loadLocalModule(fileUrl) {
-  const key = fileUrl.pathname;
-  if (moduleCache.has(key)) return moduleCache.get(key);
-  const source = fs.readFileSync(fileUrl, 'utf8');
-  const output = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const mod = { exports: {} };
-  moduleCache.set(key, mod.exports);
-  const localRequire = (specifier) => {
-    if (specifier.includes('portfolio-api')) return {};
-    if (specifier.startsWith('.')) {
-      const resolved = resolveLocalModuleUrl(fileUrl, specifier);
-      if (resolved) return loadLocalModule(resolved);
-    }
-    return require(specifier);
-  };
-  new Function('require', 'module', 'exports', output)(localRequire, mod, mod.exports);
-  return mod.exports;
-}
-
-function component(name) {
-  return loadLocalModule(new URL(`../app/components/${name}.tsx`, import.meta.url));
-}
-
-const { EtfRadarContent } = component('etf-radar');
-
-function ruleResult(overrides = {}) {
-  return {
-    rule_engine_version: 'ETF_RULE_ENGINE_V1', instrument_id: 'x', as_of: '2026-09-27T12:00:00Z',
-    factor_results: [], overall_score: 62.5, data_completeness: 0.375, confidence: 'LOW',
-    ...overrides,
-  };
-}
-
-function candidate(overrides = {}) {
-  return {
-    global_instrument_id: 'id-1', symbol: 'NIFTYBEES', disposition: 'EVALUATED', reason: 'EVALUATED',
-    subtype: 'EQUITY_INDEX', peer_group: 'EQUITY_INDEX', rule_engine_result: ruleResult(), risk_gates: [],
-    recommendation: 'OPPORTUNITY', rank: 1,
-    ...overrides,
-  };
-}
-
-// A representative cycle: 1 ranked (qualified) ETF, plus several unranked/
-// insufficient-data/technical-failure ETFs -- mirrors the reported
-// production shape (357 universe, 345 evaluated, 1 ranked).
-function universeCycle() {
-  const goldbees = candidate({
-    global_instrument_id: 'id-goldbees', symbol: 'GOLDBEES', peer_group: 'GOLD', rank: 1,
-    recommendation: 'OPPORTUNITY',
-    historical_acquisition: { status: 'PROVIDER_UNAVAILABLE', reason: 'ETF_HISTORY_LISTING_NOT_VERIFIED', observations: 59 },
+  const top = renderToStaticMarkup(
+    React.createElement(EtfRadarContent, {
+      data: cycle([ranked, excluded]),
+      initialTab: "top",
+    }),
+  );
+  assert.doesNotMatch(top, /EXCLUDED/);
+  assert.match(top, /Preliminary research opportunity/);
+});
+test("pagination covers the whole ranked set, resets after filters and never eagerly mounts detail cards", async () => {
+  let tree;
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, {
+        data: cycle(many(61)),
+        initialTab: "top",
+      }),
+    );
   });
-  const niftybees = candidate({
-    global_instrument_id: 'id-niftybees', symbol: 'NIFTYBEES', peer_group: 'EQUITY_INDEX', rank: null,
-    recommendation: null, disposition: 'INSUFFICIENT_DATA', reason: 'INSUFFICIENT_ANALYTICAL_DATA',
-    rule_engine_result: null, missing_data: ['TRACKING_QUALITY'], limitations: ['Price history incomplete.'],
-  });
-  const bankbees = candidate({
-    global_instrument_id: 'id-bankbees', symbol: 'BANKBEES', peer_group: 'EQUITY_SECTOR', rank: null,
-    recommendation: null, disposition: 'TECHNICAL_FAILURE', reason: 'BASELINE_ACQUISITION_TECHNICAL_FAILURE',
-    rule_engine_result: null,
-  });
-  const unclassified = candidate({
-    global_instrument_id: 'id-unclassified', symbol: 'UNKNOWNETF', peer_group: undefined, rank: null,
-    recommendation: null, disposition: 'EVALUATED', reason: 'EVALUATED', rule_engine_result: ruleResult({ overall_score: 40 }),
-  });
-  return {
-    radar_version: 'ETF_RADAR_V1', cycle_id: 'c1', correlation_id: null, as_of: '2026-10-28T12:00:00Z',
-    universe_count: 4, candidates: [goldbees, niftybees, bankbees, unclassified], ranked: [goldbees],
-    top_opportunities: [goldbees], excluded_by_reason: { INSUFFICIENT_ANALYTICAL_DATA: 1, BASELINE_ACQUISITION_TECHNICAL_FAILURE: 1 },
+  assert.equal(rowNodes(tree).length, 25);
+  assert.match(textOf(tree), /61 of 61 results/);
+  assert.equal(
+    tree.root.findAll(
+      (n) => n.props.className === "opportunity-card etf-radar-card",
+    ).length,
+    0,
+  );
+  await settle(() => button(tree, "Next page").props.onClick());
+  assert.match(textOf(tree), /Page 2 of 3/);
+  assert.equal(names(tree)[0], "ETF025");
+  await settle(() => change(tree, "Minimum score / 100", "99"));
+  assert.match(textOf(tree), /0 of 61 results/);
+  assert.match(textOf(tree), /Page 1 of 1/);
+  await settle(() => button(tree, "Reset filters").props.onClick());
+  assert.equal(names(tree)[0], "ETF000");
+  await settle(() => tree.unmount());
+});
+test("debounced search matches fund names, evidence sources and other displayed fields before pagination", async () => {
+  const data = cycle(many(40));
+  data.candidates[37] = {
+    ...data.candidates[37],
+    fund_name: "Unique synthetic long fund",
+    source_references: [
+      {
+        metric: "NAV",
+        value: "100",
+        as_of: "2026-11-04",
+        provider: "OFFICIAL_SYNTHETIC",
+        url: "https://example.test",
+      },
+    ],
   };
-}
-
-test('1. Research Universe tab makes every candidate accessible, including insufficient-data and unranked ones', () => {
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: universeCycle(), initialTab: 'universe' }));
-  assert.match(html, /GOLDBEES/);
-  assert.match(html, /NIFTYBEES/);
-  assert.match(html, /BANKBEES/);
-  assert.match(html, /UNKNOWNETF/);
-  assert.match(html, /4 of 4 result/);
+  let tree;
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, { data, initialTab: "universe" }),
+    );
+  });
+  const search = tree.root
+    .findAllByType("input")
+    .find((n) => n.props.type === "search");
+  await settle(() =>
+    search.props.onChange({ target: { value: "unique official_synthetic" } }),
+  );
+  assert.match(textOf(tree), /Updating search/);
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 240));
+  });
+  assert.deepEqual(names(tree), ["ETF037"]);
+  assert.match(textOf(tree), /1 of 40 results/);
+  await settle(() => tree.unmount());
+});
+test("combined category, status, confidence and numeric filters operate on all assessed candidates", async () => {
+  const a = candidate({
+      peer_group: "GOLD",
+      screening_metrics: {
+        aum: { value: "1000", unit: "INR", quality: "VALID" },
+      },
+    }),
+    b = candidate({
+      global_instrument_id: "b",
+      symbol: "OTHER",
+      peer_group: "DEBT",
+      rank: null,
+    });
+  let tree;
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, {
+        data: cycle([a, b]),
+        initialTab: "screener",
+      }),
+    );
+  });
+  await settle(() => change(tree, "Peer category", "GOLD"));
+  await settle(() => change(tree, "Confidence", "LOW"));
+  await settle(() => change(tree, "Minimum AUM (INR)", "900"));
+  assert.deepEqual(names(tree), ["SYNTHETICETF"]);
+  await settle(() => change(tree, "Research status", "Insufficient data"));
+  assert.equal(rowNodes(tree).length, 0);
+  await settle(() => button(tree, "Reset filters").props.onClick());
+  assert.equal(rowNodes(tree).length, 2);
+  await settle(() => tree.unmount());
+});
+test("table sort toggles both directions and missing expense remains last", async () => {
+  const data = cycle([
+    candidate({
+      global_instrument_id: "a",
+      symbol: "LOW",
+      screening_metrics: {
+        expense_ratio: { value: ".1", unit: "PERCENT_PA", quality: "VALID" },
+      },
+    }),
+    candidate({
+      global_instrument_id: "b",
+      symbol: "HIGH",
+      screening_metrics: {
+        expense_ratio: { value: ".5", unit: "PERCENT_PA", quality: "VALID" },
+      },
+    }),
+    candidate({ global_instrument_id: "c", symbol: "MISSING" }),
+  ]);
+  let tree;
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, { data, initialTab: "universe" }),
+    );
+  });
+  await settle(() => button(tree, "Expense ratio").props.onClick());
+  assert.deepEqual(names(tree), ["LOW", "HIGH", "MISSING"]);
+  await settle(() => button(tree, "Expense ratio \u25b2").props.onClick());
+  assert.deepEqual(names(tree), ["HIGH", "LOW", "MISSING"]);
+  await settle(() => tree.unmount());
+});
+test("analysis and chart mount only for selected canonical ETF; closing removes both", async () => {
+  let tree;
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, {
+        data: cycle(many(40)),
+        initialTab: "universe",
+      }),
+    );
+  });
+  assert.equal(
+    tree.root.findAll((n) => n.props["data-chart-instrument"]).length,
+    0,
+  );
+  await settle(() =>
+    tree.root
+      .findAll((n) => n.props["aria-label"] === "Analyze ETF002")[0]
+      .props.onClick(),
+  );
+  assert.equal(
+    tree.root.findAll((n) => n.props["data-chart-instrument"])[0].props[
+      "data-chart-instrument"
+    ],
+    "synthetic-002",
+  );
+  assert.equal(
+    tree.root.findAll(
+      (n) => n.props.className === "opportunity-card etf-radar-card",
+    ).length,
+    1,
+  );
+  await settle(() => button(tree, "Close analysis").props.onClick());
+  assert.equal(
+    tree.root.findAll((n) => n.props["data-chart-instrument"]).length,
+    0,
+  );
+  await settle(() => tree.unmount());
+});
+test("comparison preserves full-candidate identities across pages, caps at five, and requires two columns", async () => {
+  let tree;
+  const data = cycle(many(8).map((c) => ({ ...c, rank: null })));
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, { data, initialTab: "universe" }),
+    );
+  });
+  for (let i = 0; i < 5; i++)
+    await settle(() =>
+      tree.root
+        .findAllByType("input")
+        .find((n) => n.props["aria-label"] === `Compare ETF00${i}`)
+        .props.onChange(),
+    );
+  assert.equal(
+    tree.root
+      .findAllByType("input")
+      .find((n) => n.props["aria-label"] === "Compare ETF005").props.disabled,
+    true,
+  );
+  await settle(() => tab(tree, "ETF Comparison (5)").props.onClick());
+  assert.match(textOf(tree), /ETF004/);
+  assert.match(textOf(tree), /Peer rank \(within category\)/);
+  assert.equal(tree.root.findAllByType("table").length, 1);
+  for (let i = 1; i < 5; i++)
+    await settle(() => button(tree, `Remove ETF00${i}`).props.onClick());
+  assert.equal(tree.root.findAllByType("table").length, 0);
+  assert.match(textOf(tree), /Select one more ETF/);
+  await settle(() => tree.unmount());
+});
+test("Category Leaders is filterable and paginated across every peer group, preserving category ranks", async () => {
+  const rows = many(37).map((c, i) => ({
+    ...c,
+    peer_group: `PEER${i}`,
+    rank: 1,
+  }));
+  let tree;
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, {
+        data: cycle(rows),
+        initialTab: "leaders",
+      }),
+    );
+  });
+  assert.match(textOf(tree), /37 of 37 results/);
+  assert.equal(rowNodes(tree).length, 25);
+  assert.match(textOf(tree), /within peer/);
+  await settle(() => button(tree, "Next page").props.onClick());
+  assert.equal(rowNodes(tree).length, 12);
+  await settle(() => tree.unmount());
+});
+test("active tab is conditionally mounted, preserving selection without rendering every table", async () => {
+  let tree;
+  await settle(() => {
+    tree = create(React.createElement(EtfRadarContent, { data: cycle() }));
+  });
+  assert.equal(tree.root.findAllByType("table").length, 0);
+  await settle(() => tab(tree, "Research Universe").props.onClick());
+  assert.equal(tree.root.findAllByType("table").length, 1);
+  await settle(() => tab(tree, "Overview").props.onClick());
+  assert.equal(tree.root.findAllByType("table").length, 0);
+  await settle(() => tree.unmount());
 });
 
-test('2. An unranked ETF (NIFTYBEES, rank: null) is selectable for comparison in the Research Universe tab', () => {
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: universeCycle(), initialTab: 'universe' }));
-  assert.match(html, /aria-label="Compare NIFTYBEES"/);
-  assert.doesNotMatch(html, /aria-label="Compare NIFTYBEES"[^>]*disabled/);
-});
-
-test('3. Comparison resolves against data.candidates and includes up to 5 ETFs, not just data.ranked', () => {
-  const source = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
-  assert.match(source, /const compared = data\.candidates\.filter/);
-  assert.doesNotMatch(source, /const compared = data\.ranked\.filter/);
-  assert.match(source, /prev\.length < 5 \? \[\.\.\.prev, id\] : prev/);
-});
-
-test('4. Qualified Opportunities (Top Opportunities / Category Leaders) remain restricted to ranked candidates', () => {
-  const data = universeCycle();
-  const topHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'top' }));
-  assert.match(topHtml, /GOLDBEES/);
-  assert.doesNotMatch(topHtml, /NIFTYBEES/);
-  assert.doesNotMatch(topHtml, /BANKBEES/);
-  const leadersHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'leaders' }));
-  assert.match(leadersHtml, /GOLDBEES/);
-  assert.doesNotMatch(leadersHtml, /NIFTYBEES/);
-});
-
-test('5. Missing metrics render as "Unavailable" (the house em-dash convention), never a fabricated value', () => {
-  const data = universeCycle();
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'universe' }));
-  assert.match(html, /—/);
-  assert.doesNotMatch(html, />0</);
-  assert.doesNotMatch(html, />0%</);
-});
-
-test('6. No recommendation is fabricated from incomplete evidence: insufficient-data/technical-failure rows show their honest status', () => {
-  const data = universeCycle();
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'universe' }));
-  assert.match(html, /Insufficient data/);
-  assert.match(html, /Technical failure/);
-  assert.match(html, /Qualified opportunity/);
-  assert.doesNotMatch(html, /NIFTYBEES[\s\S]{0,400}Qualified opportunity/);
-  assert.doesNotMatch(html, /BANKBEES[\s\S]{0,400}Qualified opportunity/);
-});
-
-test('7. Existing Top Opportunities and Category Leaders behavior is unchanged (still ranked-only, unaffected by the new tab)', () => {
-  const data = universeCycle();
-  const topHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'top' }));
-  assert.match(topHtml, /Top opportunities/);
-  assert.equal((topHtml.match(/class="opportunity-card etf-radar-card"/g) ?? []).length, 1);
-  const leadersHtml = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'leaders' }));
-  assert.match(leadersHtml, /Category leaders/);
-  assert.match(leadersHtml, /GOLD/);
-});
-
-test('Research Universe category filter includes an explicit "Unclassified" bucket for a missing peer_group', () => {
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: universeCycle(), initialTab: 'universe' }));
-  assert.match(html, /<option value="Unclassified">Unclassified<\/option>/);
-});
-
-test('Historical acquisition diagnostics (status/reason) are surfaced per-row in the Research Universe tab', () => {
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: universeCycle(), initialTab: 'universe' }));
-  assert.match(html, /PROVIDER_UNAVAILABLE \(ETF_HISTORY_LISTING_NOT_VERIFIED\)/);
-});
-
-test('ETF comparison table distinguishes qualified recommendations from incomplete research candidates via "Research status"', () => {
-  const source = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
-  assert.match(source, /\["Research status", \(c\) => researchStatusLabel\(c\)\]/);
-});
-
-test('Evaluation-coverage wording does not imply full evidence completeness', () => {
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: universeCycle() }));
-  assert.match(html, /of the universe evaluated/);
-  assert.doesNotMatch(html, /coverage \d+% evaluated/);
-});
-
-test('EtfRadarCard distinguishes persisted subtype from current verified peer group', () => {
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data: universeCycle(), initialTab: 'universe' }));
-  assert.match(html, /Subtype: EQUITY_INDEX/);
-  assert.match(html, /Peer group: EQUITY_INDEX/);
-});
-
-test('Large metric values render without raw floating-point artifacts (maximumFractionDigits applied)', () => {
-  const source = fs.readFileSync(new URL('../app/components/etf-radar.tsx', import.meta.url), 'utf8');
-  assert.match(source, /maximumFractionDigits: 2/);
+test("numeric sort headers alternate descending and ascending on repeated clicks", async () => {
+  const rows = [
+    candidate({
+      global_instrument_id: "a",
+      symbol: "LOW",
+      rule_engine_result: {
+        overall_score: 10,
+        data_completeness: 0.1,
+        confidence: "LOW",
+      },
+    }),
+    candidate({
+      global_instrument_id: "b",
+      symbol: "HIGH",
+      rule_engine_result: {
+        overall_score: 90,
+        data_completeness: 0.9,
+        confidence: "HIGH",
+      },
+    }),
+  ];
+  let tree;
+  await settle(() => {
+    tree = create(
+      React.createElement(EtfRadarContent, {
+        data: cycle(rows),
+        initialTab: "universe",
+      }),
+    );
+  });
+  await settle(() => button(tree, "Score / 100").props.onClick());
+  assert.deepEqual(names(tree), ["HIGH", "LOW"]);
+  await settle(() => button(tree, "Score / 100 \u25bc").props.onClick());
+  assert.deepEqual(names(tree), ["LOW", "HIGH"]);
+  await settle(() => button(tree, "Score / 100 \u25b2").props.onClick());
+  assert.deepEqual(names(tree), ["HIGH", "LOW"]);
+  await settle(() => tree.unmount());
 });

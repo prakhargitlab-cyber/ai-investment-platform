@@ -1,107 +1,106 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import { createRequire } from 'node:module';
-import ts from 'typescript';
-import React from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import {
+  React,
+  renderToStaticMarkup,
+  loadEtfModule,
+  candidate,
+  cycle,
+} from "./etf-test-helpers.mjs";
+const { EtfRadarContent, EtfPhaseProgressPanel } = loadEtfModule();
 
-const require = createRequire(import.meta.url);
-const moduleCache = new Map();
-
-function resolveLocalModuleUrl(baseUrl, specifier) {
-  for (const ext of ['.tsx', '.ts']) {
-    const candidate = new URL(specifier + ext, baseUrl);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-function loadLocalModule(fileUrl) {
-  const key = fileUrl.pathname;
-  if (moduleCache.has(key)) return moduleCache.get(key);
-  const source = fs.readFileSync(fileUrl, 'utf8');
-  const output = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const mod = { exports: {} };
-  moduleCache.set(key, mod.exports);
-  const localRequire = (specifier) => {
-    if (specifier.includes('portfolio-api')) return {};
-    if (specifier.startsWith('.')) {
-      const resolved = resolveLocalModuleUrl(fileUrl, specifier);
-      if (resolved) return loadLocalModule(resolved);
-    }
-    return require(specifier);
-  };
-  new Function('require', 'module', 'exports', output)(localRequire, mod, mod.exports);
-  return mod.exports;
-}
-
-const etfRadarUrl = new URL('../app/components/etf-radar.tsx', import.meta.url);
-const etfRadarSource = fs.readFileSync(etfRadarUrl, 'utf8');
-const { EtfRadarContent } = loadLocalModule(etfRadarUrl);
-
-function etfCandidate(overrides = {}) {
-  return {
-    global_instrument_id: 'id-1', symbol: 'NIFTYBEES', disposition: 'EVALUATED', reason: 'EVALUATED',
-    subtype: 'EQUITY_INDEX', rule_engine_result: null, risk_gates: [], recommendation: 'OPPORTUNITY', rank: 1,
-    peer_group: 'EQUITY_INDEX',
-    ...overrides,
-  };
-}
-
-test('ETF Radar has its own 3-column analysis area, deliberately never using BASELINE/DEEP terminology', () => {
-  assert.match(etfRadarSource, /function EtfAnalysisPanels/);
-  assert.match(etfRadarSource, /aria-label="Fund universe and coverage"/);
-  assert.match(etfRadarSource, /aria-label="Research outcomes"/);
-  assert.match(etfRadarSource, /aria-label="Category coverage"/);
-  assert.match(etfRadarSource, /aria-label="Failure reason distribution"/);
-  assert.match(etfRadarSource, /aria-label="Research results and publication status"/);
-  // ETF now has its own persisted BASELINE and ETF_ONBOARD checkpoints.
-  // It must still never reuse Equity's DEEP-stage progress vocabulary.
-  assert.match(etfRadarSource, /stages\?\.baseline\?\.completed/);
-  assert.match(etfRadarSource, /stages\?\.onboarding\?\.completed/);
-  assert.doesNotMatch(etfRadarSource, /\bdeep_completed\b|\bdeep_ready\b/);
+test("compact overview partitions every assessed outcome once and separates evidence from score coverage", () => {
+  const data = cycle([
+    candidate(),
+    candidate({
+      global_instrument_id: "b",
+      disposition: "INSUFFICIENT_DATA",
+      rank: null,
+    }),
+    candidate({
+      global_instrument_id: "c",
+      disposition: "TECHNICAL_FAILURE",
+      rank: null,
+    }),
+  ]);
+  const html = renderToStaticMarkup(
+    React.createElement(EtfRadarContent, { data }),
+  );
+  assert.match(html, /Research outcomes: 3 assessed ETFs/);
+  assert.match(html, /Each of 3 assessed ETFs appears once/);
+  assert.match(html, /Core fund evidence complete/);
+  assert.match(html, /not fund evidence completeness/);
+  assert.match(html, /Peer categories/);
+  assert.doesNotMatch(html, /etf-selected-analysis/);
 });
-
-test('EtfAnalysisPanels never imports from opportunity-radar.tsx and uses its own local donut', () => {
-  assert.doesNotMatch(etfRadarSource, /from ["']\.\/opportunity-radar["']/);
-  assert.match(etfRadarSource, /function EtfDonut\(/);
-  assert.match(etfRadarSource, /function EtfDonutLegend\(/);
+test("old favorable entry does not inflate verified entry overview counts", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(EtfRadarContent, {
+      data: cycle([
+        candidate({
+          entry_assessment: { classification: "FAVORABLE_ENTRY_ZONE" },
+        }),
+      ]),
+    }),
+  );
+  assert.match(html, /Favorable entry conditions recorded<\/dt><dd>0/);
 });
-
-test('EtfAnalysisPanels is additive -- wired into the overview tab alongside the existing summary tiles', () => {
-  assert.match(etfRadarSource, /<EtfAnalysisPanels data={data} evaluated={evaluated} eligible={eligible} dataGaps={dataGaps} failures={failures} excluded={excluded} coveragePct={coveragePct} leaders={leaders} categories={categories} \/>/);
+test("responsive ETF styles have compact desktop columns and mobile reflow without hiding data columns", () => {
+  const css = fs.readFileSync(
+    new URL("../app/styles.css", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    css,
+    /\.etf-overview-grid \{[^}]*grid-template-columns: 1\.25fr 1fr 1fr/,
+  );
+  assert.match(css, /@media \(max-width: 700px\)/);
+  assert.match(
+    css,
+    /\.etf-overview-grid, \.etf-quality-grid \{ grid-template-columns: minmax\(0,1fr\)/,
+  );
+  assert.match(css, /\.etf-table-toolbar > label \{ flex: 1 1 100%/);
+  assert.match(css, /\.etf-table-scroll:focus-visible/);
+  assert.doesNotMatch(css, /\.etf-data-table[^}]*display: none/);
 });
-
-test('ETF research-outcomes donut segments are a genuine partition of evaluated funds', () => {
-  const data = {
-    cycle_id: 'c1', as_of: '2026-10-11T12:00:00Z', universe_count: 5,
-    candidates: [
-      etfCandidate({ global_instrument_id: 'a', recommendation: 'OPPORTUNITY', disposition: 'EVALUATED' }),
-      etfCandidate({ global_instrument_id: 'b', recommendation: 'INSUFFICIENT_DATA', disposition: 'INSUFFICIENT_DATA' }),
-      etfCandidate({ global_instrument_id: 'c', recommendation: null, disposition: 'TECHNICAL_FAILURE' }),
-      etfCandidate({ global_instrument_id: 'd', recommendation: null, disposition: 'EVALUATED' }),
-      etfCandidate({ global_instrument_id: 'e', recommendation: null, disposition: 'INELIGIBLE' }),
+test("all eight phases are present for legacy state with unknown counts rather than zero success", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(EtfPhaseProgressPanel, {}),
+  );
+  assert.equal((html.match(/Not recorded/g) || []).length, 8);
+  assert.match(html, /universe discovery/);
+  assert.match(html, /fundamental acquisition/);
+  assert.match(html, /publication/);
+  assert.doesNotMatch(html, />0</);
+});
+test("phase counters preserve real zero, attempted/retry/failed/reused/skipped distinctions without synthetic percentages", () => {
+  const progress = {
+    current_phase: "HISTORY_ONBOARDING",
+    phases: [
+      {
+        phase: "HISTORY_ONBOARDING",
+        observed: true,
+        total: 5,
+        pending: 1,
+        attempted: 4,
+        attempt_count: 6,
+        succeeded: 0,
+        failed: 1,
+        failed_attempts: 2,
+        skipped: 1,
+        reused: 2,
+        remaining: 1,
+        in_progress: 0,
+      },
     ],
-    ranked: [etfCandidate({ global_instrument_id: 'a', recommendation: 'OPPORTUNITY' })],
-    excluded_by_reason: { FAILED_NSE_ETF_ACTIVE_PREFILTER: 1 },
   };
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'overview' }));
-  assert.match(html, /aria-label="Fund universe and coverage"/);
-  assert.match(html, /aria-label="Research outcomes"/);
-  assert.match(html, /FAILED NSE ETF ACTIVE PREFILTER/);
-  assert.match(html, /A genuine partition of \d+ evaluated funds/);
-});
-
-test('ETF analysis panels render category leaders from real peer_group ranks, never fabricated', () => {
-  const data = {
-    cycle_id: 'c1', as_of: '2026-10-11T12:00:00Z', universe_count: 2,
-    candidates: [etfCandidate({ global_instrument_id: 'a', peer_group: 'GOLD', rank: 1 }), etfCandidate({ global_instrument_id: 'b', peer_group: 'DEBT', rank: 1 })],
-    ranked: [etfCandidate({ global_instrument_id: 'a', peer_group: 'GOLD', rank: 1 }), etfCandidate({ global_instrument_id: 'b', peer_group: 'DEBT', rank: 1 })],
-    excluded_by_reason: {},
-  };
-  const html = renderToStaticMarkup(React.createElement(EtfRadarContent, { data, initialTab: 'overview' }));
-  assert.match(html, /Category coverage/);
-  assert.match(html, /Peer categories<\/dt><dd>2/);
-  assert.match(html, /Category leaders<\/dt><dd>2/);
+  const html = renderToStaticMarkup(
+    React.createElement(EtfPhaseProgressPanel, { progress }),
+  );
+  assert.match(html, /succeeded<\/dt><dd>0/);
+  assert.match(html, /Attempts including retries: 6/);
+  assert.match(html, /Failed attempts: 2/);
+  assert.match(html, /reused<\/dt><dd>2/);
+  assert.doesNotMatch(html, /aria-valuenow/);
 });

@@ -78,3 +78,49 @@ The read-only backup-format inspector `infrastructure/scripts/helm_k3d_backup_fo
 A recognized signature or valid gzip checksum is **not** proof that a backup can be restored or that the dump includes all necessary roles/schema/data. A real restore test must use a **separate temporary PostgreSQL instance and isolated storage**, not the live `postgres-0` or its PVC.
 
 **Patch-impact risk persists:** Helm 3/4 uses a three-way strategic merge patch for built-in Kubernetes resources. An unchanged old-vs-new manifest does not by itself prove that drifted live fields cannot be reconciled, particularly for images and environment arrays. The 110 stored-v1-to-live field differences (including many unrelated deployments) justify preserving the deployment gate until the patch plan is verified through an implementation faithful to the Helm/Kubernetes patch algorithm or a fully isolated representative rehearsal. Neither `helm upgrade --dry-run=server` nor the current structural guard provides an exact patch payload. Do not claim that any change to live workloads is impossible. No real upgrade is approved yet.
+
+## Upgrade-impact decision after the isolated restore succeeded
+
+Operator result: PostgreSQL 16 isolated restore completed with 71 user tables,
+no restore-command errors, and disposable container cleanup succeeded. The
+working `postgres-0` and its PVC were untouched.
+
+**RELEASE BLOCKED — pending faithful patch-impact evaluation.**
+The Helm v1 stored manifest differs from live deployment fields across 18
+Deployments (110 reported field paths, principally container images and env
+values). Proposed v2 differs from stored v1 in only five approved research-engine
+paths, but this **does not** establish that 18 unrelated workload pod templates
+will remain unchanged: Helm's implementation generates a strategic three-way
+patch from the old release, the new release, and the current Kubernetes object,
+not merely an old-to-new diff.
+
+A no-deploy decision is warranted without further user-side reruns. A successful
+unit-test suite, cluster readiness check, backup restore, and scoped Helm manifest
+change are all necessary evidence, but insufficient to authorize upgrading.
+
+### Safe engineering paths
+
+**Preferred:** Build a reviewed release reconciliation that produces a Helm
+revision-2 desired manifest preserving all already-approved live image and env
+values for unrelated deployments (without copying credentials into git). Feed
+the exact effective manifests into a Helm/Kubernetes strategic three-way patch
+calculation against the stored revision 1 and current live objects. Reject any
+patch to unrelated Deployment pod templates, protected Secrets, StatefulSets or
+PVCs. Dry-run with the **exact same** options and post-rendering behavior as
+the approved real upgrade. Preserve the five research-engine flags and image
+in both manifest and live state. A tested, deterministic process for acquiring
+live values and reconciling only reviewed fields is required; do not blindly
+replace Helm values or use a bulk live-manifest takeover.
+
+**Alternative:** Intentionally adopt Helm's older stored values for each
+drifted workload only after a separate change review and application-health
+plan; this is **not** approved in the current DEV release.
+
+Do not use `helm upgrade --force`, `helm rollback`, `kubectl apply`, secret
+rotation, cluster recreation, blanket pod restarts, or delete any DB/PVC in
+an attempt to make the acceptance checks pass. The current live cluster is
+the operational baseline until a faithful patch impact is proven safe.
+
+**Milestone:** Backup recovery evidence now supports the release; the only
+remaining blocker is exact upgrade-impact/reconciliation engineering, not a
+request for more manual backup, node, or scope commands.

@@ -34,7 +34,8 @@ spec:
       {{- end }}
       containers:
         - name: ibkr-connector
-          image: {{ include "aip.image" (dict "root" . "image" .Values.ibkrConnector.image "tag" .Values.ibkrConnector.tag) | quote }}
+          {{- $pin := get (default (dict) (index (default (dict) .Values.workloadOverrides) "ibkr-connector")) "imageTagOverride" }}
+          image: {{ if $pin }}{{ include "aip.imageExplicitTag" (dict "root" . "image" .Values.ibkrConnector.image "tag" $pin) | quote }}{{ else }}{{ include "aip.image" (dict "root" . "image" .Values.ibkrConnector.image "tag" .Values.ibkrConnector.tag) | quote }}{{ end }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy | quote }}
           env:
             {{- include "aip.commonEnv" (dict "root" . "serviceName" "ibkr-connector") | nindent 12 }}

@@ -51,6 +51,8 @@ jobs:
             infrastructure/scripts/test_helm_k3d_image_rebaseline.py \
             infrastructure/scripts/test_helm_jwt_upgrade_guard.py \
             infrastructure/scripts/test_helm_k3d_strategic_patch.py
+      - name: Validate rendered images, research init and Kafka probe
+        run: python infrastructure/scripts/validate_helm_render_contract.py
       - name: Helm lint LOCAL chart
         run: helm lint infrastructure/helm/ai-investment-platform --values infrastructure/helm/ai-investment-platform/values-dev.yaml
       - name: Render clean LOCAL release without cluster writes

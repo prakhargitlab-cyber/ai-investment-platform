@@ -56,3 +56,15 @@ Live Postgres and SearXNG credential equality is checked separately before
 any release success message. Three synthetic regression tests cover matching
 bytes, changed bytes and changed metadata. This is not authorization to
 perform the actual Helm upgrade.
+
+## Final read-only prerequisite inventory (added, not yet operator-tested)
+
+The release-scope guard passed on Windows: 12 tests passed, 54 identities, both DEV credentials unchanged, only the 5 approved research-engine fields differ from stored v1. That is strong evidence for a narrow proposed manifest change, **not** a proof of exact Kubernetes strategic merge patch behavior.
+
+A second script inventories node-readiness and image-tag cache evidence plus basic backup existence/freshness, without reading backup content or changing Kubernetes. Run from repo root with the trusted project venv:
+
+    .\.venv\Scripts\python.exe infrastructure\scripts\helm_k3d_release_prerequisites.py
+
+The script intentionally reports cache presence as evidence, **not** registry pull availability, and reports backup file presence **not** backup restorability. A recent successful restore test, verified release rollback readiness, and explicit review of the Helm three-way apply impact remain mandatory before any live upgrade. No one should run `helm upgrade` merely because this inventory succeeds. Backup files are not committed.
+
+For a no-change Kubernetes object where the old and new Helm manifests are identical, Helm generally has no user-authored field difference to patch, but this is not a substitute for reviewing generated Kubernetes patches and potential defaults/metadata side effects. Historical drift remains visible; the current validator deliberately avoids changing that live drift to match old revision 1.

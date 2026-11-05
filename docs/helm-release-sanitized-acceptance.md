@@ -542,3 +542,26 @@ authorizes immediate Helm upgrade. Run the consolidated strict gate
 only after obtaining the exact latest chart and calculator sources,
 and review any remaining real changes. Do not perform unrelated
 deployment rollouts or Secret rotations.
+
+## Next engineering input: field paths, not more patch rebuilds
+
+The last operator validation already established that all 3 Secrets have
+byte-preserving no-op patches, while 17 unrelated Deployment patches and
+research-engine have genuine spec effects. Their previous report includes
+only broad categories, not enough to correct values safely. Do **not**
+blanket-adopt live specs into Helm; it could also capture Kubernetes
+defaulted fields and hide unreviewed drift.
+
+Use the one-shot read-only
+`infrastructure/scripts/helm_k3d_reconcile_fields.py` on the operator
+machine (no Go rebuild). It invokes the existing server-connected Helm
+dry-run, validates the original 54-resource scope and emits only bounded
+**field paths and counts**, grouped by all 18 affected Deployments for
+stored v1 vs candidate vs live. No Secret values, environment contents,
+manifest bodies, image strings or raw exceptions are printed.
+Names are constrained to a safe alphabet. Source and synthetic tests
+are committed to this draft PR; local operator execution is still
+needed to know the exact paths. This is the minimum missing input
+for reviewable per-template Helm reconciliation, not an upgrade.
+
+Helm revision 1 remains in place and revision 2 stays blocked.

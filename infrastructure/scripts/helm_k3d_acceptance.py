@@ -172,13 +172,26 @@ def only_approved_revision_changes(baseline, proposed, actual):
             continue
         old_secret = deepcopy(old[key])
         new_secret = deepcopy(new[key])
+        live_secret = actual.get(key)
+        if not isinstance(live_secret, dict):
+            raise Blocked("LIVE_SECRET_MISSING")
         for secret in (old_secret, new_secret):
             secret.pop("stringData", None)
             secret.pop("data", None)
         if old_secret != new_secret:
             raise Blocked("UNAPPROVED_SECRET_METADATA_CHANGE: " + key[2])
         if selected(old[key]) != selected(new[key]):
-            raise Blocked("UNAPPROVED_SECRET_CONTENT_CHANGE: " + key[2])
+            # JWT was originally stored with write-only stringData and may
+            # contain a stale bootstrap value. On an existing cluster the
+            # new chart must render EXACTLY the live persisted bytes, never
+            # the old Helm value. The Go patch gate independently checks
+            # the resulting three-way patch is a byte-preserving rewrite.
+            if not (key[2] == "aip-auth-jwt"
+                    and "data" in new[key]
+                    and "stringData" not in new[key]
+                    and "stringData" in old[key]
+                    and selected(new[key]) == selected(live_secret)):
+                raise Blocked("UNAPPROVED_SECRET_CONTENT_CHANGE: " + key[2])
         new[key] = deepcopy(old[key])
 
     # Require exact structural equality for every other resource field.

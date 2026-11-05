@@ -721,10 +721,8 @@ function Validate-Helm {
 }
 
 function Deploy-Helm {
-    # Never attempt a full-stack Helm upgrade of an existing LOCAL release
-    # through the generic "up" path: the current v1 release contains live
-    # Deployment drift and Helm would revert healthy images/env settings.
-    # Existing releases must pass the dedicated reviewed reconciliation gate.
+    # Prevent a generic full-stack upgrade from reverting manual changes
+    # in any existing Helm release. New installations only here.
     $releaseRows = helm list --all --namespace $Namespace --output json 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($releaseRows | Out-String).Trim())) {
         throw 'HELM_RELEASE_DISCOVERY_FAILED'
@@ -733,9 +731,7 @@ function Deploy-Helm {
     if (@($releaseList | Where-Object { $_.name -eq $ReleaseName }).Count -gt 0) {
         throw 'EXISTING_HELM_RELEASE_REQUIRES_REVIEWED_RECONCILIATION: do not use platform.ps1 up to upgrade a running release'
     }
-    # Helm must own image tags and runtime configuration. Patching workloads
-    # after the upgrade makes the next three-way merge revert live state.
-    # This path is deliberately for fresh or already-reconciled releases only.
+
     $ibkrEnabled = if ($EnableIbkr) { 'true' } else { 'false' }
     $connectorReplicas = if ($EnableIbkr) { '1' } else { '0' }
     $helmArgs = @(
@@ -748,11 +744,16 @@ function Deploy-Helm {
         '--set', "ibkrConnector.replicaCount=$connectorReplicas",
         '--timeout', '10m'
     )
-    # Some services have a higher-precedence tag pin in values-dev.yaml.
-    # Override the pin explicitly at install time for every built workload,
-    # so the Helm release records exactly the images that were just built.
-    foreach ($image in Get-ImageDefinitions) {
-        if ($image.Name -notmatch '^[a-z0-9][a-z0-9-]{0,62}
+    # Persist exact immutable tags in Helm, including per-service overrides.
+    foreach ($image in @(Get-ImageDefinitions)) {
+        if ($image.Name -notmatch '^[a-z0-9][a-z0-9-]{0,62}$') {
+            throw 'INVALID_HELM_IMAGE_WORKLOAD_NAME'
+        }
+        $helmArgs += @('--set-string', "workloadOverrides.$($image.Name).imageTagOverride=$ImageTag")
+    }
+    Invoke-Checked "Installing Helm-managed DEV stack" {
+        & helm @helmArgs
+    }
 }
 
 # Strict-mode-safe init-container lookup. Under Set-StrictMode, a direct

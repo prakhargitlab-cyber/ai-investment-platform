@@ -613,3 +613,29 @@ values/release changes, not out-of-band `kubectl set env` or
 `kubectl patch` commands. Azure installations start with clean,
 environment-specific values; this LOCAL drift should not be adopted into
 AKS. Require exact live Helm upgrade impact review and rollback plans.
+
+## Private one-time image pin candidate (code added; no live run yet)
+
+`infrastructure/scripts/helm_k3d_image_rebaseline.py` uses the
+existing read-only old/new/live manifest loader to generate a local-only
+`.tmp/helm-reconciliation-image-pins.yaml` containing **16 first-party
+service image tags**. It checks the local registry repositories and
+non-mutable tag syntax, the exact list of expected Deployments, and
+the existing research feature/image scope gate. The output never
+contains Secret bytes, environment variable values, full image
+repositories, manifest JSON or live Kubernetes specs. It fails on an
+existing candidate file instead of silently overwriting it, and makes
+no cluster or Helm writes.
+
+Kafka is an externally sourced image and is intentionally **excluded**
+from this pin generator. Its existing runtime/probe/revision drift
+requires an explicit separately reviewed chart configuration.
+Research-engine is also excluded because its image and safety flags
+already have a separate exact approval scope.
+
+This file is an **input to a reviewed Helm migration, not the migration
+itself**. Do not pass it to a live `helm upgrade` until all other
+environment, Kafka, image/registry, and Kubernetes-defaulted spec drift
+is reconciled and the complete 54-object actual patch gate confirms no
+unintended changes. There has been no operator-run verification of
+this candidate generator.

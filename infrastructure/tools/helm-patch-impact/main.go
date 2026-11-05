@@ -45,6 +45,7 @@ type report struct {
     JWTFailureCode string `json:"jwt_failure_code"`
     JWTPatchShape string `json:"jwt_patch_shape"`
     ResearchPatchLabels []string `json:"research_patch_labels"`
+    ResearchEnvAudit []string `json:"research_env_audit"`
     Blocked bool `json:"blocked"`
     Version string `json:"version"`
 }
@@ -123,6 +124,8 @@ func perform(r request) (report, error) {
         }
         if name == "Deployment/research-engine" {
             out.ResearchPatchLabels, err = researchPatchLabels(patch)
+            if err != nil { return out, err }
+            out.ResearchEnvAudit, err = researchEnvAudit(patch)
             if err != nil { return out, err }
         }
         if secretNoop {

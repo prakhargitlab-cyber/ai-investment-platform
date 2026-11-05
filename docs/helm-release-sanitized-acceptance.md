@@ -251,3 +251,31 @@ result is expected; this reports *why* and is not release authorization.
 **Do not overwrite running settings or rotate Secrets** in order to
 suppress warnings. Patch categories require explicit reviewer approval
 and appropriate reconciliation before upgrade.
+
+## Fail-closed write-only Secret patch validation (operator test pending)
+
+The first strategic merge report showed exactly `secret-stringData` for
+`aip-auth-jwt`, `dev-postgres` and `dev-searxng`. A category alone does
+**not** prove harmlessness. `secret_audit.go` now exempts a Secret from
+the unresolved risk count ONLY when all these hold:
+
+1. The Secret is precisely one of those three reviewed names.
+2. The **complete** strategic patch is exactly `{"stringData":null}`
+   (no metadata, type, data, or other operations).
+3. All encoded `data` fields are canonical valid base64.
+4. All effective decoded Secret bytes, keys, and Secret types match
+   across stored Helm v1, candidate v2, and the live Secret.
+5. No ambiguous duplicate keys between `data` and `stringData`.
+
+Any failed check remains a regular blocking risk. The report records
+`VERIFIED_SECRET_NOOP` names without revealing any Secret bytes.
+New Go unit tests cover successful write-only deletion and malicious
+changes to bytes, Secret type, patch shape, invalid base64 and ambiguous
+representations. This change **does not** relax the 17 unrelated
+Deployment risks or the research-engine field audit. No live write or
+Helm upgrade is performed.
+
+After fetching all changed Go files plus the updated Python wrapper,
+rerun the existing isolated build script and strategic patch checker.
+The exact results have **not yet been observed** on the operator's
+Windows environment.

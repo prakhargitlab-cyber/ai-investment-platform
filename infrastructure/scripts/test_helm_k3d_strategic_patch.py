@@ -45,3 +45,9 @@ def test_diagnostic_phase_is_allowlisted():
     import pytest
     with pytest.raises(RuntimeError, match="INVALID_DIAGNOSTIC_PHASE"):
         patch.phase("secret=never-print")
+
+
+def test_safe_numeric_os_error_without_path_disclosure():
+    err = OSError(2, "credential path not safe to disclose")
+    assert patch.safe_windows_error_code(err) == "ERRNO_2"
+    assert patch.safe_windows_error_code(ValueError("secret")) == "NOT_AVAILABLE"

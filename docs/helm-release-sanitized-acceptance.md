@@ -367,3 +367,52 @@ Fetch updated `main.go`, `secret_audit.go`,
 `research_audit.go`, `patch_shape_test.go` and
 `helm_k3d_strategic_patch.py`; rebuild the isolated Linux checker
 and rerun the read-only wrapper. No upgrade or live mutation.
+
+## Consolidated release reconciliation: decision and implementation boundary
+
+This is the release engineering checkpoint after the operator's final read-only
+Linux patch-calculator run (54 resources, 21 nonempty strategic patches):
+
+* **JWT Secret/aip-auth-jwt: BLOCKED.** Its exact patch is classified
+  `STRINGDATA_OBJECT_VALUES`, **not** a write-only `stringData:null`
+  deletion. No exemption or rotation is safe. Fix at the chart/values
+  rendering layer so candidate desired values and live JWT credentials are
+  byte-equivalent, **without writing the credential to Git, logging it,
+  copying it into a Helm override, or creating a new JWT**.
+* **Deployment/research-engine: BLOCKED.** Actual patch contains
+  `UNAPPROVED_ENV_PATCH_ENTRY` and env/container ordering directives,
+  not merely the five reviewed research flags. Determine why Helm's
+  three-way merge is reconciling other settings; preserve the approved
+  live image, paused recovery, disabled scheduler and manual flags.
+  A name-only list directive is not automatically a harmless patch.
+* **17 unrelated Deployments: BLOCKED**:
+  api-gateway, auth-service, broker-service, company-service, frontend,
+  ibkr-connector, kafka, mcp-gateway, notification-service,
+  portfolio-optimizer, portfolio-service, ranking-engine,
+  recommendation-service, research-service, risk-service,
+  valuation-engine, yahoo-finance-mcp. Their strategic patches touch
+  images, env, container or pod configuration. **No automatic adoption
+  of live values** into chart, no blind rollback to stored v1 values.
+  The owner must review each intended config difference; author approved
+  values as chart/Helm release inputs and calculate all 54 three-way
+  patches against the same old/new/live baseline.
+* **Database-related Secrets** dev-postgres and dev-searxng are independently
+  verified byte-preserving `stringData` no-op patches. **PostgreSQL
+  StatefulSet and PVC are not to be modified**, and no database recovery
+  test needs repeating (isolated PostgreSQL 16 restore yielded 71 tables).
+* **Deployment decision:** DO NOT RUN `helm upgrade` while any unreviewed
+  strategic patch remains. PR #24 is draft and is not deployment authorization.
+
+**Efficiency change:** the Go calculator build script now persists module
+downloads and compiled object cache only under local `.tmp/helm-patch-impact`.
+This avoids repeated Go module downloads during future engineering revisions.
+The build container still mounts only local tool source/cache/output—no
+Kubernetes credentials or database files. This is an implementation change
+in PR #24; it has not yet been operator-run after the caching update.
+
+**Stop point:** no more operator diagnostics solely to rediscover the above
+21 patches. The next meaningful action is a separately reviewed chart/value
+reconciliation commit for each affected field, followed by one final exact
+patch run. There is no safe blanket automatic fix based only on category
+labels because they intentionally omit the values and operations necessary
+to authorize the changes.

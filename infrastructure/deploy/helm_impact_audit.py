@@ -66,6 +66,50 @@ def helm(base, *arguments):
     return call(base + list(arguments))
 
 
+
+def helm_dry_run(base, *arguments):
+    """Classify failed Helm invocations without disclosing raw stderr."""
+    try:
+        result = subprocess.run(base + list(arguments),
+                                capture_output=True, timeout=150, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Blocked("HELM_DRY_RUN_COMMAND_UNAVAILABLE_OR_TIMEOUT") from exc
+    if result.returncode:
+        # Only emit predefined categories. Never dump stderr: it could include
+        # rendered Secret manifests, credentials, or request details.
+        message = (result.stderr + b"\\n" + result.stdout).lower()
+        categories = (
+            (b"unknown flag", "UNSUPPORTED_HELM_FLAG"),
+            (b"unknown shorthand flag", "UNSUPPORTED_HELM_FLAG"),
+            (b"yaml parse error", "CHART_YAML_PARSE_FAILED"),
+            (b"parse error at", "CHART_TEMPLATE_PARSE_FAILED"),
+            (b"nil pointer evaluating", "CHART_TEMPLATE_VALUE_MISSING"),
+            (b"can't evaluate field", "CHART_TEMPLATE_VALUE_MISSING"),
+            (b"template:", "CHART_TEMPLATE_RENDER_FAILED"),
+            (b"failed to download", "CHART_DEPENDENCY_MISSING"),
+            (b"forbidden", "KUBERNETES_PERMISSION_DENIED"),
+            (b"admission webhook", "KUBERNETES_ADMISSION_BLOCKED"),
+            (b"context deadline exceeded", "KUBERNETES_API_TIMEOUT"),
+            (b"connection refused", "KUBERNETES_API_UNREACHABLE"),
+            (b"no route to host", "KUBERNETES_API_UNREACHABLE"),
+            (b"timed out", "KUBERNETES_API_TIMEOUT"),
+            (b"cannot re-use a name", "HELM_RELEASE_STATE_CONFLICT"),
+            (b"has no deployed releases", "HELM_RELEASE_NOT_DEPLOYED"),
+            (b"not found", "HELM_REFERENCED_RESOURCE_NOT_FOUND"),
+            (b"invalid value", "HELM_VALUE_INVALID"),
+            (b"invalid type", "HELM_VALUE_TYPE_INVALID"),
+            (b"invalid character", "HELM_INPUT_JSON_INVALID"),
+            (b"failed to create", "DRY_RUN_RESOURCE_VALIDATION_FAILED"),
+            (b"error validating", "DRY_RUN_RESOURCE_VALIDATION_FAILED"),
+            (b"unable to build kubernetes objects", "DRY_RUN_RESOURCE_VALIDATION_FAILED"),
+        )
+        for pattern, code in categories:
+            if pattern in message:
+                raise Blocked(code)
+        raise Blocked("HELM_DRY_RUN_UNCLASSIFIED_FAILURE")
+    return result.stdout
+
+
 def calculator(executable, resources):
     # The Go implementation is trusted local code, isolated from the network,
     # filesystems and host credentials. Sensitive docs only enter via stdin.
@@ -129,7 +173,7 @@ def main():
             raise Blocked("SERVICE_TAG_MISMATCH")
         origins = json.dumps(spec["origins"])
         phase("HELM_SERVER_DRY_RUN")
-        preview = helm(base, "upgrade", RELEASE, "/chart", "--namespace",
+        preview = helm_dry_run(base, "upgrade", RELEASE, "/chart", "--namespace",
                        NAMESPACE, "--reuse-values", "--dry-run=server",
                        "--set-string", "workloadOverrides.auth-service.imageTagOverride=" + tag,
                        "--set-string", "workloadOverrides.api-gateway.imageTagOverride=" + tag,
@@ -186,5 +230,7 @@ if __name__ == "__main__":
     except Exception:
         # Never print exception strings: Helm or YAML errors may contain Secrets.
         print("HELM_IMPACT_AUDIT_BLOCKED_AT:", PHASE, file=sys.stderr)
+        if isinstance(sys.exc_info()[1], Blocked):
+            print("HELM_AUDIT_REASON:", str(sys.exc_info()[1]), file=sys.stderr)
         print("NO_KUBERNETES_WRITES_PERFORMED", file=sys.stderr)
         sys.exit(2)

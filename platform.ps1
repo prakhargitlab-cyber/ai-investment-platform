@@ -721,14 +721,19 @@ function Validate-Helm {
 }
 
 function Deploy-Helm {
-    # Intentionally do NOT use --wait here. We must normalize LOCAL env values
-    # and optional broker runtime settings before Kubernetes readiness is judged.
-    Invoke-Checked "Installing/upgrading complete DEV stack" {
+    # Helm must own image tags and runtime configuration. Patching workloads
+    # after the upgrade makes the next three-way merge revert live state.
+    # This path is deliberately for fresh or already-reconciled releases only.
+    $ibkrEnabled = if ($EnableIbkr) { 'true' } else { 'false' }
+    $connectorReplicas = if ($EnableIbkr) { '1' } else { '0' }
+    Invoke-Checked "Installing/upgrading Helm-managed DEV stack" {
         helm upgrade --install $ReleaseName $HelmChart `
             --namespace $Namespace `
             --create-namespace `
             --values $HelmValues `
-            --force-conflicts `
+            --set-string "global.imageTag=$ImageTag" `
+            --set "ibkr.enabled=$ibkrEnabled" `
+            --set "ibkrConnector.replicaCount=$connectorReplicas" `
             --timeout 10m
     }
 }
@@ -1528,8 +1533,8 @@ function Start-Platform {
 
     Import-ImagesIntoK3d -Names $selected
     Deploy-Helm
-    Set-ImmutableDeploymentImages -Names $selected
-    Apply-LocalRuntimeNormalization
+    # No kubectl patch/set env/scale after Helm. All values must be declared
+    # in the chart or explicitly supplied to Helm and persisted in its release.
     Wait-ForDeployments -AllEnabled
     Assert-ImmutableDeploymentImages -Names $selected
     Invoke-FirstAdminBootstrapIfNeeded

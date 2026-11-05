@@ -1,0 +1,22 @@
+{
+  "namespace": "ai-investment",
+  "release": "ai-investment-platform",
+  "revision": 1,
+  "images": {
+    "auth-service": {
+      "image": "localhost:5001/ai-investment/auth-service:auth-reset-pr28-20261105-145100",
+      "digest": "sha256:9ccfd86312c900e56176bc3425a460c4ea064d42912f8ef5554019bd3fedd3a2"
+    },
+    "api-gateway": {
+      "image": "localhost:5001/ai-investment/api-gateway:auth-reset-pr28-20261105-145100",
+      "digest": "sha256:7a51971d82b2e871626b5085c397502952fc45902635755f7d7bec840ec21ed0"
+    }
+  },
+  "origins": [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:13000",
+    "http://localhost:18080",
+    "http://localhost:18081"
+  ]
+}

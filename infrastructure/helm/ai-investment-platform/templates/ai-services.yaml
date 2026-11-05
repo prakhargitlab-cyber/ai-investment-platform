@@ -16,6 +16,11 @@
 {{- if and $isResearch (get $imageOverride "tag") -}}
 {{- $resolvedImage = include "aip.imageExplicitTag" (dict "root" $ "image" $config.image "tag" $config.tag) -}}
 {{- end -}}
+{{- /* Explicit workload pin takes precedence over global.imageTag for all AI services.
+     Existing research image override still wins when no workload pin is specified. */ -}}
+{{- if get $workloadOverride "imageTagOverride" -}}
+{{- $resolvedImage = include "aip.imageExplicitTag" (dict "root" $ "image" $config.image "tag" $workloadOverride.imageTagOverride) -}}
+{{- end -}}
 {{ $databaseSecretName := default $.Values.database.passwordSecretName $.Values.research.persistence.passwordSecretName -}}
 {{ $databaseSecretKey := default $.Values.database.passwordSecretKey $.Values.research.persistence.passwordSecretKey -}}
 apiVersion: apps/v1

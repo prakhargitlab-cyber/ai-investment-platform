@@ -434,7 +434,13 @@ def main():
                        NAMESPACE, "--reuse-values", "--dry-run=server",
                        "--set-string", "workloadOverrides.auth-service.imageTagOverride=" + tag,
                        "--set-string", "workloadOverrides.api-gateway.imageTagOverride=" + tag,
-                       "--set-json", "apiGateway.cors.allowedOrigins=" + origins)
+                       "--set-json", "apiGateway.cors.allowedOrigins=" + origins,
+                       # Helm revision 1 predates these three LOCAL/DEV flags.
+                       # Reassert precisely the boolean invariants from the
+                       # committed values-dev.yaml, never disable validate.yaml.
+                       "--set-json", "research.equityManualExecutionEnabled=true",
+                       "--set-json", "research.etfManualExecutionEnabled=true",
+                       "--set-json", "research.etfFullUniverseExecutionEnabled=true")
     phase("PARSE_HELM_DRY_RUN")
     marker = b"\nMANIFEST:\n"
     if marker not in preview:

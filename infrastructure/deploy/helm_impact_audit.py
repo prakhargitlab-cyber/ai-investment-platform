@@ -22,6 +22,13 @@ K3S_CONFIG = "/etc/rancher/k3s/k3s.yaml"
 KINDS = ("deployments,statefulsets,services,serviceaccounts,"
          "persistentvolumeclaims,secrets,configmaps,roles,rolebindings,ingresses")
 ALLOWED = {"Deployment/api-gateway", "Deployment/auth-service"}
+PHASE = "START"
+
+
+def phase(label):
+    global PHASE
+    PHASE = label
+    print("AUDIT_STAGE:", label, flush=True)
 
 
 class Blocked(Exception):
@@ -92,6 +99,7 @@ def main():
     parser.add_argument("--calculator", type=Path, required=True)
     parser.add_argument("--spec", type=Path, required=True)
     arguments = parser.parse_args()
+    phase("READ_RELEASE_SPEC")
     spec = json.loads(arguments.spec.read_text(encoding="utf-8"))
     if (spec.get("revision") != 1 or spec.get("release") != RELEASE
             or spec.get("namespace") != NAMESPACE
@@ -99,6 +107,7 @@ def main():
         raise Blocked("RELEASE_SPEC_SCOPE_INVALID")
     if not arguments.chart.is_dir() or not arguments.calculator.is_file():
         raise Blocked("HELM_CHART_OR_CALCULATOR_MISSING")
+    phase("READ_K3D_KUBECONFIG")
     # Source chart is mounted read-only. No base64 contents printed or written.
     config = call(["docker", "exec", SERVER, "/bin/cat", K3S_CONFIG])
     if b"server: https://127.0.0.1:6443" not in config:
@@ -112,28 +121,34 @@ def main():
                 "--mount", "type=bind,source=" + str(arguments.chart.resolve())
                 + ",target=/chart,readonly",
                 "--entrypoint", "helm", HELM_IMAGE, "--kubeconfig", "/tmp/kubeconfig"]
+        phase("READ_HELM_REVISION_ONE_MANIFEST")
         old = parse_docs(helm(base, "get", "manifest", RELEASE, "--namespace",
                               NAMESPACE, "--revision", "1"))
         tag = spec["images"]["auth-service"]["image"].rsplit(":", 1)[-1]
         if tag != spec["images"]["api-gateway"]["image"].rsplit(":", 1)[-1]:
             raise Blocked("SERVICE_TAG_MISMATCH")
         origins = json.dumps(spec["origins"])
+        phase("HELM_SERVER_DRY_RUN")
         preview = helm(base, "upgrade", RELEASE, "/chart", "--namespace",
                        NAMESPACE, "--reuse-values", "--dry-run=server",
                        "--set-string", "workloadOverrides.auth-service.imageTagOverride=" + tag,
                        "--set-string", "workloadOverrides.api-gateway.imageTagOverride=" + tag,
                        "--set-json", "apiGateway.cors.allowedOrigins=" + origins)
+    phase("PARSE_HELM_DRY_RUN")
     marker = b"\nMANIFEST:\n"
     if marker not in preview:
         raise Blocked("HELM_DRY_RUN_MANIFEST_NOT_FOUND")
     proposed = parse_docs(preview.split(marker, 1)[1].split(b"\nNOTES:\n", 1)[0])
+    phase("READ_LIVE_RESOURCES")
     live_items = json.loads(kube("get", KINDS, "-o", "json"))["items"]
     live = {resource_id(d): d for d in live_items}
     if len(old) != 54 or set(old) != set(proposed) or set(old) - set(live):
         raise Blocked("HELM_RESOURCE_IDENTITY_MISMATCH")
     resources = [{"old": old[k], "new": proposed[k], "live": live[k]}
                  for k in sorted(old)]
+    phase("STRATEGIC_PATCH_CALCULATION")
     result = calculator(arguments.calculator, resources)
+    phase("VALIDATE_PATCH_REPORT")
     if result.get("resources") != 54:
         raise Blocked("PATCH_RESOURCE_COUNT_INVALID")
     risk = result.get("risk_names")
@@ -170,5 +185,6 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception:
         # Never print exception strings: Helm or YAML errors may contain Secrets.
-        print("HELM_IMPACT_AUDIT_BLOCKED", file=sys.stderr)
+        print("HELM_IMPACT_AUDIT_BLOCKED_AT:", PHASE, file=sys.stderr)
+        print("NO_KUBERNETES_WRITES_PERFORMED", file=sys.stderr)
         sys.exit(2)

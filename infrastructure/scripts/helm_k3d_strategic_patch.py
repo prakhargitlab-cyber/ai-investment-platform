@@ -121,6 +121,10 @@ def main():
         raise RuntimeError("INVALID_DEPLOYMENT_NOOP_REPORT")
     if set(safe_secrets) & set(names):
         raise RuntimeError("VERIFIED_SECRET_STILL_IN_RISK_LIST")
+    research_noop = result.get("research_spec_noop")
+    if type(research_noop) is not bool or (
+        research_noop and result.get("research_patch")):
+        raise RuntimeError("INVALID_RESEARCH_NOOP_REPORT")
     if result.get("blocked") is not (proc.returncode == 3):
         raise RuntimeError("PATCH_RESULT_EXIT_MISMATCH")
 
@@ -138,7 +142,7 @@ def main():
                 if isinstance(key, str) and isinstance(vals, list)}
     if len(reported) != result.get("nonempty") or (
         reported != set(names) | set(safe_secrets) | set(safe_deployments) | ({"Deployment/research-engine"}
-                                  if result.get("research_patch") else set())
+                                  if result.get("research_patch") or research_noop else set())
     ):
         raise RuntimeError("PATCH_CATEGORY_RESOURCE_SET_MISMATCH")
     if any(not vals or any(v not in permitted_categories for v in vals)
@@ -175,7 +179,7 @@ def main():
     }
     if not isinstance(research_env, list) or any(
         label not in allowed_env_audits for label in research_env
-    ) or (bool(research_env) and not result.get("research_patch")):
+) or (bool(research_env) and not (result.get("research_patch") or research_noop)):
         raise RuntimeError("INVALID_RESEARCH_ENV_AUDIT")
     research_labels = result.get("research_patch_labels")
     allowed_research_labels = {
@@ -190,12 +194,13 @@ def main():
         label not in allowed_research_labels for label in research_labels
     ):
         raise RuntimeError("INVALID_RESEARCH_AUDIT_LABELS")
-    if bool(research_labels) != bool(result.get("research_patch")):
+    if bool(research_labels) != bool(result.get("research_patch") or research_noop):
         raise RuntimeError("RESEARCH_AUDIT_COVERAGE_MISMATCH")
     phase("PRINT_SUMMARY")
     print("KUBERNETES_STRATEGIC_PATCH_RESOURCES:", result["resources"])
     print("NONEMPTY_THREE_WAY_PATCHES:", result.get("nonempty"))
-    print("RESEARCH_ENGINE_PATCH_NONEMPTY:", result.get("research_patch"))
+    print("RESEARCH_ENGINE_PATCH_REQUIRES_REVIEW:", result.get("research_patch"))
+    print("RESEARCH_ENGINE_SPEC_UNCHANGED_BY_PATCH:", research_noop)
     print("UNRESOLVED_UNRELATED_RESOURCE_PATCHES:", len(names))
     print("VERIFIED_DEPLOYMENT_SPEC_NOOP_PATCHES:", len(safe_deployments))
     for name in sorted(safe_deployments):
@@ -214,7 +219,7 @@ def main():
         print("RESEARCH_PATCH_AUDIT:", label)
     for label in research_env:
         print("RESEARCH_ENV_PATCH_AUDIT:", label)
-    print("RESEARCH_PATCH_NOT_YET_APPROVED")
+    print("RESEARCH_PATCH_NOT_YET_APPROVED_FOR_HELM_DEPLOYMENT")
     print("PATCH_BYTES_AND_SECRET_VALUES_NOT_DISPLAYED")
     print("SECRET_NOOP_REQUIRES_STRICT_PATCH_SHAPE_AND_EFFECTIVE_BYTE_EQUALITY")
     print("NO_KUBERNETES_WRITES_PERFORMED")
@@ -251,6 +256,7 @@ SAFE_FAILURE_CODES = frozenset({
     "RESEARCH_AUDIT_COVERAGE_MISMATCH",
     "INVALID_JWT_PATCH_SHAPE_REPORT",
     "INVALID_RESEARCH_ENV_AUDIT",
+    "INVALID_RESEARCH_NOOP_REPORT",
 })
 
 

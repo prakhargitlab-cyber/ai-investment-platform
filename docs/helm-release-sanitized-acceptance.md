@@ -42,3 +42,17 @@ The experiment with adding values-dev.yaml did not reduce the 105 differences an
 The three-way evidence is now stable: **110 stored-v1-to-live paths**, **5 proposed-v2-to-v1 paths exclusively in research-engine**, **105 proposed-v2-to-live paths**. The prior direct desired-to-live zero-drift requirement incorrectly conflated historical drift with a release change. The script now performs a strict *rendered-release scope* check: starting from the proposed manifests, it substitutes only the two approved research container image changes and three named manual execution flags with the stored v1 values, then requires **full manifest structural equality** with stored v1 for all 54 resources. It separately requires live research-engine to already have the approved images, safety flags, and manual execution values and keeps byte equality checks on the two DEV credentials. Historical live drift is reported but **is not by itself a failure**.
 
 This is **not Helm's actual Kubernetes strategic three-way patch calculation** and does not prove Helm cannot touch an unintended live field. A successful scope gate may be used to advance release review, **not** directly to authorize upgrade. Actual change-impact verification, per-node image availability, current backup integrity, and rollback readiness remain mandatory. This tool does not mutate resources. Pure synthetic regression tests cover unrelated desired changes, wrong live images and flags, unapproved resource identities, and tolerated historical drift.
+
+## Credential representation regression (awaiting operator verification)
+
+The first release-scope run after 9 passing unit tests was stopped by
+`UNAPPROVED_STORED_RELEASE_CHANGE: Secret/dev-postgres`. The chart's old
+release manifest used `Secret.stringData` while the new preserving helper
+emits `Secret.data`. The scope guard now considers those representations
+equivalent **only if** the normalized Secret type/data bytes are identical
+and all remaining Secret metadata/fields are exactly unchanged. A different
+password, missing data key, added annotation or type change still blocks.
+Live Postgres and SearXNG credential equality is checked separately before
+any release success message. Three synthetic regression tests cover matching
+bytes, changed bytes and changed metadata. This is not authorization to
+perform the actual Helm upgrade.

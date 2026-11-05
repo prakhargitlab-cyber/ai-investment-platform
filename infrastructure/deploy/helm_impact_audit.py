@@ -210,6 +210,33 @@ def helm_dry_run(base, *arguments):
             raise Blocked("HELM_TEMPLATE_DIAGNOSTIC_UNAVAILABLE") from exc
         if check.returncode != 0:
             raise Blocked("HELM_TEMPLATE_WITH_NEW_OVERRIDES_FAILED")
+        # Compare the existing release configuration against a clean defaults
+        # dry run. Both probes are read-only and their output is suppressed.
+        original_args = list(arguments)
+        option_start = original_args.index("--set-string")
+        baseline_args = original_args[:option_start]
+        baseline_args = [("--dry-run=client" if arg == "--dry-run=server"
+                          else arg) for arg in baseline_args]
+        reset_args = [("--reset-values" if arg == "--reuse-values"
+                       else "--dry-run=client" if arg == "--dry-run=server"
+                       else arg) for arg in original_args]
+        try:
+            baseline = subprocess.run(base + baseline_args, capture_output=True,
+                                      timeout=150, check=False)
+            reset = subprocess.run(base + reset_args, capture_output=True,
+                                   timeout=150, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Blocked("HELM_RELEASE_VALUES_ISOLATION_UNAVAILABLE") from exc
+        print("BASELINE_REUSE_VALUES_DRY_RUN:",
+              "PASS" if baseline.returncode == 0 else "FAIL", flush=True)
+        print("NEW_OVERRIDES_RESET_VALUES_DRY_RUN:",
+              "PASS" if reset.returncode == 0 else "FAIL", flush=True)
+        import re
+        # Report only a numeric YAML line if Helm emitted one.
+        match = re.search(rb"\\byaml\\s*:\\s*line\\s+(\\d{1,6})\\s*:",
+                          message)
+        if match:
+            print("HELM_YAML_LINE_NUMBER:", int(match.group(1)), flush=True)
         raise Blocked("HELM_TEMPLATE_OK_BUT_UPGRADE_DRY_RUN_FAILED")
     return result.stdout
 

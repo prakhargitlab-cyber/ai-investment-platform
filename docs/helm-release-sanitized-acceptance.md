@@ -221,3 +221,33 @@ A nonempty patch to an unrelated workload or protected Secret/StatefulSet
 must be reviewed before any Helm upgrade. This tool does not change
 Helm history, live workloads, PostgreSQL, Secrets, or PVCs; the 71-table
 isolated PostgreSQL restore test is already complete.
+
+## Operator's first strategic-patch result and safe category review
+
+Windows operator built the Go module successfully. The 54-resource
+Kubernetes strategic merge evaluation found **21 nonempty patches**:
+`Deployment/research-engine`, 17 unrelated Deployments, plus the
+`aip-auth-jwt`, `dev-postgres` and `dev-searxng` Secrets. The cluster
+was unchanged. This does **not** establish a Secret credential rotation:
+the helper previously verified unchanged Postgres/SearXNG encoded data,
+but a patch may still touch metadata, data/stringData representation or
+another field. An unrelated Deployment patch may or may not affect pod
+template rollout.
+
+A new `categories.go` classifier reports **only hard-coded patch
+category labels**, including `container-image`, `container-env`,
+`metadata`, `secret-data-or-config-data` and `secret-stringData`;
+it does not print patch JSON, credential values or arbitrary patch keys.
+`helm_k3d_strategic_patch.py` validates that categories belong to
+the exact 54-resource result and displays their labels. Three
+synthetic tests cover confidential value redaction and classification.
+
+After fetching the updated Go source and Python wrapper, the operator
+must **rebuild the local Windows executable** with
+`build_helm_patch_calculator.ps1` before rerunning the strategic patch
+wrapper. Otherwise the old binary lacks the new report fields. A blocked
+result is expected; this reports *why* and is not release authorization.
+
+**Do not overwrite running settings or rotate Secrets** in order to
+suppress warnings. Patch categories require explicit reviewer approval
+and appropriate reconciliation before upgrade.

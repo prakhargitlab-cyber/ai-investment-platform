@@ -102,6 +102,23 @@ def main():
         "Secret/aip-auth-jwt", "Secret/dev-postgres", "Secret/dev-searxng"
     } for n in safe_secrets):
         raise RuntimeError("UNKNOWN_VERIFIED_SECRET")
+    safe_deployments = result.get("verified_deployment_noop")
+    allowed_deployments = {
+        "Deployment/api-gateway", "Deployment/auth-service",
+        "Deployment/broker-service", "Deployment/company-service",
+        "Deployment/frontend", "Deployment/ibkr-connector",
+        "Deployment/kafka", "Deployment/mcp-gateway",
+        "Deployment/notification-service",
+        "Deployment/portfolio-optimizer", "Deployment/portfolio-service",
+        "Deployment/ranking-engine", "Deployment/recommendation-service",
+        "Deployment/research-service", "Deployment/risk-service",
+        "Deployment/valuation-engine", "Deployment/yahoo-finance-mcp"
+    }
+    if (not isinstance(safe_deployments, list)
+            or len(safe_deployments) != len(set(safe_deployments))
+            or not set(safe_deployments).issubset(allowed_deployments)
+            or set(safe_deployments) & set(names)):
+        raise RuntimeError("INVALID_DEPLOYMENT_NOOP_REPORT")
     if set(safe_secrets) & set(names):
         raise RuntimeError("VERIFIED_SECRET_STILL_IN_RISK_LIST")
     if result.get("blocked") is not (proc.returncode == 3):
@@ -120,7 +137,7 @@ def main():
     reported = {key for key, vals in categories.items()
                 if isinstance(key, str) and isinstance(vals, list)}
     if len(reported) != result.get("nonempty") or (
-        reported != set(names) | set(safe_secrets) | ({"Deployment/research-engine"}
+        reported != set(names) | set(safe_secrets) | set(safe_deployments) | ({"Deployment/research-engine"}
                                   if result.get("research_patch") else set())
     ):
         raise RuntimeError("PATCH_CATEGORY_RESOURCE_SET_MISMATCH")
@@ -180,6 +197,9 @@ def main():
     print("NONEMPTY_THREE_WAY_PATCHES:", result.get("nonempty"))
     print("RESEARCH_ENGINE_PATCH_NONEMPTY:", result.get("research_patch"))
     print("UNRESOLVED_UNRELATED_RESOURCE_PATCHES:", len(names))
+    print("VERIFIED_DEPLOYMENT_SPEC_NOOP_PATCHES:", len(safe_deployments))
+    for name in sorted(safe_deployments):
+        print("VERIFIED_DEPLOYMENT_SPEC_NOOP:", name)
     print("VERIFIED_STRINGDATA_ONLY_SECRET_NOOPS:", len(safe_secrets))
     for name in sorted(safe_secrets):
         print("VERIFIED_SECRET_NOOP:", name)
@@ -217,6 +237,7 @@ SAFE_FAILURE_CODES = frozenset({
     "INVALID_PATCH_RISK_NAMES",
     "UNKNOWN_PATCH_RISK_RESOURCE",
     "INVALID_VERIFIED_SECRET_REPORT",
+    "INVALID_DEPLOYMENT_NOOP_REPORT",
     "UNKNOWN_VERIFIED_SECRET",
     "VERIFIED_SECRET_STILL_IN_RISK_LIST",
     "PATCH_RESULT_EXIT_MISMATCH",

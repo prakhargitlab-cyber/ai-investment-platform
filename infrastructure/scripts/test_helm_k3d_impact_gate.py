@@ -24,7 +24,7 @@ def test_unrelated_live_image_drift_blocks():
     old = {key: deployment("auth-service", "old")}
     desired = {key: deployment("auth-service", "old")}
     live = {key: deployment("auth-service", "new")}
-    assert ("UNRELATED_DEPLOYMENT_LIVE_DRIFT", "Deployment", "auth-service") in (
+    assert ("UNRELATED_DEPLOYMENT_DECLARED_FIELD_DRIFT", "Deployment", "auth-service") in (
         mod.critical_live_drift(old, desired, live)
     )
 
@@ -63,7 +63,7 @@ def test_statefulset_drift_blocks():
                  "metadata": {"name": "postgres"}, "spec": {"replicas": 1}}}
     desired = {key: old[key]}
     live = {key: {**old[key], "spec": {"replicas": 2}}}
-    assert ("STATEFULSET_LIVE_DIFFERS_FROM_TARGET", "StatefulSet", "postgres") in (
+    assert ("STATEFULSET_DECLARED_FIELD_DRIFT", "StatefulSet", "postgres") in (
         mod.critical_live_drift(old, desired, live)
     )
 
@@ -75,3 +75,45 @@ def test_helm_docker_chart_mount_is_before_entrypoint():
     )
     assert '"--mount", "type=bind,source=" + str(base.CHART)' in source
     assert '"--entrypoint", "helm", base.IMAGE' in source
+
+
+def test_kubernetes_added_defaults_do_not_register_as_declared_drift():
+    key = ("apps/v1", "Deployment", "redis")
+    old = {key: deployment("redis")}
+    desired = {key: deployment("redis")}
+    live = {key: deployment("redis")}
+    pod = live[key]["spec"]["template"]
+    pod["metadata"] = {"annotations": {"kubernetes.io/injected": "example"}}
+    pod["spec"]["restartPolicy"] = "Always"
+    pod["spec"]["containers"][0]["terminationMessagePolicy"] = "File"
+    assert mod.critical_live_drift(old, desired, live) == []
+
+
+def test_named_env_items_compare_regardless_of_order():
+    key = ("apps/v1", "Deployment", "api-gateway")
+    desired = deployment("api-gateway")
+    desired["spec"]["template"]["spec"]["containers"][0]["env"].append(
+        {"name": "SECOND", "value": "yes"})
+    live = __import__("copy").deepcopy(desired)
+    live["spec"]["template"]["spec"]["containers"][0]["env"].reverse()
+    assert mod.critical_live_drift({key: desired}, {key: desired}, {key: live}) == []
+
+
+def test_named_env_changes_still_block():
+    key = ("apps/v1", "Deployment", "broker-service")
+    desired = deployment("broker-service")
+    live = __import__("copy").deepcopy(desired)
+    live["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"] = "changed"
+    assert ("UNRELATED_DEPLOYMENT_DECLARED_FIELD_DRIFT", "Deployment", "broker-service") in (
+        mod.critical_live_drift({key: desired}, {key: desired}, {key: live})
+    )
+
+
+def test_postgres_server_defaults_do_not_block():
+    key = ("apps/v1", "StatefulSet", "postgres")
+    desired = {"apiVersion": "apps/v1", "kind": "StatefulSet",
+               "metadata": {"name": "postgres"}, "spec": {"replicas": 1}}
+    live = {"apiVersion": "apps/v1", "kind": "StatefulSet",
+            "metadata": {"name": "postgres"}, "spec": {"replicas": 1,
+                                                     "revisionHistoryLimit": 10}}
+    assert mod.critical_live_drift({key: desired}, {key: desired}, {key: live}) == []

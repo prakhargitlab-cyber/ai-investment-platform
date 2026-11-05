@@ -7,7 +7,7 @@ import helm_k3d_image_rebaseline as plan
 
 def fixture_documents():
     old, candidate, live = {}, {}, {}
-    for name in sorted(plan.UNRELATED):
+    for name in sorted(plan.FIRST_PARTY):
         key = ("apps/v1", "Deployment", name)
         item = {
             "apiVersion": "apps/v1", "kind": "Deployment",
@@ -22,7 +22,7 @@ def fixture_documents():
         live[key]["spec"]["template"]["spec"]["containers"][0]["image"] = (
             "localhost:5001/ai-investment/" + name + ":stable-456"
         )
-    for i in range(54 - len(plan.UNRELATED)):
+    for i in range(54 - len(plan.FIRST_PARTY)):
         key = ("v1", "ConfigMap", "placeholder-" + str(i))
         doc = {"apiVersion": "v1", "kind": "ConfigMap",
                "metadata": {"name": "placeholder-" + str(i)}}
@@ -36,10 +36,11 @@ def test_candidate_contains_only_image_tag_overrides():
     old, candidate, live = fixture_documents()
     result = plan.candidate_values(old, candidate, live)
     assert set(result) == {"workloadOverrides"}
-    assert len(result["workloadOverrides"]) == 17
+    assert len(result["workloadOverrides"]) == 16
     assert all(value == {"imageTagOverride": "stable-456"}
                for value in result["workloadOverrides"].values())
     assert "secret" not in str(result).lower()
+    assert "kafka" not in result["workloadOverrides"]
 
 
 @pytest.mark.parametrize("image", [

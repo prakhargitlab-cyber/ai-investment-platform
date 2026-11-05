@@ -237,6 +237,45 @@ def helm_dry_run(base, *arguments):
                               result.stderr + b"\\n" + result.stdout)]
         print("HELM_ERROR_RESOURCE_KINDS:",
               ",".join(found) if found else "none", flush=True)
+        # Preserve useful ordering without leaking free-form Helm stderr.
+        # Every displayed word must match this fixed public vocabulary;
+        # everything else (including image names, paths, URLs, secrets,
+        # values, account names) is replaced with a single question mark.
+        safe_tokens = {
+            "error", "upgrade", "failed", "yaml", "parse", "parsing",
+            "line", "column", "template", "templates", "executing",
+            "execution", "include", "calling", "function", "at",
+            "cannot", "can't", "could", "not", "found", "unknown",
+            "unable", "invalid", "expected", "unexpected", "got",
+            "while", "rendering", "rendered", "manifest", "manifests",
+            "secret", "secrets", "lookup", "missing", "on", "is",
+            "the", "in", "to", "of", "with", "key", "value", "values",
+            "data", "map", "type", "string", "int", "integer",
+            "required", "empty", "failed", "nil", "pointer",
+            "field", "interface", "must", "existing", "create",
+            "created", "update", "updated", "patch", "patching",
+            "release", "chart", "resource", "resources", "server",
+            "client", "kubernetes", "api", "version", "metadata",
+            "object", "unmarshal", "marshal", "json", "converting",
+            "conversion", "deserialize", "decoding", "encoding",
+            "no", "dry", "run", "reuse", "reset", "provider",
+            "already", "exists", "conflict", "ownership", "forbidden",
+            "permission", "denied", "connection", "refused", "timeout",
+            "timed", "out", "status", "operation", "progress",
+            "from", "couldn't", "wrong", "number", "argument",
+            "arguments", "helper", "hook", "dependency", "dependencies",
+            "failed", "one", "two", "three", "four", "five",
+        }
+        all_tokens = re.findall(rb"[a-zA-Z][a-zA-Z0-9_-]{0,63}",
+                                (result.stderr + b"\\n" + result.stdout)[:1200])
+        shape = []
+        for token in all_tokens[:65]:
+            value = token.decode("ascii", "ignore").lower()
+            masked = value if value in safe_tokens else "?"
+            if masked != "?" or not shape or shape[-1] != "?":
+                shape.append(masked)
+        print("HELM_ERROR_REDACTED_WORD_SEQUENCE:",
+              " ".join(shape) or "none", flush=True)
         # If Helm's phrasing is unknown, return only approved vocabulary
         # present in the diagnostic, never the raw error or identifiers.
         import re

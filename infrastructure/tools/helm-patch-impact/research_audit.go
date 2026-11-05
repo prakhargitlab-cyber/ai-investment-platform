@@ -80,3 +80,61 @@ func researchPatchLabels(raw []byte) ([]string, error) {
     sort.Strings(out)
     return out,nil
 }
+
+
+// researchEnvAudit returns fixed labels about the PATCH's env item changes.
+// A list-order directive is treated as a distinct signal, never as an env edit.
+// No names or values from the patch are emitted in diagnostics.
+func researchEnvAudit(patch []byte) ([]string, error) {
+    var root map[string]interface{}
+    if err := json.Unmarshal(patch, &root); err != nil { return nil, err }
+    labels := map[string]bool{}
+    allowed := map[string]bool{
+        "AIP_RESEARCH_EQUITY_MANUAL_EXECUTION_ENABLED": true,
+        "AIP_RESEARCH_ETF_MANUAL_EXECUTION_ENABLED": true,
+        "AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED": true,
+        "AIP_RESEARCH_OPPORTUNITY_RECOVERY_PAUSED": true,
+        "AIP_RESEARCH_OPPORTUNITY_SCHEDULER_ENABLED": true,
+    }
+    spec, ok := root["spec"].(map[string]interface{})
+    if !ok { return []string{}, nil }
+    tmpl, ok := spec["template"].(map[string]interface{})
+    if !ok { return []string{}, nil }
+    pod, ok := tmpl["spec"].(map[string]interface{})
+    if !ok { return []string{}, nil }
+    for _, kind := range []string{"containers","initContainers"} {
+        if _, present := pod["$setElementOrder/"+kind]; present {
+            labels["CONTAINER_ORDER_DIRECTIVE"] = true
+        }
+        containers, ok := pod[kind].([]interface{})
+        if !ok { continue }
+        for _, candidate := range containers {
+            item, ok := candidate.(map[string]interface{})
+            if !ok { labels["MALFORMED_CONTAINER_PATCH"] = true; continue }
+            if _, present := item["$setElementOrder/env"]; present {
+                labels["ENV_ORDER_DIRECTIVE"] = true
+            }
+            envList, exists := item["env"]
+            if !exists { continue }
+            envs, ok := envList.([]interface{})
+            if !ok { labels["MALFORMED_ENV_PATCH"] = true; continue }
+            for _, env := range envs {
+                field, ok := env.(map[string]interface{})
+                if !ok { labels["MALFORMED_ENV_PATCH"] = true; continue }
+                name, named := field["name"].(string)
+                if !named { labels["MALFORMED_ENV_PATCH"] = true; continue }
+                if len(field) == 1 {
+                    labels["ENV_NAME_ONLY_PATCH_ENTRY"] = true
+                } else if allowed[name] {
+                    labels["APPROVED_ENV_PATCH_ENTRY"] = true
+                } else {
+                    labels["UNAPPROVED_ENV_PATCH_ENTRY"] = true
+                }
+            }
+        }
+    }
+    out := make([]string,0,len(labels))
+    for label := range labels { out=append(out,label) }
+    sort.Strings(out)
+    return out,nil
+}

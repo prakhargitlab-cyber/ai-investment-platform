@@ -14,6 +14,8 @@ import tempfile
 
 import yaml
 
+from scoped_candidate import simulate, ScopeViolation
+
 RELEASE = "ai-investment-platform"
 NAMESPACE = "ai-investment"
 SERVER = "k3d-ai-investment-dev-server-0"
@@ -397,6 +399,8 @@ def main():
     parser.add_argument("--chart", type=Path, required=True)
     parser.add_argument("--calculator", type=Path, required=True)
     parser.add_argument("--spec", type=Path, required=True)
+    parser.add_argument("--simulate-scoped-candidate", action="store_true",
+                        help="simulate two-Deployment-only manifest scope (never authorizes apply)")
     arguments = parser.parse_args()
     phase("READ_RELEASE_SPEC")
     spec = json.loads(arguments.spec.read_text(encoding="utf-8"))
@@ -451,6 +455,15 @@ def main():
     live = {resource_id(d): d for d in live_items}
     if len(old) != 54 or set(old) != set(proposed) or set(old) - set(live):
         raise Blocked("HELM_RESOURCE_IDENTITY_MISMATCH")
+    if arguments.simulate_scoped_candidate:
+        phase("SIMULATE_TWO_SERVICE_ONLY_CANDIDATE")
+        try:
+            proposed = simulate(old, proposed, spec)
+        except ScopeViolation as exc:
+            raise Blocked(str(exc)) from exc
+        print("SCOPED_CANDIDATE_TYPE: SIMULATION_ONLY", flush=True)
+        print("UNRELATED_MANIFESTS_PRESERVED_FROM_HELM_REVISION_ONE", flush=True)
+        print("NOT_AN_APPLICABLE_HELM_RELEASE", flush=True)
     resources = [{"old": old[k], "new": proposed[k], "live": live[k]}
                  for k in sorted(old)]
     phase("STRATEGIC_PATCH_CALCULATION")

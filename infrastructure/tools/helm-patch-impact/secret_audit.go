@@ -116,3 +116,57 @@ func secretPatchShape(patch []byte) string {
     }
     return "STRINGDATA_OTHER_SHAPE"
 }
+
+
+// isVerifiedLiveJWTDataRewrite recognizes a narrowly constrained v1
+// stringData -> v2 data conversion that writes only the SAME bytes already
+// persisted in the live JWT Secret. The old Helm stringData may be stale;
+// it is never used to authorize a value change. This is JWT-only and
+// must never exempt metadata, type, deletion or an unknown field operation.
+func isVerifiedLiveJWTDataRewrite(t triple, patch []byte) bool {
+    var oldRoot, newRoot map[string]json.RawMessage
+    if json.Unmarshal(t.Old, &oldRoot) != nil ||
+        json.Unmarshal(t.New, &newRoot) != nil { return false }
+    if _, exists := oldRoot["stringData"]; !exists { return false }
+    if _, exists := newRoot["stringData"]; exists { return false }
+    if _, exists := newRoot["data"]; !exists { return false }
+
+    var operations map[string]json.RawMessage
+    if json.Unmarshal(patch, &operations) != nil || len(operations) != 2 {
+        return false
+    }
+    if !bytes.Equal(bytes.TrimSpace(operations["stringData"]), []byte("null")) {
+        return false
+    }
+    var patchData map[string]json.RawMessage
+    if json.Unmarshal(operations["data"], &patchData) != nil || len(patchData) == 0 {
+        return false
+    }
+    oldData, oldType, err := persistedSecretData(t.Old)
+    if err != nil || len(oldData) == 0 { return false }
+    nextData, nextType, err := persistedSecretData(t.New)
+    if err != nil { return false }
+    liveData, liveType, err := persistedSecretData(t.Live)
+    if err != nil || oldType != nextType || nextType != liveType {
+        return false
+    }
+    // A chart lookup must render exactly the currently persisted Secret.
+    if !equalSecretData(nextData, liveData) { return false }
+    if len(oldData) != len(nextData) { return false }
+    for key := range oldData {
+        if _, ok := nextData[key]; !ok { return false }
+    }
+    // Require every patch data entry to be an existing live key, with
+    // canonical base64 and the exact unchanged bytes. No null/deletions.
+    for key, encodedJSON := range patchData {
+        var encoded string
+        if json.Unmarshal(encodedJSON, &encoded) != nil { return false }
+        decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
+        if err != nil || base64.StdEncoding.EncodeToString(decoded) != encoded {
+            return false
+        }
+        liveValue, exists := liveData[key]
+        if !exists || !bytes.Equal(decoded, liveValue) { return false }
+    }
+    return true
+}

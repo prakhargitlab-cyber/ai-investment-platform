@@ -124,3 +124,31 @@ the operational baseline until a faithful patch impact is proven safe.
 **Milestone:** Backup recovery evidence now supports the release; the only
 remaining blocker is exact upgrade-impact/reconciliation engineering, not a
 request for more manual backup, node, or scope commands.
+
+## Read-only conservative patch-risk gate (added; not operator-tested)
+
+`infrastructure/scripts/helm_k3d_impact_gate.py` reads stored Helm v1,
+server-connected proposed revision-2 dry-run, and live Kubernetes resource
+JSON using the same internal k3d API approach as the existing scope guard.
+It checks the previously approved exact research-engine release scope,
+then **blocks** on any unrelated Deployment pod-template discrepancy between
+desired and live, any change to unrelated desired Deployment pod templates,
+protected Secret data/type differences, or StatefulSet/PVC discrepancies.
+Only safe resource names and risk codes are printed; Secret contents are
+never printed and no write is performed.
+
+This gate is a **conservative risk filter**, not an implementation of Helm's
+actual strategic merge patch. A block means release safety is not established;
+it is not proof that a particular pod would roll in practice. A pass is only
+a prerequisite for a faithful Helm/Kubernetes patch calculation. Do not merge
+or upgrade solely because it passes. Five synthetic offline tests check risk
+classification; operator validation is pending.
+
+When required, run from repo root with trusted Python venv:
+
+    .\.venv\Scripts\python.exe -m pytest infrastructure\scripts\test_helm_k3d_impact_gate.py -q
+    .\.venv\Scripts\python.exe infrastructure\scripts\helm_k3d_impact_gate.py
+
+No credentials, backups, logs or kubeconfig files are written to the
+repository. The current 110 known field differences across 18 Deployments
+make a conservative block likely until a separately reviewed reconciliation.

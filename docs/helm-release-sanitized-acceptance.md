@@ -444,3 +444,40 @@ while preserving credentials entirely outside Git and command-line
 arguments. Only then use the original strict 54-resource gate and
 obtain explicit approval for an upgrade. Do not run this preview as an
 upgrade pipeline step; its output is an experiment only.
+
+## Actual JWT Helm source reconciliation implemented (operator tests pending)
+
+The JWT problem was traced to a real template defect in
+`templates/dev-dependencies.yaml`: unlike PostgreSQL and SearXNG,
+the development JWT Secret was rendered from
+`auth.devJwtSecret` directly under `stringData`. When that stored
+Helm value was stale or blank, the new candidate attempted a
+`STRINGDATA_OBJECT_VALUES` write, risking credential replacement.
+
+The JWT now uses the **existing, fail-closed** `aip.devCredential`
+helper to read the already persisted JWT key from the live Secret,
+validate its type, key, and canonical base64, and render the same
+bytes under `data`. The helper fails on missing/invalid live Secret
+during upgrade; the value supplied in `auth.devJwtSecret` is a
+bootstrap-only input for fresh installations. This change does not
+write credentials into Git, CLI flags, logs or local files.
+
+The scope gate has a JWT-specific exception for stale stored Helm
+`stringData` only when the newly rendered JWT `data` is exactly
+equal to the live Secret's complete effective data and type, with
+unchanged metadata. The Go strategic-patch gate independently
+recognizes a JWT-only write as credential-preserving only if the
+**entire patch** consists of `stringData:null` plus `data` entries
+whose decoded bytes equal live values, with no deletions, unknown
+keys, metadata changes or type changes. All other Secret operations
+remain blocked, as do changes to PostgreSQL/SearXNG bytes. Added
+synthetic Go tests rejecting changed bytes, deletion, wrong keys and
+metadata operations, plus chart-level static tests to prevent a
+regression to direct JWT stringData templating.
+
+**Validation status:** these new edits are committed to draft PR #24
+but have **not yet been run through operator's Windows/cluster
+validator**. No upgrade is authorized; the unreviewed research-engine
+env patch and 17 unrelated Deployment patches still block revision 2.
+Do not rerun a full Go build until the remaining chart/value
+reconciliation is prepared.

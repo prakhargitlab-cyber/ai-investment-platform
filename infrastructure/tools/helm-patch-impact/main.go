@@ -40,6 +40,7 @@ type report struct {
     NonEmpty int `json:"nonempty"`
     RiskNames []string `json:"risk_names"`
     VerifiedSecretNoop []string `json:"verified_secret_noop"`
+    VerifiedDeploymentNoop []string `json:"verified_deployment_noop"`
     PatchCategories map[string][]string `json:"patch_categories"`
     ResearchPatch bool `json:"research_patch"`
     JWTFailureCode string `json:"jwt_failure_code"`
@@ -108,7 +109,7 @@ func calculatePatchDetailed(t triple) (bool, string, []string, bool, []byte, err
 }
 
 func perform(r request) (report, error) {
-    out := report{Resources:len(r.Resources), RiskNames:[]string{}, VerifiedSecretNoop:[]string{}, PatchCategories:map[string][]string{},Version:"strategic-three-way-v1"}
+    out := report{Resources:len(r.Resources), RiskNames:[]string{}, VerifiedSecretNoop:[]string{}, VerifiedDeploymentNoop:[]string{}, PatchCategories:map[string][]string{},Version:"strategic-three-way-v1"}
     if len(r.Resources) != 54 { return out, fmt.Errorf("EXPECTED_54_RESOURCES") }
     seen := map[string]bool{}
     for _, t := range r.Resources {
@@ -143,12 +144,17 @@ func perform(r request) (report, error) {
             out.VerifiedSecretNoop = append(out.VerifiedSecretNoop, name)
         } else if name == "Deployment/research-engine" {
             out.ResearchPatch = true
+        } else if o := name; len(o) > len("Deployment/") &&
+            o[:len("Deployment/")] == "Deployment/" &&
+            verifiedNoopDeploymentPatch(t, patch) {
+            out.VerifiedDeploymentNoop = append(out.VerifiedDeploymentNoop, name)
         } else {
             out.RiskNames = append(out.RiskNames, name)
         }
     }
     sort.Strings(out.RiskNames)
     sort.Strings(out.VerifiedSecretNoop)
+    sort.Strings(out.VerifiedDeploymentNoop)
     // Verified write-only Secret stringData removals do not affect stored
     // bytes. Research patch still requires separate field-level approval.
     out.Blocked = len(out.RiskNames) != 0 || out.ResearchPatch

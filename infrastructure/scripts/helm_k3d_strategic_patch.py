@@ -129,7 +129,7 @@ def main():
         raise RuntimeError("UNRECOGNIZED_PATCH_CATEGORY")
     jwt_code = result.get("jwt_failure_code", "")
     permitted_jwt_codes = {
-        "", "VERIFIED", "PATCH_SHAPE", "OLD_DATA_INVALID",
+        "", "VERIFIED", "VERIFIED_LIVE_DATA_REWRITE", "PATCH_SHAPE", "OLD_DATA_INVALID",
         "NEW_DATA_INVALID", "LIVE_DATA_INVALID", "TYPE_MISMATCH",
         "OLD_TO_NEW_BYTES_MISMATCH", "NEW_TO_LIVE_BYTES_MISMATCH"
     }
@@ -137,7 +137,7 @@ def main():
         raise RuntimeError("UNEXPECTED_JWT_DIAGNOSTIC")
     if ("Secret/aip-auth-jwt" in categories) != bool(jwt_code):
         raise RuntimeError("JWT_DIAGNOSTIC_COVERAGE_MISMATCH")
-    if (jwt_code == "VERIFIED") != ("Secret/aip-auth-jwt" in safe_secrets):
+    if (jwt_code in {"VERIFIED", "VERIFIED_LIVE_DATA_REWRITE"}) != ("Secret/aip-auth-jwt" in safe_secrets):
         raise RuntimeError("JWT_DIAGNOSTIC_VERIFICATION_MISMATCH")
     jwt_shape = result.get("jwt_patch_shape", "")
     allowed_shapes = {
@@ -196,7 +196,7 @@ def main():
         print("RESEARCH_ENV_PATCH_AUDIT:", label)
     print("RESEARCH_PATCH_NOT_YET_APPROVED")
     print("PATCH_BYTES_AND_SECRET_VALUES_NOT_DISPLAYED")
-    print("SECRET_NOOP_MEANS_WRITE_ONLY_STRINGDATA_REMOVAL_AND_BYTE_EQUALITY")
+    print("SECRET_NOOP_REQUIRES_STRICT_PATCH_SHAPE_AND_EFFECTIVE_BYTE_EQUALITY")
     print("NO_KUBERNETES_WRITES_PERFORMED")
     if proc.returncode == 3:
         print("UPGRADE_REMAINS_BLOCKED: NONEMPTY_PATCH_REQUIRES_REVIEW")

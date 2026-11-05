@@ -66,3 +66,27 @@ func isVerifiedStringDataRemoval(t triple, patch []byte) bool {
     if oldType != newType || newType != liveType { return false }
     return equalSecretData(oldData, newData) && equalSecretData(newData, liveData)
 }
+
+ 
+// secretNoopFailure returns only a fixed diagnostic code. Never return
+// credential bytes, map keys, decoded values, errors or raw patch material.
+func secretNoopFailure(t triple, patch []byte) string {
+    var obj map[string]json.RawMessage
+    if json.Unmarshal(patch, &obj) != nil || len(obj) != 1 {
+        return "PATCH_SHAPE"
+    }
+    field, present := obj["stringData"]
+    if !present || !bytes.Equal(bytes.TrimSpace(field), []byte("null")) {
+        return "PATCH_SHAPE"
+    }
+    oldData, oldType, err := persistedSecretData(t.Old)
+    if err != nil { return "OLD_DATA_INVALID" }
+    newData, newType, err := persistedSecretData(t.New)
+    if err != nil { return "NEW_DATA_INVALID" }
+    liveData, liveType, err := persistedSecretData(t.Live)
+    if err != nil { return "LIVE_DATA_INVALID" }
+    if oldType != newType || newType != liveType { return "TYPE_MISMATCH" }
+    if !equalSecretData(oldData, newData) { return "OLD_TO_NEW_BYTES_MISMATCH" }
+    if !equalSecretData(newData, liveData) { return "NEW_TO_LIVE_BYTES_MISMATCH" }
+    return "VERIFIED"
+}

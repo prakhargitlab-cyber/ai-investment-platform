@@ -109,3 +109,47 @@ def test_rejects_extra_desired_resource():
     import pytest
     with pytest.raises(mod.Blocked, match="RESOURCE_IDENTITY_CHANGE"):
         mod.only_approved_revision_changes(old, new, live)
+
+
+def test_legacy_secret_stringdata_to_data_keeps_identical_credential():
+    old, new, live = synthetic_three_way()
+    key = ("v1", "Secret", "dev-postgres")
+    value = "invented-password-for-structural-test"
+    old[key] = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "dev-postgres"}, "type": "Opaque",
+                "stringData": {"POSTGRES_PASSWORD": value}}
+    new[key] = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "dev-postgres"}, "type": "Opaque",
+                "data": {"POSTGRES_PASSWORD": base64.b64encode(value.encode()).decode()}}
+    assert mod.only_approved_revision_changes(old, new, live)
+
+
+def test_legacy_secret_changed_credential_remains_blocked():
+    old, new, live = synthetic_three_way()
+    key = ("v1", "Secret", "dev-postgres")
+    old[key] = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "dev-postgres"}, "type": "Opaque",
+                "stringData": {"POSTGRES_PASSWORD": "invented-before"}}
+    new[key] = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "dev-postgres"}, "type": "Opaque",
+                "data": {"POSTGRES_PASSWORD":
+                         base64.b64encode(b"invented-after").decode()}}
+    import pytest
+    with pytest.raises(mod.Blocked, match="UNAPPROVED_SECRET_CONTENT_CHANGE"):
+        mod.only_approved_revision_changes(old, new, live)
+
+
+def test_legacy_secret_metadata_mutation_remains_blocked():
+    old, new, live = synthetic_three_way()
+    key = ("v1", "Secret", "dev-searxng")
+    value = "invented-secret"
+    old[key] = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "dev-searxng"}, "type": "Opaque",
+                "stringData": {"SEARXNG_SECRET": value}}
+    new[key] = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": "dev-searxng", "annotations": {"change": "bad"}},
+                "type": "Opaque",
+                "data": {"SEARXNG_SECRET": base64.b64encode(value.encode()).decode()}}
+    import pytest
+    with pytest.raises(mod.Blocked, match="UNAPPROVED_SECRET_METADATA_CHANGE"):
+        mod.only_approved_revision_changes(old, new, live)

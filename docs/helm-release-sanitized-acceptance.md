@@ -338,3 +338,32 @@ offline tests also verify the isolated Docker command. The updated build
 and wrapper have **not yet been operator-tested**. A successful invocation
 will still hard-block revision 2 on any unapproved three-way patch. No
 release, Secret, database, PVC or live pod changes are made.
+
+## Operator: Linux patch checker completed, exact JWT shape and research env diagnostics pending
+
+The operator's Linux calculator completed successfully (Go tests and
+9/9 Python wrapper tests passed). It evaluated 54 resources with 21
+nonempty patches. PostgreSQL and SearXNG Secrets were verified safe
+stringData-only no-ops. The JWT Secret was **not** verified:
+`JWT_SECRET_PATCH_AUDIT: PATCH_SHAPE`. Research engine showed
+`ENV_VALUE_PATCH`, `OTHER_ENV_NAME`, and
+`STRATEGIC_LIST_DIRECTIVE`. The unrelated 17 Deployment patches
+remain blockers. There were no live writes.
+
+Added an additional read-only patch-shape classifier for JWT that emits
+only a fixed code distinguishing a whole-object stringData removal
+from individual key deletions, write operations, or combined patch
+operations; it never prints field names or values. This is
+**diagnostic only**, and does not expand the strict Secret no-op
+exemption. Also added the research env-list audit to separate actual
+approved/unapproved env edit objects from order-only directives,
+using fixed output labels and no environment variable names or values.
+The existing research patch remains **unapproved** even if only
+approved names are reported, because values and unrelated patch
+operations still require review.
+
+The new Go build and diagnostics are **not yet operator-tested**.
+Fetch updated `main.go`, `secret_audit.go`,
+`research_audit.go`, `patch_shape_test.go` and
+`helm_k3d_strategic_patch.py`; rebuild the isolated Linux checker
+and rerun the read-only wrapper. No upgrade or live mutation.

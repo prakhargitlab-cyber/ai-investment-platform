@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $s = Get-Content infrastructure/scripts/recover_k3d_registry_image.ps1 -Raw
-          foreach ($required in @('switch]$Publish', 'if(-not $Publish)', 'images push --local --plain-http', 'RECOVERED_DIGEST_MISMATCH')) {
+          foreach ($required in @('switch]$Publish', 'if(-not $Publish)', 'images export --local --all-platforms --skip-manifest-json', 'OCI_ARCHIVE_ALL_BLOBS_VERIFIED', 'AssertResponseDigest $final $want')) {
             if (-not $s.Contains($required)) { throw "RECOVERY_GUARD_MISSING" }
           }
           Write-Host "RECOVERY_GUARDS_PRESENT"

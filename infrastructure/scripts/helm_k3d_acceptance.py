@@ -120,10 +120,10 @@ def main():
             "--mount", "type=bind,source=" + str(CHART) + ",target=/chart,readonly",
             "--entrypoint", "helm", IMAGE, "--kubeconfig", "/tmp/kubeconfig",
             "upgrade", RELEASE, "/chart", "--namespace", NAMESPACE,
-            # The original DEV install was composed from values-dev.yaml.
-            # --reuse-values alone does not reliably reconstruct that profile
-            # when Helm stored only explicit overrides in release.Config.
-            "-f", "/chart/values-dev.yaml",
+            # Avoid adding values-dev.yaml here: it changes portfolio-service
+            # in addition to the intended research-engine corrections.
+            # Base upgrades on Helm revision-1 stored values, not local profile
+            # defaults, until a separately reviewed values migration exists.
             "--reuse-values", "--dry-run=server",
             "--set", "research.opportunityRecoveryPaused=true",
             "--set", "research.opportunityScheduler.enabled=false",
@@ -203,6 +203,11 @@ def main():
     print("STORED_V1_TO_LIVE_FIELD_DIFFERENCES:", len(baseline_to_live))
     print("PROPOSED_V2_TO_STORED_V1_FIELD_DIFFERENCES:", len(proposed_to_baseline))
     print("DIFFERENT_DESIRED_FIELDS:", len(differences))
+    print("PROPOSED_V2_VS_STORED_V1_FIELD_PATHS:")
+    for path in proposed_to_baseline[:25]:
+        print("CHANGE_FROM_V1_PATH:", path)
+    if len(proposed_to_baseline) > 25:
+        print("ADDITIONAL_CHANGE_FROM_V1_PATHS:", len(proposed_to_baseline) - 25)
     print("PROPOSED_V2_VS_STORED_V1_RESOURCES:",
           ", ".join(sorted(set(p.split(".")[0] for p in proposed_to_baseline))) or "(none)")
     print("STORED_V1_VS_LIVE_RESOURCES:",

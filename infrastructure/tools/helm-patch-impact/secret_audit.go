@@ -90,3 +90,29 @@ func secretNoopFailure(t triple, patch []byte) string {
     if !equalSecretData(newData, liveData) { return "NEW_TO_LIVE_BYTES_MISMATCH" }
     return "VERIFIED"
 }
+
+ 
+// secretPatchShape classifies ONLY the top-level patch operation, never data.
+// This is diagnostic information; it never creates a safety exemption.
+func secretPatchShape(patch []byte) string {
+    var fields map[string]json.RawMessage
+    if json.Unmarshal(patch, &fields) != nil { return "INVALID_PATCH_JSON" }
+    if len(fields) == 0 { return "EMPTY_PATCH" }
+    raw, hasStringData := fields["stringData"]
+    if !hasStringData { return "NO_STRINGDATA_FIELD" }
+    if len(fields) != 1 { return "STRINGDATA_WITH_OTHER_OPERATIONS" }
+    trimmed := bytes.TrimSpace(raw)
+    if bytes.Equal(trimmed, []byte("null")) { return "STRINGDATA_NULL_ONLY" }
+    if len(trimmed) != 0 && trimmed[0] == '{' {
+        var entries map[string]json.RawMessage
+        if json.Unmarshal(trimmed, &entries) != nil { return "STRINGDATA_MALFORMED_OBJECT" }
+        if len(entries) == 0 { return "STRINGDATA_EMPTY_OBJECT" }
+        allNull := true
+        for _, v := range entries {
+            if !bytes.Equal(bytes.TrimSpace(v), []byte("null")) { allNull = false }
+        }
+        if allNull { return "STRINGDATA_KEY_DELETIONS" }
+        return "STRINGDATA_OBJECT_VALUES"
+    }
+    return "STRINGDATA_OTHER_SHAPE"
+}

@@ -75,17 +75,104 @@ if($null -ne $existing){
 }
 Write-Host "CACHED_IMAGE_VERIFIED: $Service"
 if(-not $Publish){Write-Host 'READ_ONLY_PREFLIGHT_PASSED'; exit 0}
-$alias=ImageRow $target
-if($null -ne $alias){
- if($alias[2] -cne $want){throw 'INTERNAL_ALIAS_DIGEST_CONFLICT'}
-}else{
- & docker exec $node /bin/ctr --address $socket --namespace k8s.io images tag $source $target
- if($LASTEXITCODE -ne 0){throw 'IMAGE_ALIAS_FAILED'}
+# Recovery uses an OCI archive and direct registry uploads, never ctr images push.
+# Keep source index + unknown/unknown attestation, preserving the original index digest.
+function CheckBlob([string]$root,[string]$digest,[long]$size=-1) {
+ if($digest -cnotmatch '^sha256:[a-f0-9]{64}$'){throw 'INVALID_DESCRIPTOR_DIGEST'}
+ $file=Join-Path $root ('blobs/sha256/'+$digest.Substring(7))
+ if(-not (Test-Path -LiteralPath $file -PathType Leaf)){throw 'ARCHIVE_CONTENT_MISSING'}
+ if($size -ge 0 -and (Get-Item -LiteralPath $file).Length -ne $size){throw 'ARCHIVE_SIZE_MISMATCH'}
+ $hash=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+ if(('sha256:'+$hash) -cne $digest){throw 'ARCHIVE_HASH_MISMATCH'}
+ return $file
 }
-# --local is required for --http-trace and avoids the transfer-service push path.
-# Never record HTTP trace: upload URLs can contain sensitive session state.
-& docker exec $node /bin/ctr --address $socket --namespace k8s.io images push --local --plain-http $target
-if($LASTEXITCODE -ne 0){throw 'IMAGE_PUSH_FAILED'}
-$published=RegistryDigest
-if($published -cne $want){throw 'RECOVERED_DIGEST_MISMATCH'}
+function WebHead([string]$uri,[string]$accept='') {
+ $params=@{Uri=$uri;Method='Head';UseBasicParsing=$true;TimeoutSec=20}
+ if($accept){$params.Headers=@{Accept=$accept}}
+ try {return Invoke-WebRequest @params}
+ catch {
+  if($null -ne $_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404){return $null}
+  throw
+ }
+}
+function AssertResponseDigest($response,[string]$expectedDigest) {
+ $got=[string]$response.Headers['Docker-Content-Digest']
+ if($got -cne $expectedDigest){throw 'REGISTRY_PUBLISHED_DIGEST_MISMATCH'}
+}
+function PutManifest([string]$name,[string]$file,[string]$type,[string]$expectedDigest) {
+ if($type -notin @('application/vnd.oci.image.manifest.v1+json','application/vnd.oci.image.index.v1+json')){throw 'UNSUPPORTED_MANIFEST_TYPE'}
+ $res=Invoke-WebRequest -Uri ($repo+'/manifests/'+$name) -Method Put -InFile $file -ContentType $type -UseBasicParsing -TimeoutSec 120
+ if($res.StatusCode -ne 201){throw 'REGISTRY_MANIFEST_PUT_FAILED'}
+ AssertResponseDigest $res $expectedDigest
+}
+$stamp=[DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
+$folder=Join-Path (Get-Location).Path ('.tmp/registry-recovery/'+$Service+'-'+$stamp)
+New-Item -ItemType Directory -Path $folder -ErrorAction Stop | Out-Null
+$remote='/tmp/oci-recovery-'+$Service+'-'+$stamp+'.tar'
+$archive=Join-Path $folder 'image.oci.tar'
+$root=Join-Path $folder 'oci'
+New-Item -ItemType Directory -Path $root | Out-Null
+& docker exec $node /bin/ctr --address $socket --namespace k8s.io images export --local --all-platforms --skip-manifest-json $remote $source
+if($LASTEXITCODE -ne 0){throw 'CONTAINERD_OCI_EXPORT_FAILED'}
+& docker cp ($node+':'+$remote) $archive
+if($LASTEXITCODE -ne 0){throw 'OCI_ARCHIVE_COPY_FAILED'}
+if(-not (Get-Command tar.exe -ErrorAction SilentlyContinue)){throw 'WINDOWS_TAR_NOT_FOUND'}
+& tar.exe -xf $archive -C $root
+if($LASTEXITCODE -ne 0){throw 'OCI_ARCHIVE_EXTRACT_FAILED'}
+$layout=Get-Content -LiteralPath (Join-Path $root 'index.json') -Raw | ConvertFrom-Json
+$refs=@($layout.manifests)
+if($refs.Count -ne 1 -or [string]$refs[0].digest -cne $want -or [string]$refs[0].mediaType -cne 'application/vnd.oci.image.index.v1+json'){throw 'ARCHIVE_ROOT_INDEX_MISMATCH'}
+$indexFile=CheckBlob $root $want ([long]$refs[0].size)
+$index=Get-Content -LiteralPath $indexFile -Raw | ConvertFrom-Json
+if([string]$index.mediaType -cne 'application/vnd.oci.image.index.v1+json'){throw 'OCI_INDEX_TYPE_MISMATCH'}
+$children=@($index.manifests)
+if($children.Count -lt 1){throw 'OCI_INDEX_CHILDREN_MISSING'}
+$manifests=@()
+$blobs=@{}
+foreach($descriptor in $children){
+ if([string]$descriptor.mediaType -cne 'application/vnd.oci.image.manifest.v1+json'){throw 'UNEXPECTED_INDEX_CHILD_MEDIA_TYPE'}
+ $mf=CheckBlob $root ([string]$descriptor.digest) ([long]$descriptor.size)
+ $doc=Get-Content -LiteralPath $mf -Raw | ConvertFrom-Json
+ if([string]$doc.mediaType -cne 'application/vnd.oci.image.manifest.v1+json'){throw 'CHILD_MANIFEST_MEDIA_TYPE_MISMATCH'}
+ $null=CheckBlob $root ([string]$doc.config.digest) ([long]$doc.config.size)
+ $blobs[[string]$doc.config.digest]=$true
+ foreach($layer in $doc.layers){
+  $null=CheckBlob $root ([string]$layer.digest) ([long]$layer.size)
+  $blobs[[string]$layer.digest]=$true
+ }
+ $manifests+=@{Digest=[string]$descriptor.digest;File=$mf;Type=[string]$descriptor.mediaType}
+}
+$all=@(Get-ChildItem -LiteralPath (Join-Path $root 'blobs/sha256') -File)
+foreach($f in $all){
+ if($f.Name -cnotmatch '^[a-f0-9]{64}$'){throw 'UNEXPECTED_ARCHIVE_BLOB_NAME'}
+ $null=CheckBlob $root ('sha256:'+$f.Name)
+}
+Write-Host ('OCI_ARCHIVE_ALL_BLOBS_VERIFIED: '+$all.Count)
+
+# Upload only content blobs first. The registry accepts small POST -> PUT uploads.
+$repo='http://localhost:5001/v2/ai-investment/'+$Service
+foreach($digest in @($blobs.Keys | Sort-Object)){
+ $exists=WebHead ($repo+'/blobs/'+$digest)
+ if($null -ne $exists){continue}
+ $start=Invoke-WebRequest -Method Post -Uri ($repo+'/blobs/uploads/') -UseBasicParsing -TimeoutSec 30
+ if($start.StatusCode -ne 202){throw 'UPLOAD_SESSION_REJECTED'}
+ $location=[string]$start.Headers['Location']
+ if(-not $location){throw 'UPLOAD_LOCATION_MISSING'}
+ $upload=[Uri]::new([Uri]($repo+'/blobs/uploads/'),$location)
+ if($upload.Scheme -cne 'http' -or $upload.Host -cne 'localhost' -or $upload.Port -ne 5001){throw 'UNEXPECTED_UPLOAD_HOST'}
+ $separator=if($upload.Query){'&'}else{'?'}
+ $f=Join-Path $root ('blobs/sha256/'+$digest.Substring(7))
+ $done=Invoke-WebRequest -Method Put -Uri ($upload.AbsoluteUri+$separator+'digest='+$digest) -InFile $f -ContentType 'application/octet-stream' -UseBasicParsing -TimeoutSec 180
+ if($done.StatusCode -ne 201){throw 'REGISTRY_BLOB_UPLOAD_FAILED'}
+ AssertResponseDigest $done $digest
+ Write-Host ('BLOB_VERIFIED: '+$digest)
+}
+foreach($entry in $manifests){PutManifest $entry.Digest $entry.File $entry.Type $entry.Digest}
+$existingTag=WebHead ($repo+'/manifests/'+$tag) 'application/vnd.oci.image.index.v1+json'
+if($null -ne $existingTag){AssertResponseDigest $existingTag $want}
+else{PutManifest $tag $indexFile 'application/vnd.oci.image.index.v1+json' $want}
+$final=WebHead ($repo+'/manifests/'+$tag) 'application/vnd.oci.image.index.v1+json'
+if($null -eq $final){throw 'FINAL_REGISTRY_INDEX_NOT_FOUND'}
+AssertResponseDigest $final $want
 Write-Host "REGISTRY_IMAGE_RECOVERED_AND_DIGEST_VERIFIED: $Service"
+Write-Host ('AUDIT_ARCHIVE_DIRECTORY: '+$folder)

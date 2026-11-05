@@ -83,6 +83,33 @@ def main():
     if any(not vals or any(v not in permitted_categories for v in vals)
            for vals in categories.values()):
         raise RuntimeError("UNRECOGNIZED_PATCH_CATEGORY")
+    jwt_code = result.get("jwt_failure_code", "")
+    permitted_jwt_codes = {
+        "", "VERIFIED", "PATCH_SHAPE", "OLD_DATA_INVALID",
+        "NEW_DATA_INVALID", "LIVE_DATA_INVALID", "TYPE_MISMATCH",
+        "OLD_TO_NEW_BYTES_MISMATCH", "NEW_TO_LIVE_BYTES_MISMATCH"
+    }
+    if jwt_code not in permitted_jwt_codes:
+        raise RuntimeError("UNEXPECTED_JWT_DIAGNOSTIC")
+    if ("Secret/aip-auth-jwt" in categories) != bool(jwt_code):
+        raise RuntimeError("JWT_DIAGNOSTIC_COVERAGE_MISMATCH")
+    if (jwt_code == "VERIFIED") != ("Secret/aip-auth-jwt" in safe_secrets):
+        raise RuntimeError("JWT_DIAGNOSTIC_VERIFICATION_MISMATCH")
+    research_labels = result.get("research_patch_labels")
+    allowed_research_labels = {
+        "STRATEGIC_LIST_DIRECTIVE", "OTHER_TOP_LEVEL",
+        "OTHER_DEPLOYMENT_SPEC", "OTHER_POD_TEMPLATE",
+        "OTHER_POD_SPEC", "CONTAINER_IMAGE",
+        "OTHER_CONTAINER_FIELD", "OTHER_ENV_NAME", "APPROVED_ENV_NAME",
+        "ENV_VALUE_PATCH", "OTHER_ENV_FIELD", "OTHER_NESTED_FIELD",
+        "OTHER_LIST_PATCH", "NONOBJECT_PATCH"
+    }
+    if not isinstance(research_labels, list) or any(
+        label not in allowed_research_labels for label in research_labels
+    ):
+        raise RuntimeError("INVALID_RESEARCH_AUDIT_LABELS")
+    if bool(research_labels) != bool(result.get("research_patch")):
+        raise RuntimeError("RESEARCH_AUDIT_COVERAGE_MISMATCH")
     print("KUBERNETES_STRATEGIC_PATCH_RESOURCES:", result["resources"])
     print("NONEMPTY_THREE_WAY_PATCHES:", result.get("nonempty"))
     print("RESEARCH_ENGINE_PATCH_NONEMPTY:", result.get("research_patch"))
@@ -94,6 +121,11 @@ def main():
         print("PATCH_RESOURCE:", name)
     for name in sorted(categories):
         print("PATCH_CATEGORY:", name, ",".join(sorted(set(categories[name]))))
+    if jwt_code:
+        print("JWT_SECRET_PATCH_AUDIT:", jwt_code)
+    for label in research_labels:
+        print("RESEARCH_PATCH_AUDIT:", label)
+    print("RESEARCH_PATCH_NOT_YET_APPROVED")
     print("PATCH_BYTES_AND_SECRET_VALUES_NOT_DISPLAYED")
     print("SECRET_NOOP_MEANS_WRITE_ONLY_STRINGDATA_REMOVAL_AND_BYTE_EQUALITY")
     print("NO_KUBERNETES_WRITES_PERFORMED")

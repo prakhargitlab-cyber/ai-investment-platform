@@ -90,7 +90,12 @@ func calculatePatchDetailed(t triple) (bool, string, []string, bool, error) {
     if bytes.Equal(trimmed, []byte("{}")) { return false, o.Kind + "/" + o.Metadata.Name, []string{}, false, nil }
     categories, err := classifyPatch(o.Kind, patch)
     if err != nil { return false, "", nil, false, err }
-        verifiedNoop := o.Kind == "Secret" && isVerifiedStringDataRemoval(t, patch)
+        // Only the three reviewed release Secrets may receive a no-op exemption.
+    allowedSecret := o.Kind == "Secret" && (
+        o.Metadata.Name == "aip-auth-jwt" ||
+        o.Metadata.Name == "dev-postgres" ||
+        o.Metadata.Name == "dev-searxng")
+    verifiedNoop := allowedSecret && isVerifiedStringDataRemoval(t, patch)
     return true, o.Kind + "/" + o.Metadata.Name, categories, verifiedNoop, nil
 }
 

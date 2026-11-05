@@ -312,3 +312,29 @@ fetch `secret_audit.go`, `research_audit.go`, `main.go`,
 `helm_k3d_strategic_patch.py`, then rebuild the executable before the
 read-only check. **No deployment permission is implied by any diagnostic
 output**, and no Kubernetes write is included.
+
+## Windows executable launch refusal and isolated Linux execution (operator verification pending)
+
+The operator's Windows Python wrapper produced `PATCH_DIAGNOSTIC_PHASE:
+EXECUTE_CALCULATOR`, `PATCH_DIAGNOSTIC_KIND: OS_ERROR`, and
+`PATCH_OS_ERROR_CODE: WINERROR_4551` while starting the previously
+compiled `.exe`. This prevented any new patch calculation; the earlier
+successful 21-patch output remains the last verified risk baseline.
+
+The build now runs Go unit tests and compiles a **static Linux** executable
+`.tmp/helm-patch-impact/helm-patch-impact-linux` instead of a Windows EXE.
+The Python wrapper executes it via `docker run --rm -i --network none
+--read-only --cap-drop ALL --security-opt no-new-privileges
+--user 65534:65534`, with **only the Linux executable** bind-mounted
+read-only and the 54-resource input sent over stdin. Neither kubeconfig
+nor backup/Secret files are mounted into the calculator container. The
+Docker image is the already-approved `golang:1.23-alpine`; Docker itself
+must remain accessible on the Windows host. This avoids trying to launch
+the Windows EXE directly and does not call the Kubernetes write API.
+
+The diagnostic's `OSError` error-code helper was corrected to use
+`isinstance`, covering Python's `FileNotFoundError` subclass;
+offline tests also verify the isolated Docker command. The updated build
+and wrapper have **not yet been operator-tested**. A successful invocation
+will still hard-block revision 2 on any unapproved three-way patch. No
+release, Secret, database, PVC or live pod changes are made.

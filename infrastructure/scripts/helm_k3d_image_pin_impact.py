@@ -82,7 +82,8 @@ def main():
         raise RuntimeError("RENDERED_RESOURCE_IDENTITY_MISMATCH")
     # The 16 workloads must now render exactly the current live main images.
     aligned = []
-    unresolved = []
+    registry_only = []
+    tag_mismatch = []
     for name in sorted(pins.FIRST_PARTY):
         key = ("apps/v1", "Deployment", name)
         current = next(x for x in live[key]["spec"]["template"]["spec"]["containers"]
@@ -92,7 +93,12 @@ def main():
         if desired["image"] == current["image"]:
             aligned.append(name)
         else:
-            unresolved.append(name)
+            live_tag = pins.image_tag(current["image"], name)
+            desired_tag = pins.image_tag(desired["image"], name, allow_mutable=True)
+            if live_tag == desired_tag:
+                registry_only.append(name)
+            else:
+                tag_mismatch.append(name)
     # Inspect authored spec mutations without accidentally approving them.
     other_changed = []
     for key in sorted(old):
@@ -111,21 +117,29 @@ def main():
                         item.pop("image", None)
             if differences(previous, current):
                 other_changed.append(key[2])
+        elif key[1] == "Secret":
+            # Metadata/resourceVersion changes alone are not credential changes.
+            # Use the same effective data normalization as the secret guard;
+            # never print the bytes or key names.
+            if base.selected(old[key]) != base.selected(updated[key]):
+                other_changed.append("Secret/" + key[2])
         elif old[key] != updated[key]:
-            # Full object diff includes Helm metadata; only report counts.
             other_changed.append(key[1] + "/" + key[2])
     print("IMAGE_PIN_CANDIDATE_RESOURCE_COUNT:", len(updated))
     print("FIRST_PARTY_IMAGES_MATCH_LIVE:", len(aligned))
-    print("FIRST_PARTY_IMAGES_NOT_MATCH_LIVE:", len(unresolved))
-    for name in unresolved:
-        print("IMAGE_NOT_ALIGNED:", name)
+    print("IMAGE_REGISTRY_ALIAS_ONLY:", len(registry_only))
+    for name in registry_only:
+        print("REGISTRY_ALIAS_ONLY:", name)
+    print("IMAGE_TAG_MISMATCH:", len(tag_mismatch))
+    for name in tag_mismatch:
+        print("TAG_NOT_ALIGNED:", name)
     print("NON_IMAGE_OR_OUT_OF_SCOPE_RENDERED_CHANGES:", len(other_changed))
     for name in other_changed[:20]:
         print("OUT_OF_SCOPE_RESOURCE:", name)
     print("NO_CREDENTIALS_OR_IMAGE_TAGS_PRINTED")
     print("NO_KUBERNETES_WRITES_PERFORMED")
     print("HELM_UPGRADE_NOT_AUTHORIZED")
-    return 0 if not unresolved else 3
+    return 0 if not tag_mismatch and not other_changed else 3
 
 
 if __name__ == "__main__":

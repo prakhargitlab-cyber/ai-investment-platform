@@ -16,9 +16,12 @@ import helm_k3d_image_rebaseline as pins
 from helm_k3d_reconcile_fields import differences
 
 SAFE_TAG = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$")
+PHASE = "START"
 
 
 def candidate_manifest():
+    global PHASE
+    PHASE = "READ_PRIVATE_PINS"
     path = pins.OUTPUT
     # Explicit file validation before allowing Helm to read private values.
     if not path.is_file() or path.stat().st_size > 8192:
@@ -36,6 +39,7 @@ def candidate_manifest():
                 or item["imageTagOverride"] in ("dev", "latest")):
             raise RuntimeError("INVALID_IMAGE_PIN")
 
+    PHASE = "READ_K3D_CONFIG"
     config = base.call(["docker", "exec", base.SERVER, "/bin/cat", base.K3S_CONFIG])
     if b"server: https://127.0.0.1:6443" not in config:
         raise RuntimeError("INTERNAL_KUBE_API_CONFIG_UNAVAILABLE")
@@ -59,7 +63,9 @@ def candidate_manifest():
             "--set", "research.etfFullUniverseExecutionEnabled=true",
             "--set-string", "aiServiceImageOverrides.research-engine.tag=" + base.TAG
         ]
+        PHASE = "HELM_SERVER_RENDER_WITH_PINS"
         output = base.call(cmd).decode("utf-8")
+    PHASE = "PARSE_HELM_MANIFEST"
     marker = "\nMANIFEST:\n"
     if marker not in output:
         raise RuntimeError("RENDERED_MANIFEST_MISSING")
@@ -72,14 +78,19 @@ def candidate_manifest():
 
 
 def main():
+    global PHASE
+    PHASE = "LOAD_ORIGINAL_AND_LIVE"
     # Existing loader captures live/old and the known, previously scoped
     # research-only candidate. This deliberately doesn't upgrade anything.
     old, original, live = impact.load_manifests()
+    PHASE = "VERIFY_RESEARCH_SCOPE"
     base.only_approved_revision_changes(old, original, live)
     updated = candidate_manifest()
+    PHASE = "VERIFY_RESOURCE_IDENTITIES"
     if (len(old) != base.EXPECTED_COUNT or set(old) != set(updated)
             or set(old) - set(live)):
         raise RuntimeError("RENDERED_RESOURCE_IDENTITY_MISMATCH")
+    PHASE = "COMPARE_IMAGE_PINS"
     # The 16 workloads must now render exactly the current live main images.
     aligned = []
     registry_only = []
@@ -106,6 +117,7 @@ def main():
                     pin_ignored.append(name)
                 if live_tag != expected_pin:
                     live_changed_since_pin.append(name)
+    PHASE = "COMPARE_NON_IMAGE_FIELDS"
     # Inspect authored spec mutations without accidentally approving them.
     other_changed = []
     for key in sorted(old):
@@ -132,6 +144,7 @@ def main():
                 other_changed.append("Secret/" + key[2])
         elif old[key] != updated[key]:
             other_changed.append(key[1] + "/" + key[2])
+    PHASE = "REPORT"
     print("IMAGE_PIN_CANDIDATE_RESOURCE_COUNT:", len(updated))
     print("FIRST_PARTY_IMAGES_MATCH_LIVE:", len(aligned))
     print("IMAGE_REGISTRY_ALIAS_ONLY:", len(registry_only))
@@ -158,6 +171,11 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:
+    except Exception as exc:
         print("IMAGE_PIN_IMPACT_REVIEW_BLOCKED")
+        print("DIAGNOSTIC_PHASE:", PHASE)
+        # Only the exception class name is reported, never exception text or data.
+        print("DIAGNOSTIC_KIND:", type(exc).__name__ if type(exc).__name__ in
+              ("Blocked", "ImpactBlocked", "RuntimeError", "ValueError", "KeyError",
+               "TypeError", "OSError", "AttributeError", "IndexError") else "OTHER")
         sys.exit(2)

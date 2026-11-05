@@ -53,3 +53,16 @@ def test_each_app_template_supports_explicit_per_service_image_pin():
 def test_hikari_max_lifetime_is_numeric_in_chart():
     source = (CHART / "java-services.yaml").read_text(encoding="utf-8")
     assert 'printf "%.0f" (float64 $.Values.database.pool.maxLifetimeMs)' in source
+
+
+def test_component_rollouts_fail_closed_before_any_image_build_or_patch():
+    # All public and internal rollout entry points must refuse unsafe
+    # component-only mutation until the dedicated Helm flow is approved.
+    for func in ("Deploy-SelectedComponents",
+                 "Start-DeploymentFreshRollout",
+                 "Deploy-VerifiedRadarComponentsCore"):
+        body = function_body(PLATFORM, func)
+        first = body.splitlines()[:12]
+        assert any("HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED" in line
+                   for line in first), func
+        assert "throw 'HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED" in body

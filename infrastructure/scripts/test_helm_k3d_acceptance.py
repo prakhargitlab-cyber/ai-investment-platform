@@ -39,6 +39,7 @@ def test_kubernetes_generated_fields_are_ignored_but_intended_change_is_not():
     assert differences == ["Deployment/example.spec.replicas"]
 
 
-def test_dev_profile_is_explicitly_pinned_in_render_command():
+def test_upgrade_does_not_add_undeclared_dev_profile():
     source = (HERE / "helm_k3d_acceptance.py").read_text(encoding="utf-8")
-    assert '"-f", "/chart/values-dev.yaml"' in source
+    assert '"-f", "/chart/values-dev.yaml"' not in source
+    assert '"--reuse-values", "--dry-run=server"' in source

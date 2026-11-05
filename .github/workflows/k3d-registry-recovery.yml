@@ -1,0 +1,43 @@
+name: K3d registry recovery script checks
+
+on:
+  pull_request:
+    paths:
+      - 'infrastructure/scripts/recover_k3d_registry_image.ps1'
+      - 'docs/k3d-registry-image-recovery.md'
+      - '.github/workflows/k3d-registry-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parse-powershell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate recovery script PowerShell syntax
+        shell: pwsh
+        run: |
+          $source = Join-Path (Get-Location).Path 'infrastructure/scripts/recover_k3d_registry_image.ps1'
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            $source, [ref]$tokens, [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            foreach ($parseError in $errors) {
+              Write-Host ("PARSER_ERROR_LINE: " + $parseError.Extent.StartLineNumber)
+            }
+            exit 1
+          }
+          Write-Host "RECOVERY_POWERSHELL_PARSE_PASSED"
+      - name: Verify read-only default, local push and strict digest gate are present
+        shell: pwsh
+        run: |
+          $s = Get-Content infrastructure/scripts/recover_k3d_registry_image.ps1 -Raw
+          foreach ($required in @('switch]$Publish', 'if(-not $Publish)', 'images push --local --plain-http', 'RECOVERED_DIGEST_MISMATCH')) {
+            if (-not $s.Contains($required)) { throw "RECOVERY_GUARD_MISSING" }
+          }
+          Write-Host "RECOVERY_GUARDS_PRESENT"

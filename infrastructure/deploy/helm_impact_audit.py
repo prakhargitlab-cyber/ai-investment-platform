@@ -136,7 +136,33 @@ def helm_dry_run(base, *arguments):
                                     timeout=150, check=False)
             if client.returncode == 0:
                 raise Blocked("SERVER_DRY_RUN_FAILED_BUT_CLIENT_SUCCEEDED")
-            raise Blocked("BOTH_SERVER_AND_CLIENT_DRY_RUN_FAILED")
+            # Probe local chart validity separately. This runs Helm lint only,
+        # without a Kubernetes write and without displaying its output.
+        lint_base = [a for a in base if a != "--kubeconfig"]
+        if "/tmp/kubeconfig" in lint_base:
+            lint_base.remove("/tmp/kubeconfig")
+        try:
+            lint = subprocess.run(lint_base + ["lint", "/chart", "--quiet"],
+                                  capture_output=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Blocked("HELM_LINT_DIAGNOSTIC_UNAVAILABLE") from exc
+        if lint.returncode != 0:
+            raise Blocked("HELM_CHART_LINT_FAILED_ALSO")
+        # Distinguish an error from the release-specific reuse-values path
+        # from an independent client-side template rendering error.
+        opts = list(arguments)
+        try:
+            idx = opts.index("--set-string")
+            settings = opts[idx:]
+            check = subprocess.run(lint_base + [
+                "template", "aip-diagnostic", "/chart", "--namespace",
+                NAMESPACE, *settings], capture_output=True, timeout=120,
+                check=False)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            raise Blocked("HELM_TEMPLATE_DIAGNOSTIC_UNAVAILABLE") from exc
+        if check.returncode != 0:
+            raise Blocked("HELM_TEMPLATE_WITH_NEW_OVERRIDES_FAILED")
+        raise Blocked("HELM_TEMPLATE_OK_BUT_UPGRADE_DRY_RUN_FAILED")
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise Blocked("CLIENT_DRY_RUN_DIAGNOSTIC_UNAVAILABLE") from exc
     return result.stdout

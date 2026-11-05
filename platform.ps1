@@ -725,12 +725,14 @@ function Deploy-Helm {
     # through the generic "up" path: the current v1 release contains live
     # Deployment drift and Helm would revert healthy images/env settings.
     # Existing releases must pass the dedicated reviewed reconciliation gate.
-    $existingRelease = helm status $ReleaseName -n $Namespace -o json 2>$null
-    $statusCode = $LASTEXITCODE
-    if ($statusCode -eq 0 -and -not [string]::IsNullOrWhiteSpace(($existingRelease | Out-String).Trim())) {
+    $releaseRows = helm list --all --namespace $Namespace --output json 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($releaseRows | Out-String).Trim())) {
+        throw 'HELM_RELEASE_DISCOVERY_FAILED'
+    }
+    $releaseList = @($releaseRows | ConvertFrom-Json)
+    if (@($releaseList | Where-Object { $_.name -eq $ReleaseName }).Count -gt 0) {
         throw 'EXISTING_HELM_RELEASE_REQUIRES_REVIEWED_RECONCILIATION: do not use platform.ps1 up to upgrade a running release'
     }
-    if ($statusCode -eq 0) { throw 'HELM_EXISTING_RELEASE_STATUS_AMBIGUOUS' }
     # Helm must own image tags and runtime configuration. Patching workloads
     # after the upgrade makes the next three-way merge revert live state.
     # This path is deliberately for fresh or already-reconciled releases only.

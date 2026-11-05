@@ -39,6 +39,7 @@ type report struct {
     Resources int `json:"resources"`
     NonEmpty int `json:"nonempty"`
     RiskNames []string `json:"risk_names"`
+    VerifiedSecretNoop []string `json:"verified_secret_noop"`
     PatchCategories map[string][]string `json:"patch_categories"`
     ResearchPatch bool `json:"research_patch"`
     Blocked bool `json:"blocked"`
@@ -62,57 +63,62 @@ func patchStructure(version, kind string) (interface{}, error) {
 }
 
 func calculatePatch(t triple) (bool, string, error) {
-    changed, name, _, err := calculatePatchDetailed(t)
+    changed, name, _, _, err := calculatePatchDetailed(t)
     return changed, name, err
 }
 
-func calculatePatchDetailed(t triple) (bool, string, []string, error) {
+func calculatePatchDetailed(t triple) (bool, string, []string, bool, error) {
     var o, n, l resource
-    if err := json.Unmarshal(t.Old, &o); err != nil { return false, "", nil, err }
-    if err := json.Unmarshal(t.New, &n); err != nil { return false, "", nil, err }
-    if err := json.Unmarshal(t.Live, &l); err != nil { return false, "", nil, err }
+    if err := json.Unmarshal(t.Old, &o); err != nil { return false, "", nil, false, err }
+    if err := json.Unmarshal(t.New, &n); err != nil { return false, "", nil, false, err }
+    if err := json.Unmarshal(t.Live, &l); err != nil { return false, "", nil, false, err }
     if o.Kind == "" || o.Metadata.Name == "" ||
         o != n || o != l {
-        return false, "", nil, fmt.Errorf("RESOURCE_IDENTITY_MISMATCH")
+        return false, "", nil, false, fmt.Errorf("RESOURCE_IDENTITY_MISMATCH")
     }
     obj, err := patchStructure(o.APIVersion, o.Kind)
-    if err != nil { return false, "", nil, err }
+    if err != nil { return false, "", nil, false, err }
     meta, err := strategicpatch.NewPatchMetaFromStruct(obj)
-    if err != nil { return false, "", nil, err }
+    if err != nil { return false, "", nil, false, err }
     // Helm's built-in object path: CreateThreeWayMergePatch(oldData, newData,
     // currentData, patchMeta, true). This is a calculation, not an API call.
     patch, err := strategicpatch.CreateThreeWayMergePatch(
         t.Old, t.New, t.Live, meta, true)
-    if err != nil { return false, "", nil, err }
+    if err != nil { return false, "", nil, false, err }
     trimmed := bytes.TrimSpace(patch)
-    if len(trimmed) == 0 { return false, "", nil, fmt.Errorf("EMPTY_PATCH_RESPONSE") }
-    if bytes.Equal(trimmed, []byte("{}")) { return false, o.Kind + "/" + o.Metadata.Name, []string{}, nil }
+    if len(trimmed) == 0 { return false, "", nil, false, fmt.Errorf("EMPTY_PATCH_RESPONSE") }
+    if bytes.Equal(trimmed, []byte("{}")) { return false, o.Kind + "/" + o.Metadata.Name, []string{}, false, nil }
     categories, err := classifyPatch(o.Kind, patch)
-    if err != nil { return false, "", nil, err }
-    return true, o.Kind + "/" + o.Metadata.Name, categories, nil
+    if err != nil { return false, "", nil, false, err }
+        verifiedNoop := o.Kind == "Secret" && isVerifiedStringDataRemoval(t, patch)
+    return true, o.Kind + "/" + o.Metadata.Name, categories, verifiedNoop, nil
 }
 
 func perform(r request) (report, error) {
-    out := report{Resources:len(r.Resources), RiskNames:[]string{}, PatchCategories:map[string][]string{},Version:"strategic-three-way-v1"}
+    out := report{Resources:len(r.Resources), RiskNames:[]string{}, VerifiedSecretNoop:[]string{}, PatchCategories:map[string][]string{},Version:"strategic-three-way-v1"}
     if len(r.Resources) != 54 { return out, fmt.Errorf("EXPECTED_54_RESOURCES") }
     seen := map[string]bool{}
     for _, t := range r.Resources {
-        changed, name, categories, err := calculatePatchDetailed(t)
+        changed, name, categories, secretNoop, err := calculatePatchDetailed(t)
         if err != nil { return out, err }
         if seen[name] { return out, fmt.Errorf("DUPLICATE_RESOURCE") }
         seen[name] = true
         if !changed { continue }
         out.NonEmpty++
         out.PatchCategories[name] = categories
-        if name == "Deployment/research-engine" {
+        if secretNoop {
+            out.VerifiedSecretNoop = append(out.VerifiedSecretNoop, name)
+        } else if name == "Deployment/research-engine" {
             out.ResearchPatch = true
         } else {
             out.RiskNames = append(out.RiskNames, name)
         }
     }
     sort.Strings(out.RiskNames)
-    // A nonempty research patch also needs independent field-level review.
-    out.Blocked = out.NonEmpty != 0
+    sort.Strings(out.VerifiedSecretNoop)
+    // Verified write-only Secret stringData removals do not affect stored
+    // bytes. Research patch still requires separate field-level approval.
+    out.Blocked = len(out.RiskNames) != 0 || out.ResearchPatch
     return out, nil
 }
 

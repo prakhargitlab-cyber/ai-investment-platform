@@ -123,6 +123,8 @@ spec:
               value: {{ $.Values.auth.email.smtpFrom | quote }}
             - name: APP_PUBLIC_URL
               value: {{ $.Values.auth.email.publicUrl | quote }}
+            - name: AUTH_ALLOWED_PUBLIC_ORIGINS
+              value: {{ join "," $.Values.apiGateway.cors.allowedOrigins | quote }}
             {{- if and (eq $.Values.auth.email.mode "SMTP") $.Values.auth.email.credentialSecretName }}
             - name: SMTP_USERNAME
               valueFrom:

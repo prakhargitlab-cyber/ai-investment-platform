@@ -21,7 +21,7 @@ def test_fresh_full_stack_uses_helm_image_tag_and_does_not_patch_after_helm():
     start = function_body(PLATFORM, "Start-Platform")
     assert 'global.imageTag=$ImageTag' in deploy
     assert 'workloadOverrides.$($image.Name).imageTagOverride=$ImageTag' in deploy
-    assert 'foreach ($image in Get-ImageDefinitions)' in deploy
+    assert 'foreach ($image in @(Get-ImageDefinitions))' in deploy
     assert 'ibkr.enabled=$ibkrEnabled' in deploy
     assert 'ibkrConnector.replicaCount=$connectorReplicas' in deploy
     assert "--force-conflicts" not in deploy

@@ -126,21 +126,22 @@ def helm_dry_run(base, *arguments):
         for pattern, code in categories:
             if pattern in message:
                 raise Blocked(code)
-        # Next distinguish chart rendering from Kubernetes API failure. Use
-        # the same Helm command with --dry-run=client; this also performs no
-        # mutations. Its output is never displayed or written to disk.
+        # Both probes are read-only; never display or persist their output.
         client_args = [a.replace("--dry-run=server", "--dry-run=client")
                        for a in arguments]
         try:
             client = subprocess.run(base + client_args, capture_output=True,
                                     timeout=150, check=False)
-            if client.returncode == 0:
-                raise Blocked("SERVER_DRY_RUN_FAILED_BUT_CLIENT_SUCCEEDED")
-            # Probe local chart validity separately. This runs Helm lint only,
-        # without a Kubernetes write and without displaying its output.
-        lint_base = [a for a in base if a != "--kubeconfig"]
-        if "/tmp/kubeconfig" in lint_base:
-            lint_base.remove("/tmp/kubeconfig")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Blocked("CLIENT_DRY_RUN_DIAGNOSTIC_UNAVAILABLE") from exc
+        if client.returncode == 0:
+            raise Blocked("SERVER_DRY_RUN_FAILED_BUT_CLIENT_SUCCEEDED")
+
+        # Inspect chart rendering separately, without kubeconfig privileges.
+        # Helm flags must appear after the chart/release arguments.
+        lint_base = list(base)
+        kube_flag = lint_base.index("--kubeconfig")
+        del lint_base[kube_flag:kube_flag + 2]
         try:
             lint = subprocess.run(lint_base + ["lint", "/chart", "--quiet"],
                                   capture_output=True, timeout=120, check=False)
@@ -148,8 +149,7 @@ def helm_dry_run(base, *arguments):
             raise Blocked("HELM_LINT_DIAGNOSTIC_UNAVAILABLE") from exc
         if lint.returncode != 0:
             raise Blocked("HELM_CHART_LINT_FAILED_ALSO")
-        # Distinguish an error from the release-specific reuse-values path
-        # from an independent client-side template rendering error.
+
         opts = list(arguments)
         try:
             idx = opts.index("--set-string")
@@ -163,8 +163,6 @@ def helm_dry_run(base, *arguments):
         if check.returncode != 0:
             raise Blocked("HELM_TEMPLATE_WITH_NEW_OVERRIDES_FAILED")
         raise Blocked("HELM_TEMPLATE_OK_BUT_UPGRADE_DRY_RUN_FAILED")
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise Blocked("CLIENT_DRY_RUN_DIAGNOSTIC_UNAVAILABLE") from exc
     return result.stdout
 
 

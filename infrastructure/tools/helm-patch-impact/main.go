@@ -43,6 +43,7 @@ type report struct {
     VerifiedDeploymentNoop []string `json:"verified_deployment_noop"`
     PatchCategories map[string][]string `json:"patch_categories"`
     ResearchPatch bool `json:"research_patch"`
+    ResearchSpecNoop bool `json:"research_spec_noop"`
     JWTFailureCode string `json:"jwt_failure_code"`
     JWTPatchShape string `json:"jwt_patch_shape"`
     ResearchPatchLabels []string `json:"research_patch_labels"`
@@ -143,7 +144,11 @@ func perform(r request) (report, error) {
         if secretNoop {
             out.VerifiedSecretNoop = append(out.VerifiedSecretNoop, name)
         } else if name == "Deployment/research-engine" {
-            out.ResearchPatch = true
+            if verifiedNoopDeploymentPatch(t, patch) {
+                out.ResearchSpecNoop = true
+            } else {
+                out.ResearchPatch = true
+            }
         } else if o := name; len(o) > len("Deployment/") &&
             o[:len("Deployment/")] == "Deployment/" &&
             verifiedNoopDeploymentPatch(t, patch) {

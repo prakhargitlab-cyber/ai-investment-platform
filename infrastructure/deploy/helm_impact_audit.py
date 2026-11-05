@@ -80,6 +80,26 @@ def helm_dry_run(base, *arguments):
         message = (result.stderr + b"\\n" + result.stdout).lower()
         categories = (
             (b"unknown flag", "UNSUPPORTED_HELM_FLAG"),
+            (b"unknown command", "UNSUPPORTED_HELM_COMMAND"),
+            (b"requires", "HELM_REQUIRED_ARGUMENT_OR_CONFIG_MISSING"),
+            (b"values don't meet", "CHART_VALUES_SCHEMA_REJECTED"),
+            (b"schema(s)", "CHART_VALUES_SCHEMA_REJECTED"),
+            (b"cannot load values", "CHART_VALUES_LOADING_FAILED"),
+            (b"error converting yaml to json", "CHART_YAML_PARSE_FAILED"),
+            (b"failed parsing --set", "HELM_SET_PARSING_FAILED"),
+            (b"failed parsing --set-json", "HELM_SET_JSON_PARSING_FAILED"),
+            (b"error parsing --set", "HELM_SET_PARSING_FAILED"),
+            (b"failed to parse", "HELM_INPUT_PARSING_FAILED"),
+            (b"failed to load", "CHART_LOAD_FAILED"),
+            (b"no chart", "HELM_CHART_NOT_MOUNTED"),
+            (b"does not exist", "HELM_REFERENCED_PATH_OR_RESOURCE_MISSING"),
+            (b"is not a directory", "HELM_CHART_MOUNT_INVALID"),
+            (b"cannot read", "HELM_FILE_NOT_READABLE"),
+            (b"permission denied", "HELM_FILE_OR_API_PERMISSION_DENIED"),
+            (b"error calling include", "CHART_HELPER_TEMPLATE_FAILED"),
+            (b"coalesce.go", "HELM_VALUES_MERGE_WARNING_OR_ERROR"),
+            (b"nil pointer", "CHART_NIL_POINTER"),
+            (b"cannot overwrite table", "HELM_VALUES_TYPE_CONFLICT"),
             (b"unknown shorthand flag", "UNSUPPORTED_HELM_FLAG"),
             (b"yaml parse error", "CHART_YAML_PARSE_FAILED"),
             (b"parse error at", "CHART_TEMPLATE_PARSE_FAILED"),
@@ -106,7 +126,19 @@ def helm_dry_run(base, *arguments):
         for pattern, code in categories:
             if pattern in message:
                 raise Blocked(code)
-        raise Blocked("HELM_DRY_RUN_UNCLASSIFIED_FAILURE")
+        # Next distinguish chart rendering from Kubernetes API failure. Use
+        # the same Helm command with --dry-run=client; this also performs no
+        # mutations. Its output is never displayed or written to disk.
+        client_args = [a.replace("--dry-run=server", "--dry-run=client")
+                       for a in arguments]
+        try:
+            client = subprocess.run(base + client_args, capture_output=True,
+                                    timeout=150, check=False)
+            if client.returncode == 0:
+                raise Blocked("SERVER_DRY_RUN_FAILED_BUT_CLIENT_SUCCEEDED")
+            raise Blocked("BOTH_SERVER_AND_CLIENT_DRY_RUN_FAILED")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Blocked("CLIENT_DRY_RUN_DIAGNOSTIC_UNAVAILABLE") from exc
     return result.stdout
 
 

@@ -114,3 +114,27 @@ The simulation is **not** a Helm post-renderer and cannot be deployed. It
 does not authorize an upgrade, even when only two Deployment patches remain.
 A production-safe Helm post-renderer or equivalently strict release mechanism
 and an end-to-end apply rehearsal are separate required deliverables.
+
+## PR #28: scoped Kubernetes plan when full Helm upgrade is unsafe
+
+The actual full Helm candidate would patch 21 managed resources; an in-memory
+two-service-only Helm manifest simulation still yielded 19 unrelated
+reconciliation patches, even though 52 of 54 desired manifests were unchanged.
+The whole-object live-vs-old comparison includes server-owned metadata, so it
+does not establish 54 meaningful workload drifts.
+
+Use the **read-only** `target_patch_plan.py` to inspect live Helm-owned
+`auth-service` and `api-gateway` fields directly. It checks the existing
+pinned research-engine before issuing any target plan:
+
+```powershell
+& .\.venv\Scripts\python.exe .\.tmp\deploy-pr29\infrastructure\deploy\target_patch_plan.py --spec .\.tmp\deploy-pr29\infrastructure\deploy\releases\auth-reset-pr28.k3d.json
+```
+
+This is neither a Helm upgrade nor a Kubernetes patch. Do not use
+`kubectl set image` or `kubectl set env` without validated compare-and-swap
+resource-version guards and read-back verification. For the immediate
+two-service fix, the forthcoming apply tool must reject arbitrary workloads,
+pin image digests, and avoid modifying unrelated Helm or cluster objects.
+It must document that Helm revision will remain unchanged, with rebase of
+release ownership/state handled separately.

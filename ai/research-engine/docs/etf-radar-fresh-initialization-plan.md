@@ -59,3 +59,18 @@ A leading gap is not re-requested once at least one year is stored (unless a kno
 request/time budgets were raised (3000 requests / 7200 s). Limitation: an existing store that already holds >= 1 year without a known
 listing date will not be extended backwards; a reset + fresh cycle (planned) or a known listing date does that.
 Gap: `listingDate` is currently populated only when the canonical row carries it.
+
+### TER / AUM source investigation (2026-11-05, host-verified from `portal.amfiindia.com` unless stated)
+| Source | Format and identity | Verdict |
+|---|---|---|
+| `portal.amfiindia.com/spages/NAVAll.txt` | text; scheme code + ISIN + fund house + category | in use (exact ISIN) |
+| `portal.amfiindia.com/DownloadSchemeData_Po.aspx?mf=0` | CSV (HTTP 200, 4.1 MB, 16,485 rows, 10 fields; header's last two ISIN columns are merged into one); AMC, scheme code, type, category, ISIN, Launch Date, Closure Date. 375 ETF-category rows, no duplicate codes | **not implemented**. Useful for AMC legal name and a launch date, but "Launch Date" is the NFO opening date and "Closure Date" the NFO close (16 ETF rows have unparseable dates), so it is not fund inception and must not be labelled as such |
+| `portal.amfiindia.com/rssNAV.aspx?fwise=y`, `AUMReport_Rpt_Po.aspx` | AMC-level quarterly AAUM only | not usable for per-ETF AUM |
+| `www.amfiindia.com/api/average-aum-schemewise` (per amfipy source, not host-verified) | scheme name + category + AAUM, **no scheme code/ISIN** | not attachable without name matching |
+| `www.amfiindia.com/api/populate-te-rdata-revised` (TER) | JSON, scheme code, no ISIN | the only identity-bearing TER found, but `www.amfiindia.com` does not respond from the host network (three 20 s timeouts), so no sample/format verification |
+| AMC TER workbooks (e.g. SBI) | scheme names / NSDL codes, no ISIN | identity gap as documented in `sbi-ter-identity-evidence-gate.md` |
+No TER or AUM parser was written. Decision needed: save a real AMFI TER JSON from a browser that can reach `www.amfiindia.com`, or approve an
+"exact AMFI-published scheme-name equality within the same AMC" rule for AMC-published TER/AAUM files.
+
+AMFI failures are bounded: `_acquire_fund_identity` records a per-instrument TECHNICAL_FAILURE attempt for any provider error (timeout,
+HTTP error, malformed file, unexpected exception) and the cycle continues; only lease loss/cancellation propagate.

@@ -343,7 +343,7 @@ async def _acquire_fund_identity(repository, selection, checkpoint, client, now,
         else:
             owned = client or httpx.AsyncClient(timeout=60.0, follow_redirects=False)
             try:
-                response = await owned.get(AMFI_NAVALL_URL, headers={'Accept': 'text/plain'})
+                response = await owned.get(AMFI_NAVALL_URL, headers={'Accept': 'text/plain'}, timeout=60.0)
                 response.raise_for_status()
                 text, published = response.content.decode('utf-8'), None
                 modified = response.headers.get('last-modified')
@@ -355,7 +355,9 @@ async def _acquire_fund_identity(repository, selection, checkpoint, client, now,
                     await owned.aclose()
         index = parse_amfi_navall(text)
         failure = None
-    except (httpx.HTTPError, AmfiNavAllError, UnicodeDecodeError, ValueError) as error:
+    except (CycleOwnershipLost, asyncio.CancelledError):
+        raise  # lease loss / cancellation is never a provider failure
+    except Exception as error:  # any AMFI-side problem is bounded to this source and never blocks the cycle
         index, published, failure = None, None, f'AMFI_NAVALL_{type(error).__name__}'
     fence = (checkpoint.cycle_id, checkpoint.owner_id)
     for item in items:

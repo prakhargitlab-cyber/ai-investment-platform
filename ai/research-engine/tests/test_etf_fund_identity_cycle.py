@@ -26,7 +26,7 @@ def navall(rows):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["ok", "failure"])
+@pytest.mark.parametrize("mode", ["ok", "failure", "garbage", "unexpected"])
 async def test_cycle_persists_exact_isin_fund_house_or_records_failure(repo, mode):
     rows, csv = universe(4)
     def handler(request):
@@ -42,6 +42,10 @@ async def test_cycle_persists_exact_isin_fund_house_or_records_failure(repo, mod
     async def fetcher():
         if mode == "failure":
             raise httpx.ConnectError("down")
+        if mode == "unexpected":
+            raise RuntimeError("provider bug")
+        if mode == "garbage":
+            return "<html>maintenance</html>", None
         return navall(rows[:3]), None          # the 4th ETF is absent from AMFI
     cp = await checkpoint(repo)
     async def history(repository, row, *, now, checkpoint):

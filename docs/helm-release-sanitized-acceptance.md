@@ -177,3 +177,47 @@ A genuine live image or env mismatch remains a blocker until the exact
 three-way merge effect is verified or the drift is explicitly reconciled.
 No live resource mutation, bulk reconciliation or actual Helm revision-2
 upgrade has been performed.
+
+## Kubernetes strategic three-way patch calculator (draft; operator test needed)
+
+A separate Go module `infrastructure/tools/helm-patch-impact` now uses
+`k8s.io/apimachinery/pkg/util/strategicpatch.CreateThreeWayMergePatch`
+with typed Kubernetes patch metadata for the chart's built-in object
+kinds (Deployment, StatefulSet, Service, ServiceAccount, Secret,
+ConfigMap, PVC, Ingress, Role, RoleBinding). The call uses stored Helm
+revision 1, proposed Helm revision 2 and current live JSON with the
+`overwrite=true` argument Helm uses for built-in objects. The tool
+**never sends a patch** to Kubernetes, never prints patch JSON, and
+classifies only resource names with nonempty patches. Any nonempty
+patch, including one on research-engine, blocks release pending human
+review. This calculation is substantially more faithful than the
+previous authored-field heuristic, though it is not a fully integrated
+Helm operation or a test of admission controllers and hooks.
+
+On the trusted Windows workstation, fetch PR #24's latest version
+of these files before running:
+
+- `infrastructure/tools/helm-patch-impact/go.mod`
+- `infrastructure/tools/helm-patch-impact/main.go`
+- `infrastructure/tools/helm-patch-impact/main_test.go`
+- `infrastructure/scripts/build_helm_patch_calculator.ps1`
+- `infrastructure/scripts/helm_k3d_strategic_patch.py`
+
+Use `infrastructure/scripts/build_helm_patch_calculator.ps1` to run
+the pure Go tests and compile a Windows executable under
+`.tmp/helm-patch-impact`. The build container has network access
+for Go module downloads but mounts **source code and .tmp output only**
+(no live kubeconfig, backups, environment or Kubernetes manifest data).
+The locally compiled Windows binary does not require network.
+Then run `infrastructure/scripts/helm_k3d_strategic_patch.py` using
+the existing project Python venv. It obtains the three documents via
+the previously verified read-only internal k3d/Helm calls and passes
+them to the Go calculator through a stdin pipe. The calculator prints
+only counts and safe resource identity labels; raw patch contents,
+Secret data and command stderr are suppressed.
+
+**This is a hard STOP gate, not an automatic reconciliation tool.**
+A nonempty patch to an unrelated workload or protected Secret/StatefulSet
+must be reviewed before any Helm upgrade. This tool does not change
+Helm history, live workloads, PostgreSQL, Secrets, or PVCs; the 71-table
+isolated PostgreSQL restore test is already complete.

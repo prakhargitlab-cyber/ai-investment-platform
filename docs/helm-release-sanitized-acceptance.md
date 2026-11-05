@@ -513,3 +513,32 @@ and actual Helm-style image update patches. This code has **not yet been
 operator-tested**. JWT live-preserving chart change is also awaiting final
 validation. Keep PR #24 draft and the release blocked until the new
 checker runs and all remaining patch effects are independently reviewed.
+
+## Consolidated semantics-first release gate (code committed, operator run pending)
+
+After JWT chart correction, the 17 unrelated Deployment patches and
+research-engine's unapproved env patch are now checked with a more precise
+question than whether the JSON patch is nonempty: **would applying
+the proposed patch change the entire current Deployment spec?**
+
+The Go checker uses Kubernetes' typed strategic merge operation *in
+memory* on the actual live object and requires exact normalized JSON
+equality of before/after `spec`. It permits a spec-no-effect
+classification only for one top-level `spec` patch (no metadata or
+other operations). Any changes to image, env, replicas, pod template,
+rollout strategy or other spec fields still block. The unrelated no-op
+classification is restricted to the exact 17 known Deployments.
+Research-engine receives its own `research_spec_noop` output; scope
+checks must still prove both the running/target image and protected
+research feature flags. This is **not** proof of zero API writes:
+mutating admission webhooks, concurrent updates and Helm release
+metadata remain independent operational concerns.
+
+Tests were added for unchanged versus changed image, env, replica,
+metadata and a computed Kubernetes three-way image patch.
+The Go and Python changes are **not yet tested on the operator's
+environment**. Neither this classification nor the new JWT migration
+authorizes immediate Helm upgrade. Run the consolidated strict gate
+only after obtaining the exact latest chart and calculator sources,
+and review any remaining real changes. Do not perform unrelated
+deployment rollouts or Secret rotations.

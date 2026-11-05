@@ -61,7 +61,8 @@ spec:
       {{- end }}
       containers:
         - name: yahoo-finance-mcp
-          image: {{ include "aip.image" (dict "root" . "image" $config.image "tag" $config.tag) | quote }}
+          {{- $pin := get (default (dict) (index (default (dict) .Values.workloadOverrides) "yahoo-finance-mcp")) "imageTagOverride" }}
+          image: {{ if $pin }}{{ include "aip.imageExplicitTag" (dict "root" . "image" $config.image "tag" $pin) | quote }}{{ else }}{{ include "aip.image" (dict "root" . "image" $config.image "tag" $config.tag) | quote }}{{ end }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy | quote }}
           securityContext:
             {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}

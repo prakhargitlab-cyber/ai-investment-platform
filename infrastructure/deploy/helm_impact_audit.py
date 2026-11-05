@@ -464,6 +464,23 @@ def main():
         print("SCOPED_CANDIDATE_TYPE: SIMULATION_ONLY", flush=True)
         print("UNRELATED_MANIFESTS_PRESERVED_FROM_HELM_REVISION_ONE", flush=True)
         print("NOT_AN_APPLICABLE_HELM_RELEASE", flush=True)
+    # Distinguish a proposed release change from pre-existing drift.
+    # A Helm three-way patch can include live-field reconciliation even
+    # when the recorded old and new manifests are identical.
+    unchanged_intent = {key for key in old if old[key] == proposed[key]}
+    live_drift = {key for key in old if old[key] != live[key]}
+    unintended_desired = {
+        key for key in old
+        if old[key] != proposed[key]
+        and (key[1] + "/" + key[2]) not in ALLOWED
+    }
+    print("INTENT_UNCHANGED_RESOURCE_COUNT:", len(unchanged_intent), flush=True)
+    print("LIVE_DIFFERS_FROM_HELM_REVISION_ONE_COUNT:", len(live_drift),
+          flush=True)
+    print("OUTSIDE_SCOPE_DESIRED_MANIFEST_CHANGES:",
+          len(unintended_desired), flush=True)
+    if unintended_desired and arguments.simulate_scoped_candidate:
+        raise Blocked("SCOPED_SIMULATION_MODIFIED_UNRELATED_MANIFESTS")
     resources = [{"old": old[k], "new": proposed[k], "live": live[k]}
                  for k in sorted(old)]
     phase("STRATEGIC_PATCH_CALCULATION")

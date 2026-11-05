@@ -138,3 +138,32 @@ two-service fix, the forthcoming apply tool must reject arbitrary workloads,
 pin image digests, and avoid modifying unrelated Helm or cluster objects.
 It must document that Helm revision will remain unchanged, with rebase of
 release ownership/state handled separately.
+
+## Guarded direct two-service rollout (local k3d only)
+
+`two_service_release.py` provides read-only preflight by default and an
+**explicit opt-in** JSON Patch path. The controller verifies both image
+OCI index digests in the registry, Helm ownership and revision 1, live
+resourceVersion and container identity, and the currently pinned
+research-engine. It alters only the two approved Deployment container
+image and origin-env entries using atomic JSON Patch `test` operations.
+It then waits for both rollouts and verifies image/env readback, the
+research pin, and unchanged Helm revision 1.
+
+Read-only preflight:
+
+```powershell
+& .\.venv\Scripts\python.exe .\.tmp\deploy-pr29\infrastructure\deploy\two_service_release.py --spec .\.tmp\deploy-pr29\infrastructure\deploy\releases\auth-reset-pr28.k3d.json
+```
+
+Only after an explicit operator approval and successful preflight, opt-in
+writes require **both** `--apply` and `--approve-exact-two-services`.
+A partial rollout is possible if the second patch or readiness check fails;
+the script reports the failure and does not blindly roll back or overwrite a
+concurrent operator. Back up/current-state snapshots and UI acceptance must
+precede treating this as a production-ready general release system.
+
+**This is not a one-command fresh installation, Linux VM installation, or
+Azure AKS deployment.** Those remain separate work requiring environment
+profiles, infrastructure prerequisites, secret injection, managed storage,
+registry authentication, and independent end-to-end acceptance.

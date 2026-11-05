@@ -128,3 +128,38 @@ def test_scheme_without_isin_in_either_source_is_never_enriched():
         "HDFC Asset Management Company Limited,154504,HDFC Nifty Metal ETF,Open Ended,Exchange Traded Funds (ETFs) - Equity ETF,"
         "HDFC Nifty Metal ETF - Growth Option,500,20-Jul-2026,24-Jul-2026,\n")
     assert nav.by_isin == {} and master.by_isin == {} and master.by_code == {}
+
+
+# Independently written golden table: (ISIN per AMFI NAVAll for that exact scheme name, Regular Total TER % published on 2026-11-04).
+GOLDEN = {
+    "SBI BSE 100 ETF": ("INF200KA1572", "0.15"), "SBI BSE PSU BANK ETF": ("INF200KB1712", "0.42"),
+    "SBI BSE Sensex ETF": ("INF200K01VT2", "0.046"), "SBI BSE Sensex Next 50 ETF": ("INF200KA1VQ2", "0.29"),
+    "SBI Gold ETF": ("INF200KA16D8", "0.65"), "SBI Nifty 10 yr Benchmark G-Sec ETF": ("INF200KA1JT1", "0.14"),
+    "SBI NIFTY 1D Rate Liquid ETF - Growth": ("INF200KB1969", "0.29"), "SBI NIFTY 1D Rate Liquid ETF - IDCW": ("INF200KA13Z8", "0.36"),
+    "SBI NIFTY 200 Quality 30 ETF": ("INF200KA1WX6", "0.33"), "SBI Nifty 50 ETF": ("INF200KA1FS1", "0.049"),
+    "SBI Nifty Bank ETF": ("INF200KA1580", "0.22"), "SBI Nifty Consumption ETF": ("INF200KA1X17", "0.31"),
+    "SBI Nifty IT ETF": ("INF200KA1S14", "0.24"), "SBI Nifty Midcap 150 ETF": ("INF200KB1AK8", "0.26"),
+    "SBI Nifty Midcap 150 Momentum 50 ETF": ("INF200KB1AJ0", "0.45"), "SBI Nifty Next 50 ETF": ("INF200KA1598", "0.18"),
+    "SBI Nifty Private Bank ETF": ("INF200KA1S22", "0.18"), "SBI Nifty Smallcap 250 ETF": ("INF200KB1AY9", "0.6"),
+    "SBI Nifty200 Value 30 ETF": ("INF200KB1AX1", "0.55"), "SBI Nifty50 Equal Weight ETF": ("INF200KB1282", "0.21"),
+    "SBI Silver ETF": ("INF200KB1217", "0.41"),
+}
+
+
+def test_all_21_accepted_records_match_the_independent_golden_table(tmp_path):
+    path = build_workbook(tmp_path)
+    names = {o.scheme_code: o.scheme_name for o in build_staged_observations(path)}
+    resolver = build_name_based_code_resolver(names, amc=SBI, navall=NAV, master=MASTER, canonical_by_isin=CANONICAL)
+    store = Store()
+    BoundedSbiTerAdapter(resolver, max_instruments=30).acquire(store, path, source_identity="sbi-ter-sha256:" + REAL["capture"]["sha256"],
+                                                               retrieved_at=NOW)
+    inverse = {v: k for k, v in CANONICAL.items()}
+    got = {}
+    for evidence, attempt in store.saved:
+        (fact,) = evidence
+        name = fact.provenance.source_metadata["scheme_name"]
+        got[name] = (inverse[fact.instrument_id], str(fact.value))
+        assert (fact.unit, fact.as_of_date, fact.metric) == ("percent", date(2026, 11, 4), EtfMetric.EXPENSE_RATIO)
+        assert fact.provenance.source_metadata["nsdl_scheme_code"].startswith("SBIM/O/O/")
+        assert attempt.provider == "SBI_MUTUAL_FUND" and attempt.instrument_id == fact.instrument_id
+    assert got == GOLDEN and len(got) == 21

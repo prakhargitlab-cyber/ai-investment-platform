@@ -27,6 +27,7 @@ from app.sbi_ter_workbook_adapter import AdapterOutcome, BoundedSbiTerAdapter, b
 
 SBI_TER_URL = "https://www.sbimf.com/docs/default-source/ter_allschemes/current-year-ter.xlsx"
 AMFI_SCHEME_MASTER_URL = "https://portal.amfiindia.com/DownloadSchemeData_Po.aspx?mf=0"
+SBI_FUND_HOUSE = "SBI Mutual Fund"            # NAVAll heading: used ONLY to attribute a source failure, never for evidence
 SBI_AMC = "SBI Funds Management Limited"      # AMFI scheme-master AMC name; pairing to NAVAll is verified from data
 MAX_WORKBOOK_BYTES = 8 * 1024 * 1024
 MAX_MASTER_BYTES = 16 * 1024 * 1024
@@ -152,6 +153,22 @@ async def acquire_sbi_ter(repository, selection, checkpoint, client, now, navall
     except (CycleOwnershipLost, asyncio.CancelledError):
         raise
     except Exception as error:  # bounded to this source; the cycle continues without TER
-        diagnostic.update(status="FAILED", failure=f"SBI_TER_{type(error).__name__}:{str(error)[:120]}")
+        failure = f"SBI_TER_{type(error).__name__}:{str(error)[:120]}"
+        diagnostic.update(status="FAILED", failure=failure)
+        # Attribute the failure to canonical ETFs AMFI lists under SBI so the gap is explained per instrument
+        # (TECHNICAL_FAILURE, no value). Without NAVAll nothing identifies them and only the cycle diagnostic remains.
+        for item in items if navall is not None else []:
+            scheme = navall.by_isin.get(item["canonical"]["isin"])
+            if scheme is not None and scheme.fund_house == SBI_FUND_HOUSE:
+                try:
+                    await repository._run_blocking_persistence(
+                        repository.persistence.save_etf_acquisition, [],
+                        EtfAcquisitionAttempt(instrument_id=UUID(str(item["canonical"]["globalInstrumentId"])),
+                            metric=EtfMetric.EXPENSE_RATIO.value, provider=PROVIDER, attempted_at=retrieved,
+                            outcome=EtfAcquisitionOutcome.TECHNICAL_FAILURE, reason=failure[:200]), fence=fence)
+                except CycleOwnershipLost:
+                    raise
+                except Exception:
+                    pass  # diagnostics are best-effort; the cycle diagnostic below still records the failure
     selection.setdefault("sourceDiagnostics", {})[PROVIDER] = diagnostic
     return diagnostic

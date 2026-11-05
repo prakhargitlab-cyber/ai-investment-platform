@@ -658,6 +658,11 @@ research:
   # research_etf_full_universe_execution_enabled in app/settings.py).
   # Must stay false in production.
   etfFullUniverseExecutionEnabled: false
+  # ETF Radar official-source identity/evidence steps inside the normal full cycle (app/settings.py:
+  # research_etf_amfi_navall_enabled, research_etf_sbi_ter_enabled). Off by default; the SBI TER step also runs the
+  # AMFI NAVAll step. Enabling does not start a cycle. See ai/research-engine/docs/etf-radar-pre-deployment-report.md.
+  etfAmfiNavallEnabled: false
+  etfSbiTerEnabled: false
   distributedLock:
     backend: process
     acquireTimeoutSeconds: 30

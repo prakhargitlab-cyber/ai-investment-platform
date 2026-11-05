@@ -177,6 +177,10 @@ spec:
               value: {{ $.Values.research.etfManualExecutionEnabled | default false | quote }}
             - name: AIP_RESEARCH_ETF_FULL_UNIVERSE_EXECUTION_ENABLED
               value: {{ $.Values.research.etfFullUniverseExecutionEnabled | default false | quote }}
+            - name: AIP_RESEARCH_ETF_AMFI_NAVALL_ENABLED
+              value: {{ $.Values.research.etfAmfiNavallEnabled | default false | quote }}
+            - name: AIP_RESEARCH_ETF_SBI_TER_ENABLED
+              value: {{ $.Values.research.etfSbiTerEnabled | default false | quote }}
             - name: AIP_RESEARCH_DATABASE_BACKEND
               value: {{ $.Values.research.persistence.databaseBackend | quote }}
             - name: AIP_RESEARCH_DATABASE_HOST

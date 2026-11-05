@@ -36,10 +36,11 @@ def workbook(entries):
     out = BytesIO(); wb.save(out); return out.getvalue()
 
 
-async def run(repo, mode, monkeypatch):
+async def run(repo, mode, monkeypatch, mutate=lambda nav, master: (nav, master)):
     monkeypatch.setattr(acq, "SBI_AMC", AMC)
+    monkeypatch.setattr(acq, "SBI_FUND_HOUSE", "Test Mutual Fund")
     rows, csv = universe(4)
-    nav, master = amfi_files(rows)
+    nav, master = mutate(*amfi_files(rows))
     xlsx = workbook([("N0", "Fixture ETF 0", 0.07),             # exact -> persisted
                      ("N1", "Fixture ETF 1 ", 0.05),            # trailing space only -> persisted
                      ("N2", "Fixture ETF 22", 0.5),             # no exact AMFI name -> never matched
@@ -118,3 +119,66 @@ async def test_ok_run_diagnostic_and_unavailable_reasons(repo, monkeypatch):
     rows, cp = await run(repo, "ok", monkeypatch)
     assert diag(repo, cp)["status"] == "OK" and diag(repo, cp)["ingested"] == 2 and diag(repo, cp)["withheld"] == 1
 
+
+
+NOW_AFTER = datetime(2026, 11, 6, 12, tzinfo=__import__("datetime").timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_missing_or_withheld_ter_never_counts_as_available_or_ready(repo, monkeypatch):
+    from app.etf_readiness import evaluate_etf_readiness
+    from app.etf_screening import screening_evidence
+    rows, _ = await run(repo, "ok", monkeypatch)
+    for n, row in enumerate(rows):
+        key = UUID(row["globalInstrumentId"])
+        reqs, _summary = evaluate_etf_readiness(repo.persistence, key, now=NOW_AFTER)
+        status = {r.requirement: str(r.status) for r in reqs}
+        selected = {m.value: (repo.persistence.etf_facts(key, m) or [None])[0]
+                    for m in (EtfMetric.EXPENSE_RATIO, EtfMetric.AUM, EtfMetric.TRACKING_ERROR, EtfMetric.TRACKING_DIFFERENCE)}
+        selected = {k: v for k, v in selected.items() if v is not None}
+        metrics = screening_evidence(repo.persistence, key, selected, {}, now=NOW_AFTER)["screening_metrics"]
+        if n < 2:                      # accepted: exact name + both AMFI files + canonical
+            assert status["EXPENSE_RATIO"] == "READY_FRESH" and metrics["expense_ratio"]["quality"] == "VALID"
+        else:                          # withheld (7.9%) or unmatched: missing, with no value at all
+            assert status["EXPENSE_RATIO"] == "MISSING"
+            assert metrics["expense_ratio"] == {"value": None, "unit": "PERCENT_PA", "quality": "UNAVAILABLE",
+                                                "reason": "NO_PERSISTED_METRIC_EVIDENCE"}
+        for name in ("aum", "tracking_error", "tracking_difference"):          # never acquired, never invented
+            assert metrics[name]["quality"] == "UNAVAILABLE" and metrics[name]["value"] is None
+        assert status["AUM"] == "MISSING"
+
+
+def _drop_row_from_navall(nav, master):
+    return nav.replace(nav.split("\r\n")[6] + "\r\n", ""), master          # row 0 only in the scheme master
+
+
+def _other_amc(nav, master):
+    return nav, master.replace(AMC, "Some Other AMC Limited")
+
+
+def _different_isins(nav, master):
+    # AMFI publishes both files consistently with ISINs that no canonical NSE ETF has
+    for n in range(1, 5):
+        nav = nav.replace(f"IN{n:010d}", f"INZ{n:09d}"[:11] + "0")
+        master = master.replace(f"IN{n:010d}", f"INZ{n:09d}"[:11] + "0")
+    return nav, master
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutate,expected", [
+    (_drop_row_from_navall, [0, 1, 0, 0]),   # ISIN confirmed in one AMFI file only -> rejected even with exact name
+    (_other_amc, [0, 0, 0, 0]),             # AMC identity not independently verified -> nothing
+    (_different_isins, [0, 0, 0, 0]),       # exact names, but no canonical NSE ETF owns those ISINs -> nothing
+])
+async def test_canonical_exact_isin_gate_is_enforced_in_the_running_cycle(repo, monkeypatch, mutate, expected):
+    rows, _ = await run(repo, "ok", monkeypatch, mutate)
+    assert [len(x) for x in facts(repo, rows)] == expected
+
+
+@pytest.mark.asyncio
+async def test_workbook_failure_is_durable_per_instrument_and_in_the_cycle_record(repo, monkeypatch):
+    rows, cp = await run(repo, "workbook_down", monkeypatch)
+    assert all(r == [("TECHNICAL_FAILURE", "SBI_TER_ConnectError:down")] for r in reasons(repo, rows))
+    d = diag(repo, cp)
+    assert d["status"] == "FAILED" and d["failure"] == "SBI_TER_ConnectError:down"
+    assert all(x == [] for x in facts(repo, rows))

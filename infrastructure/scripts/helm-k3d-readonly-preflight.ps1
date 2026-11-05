@@ -32,7 +32,7 @@ try {
         throw "UNEXPECTED_INTERNAL_KUBERNETES_ENDPOINT"
     }
     New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
-    [IO.File]::WriteAllText($config, $configText, (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($config, $configText, ([System.Text.UTF8Encoding]::new($false)))
     $configText = $null
     $lines = $null
 

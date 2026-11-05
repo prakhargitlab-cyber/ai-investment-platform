@@ -43,6 +43,7 @@ type report struct {
     PatchCategories map[string][]string `json:"patch_categories"`
     ResearchPatch bool `json:"research_patch"`
     JWTFailureCode string `json:"jwt_failure_code"`
+    JWTPatchShape string `json:"jwt_patch_shape"`
     ResearchPatchLabels []string `json:"research_patch_labels"`
     Blocked bool `json:"blocked"`
     Version string `json:"version"`
@@ -114,6 +115,7 @@ func perform(r request) (report, error) {
         out.NonEmpty++
         out.PatchCategories[name] = categories
         if name == "Secret/aip-auth-jwt" {
+            out.JWTPatchShape = secretPatchShape(patch)
             out.JWTFailureCode = secretNoopFailure(t, patch)
             if (out.JWTFailureCode == "VERIFIED") != secretNoop {
                 return out, fmt.Errorf("SECRET_AUDIT_INCONSISTENT")

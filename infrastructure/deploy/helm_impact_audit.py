@@ -120,12 +120,60 @@ def helm_dry_run(base, *arguments):
             (b"invalid type", "HELM_VALUE_TYPE_INVALID"),
             (b"invalid character", "HELM_INPUT_JSON_INVALID"),
             (b"failed to create", "DRY_RUN_RESOURCE_VALIDATION_FAILED"),
+            (b"cannot patch", "HELM_PATCH_REJECTED"),
+            (b"cannot update", "HELM_RESOURCE_UPDATE_REJECTED"),
+            (b"cannot be imported", "HELM_RESOURCE_OWNERSHIP_CONFLICT"),
+            (b"invalid ownership metadata", "HELM_RESOURCE_OWNERSHIP_CONFLICT"),
+            (b"another operation", "HELM_RELEASE_OPERATION_IN_PROGRESS"),
+            (b"cannot reuse", "HELM_RELEASE_NAME_CONFLICT"),
+            (b"cannot re-use", "HELM_RELEASE_NAME_CONFLICT"),
+            (b"resource mapping not found", "HELM_RESOURCE_API_MAPPING_MISSING"),
+            (b"no matches for kind", "HELM_RESOURCE_API_MAPPING_MISSING"),
+            (b"unable to recognize", "HELM_RESOURCE_API_MAPPING_MISSING"),
+            (b"cannot unmarshal", "HELM_VALUES_OR_MANIFEST_UNMARSHAL_FAILED"),
+            (b"failed to unmarshal", "HELM_VALUES_OR_MANIFEST_UNMARSHAL_FAILED"),
+            (b"failed to replace object", "HELM_PATCH_REJECTED"),
+            (b"failed to get", "HELM_GET_RESOURCE_FAILED"),
+            (b"unable to continue with update", "HELM_UPGRADE_OWNERSHIP_OR_CONFLICT"),
+            (b"pre-upgrade hooks failed", "HELM_PRE_UPGRADE_HOOK_FAILED"),
+            (b"post-upgrade hooks failed", "HELM_POST_UPGRADE_HOOK_FAILED"),
+            (b"lookup failed", "HELM_LOOKUP_FAILED"),
+            (b"unable to lookup", "HELM_LOOKUP_FAILED"),
+            (b"not a valid chart", "HELM_INVALID_CHART"),
+            (b"chart metadata", "HELM_CHART_METADATA_INVALID"),
+            (b"invalid manifest", "HELM_MANIFEST_INVALID"),
+            (b"release content", "HELM_RELEASE_CONTENT_INVALID"),
+            (b"cannot restore", "HELM_RELEASE_RESTORE_FAILED"),
+            (b"has been deleted", "HELM_RELEASE_REMOVED"),
+            (b"malformed", "HELM_INPUT_MALFORMED"),
             (b"error validating", "DRY_RUN_RESOURCE_VALIDATION_FAILED"),
             (b"unable to build kubernetes objects", "DRY_RUN_RESOURCE_VALIDATION_FAILED"),
         )
         for pattern, code in categories:
             if pattern in message:
                 raise Blocked(code)
+        # If Helm's phrasing is unknown, return only approved vocabulary
+        # present in the diagnostic, never the raw error or identifiers.
+        import re
+        whitelist = {
+            "upgrade", "failed", "error", "resource", "release", "client",
+            "server", "patch", "create", "update", "apply", "values", "chart",
+            "template", "invalid", "yaml", "json", "type", "unmarshal",
+            "conflict", "existing", "exists", "owner", "ownership", "metadata",
+            "missing", "required", "secret", "configmap", "deployment",
+            "statefulset", "persistentvolumeclaim", "service", "forbidden",
+            "unauthorized", "permission", "denied", "version", "api", "kind",
+            "not", "found", "cannot", "unable", "nil", "map", "string", "int",
+            "object", "expect", "expected", "already", "in", "progress",
+            "admission", "webhook", "validation", "schema", "parse",
+            "reconcile", "timeout", "connection", "refused", "operation",
+        }
+        words = [w.decode("ascii") for w in re.findall(rb"[a-z]{2,28}", message)
+                 if w.decode("ascii") in whitelist]
+        # Repeated words and unrecognized tokens add no useful evidence.
+        unique = list(dict.fromkeys(words))[:20]
+        print("HELM_FAILURE_SAFE_KEYWORDS:", ",".join(unique) or "none",
+              flush=True)
         # Both probes are read-only; never display or persist their output.
         client_args = [a.replace("--dry-run=server", "--dry-run=client")
                        for a in arguments]

@@ -61,6 +61,23 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(guard.Blocked):
             guard.validate_spec(invalid)
 
+    def test_helm_upgrade_keeps_dev_manual_radar_policy(self):
+        """Regression: old release values must not defeat newer LOCAL guards."""
+        chart = Path(__file__).parents[1] / "helm" / "ai-investment-platform"
+        defaults = (chart / "values-dev.yaml").read_text(encoding="utf-8")
+        audit = Path(__file__).with_name("helm_impact_audit.py").read_text(encoding="utf-8")
+        for flag in (
+            "equityManualExecutionEnabled",
+            "etfManualExecutionEnabled",
+            "etfFullUniverseExecutionEnabled",
+        ):
+            self.assertIn(flag + ": true", defaults)
+            self.assertIn('"research.' + flag + '=true"', audit)
+        self.assertIn('"--reuse-values"', audit)
+        self.assertIn('"--dry-run=server"', audit)
+        self.assertIn("NO_DEPLOYMENT_AUTHORIZATION", audit)
+
+
 
 if __name__ == "__main__":
     unittest.main()

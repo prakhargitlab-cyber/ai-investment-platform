@@ -28,3 +28,11 @@ The first run verified 54/54 resource identities, exact DEV Postgres/SearXNG cre
 ## Diagnostic revision after second operator run
 
 The explicit DEV profile did **not** change the 105-field result (4 pure tests passed, all 54 identities and two DEV credentials matched). The values-file hypothesis is therefore not supported by this observation. The script now obtains the **stored Helm revision-1 manifest** via a read-only internal Helm call and compares three states: stored revision 1, live Kubernetes, and proposed revision 2. It reports only the number of changed field paths and affected resource identifiers for each pair; Secret bodies remain memory-only. The Helm revision-2 acceptance **continues to fail closed** on ANY proposed-vs-live difference. This triage distinguishes old Helm drift from changes introduced by the proposed upgrade, rather than assuming that loading a values file fixes the problem. Do not deploy or merge on the basis of the 105-field result.
+
+## Three-way operator result and conservative baseline
+
+Observed: 54/54 resource identities, credential equality passed, 110 v1-to-live field differences, 6 proposed-v2-to-v1 differences affecting portfolio-service and research-engine, and 105 proposed-v2-to-live field differences. No deployment. This establishes substantial pre-existing drift, but it does **not** establish how Helm would construct and apply its three-way patch; direct manifest comparison is deliberately more conservative than Helm's patch calculation.
+
+The experiment with adding values-dev.yaml did not reduce the 105 differences and introduced a portfolio-service change relative to stored v1. The acceptance script has reverted that addition and now bases the upgrade dry-run on stored release values with only the explicitly approved research flags and image tag overrides. It prints **only field paths** for changes relative to v1, in addition to prior counts. Those paths must be reviewed; any unexpected portfolio-service change blocks release.
+
+**Do not automatically reconcile historical drift by forcing live manifests back to stored v1.** The next release gate needs an audited Helm three-way patch / server dry-run impact review to determine which live fields would actually be changed. No upgrade is approved by this diagnostic.

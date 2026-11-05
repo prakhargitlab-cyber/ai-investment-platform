@@ -48,3 +48,8 @@ def test_each_app_template_supports_explicit_per_service_image_pin():
         data = (CHART / template).read_text(encoding="utf-8")
         assert '"imageTagOverride"' in data
         assert 'aip.imageExplicitTag' in data
+
+
+def test_hikari_max_lifetime_is_numeric_in_chart():
+    source = (CHART / "java-services.yaml").read_text(encoding="utf-8")
+    assert 'printf "%.0f" (float64 $.Values.database.pool.maxLifetimeMs)' in source

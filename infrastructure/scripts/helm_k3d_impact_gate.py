@@ -65,10 +65,16 @@ def load_manifests():
                 "--kubeconfig", "/tmp/kubeconfig"]
         original = base.call(helm + ["get", "manifest", base.RELEASE,
                                     "--namespace", base.NAMESPACE, "--revision", "1"])
+        # Docker flags must precede --entrypoint. Inserting at helm[:8]
+        # would have placed --mount after --entrypoint and broken docker run.
+        helm_with_chart = [
+            "docker", "run", "--rm", "--network", "container:" + base.SERVER,
+            "--mount", "type=bind,source=" + str(cfg) + ",target=/tmp/kubeconfig,readonly",
+            "--mount", "type=bind,source=" + str(base.CHART) + ",target=/chart,readonly",
+            "--entrypoint", "helm", base.IMAGE, "--kubeconfig", "/tmp/kubeconfig"
+        ]
         desired_output = base.call(
-            helm[:8] +
-            ["--mount", "type=bind,source=" + str(base.CHART) + ",target=/chart,readonly"] +
-            helm[8:] +
+            helm_with_chart +
             ["upgrade", base.RELEASE, "/chart", "--namespace", base.NAMESPACE,
              "--reuse-values", "--dry-run=server",
              "--set", "research.opportunityRecoveryPaused=true",

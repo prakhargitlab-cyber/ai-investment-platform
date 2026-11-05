@@ -43,3 +43,69 @@ def test_upgrade_does_not_add_undeclared_dev_profile():
     source = (HERE / "helm_k3d_acceptance.py").read_text(encoding="utf-8")
     assert '"-f", "/chart/values-dev.yaml"' not in source
     assert '"--reuse-values", "--dry-run=server"' in source
+
+
+def synthetic_three_way():
+    from copy import deepcopy
+    key = ("apps/v1", "Deployment", "research-engine")
+    env = ([{"name": x, "value": "false"} for x in mod.APPROVED_FLAGS]
+           + [{"name": x, "value": v} for x, v in mod.PROTECTED_FLAGS.items()])
+    old = {
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "research-engine"},
+        "spec": {"template": {"spec": {
+            "containers": [{"name": "research-engine", "image": "old-image", "env": env}],
+            "initContainers": [{"name": "wait-for-research-migrations", "image": "old-image"}]
+        }}}
+    }
+    new = deepcopy(old)
+    new_pod = new["spec"]["template"]["spec"]
+    new_pod["containers"][0]["image"] = mod.EXPECTED_IMAGE
+    new_pod["initContainers"][0]["image"] = mod.EXPECTED_IMAGE
+    for item in new_pod["containers"][0]["env"]:
+        if item["name"] in mod.APPROVED_FLAGS:
+            item["value"] = "true"
+    live = deepcopy(new)
+    live["spec"]["template"]["spec"]["containers"][0]["env"].append({
+        "name": "EXTRA_LIVE_ONLY", "value": "historical-drift"
+    })
+    return {key: old}, {key: new}, {key: live}
+
+
+def test_approved_research_fields_allow_unrelated_live_drift():
+    old, new, live = synthetic_three_way()
+    assert mod.only_approved_revision_changes(old, new, live)
+
+
+def test_rejects_unrelated_desired_workload_change():
+    old, new, live = synthetic_three_way()
+    new[next(iter(new))]["spec"]["replicas"] = 3
+    import pytest
+    with pytest.raises(mod.Blocked, match="UNAPPROVED_STORED_RELEASE_CHANGE"):
+        mod.only_approved_revision_changes(old, new, live)
+
+
+def test_rejects_unapproved_live_research_image():
+    old, new, live = synthetic_three_way()
+    live[next(iter(live))]["spec"]["template"]["spec"]["containers"][0]["image"] = "wrong-tag"
+    import pytest
+    with pytest.raises(mod.Blocked, match="LIVE_RESEARCH_IMAGE_MISMATCH"):
+        mod.only_approved_revision_changes(old, new, live)
+
+
+def test_rejects_wrong_live_execution_gate():
+    old, new, live = synthetic_three_way()
+    live[next(iter(live))]["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"] = "false"
+    import pytest
+    with pytest.raises(mod.Blocked, match="PROTECTED_FLAG_VALUE_MISMATCH"):
+        mod.only_approved_revision_changes(old, new, live)
+
+
+def test_rejects_extra_desired_resource():
+    old, new, live = synthetic_three_way()
+    new[("v1", "ConfigMap", "unreviewed")] = {
+        "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "unreviewed"}
+    }
+    import pytest
+    with pytest.raises(mod.Blocked, match="RESOURCE_IDENTITY_CHANGE"):
+        mod.only_approved_revision_changes(old, new, live)

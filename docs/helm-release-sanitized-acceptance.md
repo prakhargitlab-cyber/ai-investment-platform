@@ -416,3 +416,31 @@ reconciliation commit for each affected field, followed by one final exact
 patch run. There is no safe blanket automatic fix based only on category
 labels because they intentionally omit the values and operations necessary
 to authorize the changes.
+
+## Single consolidated, non-applicable reconciliation feasibility preview
+
+Added `infrastructure/scripts/helm_k3d_reconciliation_preview.py` and
+synthetic tests. **This is an executable in-memory feasibility experiment,
+not a Helm override, post-renderer, approved values migration, or
+production patch.** It obtains the same 54 old/new/live objects as the
+previous working read-only gate, hypothetically copies only the live
+`spec` fields of the exact 17 listed unrelated Deployments into the
+candidate manifest **in process memory**, then sends all 54 triples to
+the existing Kubernetes strategic merge calculator in an isolated Linux
+container. It prints only total counts (no config, Secret, image, env
+values or patch JSON), and ALWAYS exits nonzero. The original candidate,
+JWT Secret and research-engine remain unchanged; there is no Helm upgrade
+or Kubernetes write path. This allows us to determine whether preserving
+the existing live Deployment specs would even avoid those 17 patches,
+before engineering reviewed individual chart values. It does **not**
+authorize copying those specs into a stored release, and may include
+Kubernetes defaulted fields that would be unsuitable for a real chart.
+The preview script has not been run on the operator's live cluster.
+
+The active Go build now has persistent module/build caches under ignored
+`.tmp`. The next proper review must reconcile exact deployment
+settings in authored chart values and solve the JWT write operation,
+while preserving credentials entirely outside Git and command-line
+arguments. Only then use the original strict 54-resource gate and
+obtain explicit approval for an upgrade. Do not run this preview as an
+upgrade pipeline step; its output is an experiment only.

@@ -565,3 +565,51 @@ needed to know the exact paths. This is the minimum missing input
 for reviewable per-template Helm reconciliation, not an upgrade.
 
 Helm revision 1 remains in place and revision 2 stays blocked.
+
+## Root-cause correction for future local installs and AKS releases
+
+**Confirmed root cause from repository code:** `platform.ps1 up` originally
+performed `helm upgrade --install`, then immediately:
+- applied `Set-ImmutableDeploymentImages` via `kubectl patch deployment`
+  (images and a pod annotation);
+- called `Apply-LocalRuntimeNormalization`, which used `kubectl set env`
+  for DB-backed Java services, patched Kafka startup probe, set broker
+  `IBKR_ENABLED`, and scaled `ibkr-connector`.
+
+Those operations created Deployment specification drift that Helm's stored
+release manifest never recorded. Using `--field-manager=helm` on kubectl
+did **not** modify Helm's stored release.
+
+**Committed structural remediation (not an upgrade):**
+- Fresh full-stack `platform.ps1 up` now sends the immutable build tag to
+  Helm as `global.imageTag` and explicitly sets the IBKR enablement and
+  connector replica count in Helm, instead of patching those fields afterward.
+- The full-stack path no longer invokes post-upgrade image patching and
+  runtime normalization, and no longer uses `--force-conflicts`.
+- The LOCAL Kafka startup period is chart-owned; the retained optional
+  normalization function now **verifies** Kafka's chart-managed probe
+  instead of patching it.
+- Added a per-workload immutable image tag override to AI services,
+  frontend and IBKR connector, complementing the already existing Java
+  override. The default image behavior is unchanged absent an explicit pin.
+- **Fail-closed:** `platform.ps1 up` now refuses to upgrade **any existing**
+  Helm release. Existing-release upgrades must use a separately reviewed
+  migration procedure; a generic full-stack restart/build must not silently
+  reconcile the 17 drifted workloads.
+- Added static source regression checks for these invariants.
+
+**Remaining before existing local revision 2 can deploy:** a one-time
+state reconciliation of Helm's stored revision 1 against the approved
+running image/env settings for 17 workloads and research-engine. This
+change intentionally does not automate copying live defaulted specs or
+secret-bearing env fields into a new Helm release. The component-specific
+`platform.ps1 deploy` paths still perform imperative image updates and
+must be migrated to Helm-managed per-workload image pins before declaring
+the overall toolchain Helm-only. No chart lint, operator cluster run,
+Helm upgrade, or UI verification has been performed for this new code.
+
+**AKS policy:** Kubernetes workloads should be changed through Helm
+values/release changes, not out-of-band `kubectl set env` or
+`kubectl patch` commands. Azure installations start with clean,
+environment-specific values; this LOCAL drift should not be adopted into
+AKS. Require exact live Helm upgrade impact review and rollback plans.

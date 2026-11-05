@@ -66,3 +66,12 @@ def test_statefulset_drift_blocks():
     assert ("STATEFULSET_LIVE_DIFFERS_FROM_TARGET", "StatefulSet", "postgres") in (
         mod.critical_live_drift(old, desired, live)
     )
+
+
+def test_helm_docker_chart_mount_is_before_entrypoint():
+    source = (HERE / "helm_k3d_impact_gate.py").read_text(encoding="utf-8")
+    assert 'helm[:8]' not in source.replace('helm[:8]\n', '') or (
+        '# would have placed --mount after --entrypoint' in source
+    )
+    assert '"--mount", "type=bind,source=" + str(base.CHART)' in source
+    assert '"--entrypoint", "helm", base.IMAGE' in source

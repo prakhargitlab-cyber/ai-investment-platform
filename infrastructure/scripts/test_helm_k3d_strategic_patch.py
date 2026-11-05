@@ -23,3 +23,25 @@ def test_never_echo_runtime_error_with_extra_arguments():
     assert patch.safe_failure_code(
         RuntimeError("INVALID_RESEARCH_AUDIT_LABELS", "sensitive context")
     ) == "UNCLASSIFIED_READ_ONLY_CHECK_FAILURE"
+
+
+def test_safe_diagnostic_kinds_do_not_echo_exception_message():
+    import json
+    import subprocess
+
+    assert patch.safe_failure_kind(KeyError("POSTGRES_PASSWORD=secret")) == "KEY_ERROR"
+    assert patch.safe_failure_kind(TypeError("secret-value")) == "TYPE_ERROR"
+    assert patch.safe_failure_kind(
+        json.JSONDecodeError("private data", "sensitive json", 1)
+    ) == "JSON_DECODE_ERROR"
+    assert patch.safe_failure_kind(
+        subprocess.TimeoutExpired(["private", "cli"], 1)
+    ) == "SUBPROCESS_TIMEOUT"
+
+
+def test_diagnostic_phase_is_allowlisted():
+    patch.phase("EXECUTE_CALCULATOR")
+    assert patch.PHASE == "EXECUTE_CALCULATOR"
+    import pytest
+    with pytest.raises(RuntimeError, match="INVALID_DIAGNOSTIC_PHASE"):
+        patch.phase("secret=never-print")

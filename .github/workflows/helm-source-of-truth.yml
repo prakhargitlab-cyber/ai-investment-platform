@@ -1,0 +1,49 @@
+name: Helm source-of-truth validation
+
+on:
+  push:
+    branches:
+      - fix/helm-release-sanitized-acceptance
+  pull_request:
+    paths:
+      - 'infrastructure/helm/**'
+      - 'infrastructure/scripts/**'
+      - 'platform.ps1'
+      - '.github/workflows/helm-source-of-truth.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  helm-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-helm@v4
+        with:
+          version: 'v3.17.3'
+      - name: Install offline-contract test dependencies
+        run: python -m pip install --disable-pip-version-check pytest PyYAML
+      - name: Python source/regression tests (no cluster)
+        run: |
+          python -m pytest -q \
+            infrastructure/scripts/test_helm_managed_deployment_sources.py \
+            infrastructure/scripts/test_helm_k3d_image_rebaseline.py \
+            infrastructure/scripts/test_helm_jwt_upgrade_guard.py \
+            infrastructure/scripts/test_helm_k3d_strategic_patch.py
+      - name: Helm lint LOCAL chart
+        run: helm lint infrastructure/helm/ai-investment-platform --values infrastructure/helm/ai-investment-platform/values-dev.yaml
+      - name: Render clean LOCAL release without cluster writes
+        run: |
+          helm template ai-investment-platform infrastructure/helm/ai-investment-platform \
+            --namespace ai-investment \
+            --values infrastructure/helm/ai-investment-platform/values-dev.yaml \
+            --set-string global.imageTag=ci-validation \
+            --set ibkr.enabled=false \
+            --set ibkrConnector.replicaCount=0 \
+            >/dev/null

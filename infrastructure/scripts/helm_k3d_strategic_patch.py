@@ -51,6 +51,15 @@ def main():
         raise RuntimeError("INVALID_PATCH_RISK_NAMES")
     if any(name not in {k[1] + "/" + k[2] for k in keys} for name in names):
         raise RuntimeError("UNKNOWN_PATCH_RISK_RESOURCE")
+    safe_secrets = result.get("verified_secret_noop")
+    if not isinstance(safe_secrets, list) or len(safe_secrets) != len(set(safe_secrets)):
+        raise RuntimeError("INVALID_VERIFIED_SECRET_REPORT")
+    if any(not isinstance(n, str) or n not in {
+        "Secret/aip-auth-jwt", "Secret/dev-postgres", "Secret/dev-searxng"
+    } for n in safe_secrets):
+        raise RuntimeError("UNKNOWN_VERIFIED_SECRET")
+    if set(safe_secrets) & set(names):
+        raise RuntimeError("VERIFIED_SECRET_STILL_IN_RISK_LIST")
     if result.get("blocked") is not (proc.returncode == 3):
         raise RuntimeError("PATCH_RESULT_EXIT_MISMATCH")
 
@@ -67,7 +76,7 @@ def main():
     reported = {key for key, vals in categories.items()
                 if isinstance(key, str) and isinstance(vals, list)}
     if len(reported) != result.get("nonempty") or (
-        reported != set(names) | ({"Deployment/research-engine"}
+        reported != set(names) | set(safe_secrets) | ({"Deployment/research-engine"}
                                   if result.get("research_patch") else set())
     ):
         raise RuntimeError("PATCH_CATEGORY_RESOURCE_SET_MISMATCH")
@@ -77,12 +86,16 @@ def main():
     print("KUBERNETES_STRATEGIC_PATCH_RESOURCES:", result["resources"])
     print("NONEMPTY_THREE_WAY_PATCHES:", result.get("nonempty"))
     print("RESEARCH_ENGINE_PATCH_NONEMPTY:", result.get("research_patch"))
-    print("UNRELATED_RESOURCE_PATCHES:", len(names))
+    print("UNRESOLVED_UNRELATED_RESOURCE_PATCHES:", len(names))
+    print("VERIFIED_STRINGDATA_ONLY_SECRET_NOOPS:", len(safe_secrets))
+    for name in sorted(safe_secrets):
+        print("VERIFIED_SECRET_NOOP:", name)
     for name in names:
         print("PATCH_RESOURCE:", name)
     for name in sorted(categories):
         print("PATCH_CATEGORY:", name, ",".join(sorted(set(categories[name]))))
     print("PATCH_BYTES_AND_SECRET_VALUES_NOT_DISPLAYED")
+    print("SECRET_NOOP_MEANS_WRITE_ONLY_STRINGDATA_REMOVAL_AND_BYTE_EQUALITY")
     print("NO_KUBERNETES_WRITES_PERFORMED")
     if proc.returncode == 3:
         print("UPGRADE_REMAINS_BLOCKED: NONEMPTY_PATCH_REQUIRES_REVIEW")

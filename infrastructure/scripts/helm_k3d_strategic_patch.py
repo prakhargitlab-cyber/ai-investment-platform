@@ -193,6 +193,18 @@ def safe_failure_code(exc):
     return "UNCLASSIFIED_READ_ONLY_CHECK_FAILURE"
 
 
+def safe_windows_error_code(exc):
+    # Only numeric OS error codes. Never print exception text or arguments.
+    if type(exc) is OSError:
+        winerror = getattr(exc, "winerror", None)
+        if type(winerror) is int and 0 <= winerror <= 65535:
+            return "WINERROR_" + str(winerror)
+        errno = getattr(exc, "errno", None)
+        if type(errno) is int and 0 <= errno <= 65535:
+            return "ERRNO_" + str(errno)
+    return "NOT_AVAILABLE"
+
+
 def safe_failure_kind(exc):
     # No exception messages or repr(), no arbitrary types or custom names.
     allowed = {
@@ -223,4 +235,6 @@ if __name__ == "__main__":
         print("PATCH_IMPACT_CHECK_BLOCKED:", safe_failure_code(exc))
         print("PATCH_DIAGNOSTIC_PHASE:", PHASE)
         print("PATCH_DIAGNOSTIC_KIND:", safe_failure_kind(exc))
+        if safe_failure_kind(exc) == "OS_ERROR":
+            print("PATCH_OS_ERROR_CODE:", safe_windows_error_code(exc))
         sys.exit(2)

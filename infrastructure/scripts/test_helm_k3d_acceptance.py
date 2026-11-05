@@ -37,3 +37,8 @@ def test_kubernetes_generated_fields_are_ignored_but_intended_change_is_not():
     differences.clear()
     mod.compare(mod.selected(requested), mod.selected(actual), "Deployment/example", differences)
     assert differences == ["Deployment/example.spec.replicas"]
+
+
+def test_dev_profile_is_explicitly_pinned_in_render_command():
+    source = (HERE / "helm_k3d_acceptance.py").read_text(encoding="utf-8")
+    assert '"-f", "/chart/values-dev.yaml"' in source

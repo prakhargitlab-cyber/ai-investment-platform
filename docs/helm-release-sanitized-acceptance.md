@@ -20,3 +20,7 @@ Security: The tool reads live Kubernetes Secrets and temporarily mounts the exis
 The tool deliberately fails closed on drift. It does not verify the research-image cache on every k3d node, rollback, or backup validity; these are separate gates before an actual upgrade. Any BSE market-data recovery requiring executed price, positive volume, currency, and timestamps remains out of scope.
 
 Do not merge this PR or run a Helm upgrade on the basis of an untested result. First run the script and its pure unit tests (pytest infrastructure/scripts/test_helm_k3d_acceptance.py), review sanitized output, and separately verify image availability and rollback capability.
+
+## First operator result (blocked safely)
+
+The first run verified 54/54 resource identities, exact DEV Postgres/SearXNG credential matches and approved research images, but reported 105 desired-vs-live field differences, including unrelated Java workload image/env fields. No upgrade occurred. This is **not** an application incident: it means the proposed upgrade was not equivalent to live desired state. The first script used only --reuse-values; the chart's established LOCAL/DEV configuration is in values-dev.yaml. The next revision explicitly supplies -f /chart/values-dev.yaml in addition to --reuse-values, retaining the guard. This is a hypothesis to test, not proof that the 105 differences are harmless. If any differences remain, the gate must continue blocking. No automatic drift repair or deployment is authorized.

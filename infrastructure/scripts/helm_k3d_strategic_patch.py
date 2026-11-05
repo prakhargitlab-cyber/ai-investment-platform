@@ -13,7 +13,22 @@ import helm_k3d_impact_gate as impact
 import helm_k3d_acceptance as base
 
 ROOT = Path(__file__).resolve().parents[2]
-CALCULATOR = ROOT / ".tmp" / "helm-patch-impact" / "helm-patch-impact.exe"
+CALCULATOR = ROOT / ".tmp" / "helm-patch-impact" / "helm-patch-impact-linux"
+CALCULATOR_IMAGE = "golang:1.23-alpine"
+
+
+def calculator_command(executable):
+    """Run Linux ELF with Docker; pass sensitive manifests ONLY through stdin."""
+    return [
+        "docker", "run", "--rm", "-i",
+        "--network", "none", "--read-only",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--user", "65534:65534",
+        "--mount", "type=bind,source=" + str(executable)
+                   + ",target=/usr/local/bin/helm-patch-impact,readonly",
+        "--entrypoint", "/usr/local/bin/helm-patch-impact",
+        CALCULATOR_IMAGE
+    ]
 
 
 # This is the only diagnostic state emitted on unexpected exceptions.
@@ -35,7 +50,7 @@ def phase(label):
 def main():
     phase("START")
     if not CALCULATOR.is_file():
-        raise RuntimeError("COMPILED_GO_PATCH_CALCULATOR_MISSING")
+        raise RuntimeError("COMPILED_LINUX_PATCH_CALCULATOR_MISSING")
     phase("LOAD_MANIFESTS")
     old, new, live = impact.load_manifests()
     phase("VALIDATE_SCOPE")
@@ -50,8 +65,14 @@ def main():
     ]}, separators=(",", ":")).encode("utf-8")
 
     phase("EXECUTE_CALCULATOR")
+    # The executable is a Linux ELF. Docker is already functioning on the
+    # operator's Windows workstation; no Windows .exe is started directly.
+    # The calculator container has no network, no writeable root filesystem,
+    # no host kubeconfig, and no backup/Secret mounts. Sensitive JSON travels
+    # only on stdin; neither input nor patch JSON is written to a file.
+    command = calculator_command(CALCULATOR)
     proc = subprocess.run(
-        [str(CALCULATOR)], input=payload,
+        command, input=payload,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
         check=False
     )
@@ -195,7 +216,7 @@ def safe_failure_code(exc):
 
 def safe_windows_error_code(exc):
     # Only numeric OS error codes. Never print exception text or arguments.
-    if type(exc) is OSError:
+    if isinstance(exc, OSError):
         winerror = getattr(exc, "winerror", None)
         if type(winerror) is int and 0 <= winerror <= 65535:
             return "WINERROR_" + str(winerror)
@@ -225,6 +246,8 @@ def safe_failure_kind(exc):
         return "IMPACT_MANIFEST_BLOCKED"
     if type(exc) is subprocess.TimeoutExpired:
         return "SUBPROCESS_TIMEOUT"
+    if isinstance(exc, OSError):
+        return "OS_ERROR"
     return allowed.get(type(exc), "OTHER_EXCEPTION")
 
 

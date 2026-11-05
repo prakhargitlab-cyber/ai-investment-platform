@@ -279,3 +279,36 @@ After fetching all changed Go files plus the updated Python wrapper,
 rerun the existing isolated build script and strategic patch checker.
 The exact results have **not yet been observed** on the operator's
 Windows environment.
+
+## JWT non-verification and research-engine patch diagnostics (pending operator validation)
+
+The prior operator run passed Go tests and verified two harmless stringData-only
+Secret patches, `dev-postgres` and `dev-searxng`, but the third Secret
+`aip-auth-jwt` did **not** pass. Unresolved patches remain **17 unrelated
+Deployments, JWT Secret, and research-engine**.
+
+The patch checker now emits a **fixed JWT failure code** instead of a
+generic Secret risk. The code can be `PATCH_SHAPE`,
+`OLD_DATA_INVALID`, `NEW_DATA_INVALID`, `LIVE_DATA_INVALID`,
+`TYPE_MISMATCH`, `OLD_TO_NEW_BYTES_MISMATCH`,
+`NEW_TO_LIVE_BYTES_MISMATCH` or `VERIFIED`. No credential values,
+Secret key names, hashes, full patches or exception strings are exposed.
+
+It also audits the **actual research-engine strategic patch** and emits
+only fixed diagnostic labels such as `APPROVED_ENV_NAME`,
+`OTHER_ENV_NAME`, `ENV_VALUE_PATCH`,
+`OTHER_CONTAINER_FIELD`, `OTHER_POD_SPEC`,
+`OTHER_DEPLOYMENT_SPEC`, `STRATEGIC_LIST_DIRECTIVE`,
+`CONTAINER_IMAGE`, and `OTHER_TOP_LEVEL`.
+This is a *path-family audit*, not a full value-by-value authorization.
+Recognizing an allowed environment-variable name does not validate its
+value, and any unapproved pod-template or strategic list directive remains
+a stop condition. The exact research patch still requires semantic
+review, and the 17 unrelated deployments must be reconciled separately.
+
+Regression tests were added for the codes and redaction. Operator must
+fetch `secret_audit.go`, `research_audit.go`, `main.go`,
+`audit_diagnostics_test.go`, and updated
+`helm_k3d_strategic_patch.py`, then rebuild the executable before the
+read-only check. **No deployment permission is implied by any diagnostic
+output**, and no Kubernetes write is included.

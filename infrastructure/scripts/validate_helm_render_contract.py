@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "infrastructure/helm/ai-investment-platform"
 PINNED = (
     "auth-service", "frontend", "ranking-engine", "ibkr-connector",
-    "research-engine",
+    "research-engine", "yahoo-finance-mcp",
 )
 TAG = "ci-pin-immutable-20261105"
 

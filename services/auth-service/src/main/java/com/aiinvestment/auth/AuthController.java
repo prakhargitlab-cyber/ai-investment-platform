@@ -4,6 +4,7 @@ import com.aiinvestment.shared.web.auth.AuthenticatedUserResolver;
 import com.aiinvestment.shared.web.auth.HmacJwtService;
 import com.aiinvestment.shared.web.auth.JwtClaims;
 import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Value;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
@@ -23,6 +24,8 @@ public class AuthController {
             "user-b", new DevIdentity("dev-user-b", "user.b@example.invalid", "User B", List.of("USER"))
     );
 
+    @Value("${auth.allowed-public-origins:}")
+    private String allowedPublicOrigins = "";
     private final AuthProperties properties;
     private final AppUserRepository users;
     private final AuthLifecycleService lifecycle;
@@ -45,7 +48,11 @@ public class AuthController {
     @PostMapping("/login")
     public TokenResponse login(@Valid @RequestBody LoginRequest request) { return lifecycle.login(request); }
     @PostMapping("/password-reset/request")
-    public PasswordResetRequestResponse passwordResetRequest(@Valid @RequestBody PasswordResetRequest request) { return lifecycle.requestPasswordReset(request.email()); }
+    public PasswordResetRequestResponse passwordResetRequest(@Valid @RequestBody PasswordResetRequest request,
+                                                            @RequestHeader(value = "Origin", required = false) String origin) {
+        String publicUrl = AuthPublicOriginPolicy.resolve(origin, allowedPublicOrigins, properties.appPublicUrl());
+        return lifecycle.requestPasswordReset(request.email(), publicUrl);
+    }
     @PostMapping("/password-reset/confirm")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void passwordResetConfirm(@Valid @RequestBody PasswordResetConfirmRequest request) { lifecycle.confirmPasswordReset(request.token(), request.newPassword()); }

@@ -40,6 +40,7 @@ auth:
   smtp-password: ${SMTP_PASSWORD:}
   smtp-from: ${SMTP_FROM:}
   app-public-url: ${APP_PUBLIC_URL:}
+  allowed-public-origins: ${AUTH_ALLOWED_PUBLIC_ORIGINS:}
 server:
   port: ${SERVER_PORT:8081}
   shutdown: graceful

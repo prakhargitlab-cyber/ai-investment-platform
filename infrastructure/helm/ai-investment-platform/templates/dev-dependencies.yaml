@@ -5,8 +5,8 @@ kind: Secret
 metadata:
   name: {{ .Values.auth.jwtSecretName }}
 type: Opaque
-stringData:
-  {{ .Values.auth.jwtSecretKey }}: {{ .Values.auth.devJwtSecret | quote }}
+data:
+  {{ .Values.auth.jwtSecretKey }}: {{ include "aip.devCredential" (dict "root" . "name" .Values.auth.jwtSecretName "key" .Values.auth.jwtSecretKey "value" .Values.auth.devJwtSecret "length" 48) | quote }}
 ---
 {{- end }}
 apiVersion: v1
@@ -225,8 +225,11 @@ spec:
           startupProbe:
             tcpSocket:
               port: broker
+            initialDelaySeconds: 10
             periodSeconds: 5
-            failureThreshold: 30
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 120
           readinessProbe:
             tcpSocket:
               port: broker

@@ -1,0 +1,83 @@
+name: Helm source-of-truth validation
+
+on:
+  push:
+    branches:
+      - fix/helm-release-sanitized-acceptance
+  pull_request:
+    paths:
+      - 'infrastructure/helm/**'
+      - 'infrastructure/scripts/**'
+      - 'platform.ps1'
+      - '.github/workflows/helm-source-of-truth.yml'
+      - 'services/auth-service/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  helm-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-helm@v4
+        with:
+          version: 'v3.17.3'
+      - name: Install offline-contract test dependencies
+        run: python -m pip install --disable-pip-version-check pytest PyYAML
+      - name: Parse full PowerShell platform script (no execution)
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path (Get-Location).Path 'platform.ps1'),
+            [ref]$tokens,
+            [ref]$parseErrors
+          )
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | ForEach-Object { Write-Host ("PARSE_ERROR_AT_LINE: " + $_.Extent.StartLineNumber) }
+            exit 1
+          }
+          Write-Host 'POWERSHELL_PARSE_PASSED'
+      - name: Python source/regression tests (no cluster)
+        run: |
+          python -m pytest -q \
+            infrastructure/scripts/test_helm_managed_deployment_sources.py \
+            infrastructure/scripts/test_helm_k3d_image_rebaseline.py \
+            infrastructure/scripts/test_helm_k3d_image_pin_impact.py \
+            infrastructure/scripts/test_helm_jwt_upgrade_guard.py \
+            infrastructure/scripts/test_helm_k3d_strategic_patch.py
+      - name: Compile pinned three-way patch checker without executing cluster access
+        run: python -m py_compile infrastructure/scripts/helm_k3d_pinned_strategic_patch.py
+      - name: Validate rendered images, research init and Kafka probe
+        run: python infrastructure/scripts/validate_helm_render_contract.py
+      - name: Helm lint LOCAL chart
+        run: helm lint infrastructure/helm/ai-investment-platform --values infrastructure/helm/ai-investment-platform/values-dev.yaml
+      - name: Render clean LOCAL release without cluster writes
+        run: |
+          helm template ai-investment-platform infrastructure/helm/ai-investment-platform \
+            --namespace ai-investment \
+            --values infrastructure/helm/ai-investment-platform/values-dev.yaml \
+            --set-string global.imageTag=ci-validation \
+            --set ibkr.enabled=false \
+            --set ibkrConnector.replicaCount=0 \
+            >/dev/null
+
+  auth-reset-link-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Run auth-service unit and integration tests
+        run: mvn -B -ntp -pl services/auth-service -am test

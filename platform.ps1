@@ -721,15 +721,38 @@ function Validate-Helm {
 }
 
 function Deploy-Helm {
-    # Intentionally do NOT use --wait here. We must normalize LOCAL env values
-    # and optional broker runtime settings before Kubernetes readiness is judged.
-    Invoke-Checked "Installing/upgrading complete DEV stack" {
-        helm upgrade --install $ReleaseName $HelmChart `
-            --namespace $Namespace `
-            --create-namespace `
-            --values $HelmValues `
-            --force-conflicts `
-            --timeout 10m
+    # Prevent a generic full-stack upgrade from reverting manual changes
+    # in any existing Helm release. New installations only here.
+    $releaseRows = helm list --all --namespace $Namespace --output json 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($releaseRows | Out-String).Trim())) {
+        throw 'HELM_RELEASE_DISCOVERY_FAILED'
+    }
+    $releaseList = @($releaseRows | ConvertFrom-Json)
+    if (@($releaseList | Where-Object { $_.name -eq $ReleaseName }).Count -gt 0) {
+        throw 'EXISTING_HELM_RELEASE_REQUIRES_REVIEWED_RECONCILIATION: do not use platform.ps1 up to upgrade a running release'
+    }
+
+    $ibkrEnabled = if ($EnableIbkr) { 'true' } else { 'false' }
+    $connectorReplicas = if ($EnableIbkr) { '1' } else { '0' }
+    $helmArgs = @(
+        'upgrade', '--install', $ReleaseName, $HelmChart,
+        '--namespace', $Namespace,
+        '--create-namespace',
+        '--values', $HelmValues,
+        '--set-string', "global.imageTag=$ImageTag",
+        '--set', "ibkr.enabled=$ibkrEnabled",
+        '--set', "ibkrConnector.replicaCount=$connectorReplicas",
+        '--timeout', '10m'
+    )
+    # Persist exact immutable tags in Helm, including per-service overrides.
+    foreach ($image in @(Get-ImageDefinitions)) {
+        if ($image.Name -notmatch '^[a-z0-9][a-z0-9-]{0,62}$') {
+            throw 'INVALID_HELM_IMAGE_WORKLOAD_NAME'
+        }
+        $helmArgs += @('--set-string', "workloadOverrides.$($image.Name).imageTagOverride=$ImageTag")
+    }
+    Invoke-Checked "Installing Helm-managed DEV stack" {
+        & helm @helmArgs
     }
 }
 
@@ -880,54 +903,21 @@ function Apply-LocalRuntimeNormalization {
     $kafkaDeployment = kubectl get deployment kafka -n $Namespace --ignore-not-found -o name 2>$null
     if ($LASTEXITCODE -ne 0) { throw "Unable to query Kafka deployment." }
     if (-not [string]::IsNullOrWhiteSpace(($kafkaDeployment | Out-String).Trim())) {
-        Write-Step "Applying LOCAL Kafka startup grace period"
+        Write-Step "Verifying Helm-managed LOCAL Kafka startup grace period"
 
-        # Use --patch-file rather than passing JSON directly on the command line.
-        # This avoids Windows PowerShell/native-command quoting differences that
-        # can make a syntactically successful kubectl call leave the probe unchanged.
-        $kafkaPatchObject = @{
-            spec = @{
-                template = @{
-                    spec = @{
-                        containers = @(
-                            @{
-                                name = "kafka"
-                                startupProbe = @{
-                                    tcpSocket = @{ port = "broker" }
-                                    initialDelaySeconds = 10
-                                    periodSeconds = 5
-                                    timeoutSeconds = 3
-                                    successThreshold = 1
-                                    failureThreshold = 120
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-        }
-
-        $kafkaPatchFile = Join-Path ([System.IO.Path]::GetTempPath()) ("aip-kafka-startup-probe-" + [guid]::NewGuid().ToString("N") + ".json")
-        try {
-            $kafkaPatchObject | ConvertTo-Json -Depth 10 | Set-Content -Path $kafkaPatchFile -Encoding UTF8
-            kubectl patch deployment kafka -n $Namespace --field-manager=helm --type=strategic --patch-file $kafkaPatchFile | Out-Host
-            if ($LASTEXITCODE -ne 0) {
-                throw "Unable to apply LOCAL Kafka startup probe normalization."
-            }
-        }
-        finally {
-            Remove-Item $kafkaPatchFile -Force -ErrorAction SilentlyContinue
-        }
-
+        # The startup probe is defined in templates/dev-dependencies.yaml.
+        # Never mutate Helm-managed Deployment fields after helm upgrade;
+        # verify the chart output instead, so future upgrades/AKS do not
+        # attempt to roll back imperative drift.
         # Fail immediately if the live Deployment did not receive the intended
         # startup probe. Do not wait 12 minutes with an ineffective configuration.
         $liveKafkaProbe = kubectl get deployment kafka -n $Namespace -o jsonpath="{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.failureThreshold}{'|'}{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.periodSeconds}{'|'}{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.timeoutSeconds}{'|'}{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.initialDelaySeconds}"
         if ($LASTEXITCODE -ne 0) {
-            throw "Unable to verify Kafka startup probe normalization."
+            throw "Unable to verify Helm-managed Kafka startup probe."
         }
 
         if (($liveKafkaProbe | Out-String).Trim() -ne "120|5|3|10") {
-            throw "Kafka startup probe normalization was not applied. Live values: $liveKafkaProbe"
+            throw "Helm-managed Kafka startup probe does not match required startup grace period."
         }
 
         Write-Host "Kafka startup probe verified: failureThreshold=120, periodSeconds=5, timeoutSeconds=3, initialDelaySeconds=10" -ForegroundColor DarkGray
@@ -1561,8 +1551,8 @@ function Start-Platform {
 
     Import-ImagesIntoK3d -Names $selected
     Deploy-Helm
-    Set-ImmutableDeploymentImages -Names $selected
-    Apply-LocalRuntimeNormalization
+    # No kubectl patch/set env/scale after Helm. All values must be declared
+    # in the chart or explicitly supplied to Helm and persisted in its release.
     Wait-ForDeployments -AllEnabled
     Assert-ImmutableDeploymentImages -Names $selected
     Invoke-FirstAdminBootstrapIfNeeded
@@ -2544,6 +2534,11 @@ function Get-DeploymentFrontendBuildConfig {
 
 function Start-DeploymentFreshRollout {
     param([string[]]$Names)
+    # Component deployment currently writes directly to Helm-owned Deployments.
+    # Until the scoped Helm upgrade path has an approved exact three-way impact
+    # check, reject BEFORE building, pushing, patching, scaling, or touching
+    # recovery isolation. No risk-acceptance flags override this restriction.
+    throw 'HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED: component image updates must be recorded in the Helm release; see issue #25'
     if (-not $Names -or @($Names | Where-Object { $_ -notin @('api-gateway', 'research-engine', 'portfolio-service', 'frontend') }).Count) { throw 'Invalid fresh deployment selection' }
     if ($SkipBuild) { throw 'SkipBuild is not supported for fresh deployment' }
     Assert-LocalPrerequisites
@@ -2736,6 +2731,11 @@ function Assert-ResumeAudit {
 
 function Deploy-VerifiedRadarComponentsCore {
     param([string[]]$Names)
+    # Component deployment currently writes directly to Helm-owned Deployments.
+    # Until the scoped Helm upgrade path has an approved exact three-way impact
+    # check, reject BEFORE building, pushing, patching, scaling, or touching
+    # recovery isolation. No risk-acceptance flags override this restriction.
+    throw 'HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED: component image updates must be recorded in the Helm release; see issue #25'
     if (-not $Names -or @($Names | Where-Object { $_ -notin @('api-gateway','research-engine','portfolio-service','frontend') }).Count) { throw 'Invalid safe deployment selection' }
     if ($SkipBuild) { throw 'SkipBuild is not supported for verified deployment' }
     if ($ResumeAuditTag -and $NoCache) { throw 'NoCache is invalid for artifact-reuse recovery' }
@@ -2923,6 +2923,11 @@ function Deploy-VerifiedRadarComponentsCore {
 }
 
 function Deploy-SelectedComponents {
+    # Component deployment currently writes directly to Helm-owned Deployments.
+    # Until the scoped Helm upgrade path has an approved exact three-way impact
+    # check, reject BEFORE building, pushing, patching, scaling, or touching
+    # recovery isolation. No risk-acceptance flags override this restriction.
+    throw 'HELM_COMPONENT_DEPLOYMENT_RECONCILIATION_REQUIRED: component image updates must be recorded in the Helm release; see issue #25'
     $safeSelection = @(Resolve-SelectedComponents -RequireSelection)
     if (@($safeSelection | Where-Object { $_ -notin @('api-gateway', 'research-engine', 'portfolio-service', 'frontend') }).Count -eq 0) {
         # Explicitly accepting the high-risk gate always routes to the

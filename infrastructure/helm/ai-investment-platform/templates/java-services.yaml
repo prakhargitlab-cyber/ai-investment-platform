@@ -123,6 +123,8 @@ spec:
               value: {{ $.Values.auth.email.smtpFrom | quote }}
             - name: APP_PUBLIC_URL
               value: {{ $.Values.auth.email.publicUrl | quote }}
+            - name: AUTH_ALLOWED_PUBLIC_ORIGINS
+              value: {{ join "," $.Values.apiGateway.cors.allowedOrigins | quote }}
             {{- if and (eq $.Values.auth.email.mode "SMTP") $.Values.auth.email.credentialSecretName }}
             - name: SMTP_USERNAME
               valueFrom:
@@ -165,7 +167,7 @@ spec:
             - name: DB_POOL_IDLE_TIMEOUT_MS
               value: {{ $.Values.database.pool.idleTimeoutMs | quote }}
             - name: DB_POOL_MAX_LIFETIME_MS
-              value: {{ printf "%.0f" $.Values.database.pool.maxLifetimeMs | quote }}
+              value: {{ printf "%.0f" (float64 $.Values.database.pool.maxLifetimeMs) | quote }}
             - name: SPRING_DATASOURCE_URL
               value: {{ printf "jdbc:postgresql://%s:%v/%s?sslmode=%s&connectTimeout=%v&socketTimeout=%v" $.Values.database.host $.Values.database.port $.Values.database.name $.Values.database.sslMode $.Values.database.connectTimeoutSeconds $.Values.database.socketTimeoutSeconds | quote }}
             - name: SPRING_DATASOURCE_USERNAME

@@ -67,6 +67,27 @@ def helm(base, *arguments):
 
 
 
+def check_credential_presence():
+    """Only report structural metadata; never show or log Secret data."""
+    expected = (
+        ("dev-postgres", "POSTGRES_PASSWORD"),
+        ("dev-searxng", "SEARXNG_SECRET"),
+        ("aip-auth-jwt", "jwt-secret"),
+    )
+    for name, key in expected:
+        try:
+            doc = json.loads(kube("get", "secret", name, "-o", "json"))
+        except (ValueError, KeyError) as exc:
+            raise Blocked("SECRET_METADATA_JSON_INVALID") from exc
+        if (doc.get("kind") != "Secret" or doc.get("type") != "Opaque"
+                or doc.get("metadata", {}).get("name") != name):
+            raise Blocked("PROTECTED_SECRET_SHAPE_INVALID")
+        data = doc.get("data") or {}
+        if not isinstance(data, dict) or not isinstance(data.get(key), str) or not data[key]:
+            raise Blocked("PROTECTED_SECRET_KEY_MISSING_OR_EMPTY")
+        print("PROTECTED_SECRET_STRUCTURE_PRESENT:", name, flush=True)
+
+
 def helm_dry_run(base, *arguments):
     """Classify failed Helm invocations without disclosing raw stderr."""
     try:
@@ -315,6 +336,8 @@ def main():
         raise Blocked("RELEASE_SPEC_SCOPE_INVALID")
     if not arguments.chart.is_dir() or not arguments.calculator.is_file():
         raise Blocked("HELM_CHART_OR_CALCULATOR_MISSING")
+    phase("VERIFY_PROTECTED_SECRET_STRUCTURE")
+    check_credential_presence()
     phase("READ_K3D_KUBECONFIG")
     # Source chart is mounted read-only. No base64 contents printed or written.
     config = call(["docker", "exec", SERVER, "/bin/cat", K3S_CONFIG])

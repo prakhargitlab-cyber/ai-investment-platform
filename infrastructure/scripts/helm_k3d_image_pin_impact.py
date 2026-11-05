@@ -84,6 +84,8 @@ def main():
     aligned = []
     registry_only = []
     tag_mismatch = []
+    pin_ignored = []
+    live_changed_since_pin = []
     for name in sorted(pins.FIRST_PARTY):
         key = ("apps/v1", "Deployment", name)
         current = next(x for x in live[key]["spec"]["template"]["spec"]["containers"]
@@ -99,6 +101,11 @@ def main():
                 registry_only.append(name)
             else:
                 tag_mismatch.append(name)
+                expected_pin = yaml.safe_load(pins.OUTPUT.read_bytes())["workloadOverrides"][name]["imageTagOverride"]
+                if desired_tag != expected_pin:
+                    pin_ignored.append(name)
+                if live_tag != expected_pin:
+                    live_changed_since_pin.append(name)
     # Inspect authored spec mutations without accidentally approving them.
     other_changed = []
     for key in sorted(old):
@@ -131,6 +138,12 @@ def main():
     for name in registry_only:
         print("REGISTRY_ALIAS_ONLY:", name)
     print("IMAGE_TAG_MISMATCH:", len(tag_mismatch))
+    print("HELM_RENDER_IGNORED_PIN:", len(pin_ignored))
+    for name in pin_ignored:
+        print("PIN_NOT_RENDERED:", name)
+    print("LIVE_TAG_CHANGED_SINCE_CANDIDATE:", len(live_changed_since_pin))
+    for name in live_changed_since_pin:
+        print("PIN_STALE_AGAINST_LIVE:", name)
     for name in tag_mismatch:
         print("TAG_NOT_ALIGNED:", name)
     print("NON_IMAGE_OR_OUT_OF_SCOPE_RENDERED_CHANGES:", len(other_changed))

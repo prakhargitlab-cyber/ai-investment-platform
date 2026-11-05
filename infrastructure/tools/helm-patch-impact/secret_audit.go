@@ -132,15 +132,20 @@ func isVerifiedLiveJWTDataRewrite(t triple, patch []byte) bool {
     if _, exists := newRoot["data"]; !exists { return false }
 
     var operations map[string]json.RawMessage
-    if json.Unmarshal(patch, &operations) != nil || len(operations) != 2 {
+    if json.Unmarshal(patch, &operations) != nil ||
+        (len(operations) != 1 && len(operations) != 2) {
         return false
     }
     if !bytes.Equal(bytes.TrimSpace(operations["stringData"]), []byte("null")) {
         return false
     }
     var patchData map[string]json.RawMessage
-    if json.Unmarshal(operations["data"], &patchData) != nil || len(patchData) == 0 {
-        return false
+    if len(operations) == 2 {
+        rawPatchData, exists := operations["data"]
+        if !exists || json.Unmarshal(rawPatchData, &patchData) != nil ||
+            len(patchData) == 0 {
+            return false
+        }
     }
     oldData, oldType, err := persistedSecretData(t.Old)
     if err != nil || len(oldData) == 0 { return false }

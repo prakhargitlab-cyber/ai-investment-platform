@@ -18,8 +18,52 @@ class ImpactBlocked(Exception):
     pass
 
 
+def declared_field_differences(desired, live, path=""):
+    """Find drift in authored fields, ignoring Kubernetes-added defaults.
+
+    Kubernetes list-map elements (containers, env, ports, volumes) are matched
+    by 'name' where possible. This is conservative and NOT an actual patch.
+    """
+    if isinstance(desired, dict):
+        if not isinstance(live, dict):
+            return [path or "$"]
+        result = []
+        for key, value in desired.items():
+            next_path = path + "." + str(key) if path else str(key)
+            if key not in live:
+                result.append(next_path)
+            else:
+                result.extend(declared_field_differences(value, live[key], next_path))
+        return result
+    if isinstance(desired, list):
+        if not isinstance(live, list):
+            return [path]
+        # Kubernetes associates these lists by element name; avoid treating
+        # harmless ordering and server-added elements as changes.
+        if (all(isinstance(x, dict) and isinstance(x.get("name"), str)
+                for x in desired + live)):
+            actual = {x["name"]: x for x in live}
+            if len(actual) != len(live):
+                return [path + ".duplicate-name"]
+            result = []
+            for item in desired:
+                name = item["name"]
+                item_path = path + "[" + name + "]"
+                if name not in actual:
+                    result.append(item_path)
+                else:
+                    result.extend(declared_field_differences(item, actual[name], item_path))
+            return result
+        # Unknown list semantics are intentionally fail-closed.
+        return [] if desired == live else [path]
+    return [] if desired == live else [path]
+
+
 def critical_live_drift(old, desired, live):
-    """Return only safe resource identifiers; never credential values."""
+    """Classify authored drift; report resource names only, never values.
+
+    This is a risk filter, not Helm's Kubernetes strategic-three-way patch.
+    """
     findings = []
     protected = {"Deployment", "StatefulSet", "Secret", "PersistentVolumeClaim"}
     for key in sorted(old):
@@ -36,17 +80,19 @@ def critical_live_drift(old, desired, live):
         elif kind == "PersistentVolumeClaim":
             if base.selected(old_doc) != base.selected(target):
                 findings.append(("PVC_DESIRED_CHANGE", kind, name))
+            if declared_field_differences(base.selected(target), base.selected(current)):
+                findings.append(("PVC_DECLARED_FIELD_DRIFT", kind, name))
         elif kind == "StatefulSet":
-            if base.selected(target) != base.selected(current):
-                findings.append(("STATEFULSET_LIVE_DIFFERS_FROM_TARGET", kind, name))
+            if declared_field_differences(base.selected(target), base.selected(current)):
+                findings.append(("STATEFULSET_DECLARED_FIELD_DRIFT", kind, name))
         elif name != "research-engine":
             baseline_pod = (old_doc.get("spec") or {}).get("template")
             proposed_pod = (target.get("spec") or {}).get("template")
             live_pod = (current.get("spec") or {}).get("template")
             if baseline_pod != proposed_pod:
                 findings.append(("UNRELATED_DEPLOYMENT_DESIRED_CHANGE", kind, name))
-            if proposed_pod != live_pod:
-                findings.append(("UNRELATED_DEPLOYMENT_LIVE_DRIFT", kind, name))
+            if declared_field_differences(proposed_pod, live_pod):
+                findings.append(("UNRELATED_DEPLOYMENT_DECLARED_FIELD_DRIFT", kind, name))
     return findings
 
 

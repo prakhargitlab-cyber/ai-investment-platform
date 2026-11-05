@@ -880,54 +880,21 @@ function Apply-LocalRuntimeNormalization {
     $kafkaDeployment = kubectl get deployment kafka -n $Namespace --ignore-not-found -o name 2>$null
     if ($LASTEXITCODE -ne 0) { throw "Unable to query Kafka deployment." }
     if (-not [string]::IsNullOrWhiteSpace(($kafkaDeployment | Out-String).Trim())) {
-        Write-Step "Applying LOCAL Kafka startup grace period"
+        Write-Step "Verifying Helm-managed LOCAL Kafka startup grace period"
 
-        # Use --patch-file rather than passing JSON directly on the command line.
-        # This avoids Windows PowerShell/native-command quoting differences that
-        # can make a syntactically successful kubectl call leave the probe unchanged.
-        $kafkaPatchObject = @{
-            spec = @{
-                template = @{
-                    spec = @{
-                        containers = @(
-                            @{
-                                name = "kafka"
-                                startupProbe = @{
-                                    tcpSocket = @{ port = "broker" }
-                                    initialDelaySeconds = 10
-                                    periodSeconds = 5
-                                    timeoutSeconds = 3
-                                    successThreshold = 1
-                                    failureThreshold = 120
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-        }
-
-        $kafkaPatchFile = Join-Path ([System.IO.Path]::GetTempPath()) ("aip-kafka-startup-probe-" + [guid]::NewGuid().ToString("N") + ".json")
-        try {
-            $kafkaPatchObject | ConvertTo-Json -Depth 10 | Set-Content -Path $kafkaPatchFile -Encoding UTF8
-            kubectl patch deployment kafka -n $Namespace --field-manager=helm --type=strategic --patch-file $kafkaPatchFile | Out-Host
-            if ($LASTEXITCODE -ne 0) {
-                throw "Unable to apply LOCAL Kafka startup probe normalization."
-            }
-        }
-        finally {
-            Remove-Item $kafkaPatchFile -Force -ErrorAction SilentlyContinue
-        }
-
+        # The startup probe is defined in templates/dev-dependencies.yaml.
+        # Never mutate Helm-managed Deployment fields after helm upgrade;
+        # verify the chart output instead, so future upgrades/AKS do not
+        # attempt to roll back imperative drift.
         # Fail immediately if the live Deployment did not receive the intended
         # startup probe. Do not wait 12 minutes with an ineffective configuration.
         $liveKafkaProbe = kubectl get deployment kafka -n $Namespace -o jsonpath="{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.failureThreshold}{'|'}{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.periodSeconds}{'|'}{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.timeoutSeconds}{'|'}{.spec.template.spec.containers[?(@.name=='kafka')].startupProbe.initialDelaySeconds}"
         if ($LASTEXITCODE -ne 0) {
-            throw "Unable to verify Kafka startup probe normalization."
+            throw "Unable to verify Helm-managed Kafka startup probe."
         }
 
         if (($liveKafkaProbe | Out-String).Trim() -ne "120|5|3|10") {
-            throw "Kafka startup probe normalization was not applied. Live values: $liveKafkaProbe"
+            throw "Helm-managed Kafka startup probe does not match required startup grace period."
         }
 
         Write-Host "Kafka startup probe verified: failureThreshold=120, periodSeconds=5, timeoutSeconds=3, initialDelaySeconds=10" -ForegroundColor DarkGray

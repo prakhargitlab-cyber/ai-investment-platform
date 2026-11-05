@@ -164,8 +164,24 @@ def only_approved_revision_changes(baseline, proposed, actual):
     for flag, value in PROTECTED_FLAGS.items():
         if new_env.get(flag, {}).get("value") != value or live_env.get(flag, {}).get("value") != value:
             raise Blocked("SAFETY_FLAG_VALUE_MISMATCH")
-    # The chart generates the same full manifests for all other resources.
-    # Mask ONLY the approved fields, then require exact structural identity.
+    # Earlier stored manifests used Secret.stringData; new manifests use
+    # Secret.data. Mask representation only after checking equivalent bytes,
+    # unchanged metadata, Secret type, and all other Secret fields.
+    for key in old:
+        if key[1] != "Secret":
+            continue
+        old_secret = deepcopy(old[key])
+        new_secret = deepcopy(new[key])
+        for secret in (old_secret, new_secret):
+            secret.pop("stringData", None)
+            secret.pop("data", None)
+        if old_secret != new_secret:
+            raise Blocked("UNAPPROVED_SECRET_METADATA_CHANGE: " + key[2])
+        if selected(old[key]) != selected(new[key]):
+            raise Blocked("UNAPPROVED_SECRET_CONTENT_CHANGE: " + key[2])
+        new[key] = deepcopy(old[key])
+
+    # Require exact structural equality for every other resource field.
     for key in old:
         if old[key] != new[key]:
             raise Blocked("UNAPPROVED_STORED_RELEASE_CHANGE: " + key[1] + "/" + key[2])

@@ -121,10 +121,6 @@ def main():
         raise RuntimeError("INVALID_DEPLOYMENT_NOOP_REPORT")
     if set(safe_secrets) & set(names):
         raise RuntimeError("VERIFIED_SECRET_STILL_IN_RISK_LIST")
-    research_noop = result.get("research_spec_noop")
-    if type(research_noop) is not bool or (
-        research_noop and result.get("research_patch")):
-        raise RuntimeError("INVALID_RESEARCH_NOOP_REPORT")
     if result.get("blocked") is not (proc.returncode == 3):
         raise RuntimeError("PATCH_RESULT_EXIT_MISMATCH")
 
@@ -135,6 +131,10 @@ def main():
         "pod-template-metadata", "pod-spec-other", "container-other",
         "container-image", "container-env"
     }
+    research_noop = result.get("research_spec_noop")
+    if type(research_noop) is not bool or (
+        research_noop and result.get("research_patch")):
+        raise RuntimeError("INVALID_RESEARCH_NOOP_REPORT")
     categories = result.get("patch_categories")
     if not isinstance(categories, dict):
         raise RuntimeError("PATCH_CATEGORY_REPORT_MISSING")
@@ -179,7 +179,7 @@ def main():
     }
     if not isinstance(research_env, list) or any(
         label not in allowed_env_audits for label in research_env
-) or (bool(research_env) and not (result.get("research_patch") or research_noop)):
+    ) or (bool(research_env) and not (result.get("research_patch") or research_noop)):
         raise RuntimeError("INVALID_RESEARCH_ENV_AUDIT")
     research_labels = result.get("research_patch_labels")
     allowed_research_labels = {

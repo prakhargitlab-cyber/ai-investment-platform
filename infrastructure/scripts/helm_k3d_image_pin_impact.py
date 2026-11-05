@@ -77,14 +77,58 @@ def candidate_manifest():
     return by_id
 
 
+def allow_only_unchanged_live_kafka_probe(old, candidate, live):
+    """Normalize only reviewed Kafka probe drift for the research-only gate.
+
+    The new Helm manifest's Kafka probe must ALREADY match the live workload.
+    Other Kafka spec/metadata changes remain blocked. No mutation of source maps.
+    """
+    from copy import deepcopy
+    key = ("apps/v1", "Deployment", "kafka")
+    if key not in old or key not in candidate or key not in live:
+        raise RuntimeError("KAFKA_IDENTITY_MISSING")
+    before, after, running = (x[key] for x in (old, candidate, live))
+    def get_probe(obj):
+        containers = obj["spec"]["template"]["spec"]["containers"]
+        found = [c for c in containers if c.get("name") == "kafka"]
+        if len(found) != 1:
+            raise RuntimeError("KAFKA_CONTAINER_IDENTITY_MISMATCH")
+        return found[0].get("startupProbe")
+    old_probe, new_probe, live_probe = (
+        get_probe(before), get_probe(after), get_probe(running)
+    )
+    expected = {
+        "tcpSocket": {"port": "broker"},
+        "initialDelaySeconds": 10,
+        "periodSeconds": 5,
+        "timeoutSeconds": 3,
+        "successThreshold": 1,
+        "failureThreshold": 120,
+    }
+    if new_probe != expected or live_probe != expected:
+        raise RuntimeError("KAFKA_PROBE_NOT_ALREADY_LIVE_AND_REVIEWED")
+    normalized = deepcopy(candidate)
+    target = next(x for x in normalized[key]["spec"]["template"]["spec"]["containers"]
+                  if x.get("name") == "kafka")
+    if old_probe is None:
+        target.pop("startupProbe", None)
+    else:
+        target["startupProbe"] = deepcopy(old_probe)
+    if normalized[key] != before:
+        raise RuntimeError("KAFKA_UNAPPROVED_CHANGE_OUTSIDE_STARTUP_PROBE")
+    return normalized
+
+
 def main():
     global PHASE
     PHASE = "LOAD_ORIGINAL_AND_LIVE"
     # Existing loader captures live/old and the known, previously scoped
     # research-only candidate. This deliberately doesn't upgrade anything.
     old, original, live = impact.load_manifests()
+    PHASE = "VERIFY_REVIEWED_KAFKA_PROBE"
+    research_scoped = allow_only_unchanged_live_kafka_probe(old, original, live)
     PHASE = "VERIFY_RESEARCH_SCOPE"
-    base.only_approved_revision_changes(old, original, live)
+    base.only_approved_revision_changes(old, research_scoped, live)
     updated = candidate_manifest()
     PHASE = "VERIFY_RESOURCE_IDENTITIES"
     if (len(old) != base.EXPECTED_COUNT or set(old) != set(updated)

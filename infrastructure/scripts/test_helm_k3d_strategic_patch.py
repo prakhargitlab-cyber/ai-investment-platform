@@ -51,3 +51,27 @@ def test_safe_numeric_os_error_without_path_disclosure():
     err = OSError(2, "credential path not safe to disclose")
     assert patch.safe_windows_error_code(err) == "ERRNO_2"
     assert patch.safe_windows_error_code(ValueError("secret")) == "NOT_AVAILABLE"
+
+
+def test_linux_calculator_runs_only_in_isolated_docker():
+    from pathlib import Path
+    source = Path("C:/workspace/project/.tmp/helm-patch-impact/helm-patch-impact-linux")
+    args = patch.calculator_command(source)
+    assert args[:4] == ["docker", "run", "--rm", "-i"]
+    assert args[args.index("--network") + 1] == "none"
+    assert "--read-only" in args
+    assert args[args.index("--cap-drop") + 1] == "ALL"
+    assert args[args.index("--user") + 1] == "65534:65534"
+    assert "--mount" in args
+    assert "target=/usr/local/bin/helm-patch-impact,readonly" in args[
+        args.index("--mount") + 1
+    ]
+    assert args[args.index("--entrypoint") + 1] == "/usr/local/bin/helm-patch-impact"
+    assert args[-1] == "golang:1.23-alpine"
+    assert not any("kubeconfig" in arg.lower() for arg in args)
+
+
+def test_os_error_subclass_safely_classified():
+    err = FileNotFoundError(2, "private kubeconfig")
+    assert patch.safe_windows_error_code(err) == "ERRNO_2"
+    assert patch.safe_failure_kind(err) == "OS_ERROR"

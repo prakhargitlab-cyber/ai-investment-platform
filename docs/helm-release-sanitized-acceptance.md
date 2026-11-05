@@ -152,3 +152,28 @@ When required, run from repo root with trusted Python venv:
 No credentials, backups, logs or kubeconfig files are written to the
 repository. The current 110 known field differences across 18 Deployments
 make a conservative block likely until a separately reviewed reconciliation.
+
+## Impact gate refinement: distinguish Kubernetes defaults (awaiting operator run)
+
+Earlier conservative risk output: 20 findings (19 unrelated Deployments and the
+PostgreSQL StatefulSet). That was a **potential** impact classification, not
+the actual strategic patch. The prior checker compared whole live pod templates,
+where Kubernetes-injected fields such as default `restartPolicy`,
+`terminationMessagePolicy`, container settings, and StatefulSet defaults can
+create false positives.
+
+The revised gate compares the **chart-declared** subset of the proposed
+fields with live Kubernetes values; it ignores additional Kubernetes-injected
+keys and matches named container/environment lists by `name` rather than
+array position. It retains fail-closed behavior for changes to declared
+images, env, replica fields, container settings and other authored fields,
+as well as protected Secret data/type, PVC and StatefulSet declared fields.
+Additional synthetic tests cover defaults, reordered env entries and
+genuine env drift. Operator verification is pending.
+
+This change intentionally does **not** claim a precise Helm upgrade patch,
+nor does ignoring default-only differences prove the upgrade safe.
+A genuine live image or env mismatch remains a blocker until the exact
+three-way merge effect is verified or the drift is explicitly reconciled.
+No live resource mutation, bulk reconciliation or actual Helm revision-2
+upgrade has been performed.

@@ -33,6 +33,9 @@ func TestJWTMigrationNoopMatchesLiveBytesEvenIfOldStale(t *testing.T) {
     if !isVerifiedLiveJWTDataRewrite(input, patch) {
         t.Fatal("exact live-preserving JWT representation conversion rejected")
     }
+    if !isVerifiedLiveJWTDataRewrite(input, []byte(`{"stringData":null}`)) {
+        t.Fatal("JWT no-op removal without redundant data field rejected")
+    }
 }
 
 func TestJWTMigrationRejectsAnyCredentialModification(t *testing.T) {

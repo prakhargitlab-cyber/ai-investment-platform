@@ -12,4 +12,4 @@
 \copy (SELECT * FROM global_opportunity_cycle_run WHERE cycle_id IN (SELECT cycle_id FROM etf_cycle_scope) ORDER BY cycle_id) TO 'global_opportunity_cycle_run.csv' WITH (FORMAT csv, HEADER true)
 \copy (SELECT * FROM global_opportunity_cycle_progress WHERE cycle_id IN (SELECT cycle_id FROM etf_cycle_scope) ORDER BY cycle_id, phase, global_instrument_id) TO 'global_opportunity_cycle_progress.csv' WITH (FORMAT csv, HEADER true)
 \copy (SELECT * FROM global_opportunity_cycle_active WHERE market='ETF' OR cycle_id IN (SELECT cycle_id FROM etf_cycle_scope)) TO 'global_opportunity_cycle_active.csv' WITH (FORMAT csv, HEADER true)
-\copy (SELECT * FROM global_daily_market_bars WHERE global_instrument_id::text IN (SELECT instrument_id FROM etf_scope) ORDER BY global_instrument_id, trading_date, provider) TO 'global_daily_market_bars.csv' WITH (FORMAT csv, HEADER true)
+\copy (SELECT * FROM global_daily_market_bars WHERE lower(btrim(global_instrument_id::text)) IN (SELECT instrument_id FROM etf_scope) ORDER BY global_instrument_id, trading_date, provider) TO 'global_daily_market_bars.csv' WITH (FORMAT csv, HEADER true)

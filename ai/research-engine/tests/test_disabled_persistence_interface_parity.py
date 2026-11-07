@@ -23,8 +23,11 @@ instead of as a production AttributeError.
 from __future__ import annotations
 
 import inspect
+import copy
 from datetime import datetime, timezone
 from uuid import uuid4
+
+import pytest
 
 from app.persistence import DisabledResearchPersistence, ResearchPersistence
 
@@ -74,3 +77,35 @@ def test_disabled_persistence_reconcile_financial_facts_for_source_is_noop():
         uuid4(), "some-source-identity", [],
     )
     assert result == 0
+
+
+def test_disabled_read_only_snapshot_is_reusable_nested_and_connection_free(monkeypatch):
+    def forbidden_connection(*args, **kwargs):
+        pytest.fail("Disabled persistence must not open a database")
+    monkeypatch.setattr("app.persistence.sqlite3.connect", forbidden_connection)
+    disabled = DisabledResearchPersistence()
+    before = copy.deepcopy(vars(disabled))
+    for _ in range(2):
+        with disabled.read_only_snapshot() as snapshot:
+            assert snapshot is None
+            assert disabled.load_documents() == []
+            assert disabled.load_daily_market_bars(set()) == []
+            with disabled.read_only_snapshot() as nested:
+                assert nested is None
+                assert disabled.load_market_schedules() == []
+    assert vars(disabled) == before
+    assert not hasattr(disabled, "_connection")
+    assert not hasattr(disabled, "database_path")
+
+
+def test_disabled_read_only_snapshot_propagates_callback_errors_without_state_changes():
+    disabled = DisabledResearchPersistence()
+    before = copy.deepcopy(vars(disabled))
+    failure = RuntimeError("SYNTHETIC_READ_FAILURE")
+    with pytest.raises(RuntimeError) as caught:
+        with disabled.read_only_snapshot():
+            raise failure
+    assert caught.value is failure
+    with disabled.read_only_snapshot():
+        assert disabled.load_documents() == []
+    assert vars(disabled) == before

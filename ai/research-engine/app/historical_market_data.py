@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
@@ -27,6 +27,147 @@ from app.structured_market import (
 from app.yahoo_ticker_context import YahooSessionBackoffActive, YahooTickerContexts
 
 logger = logging.getLogger(__name__)
+
+MAX_REJECTED_CLOSE_DIAGNOSTICS = 32
+REJECTED_CLOSE_REASONS = frozenset({
+    "CLOSE_MISSING", "CLOSE_MALFORMED", "CLOSE_NAN", "CLOSE_INFINITE",
+    "CLOSE_ZERO", "CLOSE_NEGATIVE",
+})
+
+
+def rejected_close_reason(value: Any) -> str | None:
+    """Classify an invalid close without retaining its raw value."""
+    if value is None:
+        return "CLOSE_MISSING"
+    try:
+        close = Decimal(str(value))
+    except Exception:
+        return "CLOSE_MALFORMED"
+    if close.is_nan():
+        return "CLOSE_NAN"
+    if close.is_infinite():
+        return "CLOSE_INFINITE"
+    if close == 0:
+        return "CLOSE_ZERO"
+    if close < 0:
+        return "CLOSE_NEGATIVE"
+    return None
+
+
+def rejected_close_diagnostic(timestamp: Any, reason: str) -> dict[str, Any] | None:
+    """Return a bounded-field diagnostic, never raw prices or timestamps.
+
+    An aware UTC-midnight or Asia/Kolkata-midnight label has an explicit date
+    under the existing NSE daily-label convention. This is not proof that a
+    session occurred or that a provider candle was available. Other labels,
+    including strings, naive datetimes and NaT, retain an unknown date.
+    """
+    if not isinstance(reason, str) or reason not in REJECTED_CLOSE_REASONS:
+        return None
+    day = None
+    try:
+        if (isinstance(timestamp, datetime) and timestamp.tzinfo is not None
+                and timestamp.utcoffset() is not None and not timestamp.fold
+                and getattr(timestamp, "nanosecond", 0) == 0):
+            # fold=0 is also the default for an unresolved repeated wall time.
+            # Resolve named pytz zones through ZoneInfo so both folds can be
+            # checked even when that tzinfo object fixes one selected offset.
+            zone_name = getattr(timestamp.tzinfo, "key", None) or getattr(timestamp.tzinfo, "zone", None)
+            zone = ZoneInfo(zone_name) if isinstance(zone_name, str) else timestamp.tzinfo
+            wall = timestamp.replace(tzinfo=zone)
+            if wall.replace(fold=0).utcoffset() != wall.replace(fold=1).utcoffset():
+                return {"trading_date": None, "date_status": "UNKNOWN", "reason": reason}
+            for label in (timestamp.astimezone(timezone.utc),
+                          timestamp.astimezone(ZoneInfo("Asia/Kolkata"))):
+                if (label.hour == label.minute == label.second == label.microsecond == 0
+                        and getattr(label, "nanosecond", 0) == 0):
+                    day = label.date().isoformat()
+                    break
+    except Exception:
+        # Optional diagnostics cannot change acceptance or error propagation.
+        day = None
+    return {"trading_date": day, "date_status": "KNOWN" if day else "UNKNOWN", "reason": reason}
+
+
+def normalize_rejected_close_diagnostics(entries: Any) -> list[dict[str, Any]]:
+    """Whitelist at most 32 structured entries; never promote unknown dates."""
+    if not isinstance(entries, (list, tuple)):
+        return []
+    result = []
+    for entry in entries:
+        if len(result) >= MAX_REJECTED_CLOSE_DIAGNOSTICS:
+            break
+        if not isinstance(entry, dict):
+            continue
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or reason not in REJECTED_CLOSE_REASONS:
+            continue
+        day = None
+        if entry.get("date_status") == "KNOWN" and isinstance(entry.get("trading_date"), str):
+            raw_day = entry["trading_date"]
+            try:
+                parsed = date.fromisoformat(raw_day)
+                if parsed.isoformat() == raw_day:
+                    day = raw_day
+            except ValueError:
+                pass
+        result.append({"trading_date": day, "date_status": "KNOWN" if day else "UNKNOWN", "reason": reason})
+    return result
+
+
+def rejected_close_diagnostics_report(windows_run):
+    """Whitelist at most 32 entries across provider/window/instrument reports.
+
+    Retain order and duplicates. Omitted counts include valid overflow and
+    known rejected rows lacking usable metadata, including legacy windows.
+    Contradictory or unavailable counters are explicit unknowns, never zero.
+    All-legacy reports keep their original interface without new fields.
+    """
+    diagnostics, omitted, omitted_known, available = [], 0, True, False
+    for window in windows_run:
+        if not isinstance(window, dict):
+            continue
+        count = window.get('rejected_invalid_close_count')
+        count_known = type(count) is int and count >= 0
+        if not any(key in window for key in
+                   ('rejected_close_diagnostics', 'rejected_close_diagnostics_omitted')):
+            if count_known:
+                omitted += count
+            else:
+                omitted_known = False
+            continue
+        available = True
+        entries = window.get('rejected_close_diagnostics')
+        valid_entries, retained_before = 0, len(diagnostics)
+        malformed_entries = not isinstance(entries, (list, tuple))
+        for entry in entries if isinstance(entries, (list, tuple)) else ():
+            try:
+                normalized = normalize_rejected_close_diagnostics([entry])
+            except Exception:
+                normalized = []
+            if not normalized:
+                malformed_entries = True
+                continue
+            valid_entries += 1  # Count before the cap, so overflow cannot disappear.
+            if len(diagnostics) < MAX_REJECTED_CLOSE_DIAGNOSTICS:
+                diagnostics.append(normalized[0])
+        retained = len(diagnostics) - retained_before
+        upstream = window.get('rejected_close_diagnostics_omitted', 0)
+        upstream_known = type(upstream) is int and upstream >= 0
+        if count_known:
+            if (not upstream_known or valid_entries + upstream > count):
+                omitted_known = False
+            else:
+                omitted += count - retained
+        elif ('rejected_invalid_close_count' in window or not upstream_known or malformed_entries
+              or 'rejected_close_diagnostics_omitted' not in window):
+            omitted_known = False
+        else:
+            omitted += upstream + valid_entries - retained
+    if not available:
+        return {}
+    return {'rejected_close_diagnostics': diagnostics,
+            'rejected_close_diagnostics_omitted': omitted if omitted_known else None}
 
 
 def has_year_historical_coverage(
@@ -184,6 +325,28 @@ def _log_historical_price_failure_diagnostic(
         )
 
 
+class _ObservationList(list):
+    """A plain list of observations that also reports how many provider rows were dropped.
+
+    Diagnostics only: ``rejected_close_count`` counts returned rows whose Close was missing,
+    NaN, infinite, zero or negative. Those rows are still rejected exactly as before.
+    """
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.rejected_close_count = 0
+        self.rejected_close_diagnostics = []
+        self.rejected_close_diagnostics_omitted = 0
+
+    def reject_close(self, timestamp: Any, reason: str) -> None:
+        self.rejected_close_count += 1
+        diagnostic = rejected_close_diagnostic(timestamp, reason)
+        if diagnostic is not None and len(self.rejected_close_diagnostics) < MAX_REJECTED_CLOSE_DIAGNOSTICS:
+            self.rejected_close_diagnostics.append(diagnostic)
+        else:
+            self.rejected_close_diagnostics_omitted += 1
+
+
 class YahooHistoricalPriceProvider:
     """Existing structured-market Yahoo integration's historical-close adapter.
 
@@ -277,16 +440,26 @@ class YahooHistoricalPriceProvider:
                 # Recheck canonical identity against the same returned info;
                 # sharing a ticker never substitutes for verification.
                 self._verify_identity_or_raise(instrument, ticker, access)
-        out: list[MarketPriceObservation] = []
+        out: list[MarketPriceObservation] = _ObservationList()
         for observed_at, row in rows:
             try:
-                close = Decimal(str(row["Close"]))
+                close_value = row["Close"]
+            except KeyError:
+                out.reject_close(observed_at, "CLOSE_MISSING")
+                continue
             except Exception:
+                out.reject_close(observed_at, "CLOSE_MALFORMED")
+                continue
+            try:
+                close = Decimal(str(close_value))
+            except Exception:
+                out.reject_close(observed_at, "CLOSE_MISSING" if close_value is None else "CLOSE_MALFORMED")
                 continue
             # Yahoo can include rows whose Close value is NaN. Decimal accepts
             # "nan", but ordering it raises decimal.InvalidOperation and would
             # discard every otherwise valid row returned for the instrument.
             if not close.is_finite() or close <= 0:
+                out.reject_close(observed_at, rejected_close_reason(close))
                 continue
             stamp = observed_at.to_pydatetime()
             if stamp.tzinfo is None:

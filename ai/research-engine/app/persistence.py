@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, ContextManager, Mapping, Protocol
 from uuid import UUID, uuid4
 
 from app.models import (
@@ -152,6 +153,7 @@ class ResearchPersistence(Protocol):
     def upsert_market_price_observation(self, observation: MarketPriceObservation) -> None: ...
     def upsert_daily_market_bar(self, bar: DailyMarketBar) -> None: ...
     def upsert_daily_market_bars(self, bars: list[DailyMarketBar]) -> int: ...
+    def read_only_snapshot(self) -> ContextManager[None]: ...
     def load_daily_market_bars(self, instrument_ids: set[UUID], *, start_date: date | None = None,
                               end_date: date | None = None, provider: str | None = None) -> list[DailyMarketBar]: ...
     def daily_market_history_sources(self, instrument_id: UUID, *, end_date: date): ...
@@ -238,6 +240,12 @@ class DisabledResearchPersistence:
     def upsert_market_price_observation(self, observation): return None
     def upsert_daily_market_bar(self, bar): return None
     def upsert_daily_market_bars(self, bars): return 0
+
+    @contextmanager
+    def read_only_snapshot(self):
+        """No-op context for disabled persistence; never opens a database."""
+        yield
+
     def load_daily_market_bars(self, instrument_ids, *, start_date=None, end_date=None, provider=None): return []
     def daily_market_history_sources(self, instrument_id, *, end_date): return []
     def daily_market_history_page(self, instrument_id, *, provider, start_date, end_date, after=None, limit=500, descending=False): return []
@@ -327,6 +335,25 @@ class SqliteResearchPersistence(NewsPersistenceMixin, OpportunityPersistenceMixi
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self.migrate()
+
+    @contextmanager
+    def read_only_snapshot(self):
+        """Test/local equivalent of the production enforced read-only snapshot.
+
+        Refuse an existing transaction rather than committing another caller's
+        work. SQLite's nested connection contexts end SELECT transactions, so
+        the local adapter enforces query-only for the entire callback; production
+        additionally guarantees repeatable-read across all nested repository reads.
+        """
+        if self._connection.in_transaction:
+            raise RuntimeError('READ_ONLY_SNAPSHOT_REQUIRES_IDLE_CONNECTION')
+        previous = self._connection.execute('PRAGMA query_only').fetchone()[0]
+        self._connection.execute('PRAGMA query_only=ON')
+        try:
+            yield
+        finally:
+            self._connection.rollback()
+            self._connection.execute(f'PRAGMA query_only={int(previous)}')
 
     def migrate(self) -> None:
         self._connection.executescript(_sqlite_schema())

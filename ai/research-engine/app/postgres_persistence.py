@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import psycopg
+from contextlib import contextmanager
+from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 
 from app.persistence import SqliteResearchPersistence
@@ -32,6 +34,26 @@ class PostgresResearchPersistence(SqliteResearchPersistence):
 
     def _lease_clock_sql(self) -> str:
         return "to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00'"
+
+    @contextmanager
+    def read_only_snapshot(self):
+        """One PostgreSQL-enforced snapshot around nested read interfaces.
+
+        The adapter's outer depth keeps all repository SELECTs in this same
+        repeatable-read/read-only transaction. No session default or other
+        caller's pending work is changed. PostgreSQL rejects persistent writes.
+        """
+        if (self._connection._depth != 0
+                or self._connection.connection.info.transaction_status != TransactionStatus.IDLE):
+            raise RuntimeError('READ_ONLY_SNAPSHOT_REQUIRES_IDLE_CONNECTION')
+        with self._connection:
+            self._connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            state = self._connection.execute(
+                "SELECT current_setting('transaction_read_only') AS read_only, "
+                "current_setting('transaction_isolation') AS isolation").fetchone()
+            if state['read_only'] != 'on' or state['isolation'] != 'repeatable read':
+                raise RuntimeError('READ_ONLY_SNAPSHOT_NOT_ENFORCED')
+            yield
 
     def migrate(self) -> None:
         raise RuntimeError("PostgreSQL research schema is owned by research-service Flyway migrations")

@@ -163,6 +163,26 @@ checks do not guarantee admission during arbitrary loop-shutdown races. Already
 admitted/in-flight network work is bounded by its transport timeout and cannot be
 synchronously revoked. No reservation lock is held during that I/O.
 
+## Operator environment: not the application image
+
+`scripts/discover_etf_history_recovery.py` and `scripts/recover_etf_history.py` are
+operator tools. They run from the **validated external operator Python
+environment** (Python 3.12 with the `ai/research-engine` dependencies, from a
+checkout of the approved commit, with the approved `AIP_*` database settings).
+
+- The standard research-engine Docker image does **not** package `scripts/`. Its
+  `Dockerfile` copies only `pyproject.toml` and `app/`, and `pyproject.toml`
+  installs only `app*`.
+- Do not expect `python -m scripts.recover_etf_history` or
+  `python -m scripts.discover_etf_history_recovery` to work inside the
+  research-engine pod (`kubectl exec` / `docker exec` into the container will not
+  find the modules).
+- The scripts must **not** be added to the application image as part of this
+  change. Keeping apply-capable recovery tooling out of the runtime container is
+  intentional; any change to that is a separate, separately approved decision.
+- This does not change any safety instruction in this document: backup, approval,
+  budget, confirmation and bearer-token requirements are unchanged.
+
 ## CLI: plan first, execution only after separate acceptance
 
 Run from `ai/research-engine` using the validated Python environment. Existing
@@ -302,3 +322,21 @@ and `rejected_invalid_close_count`.
 A technical failure keeps its own reason and `incomplete_detail` stays `[]`; its gaps still appear in
 `missing_session_windows`. A planning read whose clock precedes the bars' retrieval time treats those
 bars as future (`FUTURE_HISTORY`); that existing behaviour is unchanged.
+
+## Price provenance fail-closed check (history selection)
+
+`select_etf_history_bars` labels accepted closes `price_basis: UNADJUSTED_CLOSE`.
+For `YAHOO_FINANCE` and `YAHOO_FINANCE_MCP` bars it now also requires that the
+stored `source_url` carries no adjusted, malformed or ambiguous adjustment evidence
+(`yahoo_price_provenance_is_unadjusted`). Any query, fragment or path element that
+mentions an adjustment (`auto_adjust`, `adjusted`, `adjustment`, `adjclose`, ...)
+must appear exactly once with an explicit false value (`false`, `0`, `unadjusted`).
+Adjusted flags, blank or valueless flags, duplicates, conflicting query/fragment
+values, `;` separators and path-parameter forms are rejected as
+`ADJUSTED_OR_AMBIGUOUS_PRICE_PROVENANCE` (counted in `rejection_reasons`; the bar is
+excluded, never altered). The provider URL `...history?interval=1d&auto_adjust=false`
+and legacy flagless `/history` URLs are still accepted; this check never upgrades
+a source to "verified". Candle values, dates, persistence, serialized field names and
+the `CORPORATE_ACTION_ADJUSTMENT_UNVERIFIED` / `UNADJUSTED_PRICE_NOT_TOTAL_RETURN`
+warnings are unchanged. Note that Yahoo `Close` with `auto_adjust=false` is
+split-adjusted, not dividend-adjusted; those warnings still apply.

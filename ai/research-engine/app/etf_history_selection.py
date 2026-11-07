@@ -5,7 +5,7 @@ It does not fetch, fill candles, infer corporate actions, or change their weight
 """
 from collections import Counter, defaultdict
 from datetime import date
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from app.market_sessions import session_bounds
 from app.models import DailyMarketBar
@@ -17,6 +17,44 @@ SOURCE_HOSTS = {
     "YAHOO_FINANCE": {"finance.yahoo.com", "www.finance.yahoo.com", "query1.finance.yahoo.com", "query2.finance.yahoo.com"},
     "YAHOO_FINANCE_MCP": {"finance.yahoo.com", "www.finance.yahoo.com", "query1.finance.yahoo.com", "query2.finance.yahoo.com"},
 }
+
+
+# Explicit "not adjusted" spellings. This is the same vocabulary as
+# session_history.history_symbol, which cannot be reused directly: it also
+# enforces a single host and the symbol shape (stricter than this selector's
+# accepted hosts), lets a fragment silently override the query string, and
+# ignores blank or valueless flags. Provenance here must fail closed.
+_UNADJUSTED_FLAG_VALUES = frozenset({"false", "0", "unadjusted"})
+
+
+def yahoo_price_provenance_is_unadjusted(source_url):
+    """True unless the URL carries adjusted, malformed or ambiguous adjustment evidence.
+
+    Any query/fragment/path parameter that mentions an adjustment (``auto_adjust``,
+    ``adjusted``, ``adjclose`` ...) must appear exactly once with an explicit false
+    value. A URL with no adjustment indicator keeps the legacy Yahoo /history
+    contract (``auto_adjust=False``); this check never upgrades a source to verified.
+    """
+    try:
+        parts = urlsplit(source_url)
+        segments = [unquote(part).lower() for part in parts.path.split("/") if part]
+        # A ticker such as ADJUSTCO.NS legitimately contains "adj": skip the symbol segment.
+        symbol_at = segments.index("quote") + 1 if "quote" in segments else -1
+        if (";" in parts.path or ";" in parts.query or ";" in parts.fragment
+                or any("adj" in part for i, part in enumerate(segments) if i != symbol_at)):
+            return False
+        seen = set()
+        for text in (parts.query, parts.fragment):
+            for key, value in parse_qsl(text, keep_blank_values=True, strict_parsing=False):
+                name = key.strip().lower().replace("-", "_")
+                if "adj" not in name:
+                    continue
+                if name in seen or value.strip().lower() not in _UNADJUSTED_FLAG_VALUES:
+                    return False
+                seen.add(name)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def select_etf_history_bars(bars, instrument_id, *, now=None, provider=None,
@@ -57,6 +95,9 @@ def select_etf_history_bars(bars, instrument_id, *, now=None, provider=None,
                         or source.username is not None or source.password is not None
                         or source.port not in (None, 443)):
                     reason = "UNVERIFIED_HISTORY_SOURCE"
+                elif (bar.provider in ("YAHOO_FINANCE", "YAHOO_FINANCE_MCP")
+                        and not yahoo_price_provenance_is_unadjusted(bar.source_url)):
+                    reason = "ADJUSTED_OR_AMBIGUOUS_PRICE_PROVENANCE"
             except ValueError:
                 reason = "UNVERIFIED_HISTORY_SOURCE"
         if reason is None and canonical_symbol is not None:

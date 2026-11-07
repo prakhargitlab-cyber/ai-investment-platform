@@ -99,6 +99,26 @@ These remain distinct from instrument/provider results. The previous ID is never
 authorization, and `execution_authorized=false` is explicit in the output.
 Malformed matching recovery scopes raise a stable error without rewriting them.
 
+## Operator environment: not the application image
+
+`scripts/discover_etf_history_recovery.py` and `scripts/recover_etf_history.py` are
+operator tools. They run from the **validated external operator Python
+environment** (Python 3.12 with the `ai/research-engine` dependencies, from a
+checkout of the approved commit, with the approved `AIP_*` database settings).
+
+- The standard research-engine Docker image does **not** package `scripts/`. Its
+  `Dockerfile` copies only `pyproject.toml` and `app/`, and `pyproject.toml`
+  installs only `app*`.
+- Do not expect `python -m scripts.recover_etf_history` or
+  `python -m scripts.discover_etf_history_recovery` to work inside the
+  research-engine pod (`kubectl exec` / `docker exec` into the container will not
+  find the modules).
+- The scripts must **not** be added to the application image as part of this
+  change. Keeping apply-capable recovery tooling out of the runtime container is
+  intentional; any change to that is a separate, separately approved decision.
+- This does not change any safety instruction in this document: backup, approval,
+  budget, confirmation and bearer-token requirements are unchanged.
+
 ## Commands
 
 Run in the approved database connection environment from the existing worktree;
